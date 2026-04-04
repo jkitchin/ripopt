@@ -272,7 +272,7 @@ x2
 
     // Evaluate objective at initial point x=(1,2)
     let x = vec![1.0, 2.0];
-    let f = problem.objective(&x);
+    let f = problem.objective(&x, true);
     let expected = (1.0_f64).exp().sqrt() + 4.0 * 1.0;
     assert!(
         (f - expected).abs() < 1e-10,
@@ -321,7 +321,7 @@ x3
     let problem = NlProblem::from_nl_data(data);
 
     let x = vec![1.0, 2.0, 3.0];
-    let f = problem.objective(&x);
+    let f = problem.objective(&x, true);
     assert!(
         (f - 6.0).abs() < 1e-10,
         "SUMLIST at (1,2,3) = {f}, expected 6.0"

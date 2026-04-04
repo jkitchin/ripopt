@@ -35,18 +35,18 @@ impl NlpProblem for Rosenbrock {
         x0[1] = 1.0;
     }
 
-    fn objective(&self, x: &[f64]) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
         let (x1, x2) = (x[0], x[1]);
         (1.0 - x1).powi(2) + 100.0 * (x2 - x1 * x1).powi(2)
     }
 
-    fn gradient(&self, x: &[f64], grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
         let (x1, x2) = (x[0], x[1]);
         grad[0] = -2.0 * (1.0 - x1) - 400.0 * x1 * (x2 - x1 * x1);
         grad[1] = 200.0 * (x2 - x1 * x1);
     }
 
-    fn constraints(&self, _x: &[f64], _g: &mut [f64]) {
+    fn constraints(&self, _x: &[f64], _new_x: bool, _g: &mut [f64]) {
         // No constraints
     }
 
@@ -55,7 +55,7 @@ impl NlpProblem for Rosenbrock {
         (vec![], vec![])
     }
 
-    fn jacobian_values(&self, _x: &[f64], _vals: &mut [f64]) {
+    fn jacobian_values(&self, _x: &[f64], _new_x: bool, _vals: &mut [f64]) {
         // No constraints
     }
 
@@ -64,7 +64,7 @@ impl NlpProblem for Rosenbrock {
         (vec![0, 1, 1], vec![0, 0, 1])
     }
 
-    fn hessian_values(&self, x: &[f64], obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
         let (x1, x2) = (x[0], x[1]);
         // H[0,0] = 2 - 400*x2 + 1200*x1^2
         vals[0] = obj_factor * (2.0 - 400.0 * x2 + 1200.0 * x1 * x1);

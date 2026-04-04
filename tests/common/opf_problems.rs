@@ -518,7 +518,7 @@ impl NlpProblem for AcopfProblem {
         }
     }
 
-    fn objective(&self, x: &[f64]) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
         let bmva = self.base_mva;
         let mut f = 0.0;
         for g in 0..self.n_gen {
@@ -529,7 +529,7 @@ impl NlpProblem for AcopfProblem {
         f
     }
 
-    fn gradient(&self, x: &[f64], grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
         let bmva = self.base_mva;
         let nv = self.n_var();
         for i in 0..nv {
@@ -543,7 +543,7 @@ impl NlpProblem for AcopfProblem {
         }
     }
 
-    fn constraints(&self, x: &[f64], g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
         let n = self.n_bus;
         let bmva = self.base_mva;
 
@@ -601,7 +601,7 @@ impl NlpProblem for AcopfProblem {
         (rows, cols)
     }
 
-    fn jacobian_values(&self, x: &[f64], vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
         let n = self.n_bus;
         let mut idx = 0;
 
@@ -850,7 +850,7 @@ impl NlpProblem for AcopfProblem {
         dense_lower_triangle(nv)
     }
 
-    fn hessian_values(&self, x: &[f64], obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
         let n = self.n_bus;
         let bmva = self.base_mva;
 
@@ -995,7 +995,7 @@ impl NlpProblem for AcopfProblem {
 
             // Compute Jacobian values at the current point
             let mut jac_base = vec![0.0; nnz_jac];
-            self.jacobian_values(x, &mut jac_base);
+            self.jacobian_values(x, true, &mut jac_base);
 
             // For each of the 4 variables, perturb and compute numerical Hessian
             let mut x_pert = x.to_vec();
@@ -1005,7 +1005,7 @@ impl NlpProblem for AcopfProblem {
                 x_pert[va] = x_orig + eps;
 
                 let mut jac_pert = vec![0.0; nnz_jac];
-                self.jacobian_values(&x_pert, &mut jac_pert);
+                self.jacobian_values(&x_pert, true, &mut jac_pert);
 
                 // For variables b <= a (lower triangle)
                 for b in 0..=a {

@@ -20,21 +20,21 @@ impl NlpProblem for Rosenbrock {
         x0[0] = -1.2;
         x0[1] = 1.0;
     }
-    fn objective(&self, x: &[f64]) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
         let a = 1.0 - x[0];
         let b = x[1] - x[0] * x[0];
         a * a + 100.0 * b * b
     }
-    fn gradient(&self, x: &[f64], grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
         grad[0] = -2.0 * (1.0 - x[0]) - 400.0 * x[0] * (x[1] - x[0] * x[0]);
         grad[1] = 200.0 * (x[1] - x[0] * x[0]);
     }
-    fn constraints(&self, _x: &[f64], _g: &mut [f64]) {}
+    fn constraints(&self, _x: &[f64], _new_x: bool, _g: &mut [f64]) {}
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
-    fn jacobian_values(&self, _x: &[f64], _vals: &mut [f64]) {}
+    fn jacobian_values(&self, _x: &[f64], _new_x: bool, _vals: &mut [f64]) {}
     // Return dummy structure — hessian_values should never be called in lbfgs mode
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
-    fn hessian_values(&self, _x: &[f64], _obj_factor: f64, _lambda: &[f64], _vals: &mut [f64]) {
+    fn hessian_values(&self, _x: &[f64], _new_x: bool, _obj_factor: f64, _lambda: &[f64], _vals: &mut [f64]) {
         panic!("hessian_values should not be called in limited-memory mode");
     }
 }
@@ -80,23 +80,23 @@ impl NlpProblem for Hs071Lbfgs {
     fn initial_point(&self, x0: &mut [f64]) {
         x0[0] = 1.0; x0[1] = 5.0; x0[2] = 5.0; x0[3] = 1.0;
     }
-    fn objective(&self, x: &[f64]) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
         x[0] * x[3] * (x[0] + x[1] + x[2]) + x[2]
     }
-    fn gradient(&self, x: &[f64], grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
         grad[0] = x[3] * (2.0 * x[0] + x[1] + x[2]);
         grad[1] = x[0] * x[3];
         grad[2] = x[0] * x[3] + 1.0;
         grad[3] = x[0] * (x[0] + x[1] + x[2]);
     }
-    fn constraints(&self, x: &[f64], g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
         g[0] = x[0] * x[1] * x[2] * x[3];
         g[1] = x[0] * x[0] + x[1] * x[1] + x[2] * x[2] + x[3] * x[3];
     }
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         (vec![0, 0, 0, 0, 1, 1, 1, 1], vec![0, 1, 2, 3, 0, 1, 2, 3])
     }
-    fn jacobian_values(&self, x: &[f64], vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
         vals[0] = x[1] * x[2] * x[3];
         vals[1] = x[0] * x[2] * x[3];
         vals[2] = x[0] * x[1] * x[3];
@@ -108,7 +108,7 @@ impl NlpProblem for Hs071Lbfgs {
     }
     // Dummy hessian structure — never used in lbfgs mode
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
-    fn hessian_values(&self, _x: &[f64], _obj_factor: f64, _lambda: &[f64], _vals: &mut [f64]) {
+    fn hessian_values(&self, _x: &[f64], _new_x: bool, _obj_factor: f64, _lambda: &[f64], _vals: &mut [f64]) {
         panic!("hessian_values should not be called in limited-memory mode");
     }
 }
@@ -133,7 +133,7 @@ fn lbfgs_ipm_hs071_constrained() {
     // Even if it doesn't fully converge, the constraint violation should be small
     let cv: f64 = {
         let mut g = vec![0.0; 2];
-        problem.constraints(&result.x, &mut g);
+        problem.constraints(&result.x, true, &mut g);
         let mut max_v = 0.0_f64;
         // g[0] >= 25
         max_v = max_v.max((25.0 - g[0]).max(0.0));
@@ -169,18 +169,18 @@ impl NlpProblem for SimpleQuadratic {
         x0[0] = 5.0;
         x0[1] = 5.0;
     }
-    fn objective(&self, x: &[f64]) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
         x[0] * x[0] + x[1] * x[1]
     }
-    fn gradient(&self, x: &[f64], grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
         grad[0] = 2.0 * x[0];
         grad[1] = 2.0 * x[1];
     }
-    fn constraints(&self, _x: &[f64], _g: &mut [f64]) {}
+    fn constraints(&self, _x: &[f64], _new_x: bool, _g: &mut [f64]) {}
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
-    fn jacobian_values(&self, _x: &[f64], _vals: &mut [f64]) {}
+    fn jacobian_values(&self, _x: &[f64], _new_x: bool, _vals: &mut [f64]) {}
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
-    fn hessian_values(&self, _x: &[f64], _: f64, _: &[f64], _: &mut [f64]) {
+    fn hessian_values(&self, _x: &[f64], _new_x: bool, _: f64, _: &[f64], _: &mut [f64]) {
         panic!("hessian_values must not be called in limited-memory mode");
     }
 }
@@ -264,21 +264,21 @@ impl NlpProblem for BadHessianQuadratic {
         x0[0] = 5.0;
         x0[1] = 5.0;
     }
-    fn objective(&self, x: &[f64]) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
         x[0] * x[0] + x[1] * x[1]
     }
-    fn gradient(&self, x: &[f64], grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
         grad[0] = 2.0 * x[0];
         grad[1] = 2.0 * x[1];
     }
-    fn constraints(&self, _x: &[f64], _g: &mut [f64]) {}
+    fn constraints(&self, _x: &[f64], _new_x: bool, _g: &mut [f64]) {}
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
-    fn jacobian_values(&self, _x: &[f64], _vals: &mut [f64]) {}
+    fn jacobian_values(&self, _x: &[f64], _new_x: bool, _vals: &mut [f64]) {}
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         // Lower triangle: (0,0), (1,0), (1,1)
         (vec![0, 1, 1], vec![0, 0, 1])
     }
-    fn hessian_values(&self, _x: &[f64], obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, _x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
         // Return a deliberately wrong negative-definite Hessian.
         // The exact IPM will struggle with this (wrong curvature direction).
         vals[0] = obj_factor * (-100.0);
@@ -364,18 +364,18 @@ fn lbfgs_hessian_fallback_skipped_when_already_lbfgs() {
             x0[0] = 5.0;
             x0[1] = 5.0;
         }
-        fn objective(&self, x: &[f64]) -> f64 {
+        fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
             x[0] * x[0] + x[1] * x[1]
         }
-        fn gradient(&self, x: &[f64], grad: &mut [f64]) {
+        fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
             grad[0] = 2.0 * x[0];
             grad[1] = 2.0 * x[1];
         }
-        fn constraints(&self, _x: &[f64], _g: &mut [f64]) {}
+        fn constraints(&self, _x: &[f64], _new_x: bool, _g: &mut [f64]) {}
         fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
-        fn jacobian_values(&self, _x: &[f64], _vals: &mut [f64]) {}
+        fn jacobian_values(&self, _x: &[f64], _new_x: bool, _vals: &mut [f64]) {}
         fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
-        fn hessian_values(&self, _x: &[f64], _: f64, _: &[f64], _: &mut [f64]) {
+        fn hessian_values(&self, _x: &[f64], _new_x: bool, _: f64, _: &[f64], _: &mut [f64]) {
             HESS_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -418,29 +418,29 @@ fn lbfgs_hessian_fallback_constrained() {
             x0[0] = 1.0;
             x0[1] = 1.0;
         }
-        fn objective(&self, x: &[f64]) -> f64 {
+        fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
             // min (x[0]-3)^2 + (x[1]-3)^2, s.t. x[0]+x[1]=4
             // Solution: x=(2,2), f=2
             (x[0] - 3.0).powi(2) + (x[1] - 3.0).powi(2)
         }
-        fn gradient(&self, x: &[f64], grad: &mut [f64]) {
+        fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
             grad[0] = 2.0 * (x[0] - 3.0);
             grad[1] = 2.0 * (x[1] - 3.0);
         }
-        fn constraints(&self, x: &[f64], g: &mut [f64]) {
+        fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
             g[0] = x[0] + x[1];
         }
         fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
             (vec![0, 0], vec![0, 1])
         }
-        fn jacobian_values(&self, _x: &[f64], vals: &mut [f64]) {
+        fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) {
             vals[0] = 1.0;
             vals[1] = 1.0;
         }
         fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
             (vec![0, 1, 1], vec![0, 0, 1])
         }
-        fn hessian_values(&self, _x: &[f64], obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
+        fn hessian_values(&self, _x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
             // Wrong Hessian: negative definite
             vals[0] = obj_factor * (-50.0);
             vals[1] = obj_factor * 0.0;

@@ -97,7 +97,7 @@ impl<'a> RestorationNlp<'a> {
         // Compute initial p, n from constraint violations at x_r
         let mut g_r = vec![0.0; m];
         if m > 0 {
-            inner.constraints(x_r, &mut g_r);
+            inner.constraints(x_r, true, &mut g_r);
         }
         let mut g_l = vec![0.0; m];
         let mut g_u = vec![0.0; m];
@@ -182,7 +182,7 @@ impl NlpProblem for RestorationNlp<'_> {
         x0[n + m..n + 2 * m].copy_from_slice(&self.n_init);
     }
 
-    fn objective(&self, x: &[f64]) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
         let n = self.n_orig;
         let m = self.m_orig;
 
@@ -201,7 +201,7 @@ impl NlpProblem for RestorationNlp<'_> {
         obj
     }
 
-    fn gradient(&self, x: &[f64], grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
         let n = self.n_orig;
         let m = self.m_orig;
 
@@ -216,12 +216,12 @@ impl NlpProblem for RestorationNlp<'_> {
         }
     }
 
-    fn constraints(&self, x: &[f64], g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
         let n = self.n_orig;
         let m = self.m_orig;
 
         // g_resto[i] = g_orig[i] - p[i] + n[i]
-        self.inner.constraints(&x[..n], g);
+        self.inner.constraints(&x[..n], _new_x, g);
         for i in 0..m {
             g[i] = g[i] - x[n + i] + x[n + m + i];
         }
@@ -256,13 +256,13 @@ impl NlpProblem for RestorationNlp<'_> {
         (rows, cols)
     }
 
-    fn jacobian_values(&self, x: &[f64], vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
         let n = self.n_orig;
         let m = self.m_orig;
         let inner_nnz = self.inner_jac_rows.len();
 
         // Inner Jacobian values
-        self.inner.jacobian_values(&x[..n], &mut vals[..inner_nnz]);
+        self.inner.jacobian_values(&x[..n], _new_x, &mut vals[..inner_nnz]);
 
         // -1 for p
         for i in 0..m {
@@ -279,14 +279,14 @@ impl NlpProblem for RestorationNlp<'_> {
         (self.resto_hess_rows.clone(), self.resto_hess_cols.clone())
     }
 
-    fn hessian_values(&self, x: &[f64], obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
         let n = self.n_orig;
 
         // Inner hessian: obj_factor=0 (restoration doesn't optimize original objective),
         // lambda passed through (constraint curvature).
         let mut inner_vals = vec![0.0; self.inner_hess_nnz];
         self.inner
-            .hessian_values(&x[..n], 0.0, lambda, &mut inner_vals);
+            .hessian_values(&x[..n], _new_x, 0.0, lambda, &mut inner_vals);
 
         // Copy inner values to output
         vals[..self.inner_hess_nnz].copy_from_slice(&inner_vals);
@@ -334,27 +334,27 @@ mod tests {
             x0[0] = 0.0;
             x0[1] = 0.0;
         }
-        fn objective(&self, x: &[f64]) -> f64 {
+        fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
             x[0] * x[0] + x[1] * x[1]
         }
-        fn gradient(&self, x: &[f64], grad: &mut [f64]) {
+        fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
             grad[0] = 2.0 * x[0];
             grad[1] = 2.0 * x[1];
         }
-        fn constraints(&self, x: &[f64], g: &mut [f64]) {
+        fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
             g[0] = x[0] + x[1];
         }
         fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
             (vec![0, 0], vec![0, 1])
         }
-        fn jacobian_values(&self, _x: &[f64], vals: &mut [f64]) {
+        fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) {
             vals[0] = 1.0;
             vals[1] = 1.0;
         }
         fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
             (vec![0, 1], vec![0, 1])
         }
-        fn hessian_values(&self, _x: &[f64], obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
+        fn hessian_values(&self, _x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
             vals[0] = 2.0 * obj_factor;
             vals[1] = 2.0 * obj_factor;
         }
@@ -407,7 +407,7 @@ mod tests {
         let resto = RestorationNlp::new(&prob, &x_r, 0.1, 1000.0, 1.0);
         // At x=x_r, p=1, n=2: obj = rho*(1+2) + 0
         let x = vec![1.0, 2.0, 1.0, 2.0];
-        let obj = resto.objective(&x);
+        let obj = resto.objective(&x, true);
         assert!((obj - 3000.0).abs() < 1e-10, "obj = {}", obj);
     }
 
@@ -419,7 +419,7 @@ mod tests {
         let nv = resto.num_variables();
         let x = vec![1.0, 2.0, 0.5, 0.5];
         let mut grad = vec![0.0; nv];
-        resto.gradient(&x, &mut grad);
+        resto.gradient(&x, true, &mut grad);
         assert!(grad[0].abs() < 1e-10);
         assert!(grad[1].abs() < 1e-10);
         assert!((grad[2] - 1000.0).abs() < 1e-10);
@@ -435,7 +435,7 @@ mod tests {
         // g_resto = (0.3 + 0.5) - 0.2 + 0.1 = 0.7
         let x = vec![0.3, 0.5, 0.2, 0.1];
         let mut g = vec![0.0; m];
-        resto.constraints(&x, &mut g);
+        resto.constraints(&x, true, &mut g);
         assert!((g[0] - 0.7).abs() < 1e-10, "g = {}", g[0]);
     }
 
@@ -453,7 +453,7 @@ mod tests {
 
         let mut vals = vec![0.0; 4];
         let x = vec![0.5, 0.5, 0.1, 0.1];
-        resto.jacobian_values(&x, &mut vals);
+        resto.jacobian_values(&x, true, &mut vals);
         assert!((vals[0] - 1.0).abs() < 1e-10);
         assert!((vals[1] - 1.0).abs() < 1e-10);
         assert!((vals[2] - (-1.0)).abs() < 1e-10);
@@ -471,7 +471,7 @@ mod tests {
         let mut vals = vec![0.0; nnz];
         let x = vec![1.0, 2.0, 0.1, 0.1];
         let lambda = vec![1.0];
-        resto.hessian_values(&x, 1.0, &lambda, &mut vals);
+        resto.hessian_values(&x, true, 1.0, &lambda, &mut vals);
         let eta = 0.1f64.sqrt();
         assert!((vals[0] - eta * 1.0).abs() < 1e-10, "vals[0] = {}", vals[0]);
         assert!(

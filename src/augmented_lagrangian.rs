@@ -108,10 +108,10 @@ impl<P: NlpProblem> NlpProblem for AugLagProblem<'_, P> {
         self.inner.initial_point(x0);
     }
 
-    fn objective(&self, x: &[f64]) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
         let mut g = vec![0.0; self.m];
-        self.inner.constraints(x, &mut g);
-        let f = self.inner.objective(x);
+        self.inner.constraints(x, _new_x, &mut g);
+        let f = self.inner.objective(x, _new_x);
 
         let mut aug = f;
         for i in 0..self.m {
@@ -137,19 +137,19 @@ impl<P: NlpProblem> NlpProblem for AugLagProblem<'_, P> {
         aug
     }
 
-    fn gradient(&self, x: &[f64], grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
         let m = self.m;
         let n = self.n;
 
-        self.inner.gradient(x, grad);
+        self.inner.gradient(x, _new_x, grad);
 
         let mut g = vec![0.0; m];
-        self.inner.constraints(x, &mut g);
+        self.inner.constraints(x, _new_x, &mut g);
 
         let (jac_rows, jac_cols) = self.inner.jacobian_structure();
         let nnz = jac_rows.len();
         let mut jac_vals = vec![0.0; nnz];
-        self.inner.jacobian_values(x, &mut jac_vals);
+        self.inner.jacobian_values(x, _new_x, &mut jac_vals);
 
         let sigma: Vec<f64> = (0..m)
             .map(|i| {
@@ -166,19 +166,19 @@ impl<P: NlpProblem> NlpProblem for AugLagProblem<'_, P> {
         }
     }
 
-    fn constraints(&self, _x: &[f64], _g: &mut [f64]) {}
+    fn constraints(&self, _x: &[f64], _new_x: bool, _g: &mut [f64]) {}
 
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         (vec![], vec![])
     }
 
-    fn jacobian_values(&self, _x: &[f64], _vals: &mut [f64]) {}
+    fn jacobian_values(&self, _x: &[f64], _new_x: bool, _vals: &mut [f64]) {}
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         (vec![], vec![])
     }
 
-    fn hessian_values(&self, _x: &[f64], _obj_factor: f64, _lambda: &[f64], _vals: &mut [f64]) {}
+    fn hessian_values(&self, _x: &[f64], _new_x: bool, _obj_factor: f64, _lambda: &[f64], _vals: &mut [f64]) {}
 }
 
 /// Solve a constrained problem using the Augmented Lagrangian method
@@ -227,13 +227,13 @@ pub fn solve<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
 
         // Evaluate constraint violation
         let mut g = vec![0.0; m];
-        problem.constraints(&x_current, &mut g);
+        problem.constraints(&x_current, true, &mut g);
 
         let violation: f64 = (0..m)
             .map(|i| constraint_violation_i(g[i], g_l[i], g_u[i]).abs())
             .fold(0.0, f64::max);
 
-        let f_val = problem.objective(&x_current);
+        let f_val = problem.objective(&x_current, false);
 
         if print_level >= 5 {
             rip_log!(
@@ -288,9 +288,9 @@ pub fn solve<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
     }
 
     // Did not converge
-    let f_val = problem.objective(&x_current);
+    let f_val = problem.objective(&x_current, false);
     let mut g = vec![0.0; m];
-    problem.constraints(&x_current, &mut g);
+    problem.constraints(&x_current, true, &mut g);
 
     SolveResult {
         x: x_current,
@@ -340,25 +340,25 @@ impl<P: NlpProblem> NlpProblem for StartPointWrapper<'_, P> {
     fn initial_point(&self, x0: &mut [f64]) {
         x0.copy_from_slice(&self.x0);
     }
-    fn objective(&self, x: &[f64]) -> f64 {
-        self.inner.objective(x)
+    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
+        self.inner.objective(x, _new_x)
     }
-    fn gradient(&self, x: &[f64], grad: &mut [f64]) {
-        self.inner.gradient(x, grad);
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
+        self.inner.gradient(x, _new_x, grad);
     }
-    fn constraints(&self, x: &[f64], g: &mut [f64]) {
-        self.inner.constraints(x, g);
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
+        self.inner.constraints(x, _new_x, g);
     }
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         self.inner.jacobian_structure()
     }
-    fn jacobian_values(&self, x: &[f64], vals: &mut [f64]) {
-        self.inner.jacobian_values(x, vals);
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
+        self.inner.jacobian_values(x, _new_x, vals);
     }
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         self.inner.hessian_structure()
     }
-    fn hessian_values(&self, x: &[f64], obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
-        self.inner.hessian_values(x, obj_factor, lambda, vals);
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
+        self.inner.hessian_values(x, _new_x, obj_factor, lambda, vals);
     }
 }

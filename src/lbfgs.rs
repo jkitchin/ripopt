@@ -36,8 +36,8 @@ pub fn solve<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
     project_bounds(&mut x, &x_l, &x_u);
 
     let mut grad = vec![0.0; n];
-    let mut f = problem.objective(&x);
-    problem.gradient(&x, &mut grad);
+    let mut f = problem.objective(&x, true);
+    problem.gradient(&x, true, &mut grad);
 
     let print_level = options.print_level;
     let tol = options.tol;
@@ -258,7 +258,7 @@ pub fn solve<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
     // Build result
     let mut g_out = vec![0.0; m];
     if m > 0 {
-        problem.constraints(&x, &mut g_out);
+        problem.constraints(&x, true, &mut g_out);
     }
 
     SolveResult {
@@ -376,7 +376,7 @@ fn wolfe_line_search<P: NlpProblem>(
             x_trial[i] = clamp(x[i] + alpha * d[i], x_l[i], x_u[i]);
         }
 
-        let f_trial = problem.objective(&x_trial);
+        let f_trial = problem.objective(&x_trial, true);
 
         // Treat NaN/Inf as Armijo violation
         if !f_trial.is_finite() {
@@ -389,7 +389,7 @@ fn wolfe_line_search<P: NlpProblem>(
             continue;
         }
 
-        problem.gradient(&x_trial, &mut grad_trial);
+        problem.gradient(&x_trial, true, &mut grad_trial);
         let dg_trial: f64 = grad_trial.iter().zip(d.iter()).map(|(g, d)| g * d).sum();
 
         // Check sufficient decrease (Armijo)
@@ -424,8 +424,8 @@ fn wolfe_line_search<P: NlpProblem>(
         for i in 0..n {
             x_trial[i] = clamp(x[i] + alpha_lo * d[i], x_l[i], x_u[i]);
         }
-        let f_trial = problem.objective(&x_trial);
-        problem.gradient(&x_trial, &mut grad_trial);
+        let f_trial = problem.objective(&x_trial, true);
+        problem.gradient(&x_trial, true, &mut grad_trial);
         return Some((alpha_lo, f_trial, grad_trial));
     }
 
@@ -522,18 +522,18 @@ mod tests {
             x0[0] = 0.0;
             x0[1] = 0.0;
         }
-        fn objective(&self, x: &[f64]) -> f64 {
+        fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
             (x[0] - 3.0).powi(2) + (x[1] - 4.0).powi(2)
         }
-        fn gradient(&self, x: &[f64], grad: &mut [f64]) {
+        fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
             grad[0] = 2.0 * (x[0] - 3.0);
             grad[1] = 2.0 * (x[1] - 4.0);
         }
-        fn constraints(&self, _x: &[f64], _g: &mut [f64]) {}
+        fn constraints(&self, _x: &[f64], _new_x: bool, _g: &mut [f64]) {}
         fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
-        fn jacobian_values(&self, _x: &[f64], _vals: &mut [f64]) {}
+        fn jacobian_values(&self, _x: &[f64], _new_x: bool, _vals: &mut [f64]) {}
         fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![0, 1], vec![0, 1]) }
-        fn hessian_values(&self, _x: &[f64], obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
+        fn hessian_values(&self, _x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
             vals[0] = 2.0 * obj_factor;
             vals[1] = 2.0 * obj_factor;
         }
@@ -567,13 +567,13 @@ mod tests {
         }
         fn constraint_bounds(&self, _g_l: &mut [f64], _g_u: &mut [f64]) {}
         fn initial_point(&self, x0: &mut [f64]) { x0[0] = 0.0; }
-        fn objective(&self, x: &[f64]) -> f64 { (x[0] - 3.0).powi(2) }
-        fn gradient(&self, x: &[f64], grad: &mut [f64]) { grad[0] = 2.0 * (x[0] - 3.0); }
-        fn constraints(&self, _x: &[f64], _g: &mut [f64]) {}
+        fn objective(&self, x: &[f64], _new_x: bool) -> f64 { (x[0] - 3.0).powi(2) }
+        fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) { grad[0] = 2.0 * (x[0] - 3.0); }
+        fn constraints(&self, _x: &[f64], _new_x: bool, _g: &mut [f64]) {}
         fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
-        fn jacobian_values(&self, _x: &[f64], _vals: &mut [f64]) {}
+        fn jacobian_values(&self, _x: &[f64], _new_x: bool, _vals: &mut [f64]) {}
         fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![0], vec![0]) }
-        fn hessian_values(&self, _x: &[f64], obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
+        fn hessian_values(&self, _x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
             vals[0] = 2.0 * obj_factor;
         }
     }

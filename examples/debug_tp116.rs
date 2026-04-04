@@ -66,18 +66,18 @@ impl NlpProblem for TP116 {
         x0[12] = 150.0;
     }
 
-    fn objective(&self, x: &[f64]) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
         x[10] + x[11] + x[12]
     }
 
-    fn gradient(&self, _x: &[f64], grad: &mut [f64]) {
+    fn gradient(&self, _x: &[f64], _new_x: bool, grad: &mut [f64]) {
         for g in grad.iter_mut() { *g = 0.0; }
         grad[10] = 1.0;
         grad[11] = 1.0;
         grad[12] = 1.0;
     }
 
-    fn constraints(&self, x: &[f64], g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
         g[0] = -x[1] + x[2];
         g[1] = -x[0] + x[1];
         g[2] = -0.002*x[6] + 0.002*x[7] + 1.0;
@@ -100,7 +100,7 @@ impl NlpProblem for TP116 {
          vec![1, 2, 0, 1, 6, 7, 10, 11, 12, 10, 11, 12, 2, 9, 12, 1, 4, 2, 5, 0, 3, 4, 6, 7, 0, 1, 4, 5, 7, 8, 1, 2, 5, 8, 9, 1, 2, 9, 0, 3, 0, 7, 10, 1, 8, 11])
     }
 
-    fn jacobian_values(&self, x: &[f64], vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
         vals[0] = -1.0;
         vals[1] = 1.0;
         vals[2] = -1.0;
@@ -154,7 +154,7 @@ impl NlpProblem for TP116 {
          vec![0, 1, 2, 0, 1, 2, 3, 4, 0, 3, 4, 1, 5, 1, 2])
     }
 
-    fn hessian_values(&self, _x: &[f64], _obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, _x: &[f64], _new_x: bool, _obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
         vals[0] = lambda[12] * 0.0195;
         vals[1] = lambda[6] * 0.0195;
         vals[2] = lambda[7] * 0.0195;
@@ -187,7 +187,7 @@ fn main() {
     // Evaluate constraints at initial point to check feasibility
     let x0 = [0.5, 0.8, 0.9, 0.1, 0.14, 0.5, 489.0, 80.0, 650.0, 450.0, 150.0, 150.0, 150.0];
     let mut g = vec![0.0; 15];
-    TP116.constraints(&x0, &mut g);
+    TP116.constraints(&x0, true, &mut g);
     println!("Constraint values at initial point:");
     for (i, gi) in g.iter().enumerate() {
         let status = if *gi >= 0.0 { "OK (>=0)" } else { "VIOLATED (<0)" };

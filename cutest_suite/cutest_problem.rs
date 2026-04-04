@@ -346,7 +346,7 @@ impl NlpProblem for CutestProblem {
         x0.copy_from_slice(&self.x0);
     }
 
-    fn objective(&self, x: &[f64]) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
         let mut status = 0i32;
         let n = self.n as i32;
         let mut f = 0.0f64;
@@ -391,7 +391,7 @@ impl NlpProblem for CutestProblem {
         }
     }
 
-    fn constraints(&self, x: &[f64], g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
         if self.m == 0 {
             return;
         }
@@ -407,7 +407,7 @@ impl NlpProblem for CutestProblem {
         (self.jac_rows.clone(), self.jac_cols.clone())
     }
 
-    fn jacobian_values(&self, x: &[f64], vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
         if self.m == 0 {
             return;
         }
@@ -455,7 +455,7 @@ impl NlpProblem for CutestProblem {
         (self.hess_rows.clone(), self.hess_cols.clone())
     }
 
-    fn hessian_values(&self, x: &[f64], obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
         let mut status = 0i32;
         let n = self.n as i32;
 

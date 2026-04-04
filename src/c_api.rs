@@ -141,13 +141,13 @@ impl NlpProblem for CApiProblem {
         x0.copy_from_slice(&self.initial_x);
     }
 
-    fn objective(&self, x: &[f64]) -> f64 {
+    fn objective(&self, x: &[f64], new_x: bool) -> f64 {
         let mut obj = 0.0_f64;
         let ok = unsafe {
             (self.eval_f)(
                 self.n as c_int,
                 x.as_ptr(),
-                1, // new_x = true; we don't cache
+                new_x as c_int,
                 &mut obj,
                 self.user_data,
             )
@@ -159,24 +159,24 @@ impl NlpProblem for CApiProblem {
         }
     }
 
-    fn gradient(&self, x: &[f64], grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], new_x: bool, grad: &mut [f64]) {
         unsafe {
             (self.eval_grad_f)(
                 self.n as c_int,
                 x.as_ptr(),
-                1,
+                new_x as c_int,
                 grad.as_mut_ptr(),
                 self.user_data,
             );
         }
     }
 
-    fn constraints(&self, x: &[f64], g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], new_x: bool, g: &mut [f64]) {
         unsafe {
             (self.eval_g)(
                 self.n as c_int,
                 x.as_ptr(),
-                1,
+                new_x as c_int,
                 self.m as c_int,
                 g.as_mut_ptr(),
                 self.user_data,
@@ -208,13 +208,13 @@ impl NlpProblem for CApiProblem {
         )
     }
 
-    fn jacobian_values(&self, x: &[f64], vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], new_x: bool, vals: &mut [f64]) {
         let nnz = self.nele_jac;
         unsafe {
             (self.eval_jac_g)(
                 self.n as c_int,
                 x.as_ptr(),
-                1,
+                new_x as c_int,
                 self.m as c_int,
                 nnz as c_int,
                 std::ptr::null_mut(),
@@ -252,13 +252,13 @@ impl NlpProblem for CApiProblem {
         )
     }
 
-    fn hessian_values(&self, x: &[f64], obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
         let nnz = self.nele_hess;
         unsafe {
             (self.eval_h)(
                 self.n as c_int,
                 x.as_ptr(),
-                1,
+                new_x as c_int,
                 obj_factor,
                 self.m as c_int,
                 lambda.as_ptr(),

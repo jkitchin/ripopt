@@ -99,18 +99,18 @@ impl NlpProblem for Hs071 {
         x0[0] = 1.0; x0[1] = 5.0; x0[2] = 5.0; x0[3] = 1.0;
     }
 
-    fn objective(&self, x: &[f64]) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
         x[0] * x[3] * (x[0] + x[1] + x[2]) + x[2]
     }
 
-    fn gradient(&self, x: &[f64], grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
         grad[0] = x[3] * (2.0 * x[0] + x[1] + x[2]);
         grad[1] = x[0] * x[3];
         grad[2] = x[0] * x[3] + 1.0;
         grad[3] = x[0] * (x[0] + x[1] + x[2]);
     }
 
-    fn constraints(&self, x: &[f64], g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
         g[0] = x[0] * x[1] * x[2] * x[3];
         g[1] = x[0] * x[0] + x[1] * x[1] + x[2] * x[2] + x[3] * x[3];
     }
@@ -119,7 +119,7 @@ impl NlpProblem for Hs071 {
         (vec![0,0,0,0, 1,1,1,1], vec![0,1,2,3, 0,1,2,3])
     }
 
-    fn jacobian_values(&self, x: &[f64], vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
         vals[0] = x[1]*x[2]*x[3]; vals[1] = x[0]*x[2]*x[3];
         vals[2] = x[0]*x[1]*x[3]; vals[3] = x[0]*x[1]*x[2];
         vals[4] = 2.0*x[0]; vals[5] = 2.0*x[1];
@@ -211,14 +211,14 @@ impl NlpProblem for TP374 {
         for i in 0..10 { x0[i] = 0.1; }
     }
 
-    fn objective(&self, x: &[f64]) -> f64 { x[9] }
+    fn objective(&self, x: &[f64], _new_x: bool) -> f64 { x[9] }
 
     fn gradient(&self, _x: &[f64], grad: &mut [f64]) {
         for i in 0..9 { grad[i] = 0.0; }
         grad[9] = 1.0;
     }
 
-    fn constraints(&self, x: &[f64], g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
         for i in 0..10 {
             let z = PI/4.0 * (i as f64 * 0.1);
             g[i] = tp374_g(z, x) - (1.0 - x[9]).powi(2);

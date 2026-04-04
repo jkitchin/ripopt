@@ -393,11 +393,11 @@ impl NlpProblem for Rosenbrock {
     fn constraint_bounds(&self, _g_l: &mut [f64], _g_u: &mut [f64]) {}
     fn initial_point(&self, x0: &mut [f64]) { x0[0] = -1.0; x0[1] = 1.0; }
 
-    fn objective(&self, x: &[f64]) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
         100.0 * (x[1] - x[0] * x[0]).powi(2) + (1.0 - x[0]).powi(2)
     }
 
-    fn gradient(&self, x: &[f64], grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
         grad[0] = -400.0 * x[0] * (x[1] - x[0] * x[0]) - 2.0 * (1.0 - x[0]);
         grad[1] = 200.0 * (x[1] - x[0] * x[0]);
     }

@@ -15,27 +15,27 @@ impl NlpProblem for TP012 {
     fn initial_point(&self, x0: &mut [f64]) {
         x0[0] = 0.0; x0[1] = 0.0;
     }
-    fn objective(&self, x: &[f64]) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
         0.5 * x[0].powi(2) - x[0] * x[1] - 7.0 * x[0] + x[1].powi(2) - 7.0 * x[1]
     }
-    fn gradient(&self, x: &[f64], grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
         grad[0] = x[0] - x[1] - 7.0;
         grad[1] = -x[0] + 2.0 * x[1] - 7.0;
     }
-    fn constraints(&self, x: &[f64], g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
         g[0] = -4.0 * x[0].powi(2) - x[1].powi(2) + 25.0;
     }
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         (vec![0, 0], vec![0, 1])
     }
-    fn jacobian_values(&self, x: &[f64], vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
         vals[0] = -8.0 * x[0];
         vals[1] = -2.0 * x[1];
     }
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         (vec![0, 1, 1], vec![0, 0, 1])
     }
-    fn hessian_values(&self, _x: &[f64], obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, _x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
         vals[0] = obj_factor * 1.0 + lambda[0] * (-8.0);
         vals[1] = obj_factor * (-1.0);
         vals[2] = obj_factor * 2.0 + lambda[0] * (-2.0);

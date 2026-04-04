@@ -72,16 +72,16 @@ impl NlpProblem for TP374 {
         }
     }
 
-    fn objective(&self, x: &[f64]) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
         x[9]
     }
 
-    fn gradient(&self, _x: &[f64], grad: &mut [f64]) {
+    fn gradient(&self, _x: &[f64], _new_x: bool, grad: &mut [f64]) {
         for i in 0..9 { grad[i] = 0.0; }
         grad[9] = 1.0;
     }
 
-    fn constraints(&self, x: &[f64], g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
         // Constraints 0..9: G(z_i, x) - (1 - x[9])^2 >= 0
         for i in 0..10 {
             let z = PI / 4.0 * (i as f64 * 0.1);
@@ -112,7 +112,7 @@ impl NlpProblem for TP374 {
         (rows, cols)
     }
 
-    fn jacobian_values(&self, x: &[f64], vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
         let mut idx = 0;
 
         // Constraints 0..9: g_i = G(z, x) - (1 - x[9])^2
@@ -174,7 +174,7 @@ impl NlpProblem for TP374 {
         (rows, cols)
     }
 
-    fn hessian_values(&self, _x: &[f64], _obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, _x: &[f64], _new_x: bool, _obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
         // Objective Hessian is zero (f = x[9] is linear).
         // Constraint Hessians:
         // For constraints 0..9 (group 1): g = A^2 + B^2 - (1-x9)^2
@@ -256,9 +256,9 @@ fn main() {
     let mut x0 = vec![0.0; 10];
     problem.initial_point(&mut x0);
     let mut g0 = vec![0.0; 35];
-    problem.constraints(&x0, &mut g0);
+    problem.constraints(&x0, true, &mut g0);
     println!("Initial point: {:?}", x0);
-    println!("f(x0) = {}", problem.objective(&x0));
+    println!("f(x0) = {}", problem.objective(&x0, true));
     println!("Constraints at x0 (first 10): {:?}", &g0[..10]);
     println!("Constraints at x0 (10..20):   {:?}", &g0[10..20]);
     println!("Constraints at x0 (20..35):   {:?}", &g0[20..35]);
@@ -283,7 +283,7 @@ fn main() {
 
     if !result.x.is_empty() {
         let mut g_final = vec![0.0; 35];
-        problem.constraints(&result.x, &mut g_final);
+        problem.constraints(&result.x, true, &mut g_final);
         println!("\nConstraint values at solution:");
         for (i, gv) in g_final.iter().enumerate() {
             let status = if *gv < -1e-6 { " ** VIOLATED **" } else { "" };

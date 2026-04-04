@@ -44,26 +44,26 @@ impl NlpProblem for Rosenbrock {
 
     fn initial_point(&self, x0: &mut [f64]) { x0[0] = -1.2; x0[1] = 1.0; }
 
-    fn objective(&self, x: &[f64]) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
         let a = 1.0 - x[0];
         let b = x[1] - x[0] * x[0];
         a * a + 100.0 * b * b
     }
 
-    fn gradient(&self, x: &[f64], grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
         grad[0] = -2.0 * (1.0 - x[0]) - 400.0 * x[0] * (x[1] - x[0] * x[0]);
         grad[1] = 200.0 * (x[1] - x[0] * x[0]);
     }
 
-    fn constraints(&self, _x: &[f64], _g: &mut [f64]) {}
+    fn constraints(&self, _x: &[f64], _new_x: bool, _g: &mut [f64]) {}
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
-    fn jacobian_values(&self, _x: &[f64], _vals: &mut [f64]) {}
+    fn jacobian_values(&self, _x: &[f64], _new_x: bool, _vals: &mut [f64]) {}
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         (vec![0, 1, 1], vec![0, 0, 1])
     }
 
-    fn hessian_values(&self, x: &[f64], s: f64, _lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, s: f64, _lambda: &[f64], vals: &mut [f64]) {
         vals[0] = s * (2.0 + 1200.0 * x[0] * x[0] - 400.0 * x[1]);
         vals[1] = s * (-400.0 * x[0]);
         vals[2] = s * 200.0;
@@ -91,18 +91,18 @@ impl NlpProblem for Hs071 {
         x0[0] = 1.0; x0[1] = 5.0; x0[2] = 5.0; x0[3] = 1.0;
     }
 
-    fn objective(&self, x: &[f64]) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
         x[0] * x[3] * (x[0] + x[1] + x[2]) + x[2]
     }
 
-    fn gradient(&self, x: &[f64], grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
         grad[0] = x[3] * (2.0 * x[0] + x[1] + x[2]);
         grad[1] = x[0] * x[3];
         grad[2] = x[0] * x[3] + 1.0;
         grad[3] = x[0] * (x[0] + x[1] + x[2]);
     }
 
-    fn constraints(&self, x: &[f64], g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
         g[0] = x[0] * x[1] * x[2] * x[3];
         g[1] = x[0] * x[0] + x[1] * x[1] + x[2] * x[2] + x[3] * x[3];
     }
@@ -111,7 +111,7 @@ impl NlpProblem for Hs071 {
         (vec![0, 0, 0, 0, 1, 1, 1, 1], vec![0, 1, 2, 3, 0, 1, 2, 3])
     }
 
-    fn jacobian_values(&self, x: &[f64], vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
         vals[0] = x[1] * x[2] * x[3]; vals[1] = x[0] * x[2] * x[3];
         vals[2] = x[0] * x[1] * x[3]; vals[3] = x[0] * x[1] * x[2];
         vals[4] = 2.0 * x[0]; vals[5] = 2.0 * x[1];
@@ -122,7 +122,7 @@ impl NlpProblem for Hs071 {
         (vec![0, 1, 1, 2, 2, 2, 3, 3, 3, 3], vec![0, 0, 1, 0, 1, 2, 0, 1, 2, 3])
     }
 
-    fn hessian_values(&self, x: &[f64], s: f64, lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, s: f64, lambda: &[f64], vals: &mut [f64]) {
         vals[0] = s * 2.0 * x[3];
         vals[1] = s * x[3];
         vals[2] = 0.0;
@@ -166,7 +166,7 @@ impl NlpProblem for ChainedRosenbrock {
         for v in x0.iter_mut() { *v = -1.2; }
     }
 
-    fn objective(&self, x: &[f64]) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
         let mut f = 0.0;
         for i in 0..self.n - 1 {
             let a = 1.0 - x[i];
@@ -176,7 +176,7 @@ impl NlpProblem for ChainedRosenbrock {
         f
     }
 
-    fn gradient(&self, x: &[f64], grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
         for g in grad.iter_mut() { *g = 0.0; }
         for i in 0..self.n - 1 {
             let r = x[i + 1] - x[i] * x[i];
@@ -185,9 +185,9 @@ impl NlpProblem for ChainedRosenbrock {
         }
     }
 
-    fn constraints(&self, _x: &[f64], _g: &mut [f64]) {}
+    fn constraints(&self, _x: &[f64], _new_x: bool, _g: &mut [f64]) {}
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
-    fn jacobian_values(&self, _x: &[f64], _vals: &mut [f64]) {}
+    fn jacobian_values(&self, _x: &[f64], _new_x: bool, _vals: &mut [f64]) {}
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         let n = self.n;
@@ -201,7 +201,7 @@ impl NlpProblem for ChainedRosenbrock {
         (rows, cols)
     }
 
-    fn hessian_values(&self, x: &[f64], s: f64, _lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, s: f64, _lambda: &[f64], vals: &mut [f64]) {
         for v in vals.iter_mut() { *v = 0.0; }
         for i in 0..self.n - 1 {
             let diag_i = if i == 0 { 0 } else { 2 * i };
@@ -240,13 +240,13 @@ impl NlpProblem for BratuProblem {
         for v in x0.iter_mut() { *v = 0.0; }
     }
 
-    fn objective(&self, _x: &[f64]) -> f64 { 0.0 }
+    fn objective(&self, _x: &[f64], _new_x: bool) -> f64 { 0.0 }
 
-    fn gradient(&self, _x: &[f64], grad: &mut [f64]) {
+    fn gradient(&self, _x: &[f64], _new_x: bool, grad: &mut [f64]) {
         for g in grad.iter_mut() { *g = 0.0; }
     }
 
-    fn constraints(&self, x: &[f64], g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
         let h2 = self.h * self.h;
         for j in 0..self.n - 2 {
             let i = j + 1;
@@ -267,7 +267,7 @@ impl NlpProblem for BratuProblem {
         (rows, cols)
     }
 
-    fn jacobian_values(&self, x: &[f64], vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
         let h2 = self.h * self.h;
         for j in 0..self.n - 2 {
             let i = j + 1;
@@ -285,7 +285,7 @@ impl NlpProblem for BratuProblem {
         (rows, cols)
     }
 
-    fn hessian_values(&self, x: &[f64], _s: f64, lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, _s: f64, lambda: &[f64], vals: &mut [f64]) {
         for v in vals.iter_mut() { *v = 0.0; }
         for j in 0..self.n - 2 {
             let k = j + 1;
@@ -320,7 +320,7 @@ impl NlpProblem for OptimalControl {
         for v in x0.iter_mut() { *v = 0.0; }
     }
 
-    fn objective(&self, x: &[f64]) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
         let (h, t) = (self.h, self.t);
         let mut f = 0.0;
         for i in 0..=t { let dy = x[i] - 1.0; f += h * dy * dy; }
@@ -328,13 +328,13 @@ impl NlpProblem for OptimalControl {
         f
     }
 
-    fn gradient(&self, x: &[f64], grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
         let (h, t) = (self.h, self.t);
         for i in 0..=t { grad[i] = 2.0 * h * (x[i] - 1.0); }
         for i in 0..t { grad[t + 1 + i] = 2.0 * self.alpha * h * x[t + 1 + i]; }
     }
 
-    fn constraints(&self, x: &[f64], g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
         let (h, t) = (self.h, self.t);
         g[0] = x[0];
         for i in 0..t { g[i + 1] = x[i + 1] - (1.0 - h) * x[i] - h * x[t + 1 + i]; }
@@ -353,7 +353,7 @@ impl NlpProblem for OptimalControl {
         (rows, cols)
     }
 
-    fn jacobian_values(&self, _x: &[f64], vals: &mut [f64]) {
+    fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) {
         let (h, t) = (self.h, self.t);
         vals[0] = 1.0;
         for i in 0..t {
@@ -372,7 +372,7 @@ impl NlpProblem for OptimalControl {
         (rows, cols)
     }
 
-    fn hessian_values(&self, _x: &[f64], s: f64, _lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, _x: &[f64], _new_x: bool, s: f64, _lambda: &[f64], vals: &mut [f64]) {
         let (h, t) = (self.h, self.t);
         for i in 0..=t { vals[i] = s * 2.0 * h; }
         for i in 0..t { vals[t + 1 + i] = s * 2.0 * self.alpha * h; }
@@ -436,7 +436,7 @@ fn iterative_bratu_200() {
     // Feasibility problem: check constraint violation
     let n = 200;
     let mut g = vec![0.0; n - 2];
-    BratuProblem::new(n).constraints(&result.x, &mut g);
+    BratuProblem::new(n).constraints(&result.x, true, &mut g);
     let max_cv: f64 = g.iter().map(|gi| gi.abs()).fold(0.0, f64::max);
     assert!(max_cv < 1e-3, "max constraint violation should be < 1e-3, got {}", max_cv);
 }
@@ -505,7 +505,7 @@ fn hybrid_bratu_200() {
     );
     let n = 200;
     let mut g = vec![0.0; n - 2];
-    BratuProblem::new(n).constraints(&result.x, &mut g);
+    BratuProblem::new(n).constraints(&result.x, true, &mut g);
     let max_cv: f64 = g.iter().map(|gi| gi.abs()).fold(0.0, f64::max);
     assert!(max_cv < 1e-3, "max constraint violation should be < 1e-3, got {}", max_cv);
 }

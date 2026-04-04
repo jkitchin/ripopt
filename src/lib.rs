@@ -30,20 +30,20 @@
 //!     }
 //!     fn constraint_bounds(&self, _g_l: &mut [f64], _g_u: &mut [f64]) {}
 //!     fn initial_point(&self, x0: &mut [f64]) { x0[0] = 0.5; x0[1] = 0.5; }
-//!     fn objective(&self, x: &[f64]) -> f64 {
+//!     fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
 //!         (1.0 - x[0]).powi(2) + 100.0 * (x[1] - x[0].powi(2)).powi(2)
 //!     }
-//!     fn gradient(&self, x: &[f64], grad: &mut [f64]) {
+//!     fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
 //!         grad[0] = -2.0 * (1.0 - x[0]) - 400.0 * x[0] * (x[1] - x[0].powi(2));
 //!         grad[1] = 200.0 * (x[1] - x[0].powi(2));
 //!     }
-//!     fn constraints(&self, _x: &[f64], _g: &mut [f64]) {}
+//!     fn constraints(&self, _x: &[f64], _new_x: bool, _g: &mut [f64]) {}
 //!     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
-//!     fn jacobian_values(&self, _x: &[f64], _vals: &mut [f64]) {}
+//!     fn jacobian_values(&self, _x: &[f64], _new_x: bool, _vals: &mut [f64]) {}
 //!     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
 //!         (vec![0, 1, 1], vec![0, 0, 1])
 //!     }
-//!     fn hessian_values(&self, x: &[f64], obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
+//!     fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
 //!         vals[0] = obj_factor * (2.0 - 400.0 * (x[1] - x[0].powi(2)) + 800.0 * x[0].powi(2));
 //!         vals[1] = obj_factor * (-400.0 * x[0]);
 //!         vals[2] = obj_factor * 200.0;

@@ -26,16 +26,16 @@ impl NlpProblem for TP376 {
         x0[4] = 0.0017; x0[5] = 0.0013; x0[6] = 0.0027; x0[7] = 0.002;
         x0[8] = 0.15; x0[9] = 0.105;
     }
-    fn objective(&self, x: &[f64]) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
         3000.0*x[0]*(x[0] + 60.0*x[1] + 0.002).recip() + 280000.0*x[1]*(x[0] + 60.0*x[1] + 0.002).recip() - 1200.0*(x[0] + 60.0*x[1] + 0.002).recip()
     }
-    fn gradient(&self, x: &[f64], grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
         let denom2 = 0.004*x[0] + 0.24*x[1] + 3600.0*x[1].powi(2) + 120.0*x[0]*x[1] + 4.0e-6 + x[0].powi(2);
         grad[0] = -100000.0*x[1]/denom2 + 1206.0/denom2;
         grad[1] = 100000.0*x[0]/denom2 + 72560.0/denom2;
         for i in 2..10 { grad[i] = 0.0; }
     }
-    fn constraints(&self, x: &[f64], g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
         g[0] = x[0] - 0.75*x[2].recip()*x[3].recip();
         g[1] = x[0] - x[8]/(x[3]*x[4]);
         g[2] = x[0] - 10.0*x[3].recip() - x[9]/(x[3]*x[5]);
@@ -56,7 +56,7 @@ impl NlpProblem for TP376 {
         (vec![0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 8, 8, 8, 9, 9, 9, 10, 10, 10, 11, 11, 11, 12, 12, 12, 13, 13, 13, 13, 13, 14, 14],
          vec![0, 2, 3, 0, 3, 4, 8, 0, 3, 5, 9, 0, 3, 6, 0, 3, 7, 1, 3, 4, 8, 1, 3, 5, 9, 1, 3, 6, 1, 3, 7, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 2, 3, 4, 5, 7, 8, 9])
     }
-    fn jacobian_values(&self, x: &[f64], vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
         vals[0] = 1.0;
         vals[1] = 0.75*x[2].powi(-2)*x[3].recip();
         vals[2] = 0.75*x[2].recip()*x[3].powi(-2);
@@ -111,7 +111,7 @@ impl NlpProblem for TP376 {
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         (vec![0, 1, 1, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9], vec![0, 0, 1, 2, 2, 3, 3, 4, 3, 5, 3, 6, 3, 7, 3, 4, 3, 5])
     }
-    fn hessian_values(&self, x: &[f64], obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
         let d = 0.004*x[0] + 0.24*x[1] + 3600.0*x[1].powi(2) + 120.0*x[0]*x[1] + 4.0e-6 + x[0].powi(2);
         let d2 = 1.2e-5*x[0] + 0.006*x[0].powi(2) + 0.00072*x[1] + 21.6*x[1].powi(2) + 216000.0*x[1].powi(3) + 0.72*x[0]*x[1] + 10800.0*x[0]*x[1].powi(2) + 180.0*x[1]*x[0].powi(2) + 8.0e-9 + x[0].powi(3);
         let _ = d;
@@ -154,6 +154,6 @@ fn main() {
     println!("Known optimal: -4430.0879");
 
     let mut g = vec![0.0; 15];
-    problem.constraints(&result.x, &mut g);
+    problem.constraints(&result.x, true, &mut g);
     println!("g: {:?}", g);
 }

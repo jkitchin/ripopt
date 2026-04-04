@@ -41,7 +41,7 @@ impl<'a> SlackFormulation<'a> {
         // Compute initial slack values: s = g(x) clamped to [g_l, g_u]
         let mut g_val = vec![0.0; m];
         if m > 0 {
-            inner.constraints(x_warmstart, &mut g_val);
+            inner.constraints(x_warmstart, true, &mut g_val);
         }
         let mut g_l = vec![0.0; m];
         let mut g_u = vec![0.0; m];
@@ -106,27 +106,27 @@ impl NlpProblem for SlackFormulation<'_> {
         x0[n..n + m].copy_from_slice(&self.s_init);
     }
 
-    fn objective(&self, x: &[f64]) -> f64 {
-        self.inner.objective(&x[..self.n_orig])
+    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
+        self.inner.objective(&x[..self.n_orig], _new_x)
     }
 
-    fn gradient(&self, x: &[f64], grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
         let n = self.n_orig;
         let m = self.m_orig;
 
-        self.inner.gradient(&x[..n], &mut grad[..n]);
+        self.inner.gradient(&x[..n], _new_x, &mut grad[..n]);
         // Slack gradient is zero (slacks don't appear in objective)
         for i in 0..m {
             grad[n + i] = 0.0;
         }
     }
 
-    fn constraints(&self, x: &[f64], g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
         let n = self.n_orig;
         let m = self.m_orig;
 
         // g_slack[i] = g_orig[i] - s[i]
-        self.inner.constraints(&x[..n], g);
+        self.inner.constraints(&x[..n], _new_x, g);
         for i in 0..m {
             g[i] -= x[n + i];
         }
@@ -155,13 +155,13 @@ impl NlpProblem for SlackFormulation<'_> {
         (rows, cols)
     }
 
-    fn jacobian_values(&self, x: &[f64], vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
         let n = self.n_orig;
         let m = self.m_orig;
         let inner_nnz = self.inner_jac_rows.len();
 
         // Inner Jacobian values
-        self.inner.jacobian_values(&x[..n], &mut vals[..inner_nnz]);
+        self.inner.jacobian_values(&x[..n], _new_x, &mut vals[..inner_nnz]);
 
         // -1 for each slack diagonal
         for i in 0..m {
@@ -174,10 +174,10 @@ impl NlpProblem for SlackFormulation<'_> {
         (self.inner_hess_rows.clone(), self.inner_hess_cols.clone())
     }
 
-    fn hessian_values(&self, x: &[f64], obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
         // Hessian only depends on x (slacks are linear)
         self.inner
-            .hessian_values(&x[..self.n_orig], obj_factor, lambda, vals);
+            .hessian_values(&x[..self.n_orig], _new_x, obj_factor, lambda, vals);
     }
 }
 
@@ -209,27 +209,27 @@ mod tests {
             x0[0] = 0.5;
             x0[1] = 0.5;
         }
-        fn objective(&self, x: &[f64]) -> f64 {
+        fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
             x[0] * x[0] + x[1] * x[1]
         }
-        fn gradient(&self, x: &[f64], grad: &mut [f64]) {
+        fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
             grad[0] = 2.0 * x[0];
             grad[1] = 2.0 * x[1];
         }
-        fn constraints(&self, x: &[f64], g: &mut [f64]) {
+        fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
             g[0] = x[0] + x[1];
         }
         fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
             (vec![0, 0], vec![0, 1])
         }
-        fn jacobian_values(&self, _x: &[f64], vals: &mut [f64]) {
+        fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) {
             vals[0] = 1.0;
             vals[1] = 1.0;
         }
         fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
             (vec![0, 1], vec![0, 1])
         }
-        fn hessian_values(&self, _x: &[f64], obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
+        fn hessian_values(&self, _x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
             vals[0] = 2.0 * obj_factor;
             vals[1] = 2.0 * obj_factor;
         }
@@ -296,7 +296,7 @@ mod tests {
         let x_r = vec![0.5, 0.5];
         let slack = SlackFormulation::new(&prob, &x_r);
         let x = vec![1.0, 2.0, 3.0]; // slack value doesn't affect objective
-        assert!((slack.objective(&x) - 5.0).abs() < 1e-10);
+        assert!((slack.objective(&x, true) - 5.0).abs() < 1e-10);
     }
 
     #[test]
@@ -307,7 +307,7 @@ mod tests {
         let nv = slack.num_variables();
         let x = vec![1.0, 2.0, 3.0];
         let mut grad = vec![0.0; nv];
-        slack.gradient(&x, &mut grad);
+        slack.gradient(&x, true, &mut grad);
         assert!((grad[0] - 2.0).abs() < 1e-10);
         assert!((grad[1] - 4.0).abs() < 1e-10);
         assert_eq!(grad[2], 0.0); // slack gradient = 0
@@ -322,7 +322,7 @@ mod tests {
         // g_slack = g(x) - s = (1+2) - 2.5 = 0.5
         let x = vec![1.0, 2.0, 2.5];
         let mut g = vec![0.0; m];
-        slack.constraints(&x, &mut g);
+        slack.constraints(&x, true, &mut g);
         assert!((g[0] - 0.5).abs() < 1e-10);
     }
 
@@ -339,7 +339,7 @@ mod tests {
 
         let mut vals = vec![0.0; 3];
         let x = vec![1.0, 2.0, 3.0];
-        slack.jacobian_values(&x, &mut vals);
+        slack.jacobian_values(&x, true, &mut vals);
         assert!((vals[0] - 1.0).abs() < 1e-10);
         assert!((vals[1] - 1.0).abs() < 1e-10);
         assert!((vals[2] - (-1.0)).abs() < 1e-10);
@@ -359,7 +359,7 @@ mod tests {
         let mut vals = vec![0.0; 2];
         let x = vec![1.0, 2.0, 3.0];
         let lambda = vec![1.0];
-        slack.hessian_values(&x, 1.0, &lambda, &mut vals);
+        slack.hessian_values(&x, true, 1.0, &lambda, &mut vals);
         assert!((vals[0] - 2.0).abs() < 1e-10);
         assert!((vals[1] - 2.0).abs() < 1e-10);
     }

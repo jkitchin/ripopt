@@ -262,10 +262,10 @@ impl NlpProblem for ChainedRosenbrock {
     }
     fn constraint_bounds(&self, _: &mut [f64], _: &mut [f64]) {}
     fn initial_point(&self, x0: &mut [f64]) { for v in x0.iter_mut() { *v = -1.2; } }
-    fn objective(&self, x: &[f64]) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
         (0..self.n-1).map(|i| { let a = 1.0 - x[i]; let b = x[i+1] - x[i]*x[i]; a*a + 100.0*b*b }).sum()
     }
-    fn gradient(&self, x: &[f64], g: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
         for v in g.iter_mut() { *v = 0.0; }
         for i in 0..self.n-1 {
             let r = x[i+1] - x[i]*x[i];
@@ -273,9 +273,9 @@ impl NlpProblem for ChainedRosenbrock {
             g[i+1] += 200.0*r;
         }
     }
-    fn constraints(&self, _: &[f64], _: &mut [f64]) {}
+    fn constraints(&self, _: &[f64], _new_x: bool, _: &mut [f64]) {}
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
-    fn jacobian_values(&self, _: &[f64], _: &mut [f64]) {}
+    fn jacobian_values(&self, _: &[f64], _new_x: bool, _: &mut [f64]) {}
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         let n = self.n;
         let mut rows = Vec::with_capacity(2*n-1);
@@ -284,7 +284,7 @@ impl NlpProblem for ChainedRosenbrock {
         for i in 1..n { rows.push(i); cols.push(i-1); rows.push(i); cols.push(i); }
         (rows, cols)
     }
-    fn hessian_values(&self, x: &[f64], of: f64, _: &[f64], v: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, of: f64, _: &[f64], v: &mut [f64]) {
         for val in v.iter_mut() { *val = 0.0; }
         for i in 0..self.n-1 {
             let di = if i == 0 { 0 } else { 2*i };
@@ -311,9 +311,9 @@ impl NlpProblem for BratuProblem {
         for j in 0..self.n-2 { g_l[j] = 0.0; g_u[j] = 0.0; }
     }
     fn initial_point(&self, x0: &mut [f64]) { for v in x0.iter_mut() { *v = 0.0; } }
-    fn objective(&self, _: &[f64]) -> f64 { 0.0 }
-    fn gradient(&self, _: &[f64], g: &mut [f64]) { for v in g.iter_mut() { *v = 0.0; } }
-    fn constraints(&self, x: &[f64], g: &mut [f64]) {
+    fn objective(&self, _: &[f64], _new_x: bool) -> f64 { 0.0 }
+    fn gradient(&self, _: &[f64], _new_x: bool, g: &mut [f64]) { for v in g.iter_mut() { *v = 0.0; } }
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
         let h2 = self.h * self.h;
         for j in 0..self.n-2 {
             let i = j + 1;
@@ -327,7 +327,7 @@ impl NlpProblem for BratuProblem {
         for j in 0..m { let i = j+1; rows.push(j); cols.push(i-1); rows.push(j); cols.push(i); rows.push(j); cols.push(i+1); }
         (rows, cols)
     }
-    fn jacobian_values(&self, x: &[f64], vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
         let h2 = self.h * self.h;
         for j in 0..self.n-2 {
             let i = j + 1;
@@ -343,7 +343,7 @@ impl NlpProblem for BratuProblem {
         for k in 0..self.n { rows.push(k); cols.push(k); }
         (rows, cols)
     }
-    fn hessian_values(&self, x: &[f64], _of: f64, lambda: &[f64], v: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, _of: f64, lambda: &[f64], v: &mut [f64]) {
         for val in v.iter_mut() { *val = 0.0; }
         for j in 0..self.n-2 {
             let k = j + 1;
@@ -367,19 +367,19 @@ impl NlpProblem for OptimalControl {
         for j in 0..self.t+1 { g_l[j] = 0.0; g_u[j] = 0.0; }
     }
     fn initial_point(&self, x0: &mut [f64]) { for v in x0.iter_mut() { *v = 0.0; } }
-    fn objective(&self, x: &[f64]) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
         let (h, t) = (self.h, self.t);
         let mut f = 0.0;
         for i in 0..=t { let dy = x[i] - 1.0; f += h*dy*dy; }
         for i in 0..t { f += self.alpha*h*x[t+1+i]*x[t+1+i]; }
         f
     }
-    fn gradient(&self, x: &[f64], grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
         let (h, t) = (self.h, self.t);
         for i in 0..=t { grad[i] = 2.0*h*(x[i] - 1.0); }
         for i in 0..t { grad[t+1+i] = 2.0*self.alpha*h*x[t+1+i]; }
     }
-    fn constraints(&self, x: &[f64], g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
         let (h, t) = (self.h, self.t);
         g[0] = x[0];
         for i in 0..t { g[i+1] = x[i+1] - (1.0-h)*x[i] - h*x[t+1+i]; }
@@ -392,7 +392,7 @@ impl NlpProblem for OptimalControl {
         for i in 0..t { rows.push(i+1); cols.push(i); rows.push(i+1); cols.push(i+1); rows.push(i+1); cols.push(t+1+i); }
         (rows, cols)
     }
-    fn jacobian_values(&self, _: &[f64], vals: &mut [f64]) {
+    fn jacobian_values(&self, _: &[f64], _new_x: bool, vals: &mut [f64]) {
         let (h, t) = (self.h, self.t);
         vals[0] = 1.0;
         for i in 0..t { let b = 1+3*i; vals[b] = -(1.0-h); vals[b+1] = 1.0; vals[b+2] = -h; }
@@ -404,7 +404,7 @@ impl NlpProblem for OptimalControl {
         for k in 0..n { rows.push(k); cols.push(k); }
         (rows, cols)
     }
-    fn hessian_values(&self, _: &[f64], of: f64, _: &[f64], v: &mut [f64]) {
+    fn hessian_values(&self, _: &[f64], _new_x: bool, of: f64, _: &[f64], v: &mut [f64]) {
         let (h, t) = (self.h, self.t);
         for i in 0..=t { v[i] = of*2.0*h; }
         for i in 0..t { v[t+1+i] = of*2.0*self.alpha*h; }
@@ -432,7 +432,7 @@ impl NlpProblem for PoissonControl {
         for j in 0..self.num_constraints() { g_l[j] = 0.0; g_u[j] = 0.0; }
     }
     fn initial_point(&self, x0: &mut [f64]) { for v in x0.iter_mut() { *v = 0.0; } }
-    fn objective(&self, x: &[f64]) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
         let (k, h2) = (self.k, self.h*self.h);
         let mut f = 0.0;
         for j in 0..k { for i in 0..k {
@@ -443,7 +443,7 @@ impl NlpProblem for PoissonControl {
         }}
         f
     }
-    fn gradient(&self, x: &[f64], grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
         let (k, h2) = (self.k, self.h*self.h);
         for v in grad.iter_mut() { *v = 0.0; }
         for j in 0..k { for i in 0..k {
@@ -451,7 +451,7 @@ impl NlpProblem for PoissonControl {
             grad[self.idx_f(i,j)] = self.alpha*h2*x[self.idx_f(i,j)];
         }}
     }
-    fn constraints(&self, x: &[f64], g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
         let (k, h2) = (self.k, self.h*self.h);
         for j in 0..k { for i in 0..k {
             let c = j*k + i;
@@ -478,7 +478,7 @@ impl NlpProblem for PoissonControl {
         }}
         (rows, cols)
     }
-    fn jacobian_values(&self, _: &[f64], vals: &mut [f64]) {
+    fn jacobian_values(&self, _: &[f64], _new_x: bool, vals: &mut [f64]) {
         let (k, h2) = (self.k, self.h*self.h);
         let mut idx = 0;
         for j in 0..k { for i in 0..k {
@@ -497,7 +497,7 @@ impl NlpProblem for PoissonControl {
         for k in 0..n { rows.push(k); cols.push(k); }
         (rows, cols)
     }
-    fn hessian_values(&self, _: &[f64], of: f64, _: &[f64], v: &mut [f64]) {
+    fn hessian_values(&self, _: &[f64], _new_x: bool, of: f64, _: &[f64], v: &mut [f64]) {
         let (k, h2) = (self.k, self.h*self.h);
         for j in 0..k { for i in 0..k {
             v[self.idx_u(i,j)] = of*h2;
@@ -517,13 +517,13 @@ impl NlpProblem for SparseQP {
         for j in 0..self.n { g_l[j] = f64::NEG_INFINITY; g_u[j] = 2.5; }
     }
     fn initial_point(&self, x0: &mut [f64]) { for v in x0.iter_mut() { *v = 0.5; } }
-    fn objective(&self, x: &[f64]) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
         let n = self.n;
         let mut f = 0.0;
         for i in 0..n { f += 2.0*x[i]*x[i]; if i < n-1 { f -= x[i]*x[i+1]; } f -= x[i]; }
         f
     }
-    fn gradient(&self, x: &[f64], g: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
         let n = self.n;
         for i in 0..n {
             g[i] = 4.0*x[i] - 1.0;
@@ -531,7 +531,7 @@ impl NlpProblem for SparseQP {
             if i < n-1 { g[i] -= x[i+1]; }
         }
     }
-    fn constraints(&self, x: &[f64], g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
         let n = self.n;
         for j in 0..n { g[j] = x[j] + x[(j+1)%n] + x[(j+2)%n]; }
     }
@@ -542,7 +542,7 @@ impl NlpProblem for SparseQP {
         for j in 0..n { rows.push(j); cols.push(j); rows.push(j); cols.push((j+1)%n); rows.push(j); cols.push((j+2)%n); }
         (rows, cols)
     }
-    fn jacobian_values(&self, _: &[f64], vals: &mut [f64]) {
+    fn jacobian_values(&self, _: &[f64], _new_x: bool, vals: &mut [f64]) {
         for j in 0..self.n { let b = 3*j; vals[b] = 1.0; vals[b+1] = 1.0; vals[b+2] = 1.0; }
     }
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
@@ -553,7 +553,7 @@ impl NlpProblem for SparseQP {
         for i in 1..n { rows.push(i); cols.push(i-1); rows.push(i); cols.push(i); }
         (rows, cols)
     }
-    fn hessian_values(&self, _: &[f64], of: f64, _: &[f64], v: &mut [f64]) {
+    fn hessian_values(&self, _: &[f64], _new_x: bool, of: f64, _: &[f64], v: &mut [f64]) {
         v[0] = of*4.0;
         for i in 1..self.n { v[2*i-1] = of*(-1.0); v[2*i] = of*4.0; }
     }

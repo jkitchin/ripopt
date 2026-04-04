@@ -32,17 +32,17 @@ impl NlpProblem for HsTp027 {
         x0[0] = 2.0; x0[1] = 2.0; x0[2] = 2.0;
     }
 
-    fn objective(&self, x: &[f64]) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
         -2.0*x[0] + 100.0*x[0].powi(4) + 100.0*x[1].powi(2) - 200.0*x[1]*x[0].powi(2) + 1.0 + x[0].powi(2)
     }
 
-    fn gradient(&self, x: &[f64], grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
         grad[0] = 2.0*x[0] + 400.0*x[0].powi(3) - 400.0*x[0]*x[1] - 2.0;
         grad[1] = -200.0*x[0].powi(2) + 200.0*x[1];
         grad[2] = 0.0;
     }
 
-    fn constraints(&self, x: &[f64], g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
         g[0] = x[0] + 1.0 + x[2].powi(2);
     }
 
@@ -50,7 +50,7 @@ impl NlpProblem for HsTp027 {
         (vec![0, 0], vec![0, 2])
     }
 
-    fn jacobian_values(&self, x: &[f64], vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
         vals[0] = 1.0;
         vals[1] = 2.0*x[2];
     }
@@ -59,7 +59,7 @@ impl NlpProblem for HsTp027 {
         (vec![0, 1, 1, 2], vec![0, 0, 1, 2])
     }
 
-    fn hessian_values(&self, x: &[f64], obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
         vals[0] = obj_factor * (1200.0*x[0].powi(2) - 400.0*x[1] + 2.0);
         vals[1] = obj_factor * (-400.0*x[0]);
         vals[2] = obj_factor * 200.0;
@@ -95,17 +95,17 @@ fn main() {
 
     // Evaluate at starting point
     let x0 = [2.0, 2.0, 2.0];
-    let f0 = problem.objective(&x0);
+    let f0 = problem.objective(&x0, true);
     let mut g0 = [0.0; 1];
-    problem.constraints(&x0, &mut g0);
+    problem.constraints(&x0, true, &mut g0);
     let mut grad0 = [0.0; 3];
-    problem.gradient(&x0, &mut grad0);
+    problem.gradient(&x0, true, &mut grad0);
     println!("At x0: f = {:.6}, g = [{:.6}] (violation: {:.6})", f0, g0[0], g0[0].abs());
     println!("Gradient at x0: [{:.6}, {:.6}, {:.6}]", grad0[0], grad0[1], grad0[2]);
 
     // Hessian at x0
     let mut hvals = [0.0; 4];
-    problem.hessian_values(&x0, 1.0, &[0.0], &mut hvals);
+    problem.hessian_values(&x0, true, 1.0, &[0.0], &mut hvals);
     println!("Hessian diag at x0 (obj only): [{:.2}, {:.2}, {:.2}]", hvals[0], hvals[2], hvals[3]);
     println!("  H[0,0] = 1200*(2)^2 - 400*2 + 2 = {:.2}", 1200.0*4.0 - 400.0*2.0 + 2.0);
     println!("  H[1,1] = 200");
@@ -113,9 +113,9 @@ fn main() {
 
     // Evaluate at known optimal
     let x_opt = [-1.0, 1.0, 0.0];
-    let f_opt = problem.objective(&x_opt);
+    let f_opt = problem.objective(&x_opt, true);
     let mut g_opt = [0.0; 1];
-    problem.constraints(&x_opt, &mut g_opt);
+    problem.constraints(&x_opt, true, &mut g_opt);
     println!("\nAt x*=(-1,1,0): f = {:.6}, g = [{:.6}]", f_opt, g_opt[0]);
 
     // Check constraint: x1 + 1 + x3^2 = 0 => constraint requires x1 <= -1
@@ -147,9 +147,9 @@ fn main() {
 
     // Check if the solver found a LOCAL minimum at (1, 1, 0) instead of (-1, 1, 0)
     let x_local = [1.0, 1.0, 0.0];
-    let f_local = problem.objective(&x_local);
+    let f_local = problem.objective(&x_local, true);
     let mut g_local = [0.0; 1];
-    problem.constraints(&x_local, &mut g_local);
+    problem.constraints(&x_local, true, &mut g_local);
     println!("\nCheck local minimum at (1,1,0): f = {:.6}, g = [{:.6}]", f_local, g_local[0]);
     println!("This violates the constraint: x1+1+x3^2 = {} != 0", g_local[0]);
     println!("The solver converged near (1,1,0) which is INFEASIBLE for this constraint!");

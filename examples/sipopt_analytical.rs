@@ -43,23 +43,23 @@ impl NlpProblem for UnconstrainedQP {
         x0[0] = 0.0; x0[1] = 0.0;
     }
 
-    fn objective(&self, x: &[f64]) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
         (x[0] - self.a).powi(2) + (x[1] - self.b).powi(2)
     }
-    fn gradient(&self, x: &[f64], grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
         grad[0] = 2.0 * (x[0] - self.a);
         grad[1] = 2.0 * (x[1] - self.b);
     }
-    fn constraints(&self, _x: &[f64], _g: &mut [f64]) {}
+    fn constraints(&self, _x: &[f64], _new_x: bool, _g: &mut [f64]) {}
 
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
-    fn jacobian_values(&self, _x: &[f64], _vals: &mut [f64]) {}
+    fn jacobian_values(&self, _x: &[f64], _new_x: bool, _vals: &mut [f64]) {}
 
     // Lower-triangle Hessian: only diagonal
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         (vec![0, 1], vec![0, 1])
     }
-    fn hessian_values(&self, _x: &[f64], obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, _x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
         vals[0] = 2.0 * obj_factor;  // d²/dx²
         vals[1] = 2.0 * obj_factor;  // d²/dy²
     }
@@ -123,28 +123,28 @@ impl NlpProblem for EqualityQP {
         x0[0] = self.c / 2.0; x0[1] = self.c / 2.0;
     }
 
-    fn objective(&self, x: &[f64]) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
         (x[0] - self.a).powi(2) + (x[1] - self.b).powi(2)
     }
-    fn gradient(&self, x: &[f64], grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
         grad[0] = 2.0 * (x[0] - self.a);
         grad[1] = 2.0 * (x[1] - self.b);
     }
-    fn constraints(&self, x: &[f64], g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
         g[0] = x[0] + x[1];
     }
 
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         (vec![0, 0], vec![0, 1])
     }
-    fn jacobian_values(&self, _x: &[f64], vals: &mut [f64]) {
+    fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) {
         vals[0] = 1.0; vals[1] = 1.0;
     }
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         (vec![0, 1], vec![0, 1])
     }
-    fn hessian_values(&self, _x: &[f64], obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, _x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
         // g(x) = x + y is linear → no Hessian contribution from constraints
         vals[0] = 2.0 * obj_factor;
         vals[1] = 2.0 * obj_factor;
@@ -203,25 +203,25 @@ impl NlpProblem for ActiveInequalityNLP {
         x0[0] = self.p; x0[1] = 0.01;
     }
 
-    fn objective(&self, x: &[f64]) -> f64 { x[0].powi(2) + x[1].powi(2) }
-    fn gradient(&self, x: &[f64], grad: &mut [f64]) {
+    fn objective(&self, x: &[f64], _new_x: bool) -> f64 { x[0].powi(2) + x[1].powi(2) }
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
         grad[0] = 2.0 * x[0]; grad[1] = 2.0 * x[1];
     }
-    fn constraints(&self, x: &[f64], g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
         g[0] = x[0] + x[1];
     }
 
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         (vec![0, 0], vec![0, 1])
     }
-    fn jacobian_values(&self, _x: &[f64], vals: &mut [f64]) {
+    fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) {
         vals[0] = 1.0; vals[1] = 1.0;
     }
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         (vec![0, 1], vec![0, 1])
     }
-    fn hessian_values(&self, _x: &[f64], obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, _x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
         vals[0] = 2.0 * obj_factor;
         vals[1] = 2.0 * obj_factor;
     }
