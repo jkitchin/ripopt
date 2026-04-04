@@ -700,6 +700,31 @@ cc examples/c_example_with_options.c -I. -Ltarget/release -lripopt \
 ./c_example_with_options
 ```
 
+## Automatic Differentiation
+
+Implementing `NlpProblem` requires hand-derived gradients, Jacobians, and Hessians, which is tedious and error-prone for real-world problems. The [ipopt-ad](https://github.com/prehner/ipopt-ad) crate (by [@prehner](https://github.com/prehner)) eliminates this by computing exact derivatives automatically via the [num-dual](https://crates.io/crates/num-dual) crate. Users write their objective and constraints once as generic Rust functions, and ipopt-ad handles all derivative computation and sparsity detection.
+
+With automatic differentiation, the HS071 objective and constraints reduce to:
+
+```rust
+fn objective<D: DualNum<f64> + Copy>(x: SVector<D, 4>) -> D {
+    x[0] * x[3] * (x[0] + x[1] + x[2]) + x[2]
+}
+
+fn constraints<D: DualNum<f64> + Copy>(x: SVector<D, 4>) -> SVector<D, 2> {
+    SVector::from([
+        x[0] * x[1] * x[2] * x[3],
+        x[0] * x[0] + x[1] * x[1] + x[2] * x[2] + x[3] * x[3],
+    ])
+}
+```
+
+No gradient, Jacobian, or Hessian code needed. See `examples/autodiff_num_dual.rs` for a complete working example:
+
+```bash
+cargo run --example autodiff_num_dual --features num-dual
+```
+
 ## Examples
 
 ### Rust
@@ -710,6 +735,9 @@ cargo run --example rosenbrock
 
 # HS071 (constrained NLP with inequalities)
 cargo run --example hs071
+
+# HS071 with automatic differentiation (no hand-derived derivatives)
+cargo run --example autodiff_num_dual --features num-dual
 
 # Benchmark timing across 5 problems
 cargo run --release --example benchmark
