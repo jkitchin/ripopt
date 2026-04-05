@@ -56,20 +56,23 @@ impl NlpProblem for Hs071AD {
         x0.copy_from_slice(&[1.0, 5.0, 5.0, 1.0]);
     }
 
-    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
-        hs071_objective(SVector::from_column_slice(x))
+    fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+        *obj = hs071_objective(SVector::from_column_slice(x));
+        true
     }
 
-    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
         let xv = SVector::from_column_slice(x);
         let (_f, g) = gradient(hs071_objective, &xv);
         grad.copy_from_slice(g.as_slice());
+        true
     }
 
-    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
         let xv = SVector::from_column_slice(x);
         let cv: SVector<f64, 2> = hs071_constraints(xv);
         g.copy_from_slice(cv.as_slice());
+        true
     }
 
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
@@ -85,7 +88,7 @@ impl NlpProblem for Hs071AD {
         (rows, cols)
     }
 
-    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
         let xv = SVector::from_column_slice(x);
         let (_g, jac) = jacobian(hs071_constraints, &xv);
         // jac is 2x4; iterate in row-major order matching jacobian_structure
@@ -96,6 +99,7 @@ impl NlpProblem for Hs071AD {
                 idx += 1;
             }
         }
+        true
     }
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
@@ -118,7 +122,7 @@ impl NlpProblem for Hs071AD {
         obj_factor: f64,
         lambda: &[f64],
         vals: &mut [f64],
-    ) {
+    ) -> bool {
         let xv = SVector::from_column_slice(x);
 
         // Hessian of the Lagrangian: obj_factor * nabla^2 f + sum_i lambda_i * nabla^2 g_i
@@ -141,6 +145,7 @@ impl NlpProblem for Hs071AD {
                 idx += 1;
             }
         }
+        true
     }
 }
 

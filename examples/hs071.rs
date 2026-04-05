@@ -44,11 +44,12 @@ impl NlpProblem for Hs071 {
         x0[3] = 1.0;
     }
 
-    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
-        x[0] * x[3] * (x[0] + x[1] + x[2]) + x[2]
+    fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+        *obj = x[0] * x[3] * (x[0] + x[1] + x[2]) + x[2];
+        true
     }
 
-    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
         // df/dx1 = x4*(x1+x2+x3) + x1*x4 = x4*(2*x1+x2+x3)
         grad[0] = x[3] * (2.0 * x[0] + x[1] + x[2]);
         // df/dx2 = x1*x4
@@ -57,11 +58,13 @@ impl NlpProblem for Hs071 {
         grad[2] = x[0] * x[3] + 1.0;
         // df/dx4 = x1*(x1+x2+x3)
         grad[3] = x[0] * (x[0] + x[1] + x[2]);
+        true
     }
 
-    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
         g[0] = x[0] * x[1] * x[2] * x[3];
         g[1] = x[0] * x[0] + x[1] * x[1] + x[2] * x[2] + x[3] * x[3];
+        true
     }
 
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
@@ -72,7 +75,7 @@ impl NlpProblem for Hs071 {
         )
     }
 
-    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
         // dg1/dx1 = x2*x3*x4
         vals[0] = x[1] * x[2] * x[3];
         // dg1/dx2 = x1*x3*x4
@@ -89,6 +92,7 @@ impl NlpProblem for Hs071 {
         vals[6] = 2.0 * x[2];
         // dg2/dx4 = 2*x4
         vals[7] = 2.0 * x[3];
+        true
     }
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
@@ -101,7 +105,7 @@ impl NlpProblem for Hs071 {
         )
     }
 
-    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) -> bool {
         // Hessian of objective:
         //   d2f/dx1dx1 = 2*x4
         //   d2f/dx1dx2 = x4       (sym)
@@ -143,6 +147,7 @@ impl NlpProblem for Hs071 {
         vals[8] = obj_factor * x[0] + lambda[0] * x[0] * x[1];
         // Index 9: (3,3) = lambda[1]*2
         vals[9] = lambda[1] * 2.0;
+        true
     }
 }
 

@@ -81,6 +81,7 @@ impl<'a> PreprocessedProblem<'a> {
         let (inner_jac_rows, inner_jac_cols) = inner.jacobian_structure();
         let jac_nnz = inner_jac_rows.len();
 
+        'bound_tightening: {
         if m > 0 && jac_nnz > 0 {
             let mut x0 = vec![0.0; n];
             inner.initial_point(&mut x0);
@@ -92,7 +93,10 @@ impl<'a> PreprocessedProblem<'a> {
             }
 
             let mut jac_vals = vec![0.0; jac_nnz];
-            inner.jacobian_values(&x0, true, &mut jac_vals);
+            // If Jacobian eval fails, skip bound tightening (safe default)
+            if !inner.jacobian_values(&x0, true, &mut jac_vals) {
+                break 'bound_tightening;
+            }
 
             // Verify linearity: evaluate Jacobian at a perturbed point
             let mut x1 = x0.clone();
@@ -112,7 +116,9 @@ impl<'a> PreprocessedProblem<'a> {
                 }
             }
             let mut jac_vals1 = vec![0.0; jac_nnz];
-            inner.jacobian_values(&x1, true, &mut jac_vals1);
+            if !inner.jacobian_values(&x1, true, &mut jac_vals1) {
+                break 'bound_tightening;
+            }
 
             // Identify which constraints are truly linear (Jacobian doesn't change)
             let mut is_linear_constraint = vec![true; m];
@@ -205,6 +211,7 @@ impl<'a> PreprocessedProblem<'a> {
                 }
             }
         }
+        } // 'bound_tightening
 
         // --- Redundant constraint detection ---
         // Two constraints are redundant if they have the same Jacobian structure
@@ -222,7 +229,7 @@ impl<'a> PreprocessedProblem<'a> {
                 }
             }
             let mut jac_vals0 = vec![0.0; jac_nnz];
-            inner.jacobian_values(&x0, true, &mut jac_vals0);
+            let jac0_ok = inner.jacobian_values(&x0, true, &mut jac_vals0);
 
             // Also evaluate at a perturbed point for verification
             let mut x1 = x0.clone();
@@ -242,13 +249,13 @@ impl<'a> PreprocessedProblem<'a> {
                 }
             }
             let mut jac_vals1 = vec![0.0; jac_nnz];
-            inner.jacobian_values(&x1, true, &mut jac_vals1);
+            let jac1_ok = inner.jacobian_values(&x1, true, &mut jac_vals1);
 
             // Also compare constraint values at the perturbed point
             let mut g0 = vec![0.0; m];
             let mut g1 = vec![0.0; m];
-            inner.constraints(&x0, true, &mut g0);
-            inner.constraints(&x1, true, &mut g1);
+            let g0_ok = inner.constraints(&x0, true, &mut g0);
+            let g1_ok = inner.constraints(&x1, true, &mut g1);
 
             let mut g_l = vec![0.0; m];
             let mut g_u = vec![0.0; m];
@@ -419,7 +426,7 @@ impl<'a> PreprocessedProblem<'a> {
 
         // Evaluate original constraints at the full solution
         if m > 0 {
-            self.inner.constraints(&x_full, true, &mut g_full);
+            let _ = self.inner.constraints(&x_full, true, &mut g_full);
         }
 
         for (red_i, &orig_i) in self.constr_map.iter().enumerate() {
@@ -429,7 +436,8 @@ impl<'a> PreprocessedProblem<'a> {
         }
 
         // Recompute objective at full solution
-        let obj = self.inner.objective(&x_full, true);
+        let mut obj = 0.0;
+        let _ = self.inner.objective(&x_full, true, &mut obj);
 
         SolveResult {
             x: x_full,
@@ -480,53 +488,62 @@ impl NlpProblem for PreprocessedProblem<'_> {
         }
     }
 
-    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
         let x_full = self.expand_x(x);
-        self.inner.objective(&x_full, _new_x)
+        self.inner.objective(&x_full, _new_x, obj)
     }
 
-    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
         let x_full = self.expand_x(x);
         let mut grad_full = vec![0.0; self.n_orig];
-        self.inner.gradient(&x_full, _new_x, &mut grad_full);
+        if !self.inner.gradient(&x_full, _new_x, &mut grad_full) {
+            return false;
+        }
         for (red_i, &orig_i) in self.var_map.iter().enumerate() {
             grad[red_i] = grad_full[orig_i];
         }
+        true
     }
 
-    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
         let x_full = self.expand_x(x);
         let mut g_full = vec![0.0; self.m_orig];
-        self.inner.constraints(&x_full, _new_x, &mut g_full);
+        if !self.inner.constraints(&x_full, _new_x, &mut g_full) {
+            return false;
+        }
         for (red_i, &orig_i) in self.constr_map.iter().enumerate() {
             g[red_i] = g_full[orig_i];
         }
+        true
     }
 
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         (self.jac_rows.clone(), self.jac_cols.clone())
     }
 
-    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
         let x_full = self.expand_x(x);
         let inner_nnz = self.jac_entry_map.iter().copied().max().map_or(0, |m| m + 1);
         if inner_nnz == 0 {
-            return;
+            return true;
         }
         // Get all inner Jacobian values
         let (inner_jac_rows, _) = self.inner.jacobian_structure();
         let mut inner_vals = vec![0.0; inner_jac_rows.len()];
-        self.inner.jacobian_values(&x_full, _new_x, &mut inner_vals);
+        if !self.inner.jacobian_values(&x_full, _new_x, &mut inner_vals) {
+            return false;
+        }
         for (red_k, &orig_k) in self.jac_entry_map.iter().enumerate() {
             vals[red_k] = inner_vals[orig_k];
         }
+        true
     }
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         (self.hess_rows.clone(), self.hess_cols.clone())
     }
 
-    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) -> bool {
         let x_full = self.expand_x(x);
 
         // Expand lambda to original constraint indices
@@ -539,12 +556,15 @@ impl NlpProblem for PreprocessedProblem<'_> {
         let (inner_hess_rows, _) = self.inner.hessian_structure();
         let inner_nnz = inner_hess_rows.len();
         let mut inner_vals = vec![0.0; inner_nnz];
-        self.inner
-            .hessian_values(&x_full, _new_x, obj_factor, &lambda_full, &mut inner_vals);
+        if !self.inner
+            .hessian_values(&x_full, _new_x, obj_factor, &lambda_full, &mut inner_vals) {
+            return false;
+        }
 
         for (red_k, &orig_k) in self.hess_entry_map.iter().enumerate() {
             vals[red_k] = inner_vals[orig_k];
         }
+        true
     }
 }
 
@@ -582,31 +602,36 @@ mod tests {
             x0[1] = 2.0;
             x0[2] = 3.0;
         }
-        fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
-            (x[0] - 1.0).powi(2) + (x[1] - 2.0).powi(2) + (x[2] - 3.0).powi(2)
+        fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+            *obj = (x[0] - 1.0).powi(2) + (x[1] - 2.0).powi(2) + (x[2] - 3.0).powi(2);
+            true
         }
-        fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
+        fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
             grad[0] = 2.0 * (x[0] - 1.0);
             grad[1] = 2.0 * (x[1] - 2.0);
             grad[2] = 2.0 * (x[2] - 3.0);
+            true
         }
-        fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
+        fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
             g[0] = x[0] + x[2];
+            true
         }
         fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
             (vec![0, 0], vec![0, 2])
         }
-        fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) {
+        fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
             vals[0] = 1.0;
             vals[1] = 1.0;
+            true
         }
         fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
             (vec![0, 1, 2], vec![0, 1, 2])
         }
-        fn hessian_values(&self, _x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
+        fn hessian_values(&self, _x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) -> bool {
             vals[0] = 2.0 * obj_factor;
             vals[1] = 2.0 * obj_factor;
             vals[2] = 2.0 * obj_factor;
+            true
         }
     }
 
@@ -632,7 +657,9 @@ mod tests {
         // With reduced x = [1.0, 3.0] (x0=1, x2=3), x1 is fixed at 2.0
         // obj = (1-1)^2 + (2-2)^2 + (3-3)^2 = 0
         let x_red = vec![1.0, 3.0];
-        assert!((prep.objective(&x_red, true) - 0.0).abs() < 1e-10);
+        let mut obj_val = 0.0;
+        prep.objective(&x_red, true, &mut obj_val);
+        assert!((obj_val - 0.0).abs() < 1e-10);
     }
 
     #[test]
@@ -713,36 +740,41 @@ mod tests {
             x0[0] = 1.0;
             x0[1] = 1.0;
         }
-        fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
-            x[0] * x[0] + x[1] * x[1]
+        fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+            *obj = x[0] * x[0] + x[1] * x[1];
+            true
         }
-        fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
+        fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
             grad[0] = 2.0 * x[0];
             grad[1] = 2.0 * x[1];
+            true
         }
-        fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
+        fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
             g[0] = x[0] + x[1]; // same as g[2]
             g[1] = x[0] - x[1];
             g[2] = x[0] + x[1]; // duplicate of g[0]
+            true
         }
         fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
             // Dense: rows [0,0,1,1,2,2], cols [0,1,0,1,0,1]
             (vec![0, 0, 1, 1, 2, 2], vec![0, 1, 0, 1, 0, 1])
         }
-        fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) {
+        fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
             vals[0] = 1.0;
             vals[1] = 1.0; // dg0/dx1
             vals[2] = 1.0;
             vals[3] = -1.0; // dg1/dx1
             vals[4] = 1.0;
             vals[5] = 1.0; // dg2/dx1 (same as dg0)
+            true
         }
         fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
             (vec![0, 1], vec![0, 1])
         }
-        fn hessian_values(&self, _x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
+        fn hessian_values(&self, _x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) -> bool {
             vals[0] = 2.0 * obj_factor;
             vals[1] = 2.0 * obj_factor;
+            true
         }
     }
 
@@ -782,23 +814,27 @@ mod tests {
                 x0[0] = 1.0;
                 x0[1] = 1.0;
             }
-            fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
-                x[0] + x[1]
-            }
-            fn gradient(&self, _x: &[f64], _new_x: bool, grad: &mut [f64]) {
+            fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+            *obj = x[0] + x[1];
+            true
+        }
+            fn gradient(&self, _x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
                 grad[0] = 1.0;
                 grad[1] = 1.0;
-            }
-            fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
+            true
+        }
+            fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
                 g[0] = x[0] + x[1];
-            }
+            true
+        }
             fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
                 (vec![0, 0], vec![0, 1])
             }
-            fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) {
+            fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
                 vals[0] = 1.0;
                 vals[1] = 1.0;
-            }
+            true
+        }
             fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
                 (vec![], vec![])
             }
@@ -809,8 +845,7 @@ mod tests {
                 _obj_factor: f64,
                 _lambda: &[f64],
                 _vals: &mut [f64],
-            ) {
-            }
+            ) -> bool { true }
         }
 
         let prob = NothingToReduce;
@@ -833,18 +868,28 @@ mod tests {
             g_u[0] = f64::INFINITY;
         }
         fn initial_point(&self, x0: &mut [f64]) { x0[0] = 5.0; }
-        fn objective(&self, x: &[f64], _new_x: bool) -> f64 { x[0] * x[0] }
-        fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) { grad[0] = 2.0 * x[0]; }
-        fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) { g[0] = 2.0 * x[0]; }
+        fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+            *obj = x[0] * x[0];
+            true
+        }
+        fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool { grad[0] = 2.0 * x[0];
+            true
+        }
+        fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool { g[0] = 2.0 * x[0];
+            true
+        }
         fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
             (vec![0], vec![0])
         }
-        fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) { vals[0] = 2.0; }
+        fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool { vals[0] = 2.0;
+            true
+        }
         fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
             (vec![0], vec![0])
         }
-        fn hessian_values(&self, _x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
+        fn hessian_values(&self, _x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) -> bool {
             vals[0] = 2.0 * obj_factor;
+            true
         }
     }
 
@@ -875,18 +920,28 @@ mod tests {
             g_u[0] = -6.0;
         }
         fn initial_point(&self, x0: &mut [f64]) { x0[0] = 5.0; }
-        fn objective(&self, x: &[f64], _new_x: bool) -> f64 { x[0] * x[0] }
-        fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) { grad[0] = 2.0 * x[0]; }
-        fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) { g[0] = -3.0 * x[0]; }
+        fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+            *obj = x[0] * x[0];
+            true
+        }
+        fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool { grad[0] = 2.0 * x[0];
+            true
+        }
+        fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool { g[0] = -3.0 * x[0];
+            true
+        }
         fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
             (vec![0], vec![0])
         }
-        fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) { vals[0] = -3.0; }
+        fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool { vals[0] = -3.0;
+            true
+        }
         fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
             (vec![0], vec![0])
         }
-        fn hessian_values(&self, _x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
+        fn hessian_values(&self, _x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) -> bool {
             vals[0] = 2.0 * obj_factor;
+            true
         }
     }
 
@@ -917,18 +972,28 @@ mod tests {
             g_u[0] = 6.0;
         }
         fn initial_point(&self, x0: &mut [f64]) { x0[0] = 1.0; }
-        fn objective(&self, x: &[f64], _new_x: bool) -> f64 { x[0] * x[0] }
-        fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) { grad[0] = 2.0 * x[0]; }
-        fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) { g[0] = 2.0 * x[0]; }
+        fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+            *obj = x[0] * x[0];
+            true
+        }
+        fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool { grad[0] = 2.0 * x[0];
+            true
+        }
+        fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool { g[0] = 2.0 * x[0];
+            true
+        }
         fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
             (vec![0], vec![0])
         }
-        fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) { vals[0] = 2.0; }
+        fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool { vals[0] = 2.0;
+            true
+        }
         fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
             (vec![0], vec![0])
         }
-        fn hessian_values(&self, _x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
+        fn hessian_values(&self, _x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) -> bool {
             vals[0] = 2.0 * obj_factor;
+            true
         }
     }
 

@@ -64,24 +64,27 @@ impl NlpProblem for ExpActivation {
         x0.copy_from_slice(&self.x0);
     }
 
-    fn objective(&self, x: &[f64]) -> f64 {
-        x[0].exp() + x[1].exp() + 5.0 * x[2] + 6.0 * x[3] + 8.0 * x[4]
+    fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+        *obj = x[0].exp() + x[1].exp() + 5.0 * x[2] + 6.0 * x[3] + 8.0 * x[4];
+        true
     }
 
-    fn gradient(&self, x: &[f64], grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
         grad[0] = x[0].exp();
         grad[1] = x[1].exp();
         grad[2] = 5.0;
         grad[3] = 6.0;
         grad[4] = 8.0;
+        true
     }
 
-    fn constraints(&self, x: &[f64], g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
         // discopt normalization: >= becomes negated <=
         g[0] = 3.0 - x[0] - x[1];            // 3-(x1+x2) <= 0
         g[1] = x[0] - 4.0 * x[2];             // x1-4*y1 <= 0
         g[2] = x[1] - 4.0 * x[3];             // x2-4*y2 <= 0
         g[3] = x[2] + x[3] - 1.0 - x[4];      // y1+y2-1-y3 <= 0
+        true
     }
 
     // Dense Jacobian: 4*5 = 20 entries (matching PyO3 bindings)
@@ -97,7 +100,7 @@ impl NlpProblem for ExpActivation {
         (rows, cols)
     }
 
-    fn jacobian_values(&self, _x: &[f64], vals: &mut [f64]) {
+    fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
         vals.fill(0.0);
         // g0 = 3-x1-x2: dg/dx1=-1, dg/dx2=-1
         vals[0 * 5 + 0] = -1.0;
@@ -112,6 +115,7 @@ impl NlpProblem for ExpActivation {
         vals[3 * 5 + 2] = 1.0;
         vals[3 * 5 + 3] = 1.0;
         vals[3 * 5 + 4] = -1.0;
+        true
     }
 
     // Dense lower-triangle Hessian: 5*(5+1)/2 = 15 entries
@@ -127,10 +131,11 @@ impl NlpProblem for ExpActivation {
         (rows, cols)
     }
 
-    fn hessian_values(&self, x: &[f64], obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) -> bool {
         vals.fill(0.0);
         vals[0] = obj_factor * x[0].exp();  // H[0,0]
         vals[2] = obj_factor * x[1].exp();  // H[1,1]
+        true
     }
 }
 

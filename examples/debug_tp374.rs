@@ -72,16 +72,18 @@ impl NlpProblem for TP374 {
         }
     }
 
-    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
-        x[9]
+    fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+        *obj = x[9];
+        true
     }
 
-    fn gradient(&self, _x: &[f64], _new_x: bool, grad: &mut [f64]) {
+    fn gradient(&self, _x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
         for i in 0..9 { grad[i] = 0.0; }
         grad[9] = 1.0;
+        true
     }
 
-    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
         // Constraints 0..9: G(z_i, x) - (1 - x[9])^2 >= 0
         for i in 0..10 {
             let z = PI / 4.0 * (i as f64 * 0.1);
@@ -97,6 +99,7 @@ impl NlpProblem for TP374 {
             let z = PI / 4.0 * (1.2 + (i - 20) as f64 * 0.2);
             g[i] = x[9].powi(2) - tp374_g(z, x);
         }
+        true
     }
 
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
@@ -112,7 +115,7 @@ impl NlpProblem for TP374 {
         (rows, cols)
     }
 
-    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
         let mut idx = 0;
 
         // Constraints 0..9: g_i = G(z, x) - (1 - x[9])^2
@@ -159,6 +162,7 @@ impl NlpProblem for TP374 {
             vals[idx] = 2.0 * x[9];
             idx += 1;
         }
+        true
     }
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
@@ -174,7 +178,7 @@ impl NlpProblem for TP374 {
         (rows, cols)
     }
 
-    fn hessian_values(&self, _x: &[f64], _new_x: bool, _obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, _x: &[f64], _new_x: bool, _obj_factor: f64, lambda: &[f64], vals: &mut [f64]) -> bool {
         // Objective Hessian is zero (f = x[9] is linear).
         // Constraint Hessians:
         // For constraints 0..9 (group 1): g = A^2 + B^2 - (1-x9)^2
@@ -243,6 +247,7 @@ impl NlpProblem for TP374 {
             }
             vals[lt(9, 9)] += lam * 2.0;
         }
+        true
     }
 }
 
@@ -258,7 +263,7 @@ fn main() {
     let mut g0 = vec![0.0; 35];
     problem.constraints(&x0, true, &mut g0);
     println!("Initial point: {:?}", x0);
-    println!("f(x0) = {}", problem.objective(&x0, true));
+    println!("f(x0) = {}", { let mut _obj_val = 0.0; problem.objective(&x0, true, &mut _obj_val); _obj_val });
     println!("Constraints at x0 (first 10): {:?}", &g0[..10]);
     println!("Constraints at x0 (10..20):   {:?}", &g0[10..20]);
     println!("Constraints at x0 (20..35):   {:?}", &g0[20..35]);

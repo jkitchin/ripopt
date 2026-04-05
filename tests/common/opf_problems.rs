@@ -518,7 +518,7 @@ impl NlpProblem for AcopfProblem {
         }
     }
 
-    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
         let bmva = self.base_mva;
         let mut f = 0.0;
         for g in 0..self.n_gen {
@@ -526,10 +526,11 @@ impl NlpProblem for AcopfProblem {
             let pg_mw = pg_pu * bmva;
             f += self.gens[g].c2 * pg_mw * pg_mw + self.gens[g].c1 * pg_mw + self.gens[g].c0;
         }
-        f
+        *obj = f;
+        true
     }
 
-    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
         let bmva = self.base_mva;
         let nv = self.n_var();
         for i in 0..nv {
@@ -541,9 +542,10 @@ impl NlpProblem for AcopfProblem {
             grad[self.idx_pg(g)] =
                 2.0 * self.gens[g].c2 * bmva * bmva * pg_pu + self.gens[g].c1 * bmva;
         }
+        true
     }
 
-    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
         let n = self.n_bus;
         let bmva = self.base_mva;
 
@@ -593,6 +595,7 @@ impl NlpProblem for AcopfProblem {
             g[base] = p_ft * p_ft + q_ft * q_ft - limit_sq;
             g[base + 1] = p_tf * p_tf + q_tf * q_tf - limit_sq;
         }
+        true
     }
 
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
@@ -601,7 +604,7 @@ impl NlpProblem for AcopfProblem {
         (rows, cols)
     }
 
-    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
         let n = self.n_bus;
         let mut idx = 0;
 
@@ -843,6 +846,7 @@ impl NlpProblem for AcopfProblem {
         }
 
         debug_assert_eq!(idx, vals.len());
+        true
     }
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
@@ -850,7 +854,7 @@ impl NlpProblem for AcopfProblem {
         dense_lower_triangle(nv)
     }
 
-    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) -> bool {
         let n = self.n_bus;
         let bmva = self.base_mva;
 
@@ -1028,6 +1032,7 @@ impl NlpProblem for AcopfProblem {
                 x_pert[va] = x_orig;
             }
         }
+        true
     }
 }
 

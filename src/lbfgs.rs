@@ -36,8 +36,21 @@ pub fn solve<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
     project_bounds(&mut x, &x_l, &x_u);
 
     let mut grad = vec![0.0; n];
-    let mut f = problem.objective(&x, true);
-    problem.gradient(&x, true, &mut grad);
+    let mut f = 0.0;
+    if !problem.objective(&x, true, &mut f) || !problem.gradient(&x, true, &mut grad) {
+        let g_out = vec![0.0; m];
+        return SolveResult {
+            x,
+            objective: f64::NAN,
+            constraint_multipliers: vec![0.0; m],
+            bound_multipliers_lower: vec![0.0; n],
+            bound_multipliers_upper: vec![0.0; n],
+            constraint_values: g_out,
+            status: SolveStatus::EvaluationError,
+            iterations: 0,
+            diagnostics: Default::default(),
+        };
+    }
 
     let print_level = options.print_level;
     let tol = options.tol;
@@ -258,7 +271,7 @@ pub fn solve<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
     // Build result
     let mut g_out = vec![0.0; m];
     if m > 0 {
-        problem.constraints(&x, true, &mut g_out);
+        let _ = problem.constraints(&x, true, &mut g_out);
     }
 
     SolveResult {
@@ -376,10 +389,11 @@ fn wolfe_line_search<P: NlpProblem>(
             x_trial[i] = clamp(x[i] + alpha * d[i], x_l[i], x_u[i]);
         }
 
-        let f_trial = problem.objective(&x_trial, true);
+        let mut f_trial = 0.0;
+        let obj_ok = problem.objective(&x_trial, true, &mut f_trial);
 
-        // Treat NaN/Inf as Armijo violation
-        if !f_trial.is_finite() {
+        // Treat eval failure or NaN/Inf as Armijo violation
+        if !obj_ok || !f_trial.is_finite() {
             alpha_hi = alpha;
             alpha = if alpha_lo > 0.0 {
                 (alpha_lo + alpha) / 2.0
@@ -389,7 +403,15 @@ fn wolfe_line_search<P: NlpProblem>(
             continue;
         }
 
-        problem.gradient(&x_trial, true, &mut grad_trial);
+        if !problem.gradient(&x_trial, true, &mut grad_trial) {
+            alpha_hi = alpha;
+            alpha = if alpha_lo > 0.0 {
+                (alpha_lo + alpha) / 2.0
+            } else {
+                alpha * 0.1
+            };
+            continue;
+        }
         let dg_trial: f64 = grad_trial.iter().zip(d.iter()).map(|(g, d)| g * d).sum();
 
         // Check sufficient decrease (Armijo)
@@ -424,8 +446,13 @@ fn wolfe_line_search<P: NlpProblem>(
         for i in 0..n {
             x_trial[i] = clamp(x[i] + alpha_lo * d[i], x_l[i], x_u[i]);
         }
-        let f_trial = problem.objective(&x_trial, true);
-        problem.gradient(&x_trial, true, &mut grad_trial);
+        let mut f_trial = 0.0;
+        if !problem.objective(&x_trial, true, &mut f_trial) {
+            return None;
+        }
+        if !problem.gradient(&x_trial, true, &mut grad_trial) {
+            return None;
+        }
         return Some((alpha_lo, f_trial, grad_trial));
     }
 
@@ -522,20 +549,23 @@ mod tests {
             x0[0] = 0.0;
             x0[1] = 0.0;
         }
-        fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
-            (x[0] - 3.0).powi(2) + (x[1] - 4.0).powi(2)
+        fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+            *obj = (x[0] - 3.0).powi(2) + (x[1] - 4.0).powi(2);
+            true
         }
-        fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
+        fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
             grad[0] = 2.0 * (x[0] - 3.0);
             grad[1] = 2.0 * (x[1] - 4.0);
+            true
         }
-        fn constraints(&self, _x: &[f64], _new_x: bool, _g: &mut [f64]) {}
+        fn constraints(&self, _x: &[f64], _new_x: bool, _g: &mut [f64]) -> bool { true }
         fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
-        fn jacobian_values(&self, _x: &[f64], _new_x: bool, _vals: &mut [f64]) {}
+        fn jacobian_values(&self, _x: &[f64], _new_x: bool, _vals: &mut [f64]) -> bool { true }
         fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![0, 1], vec![0, 1]) }
-        fn hessian_values(&self, _x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
+        fn hessian_values(&self, _x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) -> bool {
             vals[0] = 2.0 * obj_factor;
             vals[1] = 2.0 * obj_factor;
+            true
         }
     }
 
@@ -567,14 +597,15 @@ mod tests {
         }
         fn constraint_bounds(&self, _g_l: &mut [f64], _g_u: &mut [f64]) {}
         fn initial_point(&self, x0: &mut [f64]) { x0[0] = 0.0; }
-        fn objective(&self, x: &[f64], _new_x: bool) -> f64 { (x[0] - 3.0).powi(2) }
-        fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) { grad[0] = 2.0 * (x[0] - 3.0); }
-        fn constraints(&self, _x: &[f64], _new_x: bool, _g: &mut [f64]) {}
+        fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool { *obj = (x[0] - 3.0).powi(2); true }
+        fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool { grad[0] = 2.0 * (x[0] - 3.0); true }
+        fn constraints(&self, _x: &[f64], _new_x: bool, _g: &mut [f64]) -> bool { true }
         fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
-        fn jacobian_values(&self, _x: &[f64], _new_x: bool, _vals: &mut [f64]) {}
+        fn jacobian_values(&self, _x: &[f64], _new_x: bool, _vals: &mut [f64]) -> bool { true }
         fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![0], vec![0]) }
-        fn hessian_values(&self, _x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
+        fn hessian_values(&self, _x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) -> bool {
             vals[0] = 2.0 * obj_factor;
+            true
         }
     }
 

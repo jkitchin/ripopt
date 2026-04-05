@@ -236,7 +236,7 @@ impl NlpProblem for NlProblem {
         x0.copy_from_slice(&self.x0);
     }
 
-    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
         let mut val = 0.0;
 
         // Nonlinear part
@@ -249,18 +249,20 @@ impl NlpProblem for NlProblem {
             val += coeff * x[idx];
         }
 
-        if self.maximize {
+        *obj = if self.maximize {
             -val
         } else {
             val
-        }
+        };
+        true
     }
 
-    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
         self.obj_gradient(x, grad);
+        true
     }
 
-    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
         for i in 0..self.m {
             let mut val = 0.0;
 
@@ -276,13 +278,14 @@ impl NlpProblem for NlProblem {
 
             g[i] = val;
         }
+        true
     }
 
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         (self.jac_rows.clone(), self.jac_cols.clone())
     }
 
-    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
         vals.iter_mut().for_each(|v| *v = 0.0);
 
         let mut grad = vec![0.0; self.n];
@@ -299,13 +302,14 @@ impl NlpProblem for NlProblem {
                 }
             }
         }
+        true
     }
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         (self.hess_rows.clone(), self.hess_cols.clone())
     }
 
-    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) -> bool {
         // Analytical Hessian via forward-over-reverse AD on each tape.
         vals.iter_mut().for_each(|v| *v = 0.0);
 
@@ -321,5 +325,6 @@ impl NlpProblem for NlProblem {
                 tape.hessian_accumulate(x, lambda[i], &self.hess_map, vals);
             }
         }
+        true
     }
 }

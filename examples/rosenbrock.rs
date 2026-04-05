@@ -35,19 +35,22 @@ impl NlpProblem for Rosenbrock {
         x0[1] = 1.0;
     }
 
-    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
         let (x1, x2) = (x[0], x[1]);
-        (1.0 - x1).powi(2) + 100.0 * (x2 - x1 * x1).powi(2)
+        *obj = (1.0 - x1).powi(2) + 100.0 * (x2 - x1 * x1).powi(2);
+        true
     }
 
-    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
         let (x1, x2) = (x[0], x[1]);
         grad[0] = -2.0 * (1.0 - x1) - 400.0 * x1 * (x2 - x1 * x1);
         grad[1] = 200.0 * (x2 - x1 * x1);
+        true
     }
 
-    fn constraints(&self, _x: &[f64], _new_x: bool, _g: &mut [f64]) {
-        // No constraints
+    fn constraints(&self, _x: &[f64], _new_x: bool, _g: &mut [f64]) -> bool {
+        // No constraints;
+        true
     }
 
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
@@ -55,8 +58,9 @@ impl NlpProblem for Rosenbrock {
         (vec![], vec![])
     }
 
-    fn jacobian_values(&self, _x: &[f64], _new_x: bool, _vals: &mut [f64]) {
-        // No constraints
+    fn jacobian_values(&self, _x: &[f64], _new_x: bool, _vals: &mut [f64]) -> bool {
+        // No constraints;
+        true
     }
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
@@ -64,7 +68,7 @@ impl NlpProblem for Rosenbrock {
         (vec![0, 1, 1], vec![0, 0, 1])
     }
 
-    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) -> bool {
         let (x1, x2) = (x[0], x[1]);
         // H[0,0] = 2 - 400*x2 + 1200*x1^2
         vals[0] = obj_factor * (2.0 - 400.0 * x2 + 1200.0 * x1 * x1);
@@ -72,6 +76,7 @@ impl NlpProblem for Rosenbrock {
         vals[1] = obj_factor * (-400.0 * x1);
         // H[1,1] = 200
         vals[2] = obj_factor * 200.0;
+        true
     }
 }
 

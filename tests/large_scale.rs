@@ -153,7 +153,7 @@ fn large_scale_sparse_qp_100k() {
     let result = ripopt::solve(&problem, &options);
     let elapsed = start.elapsed();
 
-    let f0 = problem.objective(&vec![0.5; 50000], true);
+    let mut f0 = 0.0; problem.objective(&vec![0.5; 50000], true, &mut f0);
     let cv = max_cv(&problem, &result.constraint_values);
     eprintln!(
         "RESULT: status={:?}, obj={:.6e}, cv={:.6e}, iters={}, time={:.3}s, f0={:.6e}",
@@ -276,7 +276,7 @@ fn large_scale_sparse_qp_1000() {
     let start = Instant::now();
     let result = ripopt::solve(&problem, &options);
     let elapsed = start.elapsed();
-    let f0 = problem.objective(&vec![0.5; n], true);
+    let mut f0 = 0.0; problem.objective(&vec![0.5; n], true, &mut f0);
     let cv = max_cv(&problem, &result.constraint_values);
     eprintln!(
         "RESULT: status={:?}, obj={:.6e}, cv={:.6e}, iters={}, time={:.3}s, f0={:.6e}",

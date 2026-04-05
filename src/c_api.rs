@@ -3,8 +3,9 @@
 //! Compile with `crate-type = ["cdylib", "rlib"]` to produce a shared library.
 //! Include `ripopt.h` from C/C++ code.
 
-use std::ffi::CStr;
-use std::os::raw::{c_char, c_double, c_int};
+use std::ffi::{CStr, CString};
+use std::io::Write;
+use std::os::raw::{c_char, c_double, c_int, c_void};
 
 use crate::options::SolverOptions;
 use crate::problem::NlpProblem;
@@ -75,6 +76,20 @@ pub type EvalHCb = unsafe extern "C" fn(
     user_data: *mut std::ffi::c_void,
 ) -> c_int;
 
+/// Intermediate callback, called once per iteration.
+/// Return 1 to continue, 0 to request early termination.
+pub type IntermediateCb = unsafe extern "C" fn(
+    iter: c_int,
+    obj_value: c_double,
+    inf_pr: c_double,
+    inf_du: c_double,
+    mu: c_double,
+    alpha_pr: c_double,
+    alpha_du: c_double,
+    ls_trials: c_int,
+    user_data: *mut c_void,
+) -> c_int;
+
 // ---------------------------------------------------------------------------
 // Opaque problem struct
 // ---------------------------------------------------------------------------
@@ -100,6 +115,15 @@ pub struct CApiProblem {
     /// Optional log callback (set via `ripopt_set_log_callback`).
     log_cb: Option<crate::logging::LogCb>,
     log_cb_user_data: *mut std::ffi::c_void,
+    /// Optional file handle for log output (set via `ripopt_open_output_file`).
+    log_file: Option<Box<std::fs::File>>,
+    /// Optional intermediate callback (set via `ripopt_set_intermediate_callback`).
+    intermediate_cb: Option<IntermediateCb>,
+    intermediate_cb_user_data: *mut c_void,
+    /// Initial multipliers for warm starting (set from ripopt_solve when warm_start=true).
+    initial_y: Vec<f64>,
+    initial_z_l: Vec<f64>,
+    initial_z_u: Vec<f64>,
     /// Diagnostics from the most recent solve.
     last_iterations: usize,
     last_obj: f64,
@@ -141,38 +165,34 @@ impl NlpProblem for CApiProblem {
         x0.copy_from_slice(&self.initial_x);
     }
 
-    fn objective(&self, x: &[f64], new_x: bool) -> f64 {
-        let mut obj = 0.0_f64;
+    fn objective(&self, x: &[f64], new_x: bool, obj: &mut f64) -> bool {
         let ok = unsafe {
             (self.eval_f)(
                 self.n as c_int,
                 x.as_ptr(),
                 new_x as c_int,
-                &mut obj,
+                obj,
                 self.user_data,
             )
         };
-        if ok == 0 {
-            f64::NAN
-        } else {
-            obj
-        }
+        ok != 0
     }
 
-    fn gradient(&self, x: &[f64], new_x: bool, grad: &mut [f64]) {
-        unsafe {
+    fn gradient(&self, x: &[f64], new_x: bool, grad: &mut [f64]) -> bool {
+        let ok = unsafe {
             (self.eval_grad_f)(
                 self.n as c_int,
                 x.as_ptr(),
                 new_x as c_int,
                 grad.as_mut_ptr(),
                 self.user_data,
-            );
-        }
+            )
+        };
+        ok != 0
     }
 
-    fn constraints(&self, x: &[f64], new_x: bool, g: &mut [f64]) {
-        unsafe {
+    fn constraints(&self, x: &[f64], new_x: bool, g: &mut [f64]) -> bool {
+        let ok = unsafe {
             (self.eval_g)(
                 self.n as c_int,
                 x.as_ptr(),
@@ -180,8 +200,9 @@ impl NlpProblem for CApiProblem {
                 self.m as c_int,
                 g.as_mut_ptr(),
                 self.user_data,
-            );
-        }
+            )
+        };
+        ok != 0
     }
 
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
@@ -208,9 +229,9 @@ impl NlpProblem for CApiProblem {
         )
     }
 
-    fn jacobian_values(&self, x: &[f64], new_x: bool, vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], new_x: bool, vals: &mut [f64]) -> bool {
         let nnz = self.nele_jac;
-        unsafe {
+        let ok = unsafe {
             (self.eval_jac_g)(
                 self.n as c_int,
                 x.as_ptr(),
@@ -221,8 +242,9 @@ impl NlpProblem for CApiProblem {
                 std::ptr::null_mut(),
                 vals.as_mut_ptr(),
                 self.user_data,
-            );
-        }
+            )
+        };
+        ok != 0
     }
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
@@ -252,9 +274,9 @@ impl NlpProblem for CApiProblem {
         )
     }
 
-    fn hessian_values(&self, x: &[f64], new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) -> bool {
         let nnz = self.nele_hess;
-        unsafe {
+        let ok = unsafe {
             (self.eval_h)(
                 self.n as c_int,
                 x.as_ptr(),
@@ -268,8 +290,9 @@ impl NlpProblem for CApiProblem {
                 std::ptr::null_mut(),
                 vals.as_mut_ptr(),
                 self.user_data,
-            );
-        }
+            )
+        };
+        ok != 0
     }
 }
 
@@ -284,6 +307,7 @@ pub enum RipoptReturnStatus {
     MaxIterExceeded = 5,
     RestorationFailed = 6,
     ErrorInStepComputation = 7,
+    UserRequestedStop = 3,
     NotEnoughDegreesOfFreedom = 10,
     InvalidProblemDefinition = 11,
     InternalError = -1,
@@ -297,7 +321,10 @@ fn map_status(s: SolveStatus) -> RipoptReturnStatus {
         }
         SolveStatus::MaxIterations => RipoptReturnStatus::MaxIterExceeded,
         SolveStatus::RestorationFailed => RipoptReturnStatus::RestorationFailed,
-        SolveStatus::NumericalError => RipoptReturnStatus::ErrorInStepComputation,
+        SolveStatus::NumericalError | SolveStatus::EvaluationError => {
+            RipoptReturnStatus::ErrorInStepComputation
+        }
+        SolveStatus::UserRequestedStop => RipoptReturnStatus::UserRequestedStop,
         SolveStatus::Unbounded => RipoptReturnStatus::InvalidProblemDefinition,
         SolveStatus::InternalError => RipoptReturnStatus::InternalError,
     }
@@ -356,6 +383,12 @@ pub unsafe extern "C" fn ripopt_create(
         user_data: std::ptr::null_mut(),
         log_cb: None,
         log_cb_user_data: std::ptr::null_mut(),
+        log_file: None,
+        intermediate_cb: None,
+        intermediate_cb_user_data: std::ptr::null_mut(),
+        initial_y: vec![0.0; m],
+        initial_z_l: vec![0.0; n],
+        initial_z_u: vec![0.0; n],
         last_iterations: 0,
         last_obj: 0.0,
         last_primal_inf: 0.0,
@@ -560,16 +593,49 @@ pub unsafe extern "C" fn ripopt_solve(
     p.initial_x
         .copy_from_slice(std::slice::from_raw_parts(x, p.n));
 
+    // When warm_start is enabled, read multipliers from input pointers (IPOPT convention)
+    if p.options.warm_start {
+        if !mult_g.is_null() && p.m > 0 {
+            p.initial_y.copy_from_slice(std::slice::from_raw_parts(mult_g, p.m));
+        }
+        if !mult_x_l.is_null() {
+            p.initial_z_l.copy_from_slice(std::slice::from_raw_parts(mult_x_l, p.n));
+        }
+        if !mult_x_u.is_null() {
+            p.initial_z_u.copy_from_slice(std::slice::from_raw_parts(mult_x_u, p.n));
+        }
+    }
+
     // Install log callback for this thread (if one was registered)
     if let Some(cb) = p.log_cb {
         crate::logging::set_log_callback(Some((cb, p.log_cb_user_data)));
     }
 
-    // Solve
-    let result: SolveResult = crate::solve(p, &p.options.clone());
+    // Install intermediate callback for this thread (if one was registered)
+    if let Some(cb) = p.intermediate_cb {
+        crate::intermediate::set_intermediate_callback(Some((cb, p.intermediate_cb_user_data)));
+    }
 
-    // Clear log callback
+    // Copy initial multipliers into options for the solver
+    let mut opts = p.options.clone();
+    if opts.warm_start {
+        if p.initial_y.iter().any(|&v| v != 0.0) {
+            opts.warm_start_y = Some(p.initial_y.clone());
+        }
+        if p.initial_z_l.iter().any(|&v| v != 0.0) {
+            opts.warm_start_z_l = Some(p.initial_z_l.clone());
+        }
+        if p.initial_z_u.iter().any(|&v| v != 0.0) {
+            opts.warm_start_z_u = Some(p.initial_z_u.clone());
+        }
+    }
+
+    // Solve
+    let result: SolveResult = crate::solve(p, &opts);
+
+    // Clear callbacks
     crate::logging::set_log_callback(None);
+    crate::intermediate::set_intermediate_callback(None);
 
     // Store diagnostics for getter functions
     p.last_iterations = result.iterations;
@@ -675,4 +741,103 @@ pub unsafe extern "C" fn ripopt_get_dual_inf(problem: *const CApiProblem) -> c_d
 #[no_mangle]
 pub unsafe extern "C" fn ripopt_get_compl_inf(problem: *const CApiProblem) -> c_double {
     (*problem).last_compl
+}
+
+// ---------------------------------------------------------------------------
+// File logging
+// ---------------------------------------------------------------------------
+
+/// File-logging callback: writes each message to the stored file handle.
+unsafe extern "C" fn file_log_callback(msg: *const c_char, user_data: *mut c_void) {
+    let file = &mut *(user_data as *mut std::fs::File);
+    if let Ok(s) = CStr::from_ptr(msg).to_str() {
+        let _ = writeln!(file, "{}", s);
+    }
+}
+
+/// Open a log file for solver output.
+///
+/// All solver output (iteration table, diagnostics, warnings) is written to
+/// the specified file. This overrides any previously set log callback.
+/// Pass `print_level` to control verbosity (0 = silent, 5 = verbose).
+///
+/// Returns 1 on success, 0 if the file cannot be opened.
+///
+/// # Safety
+/// `problem` and `filename` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn ripopt_open_output_file(
+    problem: *mut CApiProblem,
+    filename: *const c_char,
+    print_level: c_int,
+) -> c_int {
+    let p = &mut *problem;
+    let path = match CStr::from_ptr(filename).to_str() {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    match std::fs::File::create(path) {
+        Ok(file) => {
+            let boxed = Box::new(file);
+            let ptr = &*boxed as *const std::fs::File as *mut c_void;
+            p.log_file = Some(boxed);
+            p.log_cb = Some(file_log_callback);
+            p.log_cb_user_data = ptr;
+            p.options.print_level = print_level.clamp(0, 12) as u8;
+            1
+        }
+        Err(_) => 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Intermediate callback
+// ---------------------------------------------------------------------------
+
+/// Register an intermediate callback invoked once per solver iteration.
+///
+/// The callback receives current iteration metrics and returns 1 to continue
+/// or 0 to request early termination (solver returns `UserRequestedStop`).
+///
+/// # Safety
+/// `problem` must be valid. The callback and `user_data` must remain valid
+/// for the duration of the next `ripopt_solve` call.
+#[no_mangle]
+pub unsafe extern "C" fn ripopt_set_intermediate_callback(
+    problem: *mut CApiProblem,
+    callback: Option<IntermediateCb>,
+    user_data: *mut c_void,
+) {
+    let p = &mut *problem;
+    p.intermediate_cb = callback;
+    p.intermediate_cb_user_data = user_data;
+}
+
+// ---------------------------------------------------------------------------
+// Problem scaling
+// ---------------------------------------------------------------------------
+
+/// Set user-provided problem scaling.
+///
+/// `obj_scaling` scales the objective function. `g_scaling` (length m) scales
+/// each constraint. Pass NULL for `g_scaling` to scale only the objective.
+///
+/// After calling this function, the solver uses user-provided scaling instead
+/// of automatic gradient-based scaling.
+///
+/// # Safety
+/// `problem` must be valid. `g_scaling` (if non-null) must have length m.
+#[no_mangle]
+pub unsafe extern "C" fn ripopt_set_scaling(
+    problem: *mut CApiProblem,
+    obj_scaling: c_double,
+    g_scaling: *const c_double,
+) {
+    let p = &mut *problem;
+    p.options.user_obj_scaling = Some(obj_scaling);
+    if !g_scaling.is_null() && p.m > 0 {
+        p.options.user_g_scaling = Some(
+            std::slice::from_raw_parts(g_scaling, p.m).to_vec(),
+        );
+    }
 }

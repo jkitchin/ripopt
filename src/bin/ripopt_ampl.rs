@@ -78,6 +78,8 @@ fn main() {
             ripopt::SolveStatus::Unbounded => "Unbounded",
             ripopt::SolveStatus::RestorationFailed => "RestorationFailed",
             ripopt::SolveStatus::InternalError => "InternalError",
+            ripopt::SolveStatus::EvaluationError => "EvaluationError",
+            ripopt::SolveStatus::UserRequestedStop => "UserRequestedStop",
         },
         result.iterations
     );

@@ -20,6 +20,12 @@ pub enum SolveStatus {
     Unbounded,
     /// Restoration phase failed.
     RestorationFailed,
+    /// User callback returned `false`, indicating evaluation failure at the
+    /// current iterate (not during line search, where failures cause step
+    /// rejection instead).
+    EvaluationError,
+    /// Intermediate callback returned `false`, requesting early termination.
+    UserRequestedStop,
     /// Internal error.
     InternalError,
 }

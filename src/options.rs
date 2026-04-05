@@ -177,6 +177,18 @@ pub struct SolverOptions {
     /// oracle when the iterate is well-centered.
     /// Default: true.
     pub mu_oracle_quality_function: bool,
+    /// User-provided objective scaling factor. When `Some`, bypasses automatic
+    /// gradient-based scaling and uses this value directly.
+    pub user_obj_scaling: Option<f64>,
+    /// User-provided constraint scaling factors (length m). When `Some`, bypasses
+    /// automatic gradient-based constraint scaling.
+    pub user_g_scaling: Option<Vec<f64>>,
+    /// Initial constraint multipliers for warm starting.
+    pub warm_start_y: Option<Vec<f64>>,
+    /// Initial lower-bound multipliers for warm starting.
+    pub warm_start_z_l: Option<Vec<f64>>,
+    /// Initial upper-bound multipliers for warm starting.
+    pub warm_start_z_u: Option<Vec<f64>>,
     /// If set, serialize each KKT matrix (main IPM loop only) to this directory
     /// after factorization. Writes two files per iteration:
     ///   `<kkt_dump_name>_<iter:04>.mtx`  — Matrix Market format, symmetric, lower triangle
@@ -242,6 +254,11 @@ impl Default for SolverOptions {
             stall_iter_limit: 30,
             early_stall_timeout: 10.0,
             mu_oracle_quality_function: false,
+            user_obj_scaling: None,
+            user_g_scaling: None,
+            warm_start_y: None,
+            warm_start_z_l: None,
+            warm_start_z_u: None,
             kkt_dump_dir: None,
             kkt_dump_name: "problem".to_string(),
         }

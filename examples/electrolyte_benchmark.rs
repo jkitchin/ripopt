@@ -62,18 +62,18 @@ mod ipopt_ffi {
     }
 
     extern "C" fn eval_f_cb(n: i32, x: *const f64, _: bool, obj: *mut f64, ud: *mut c_void) -> bool {
-        unsafe { let w = &*(ud as *const IpoptWrapper); *obj = w.problem.objective(std::slice::from_raw_parts(x, n as usize)); true }
+        unsafe { let w = &*(ud as *const IpoptWrapper); w.problem.objective(std::slice::from_raw_parts(x, n as usize), true, &mut *obj); true }
     }
 
     extern "C" fn eval_grad_f_cb(n: i32, x: *const f64, _: bool, g: *mut f64, ud: *mut c_void) -> bool {
-        unsafe { let w = &*(ud as *const IpoptWrapper); w.problem.gradient(std::slice::from_raw_parts(x, n as usize), std::slice::from_raw_parts_mut(g, n as usize)); true }
+        unsafe { let w = &*(ud as *const IpoptWrapper); w.problem.gradient(std::slice::from_raw_parts(x, n as usize), true, std::slice::from_raw_parts_mut(g, n as usize)); true }
     }
 
     extern "C" fn eval_g_cb(n: i32, x: *const f64, _: bool, _m: i32, g: *mut f64, ud: *mut c_void) -> bool {
         unsafe {
             let w = &*(ud as *const IpoptWrapper);
             let m = w.problem.num_constraints();
-            if m > 0 { w.problem.constraints(std::slice::from_raw_parts(x, n as usize), std::slice::from_raw_parts_mut(g, m)); }
+            if m > 0 { w.problem.constraints(std::slice::from_raw_parts(x, n as usize), true, std::slice::from_raw_parts_mut(g, m)); }
             true
         }
     }
@@ -86,7 +86,7 @@ mod ipopt_ffi {
                 std::slice::from_raw_parts_mut(ir, nele).copy_from_slice(&w.jac_rows);
                 std::slice::from_raw_parts_mut(jc, nele).copy_from_slice(&w.jac_cols);
             } else {
-                w.problem.jacobian_values(std::slice::from_raw_parts(x, n as usize), std::slice::from_raw_parts_mut(vals, w.jac_rows.len()));
+                w.problem.jacobian_values(std::slice::from_raw_parts(x, n as usize), true, std::slice::from_raw_parts_mut(vals, w.jac_rows.len()));
             }
             true
         }
@@ -103,7 +103,7 @@ mod ipopt_ffi {
                 let xs = std::slice::from_raw_parts(x, n as usize);
                 let m = w.problem.num_constraints();
                 let ls = if m > 0 { std::slice::from_raw_parts(lambda, m) } else { &[] };
-                w.problem.hessian_values(xs, obj_factor, ls, std::slice::from_raw_parts_mut(vals, w.hess_rows.len()));
+                w.problem.hessian_values(xs, true, obj_factor, ls, std::slice::from_raw_parts_mut(vals, w.hess_rows.len()));
             }
             true
         }

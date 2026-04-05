@@ -100,11 +100,16 @@ pub fn solve<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         iter = k + 1;
 
         // Evaluate functions
-        let f = problem.objective(&x, true);
-        problem.gradient(&x, true, &mut grad_f);
-        problem.constraints(&x, true, &mut g);
-        problem.jacobian_values(&x, true, &mut jac_vals);
-        problem.hessian_values(&x, true, 1.0, &lambda, &mut hess_vals);
+        let mut f = 0.0;
+        if !problem.objective(&x, true, &mut f)
+            || !problem.gradient(&x, true, &mut grad_f)
+            || !problem.constraints(&x, true, &mut g)
+            || !problem.jacobian_values(&x, true, &mut jac_vals)
+            || !problem.hessian_values(&x, true, 1.0, &lambda, &mut hess_vals)
+        {
+            status = SolveStatus::EvaluationError;
+            break;
+        }
 
         // Compute constraint violation c = g - target
         for i in 0..m {
@@ -239,8 +244,16 @@ pub fn solve<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 }
             }
 
-            let f_trial = problem.objective(&x_trial, true);
+            let mut f_trial = f64::INFINITY;
+            let eval_ok = problem.objective(&x_trial, true, &mut f_trial);
             problem.constraints(&x_trial, true, &mut g_trial);
+            if !eval_ok {
+                alpha *= 0.5;
+                if alpha < 1e-16 {
+                    break;
+                }
+                continue;
+            }
             let c_trial_norm: f64 = g_trial
                 .iter()
                 .zip(target.iter())
@@ -277,7 +290,8 @@ pub fn solve<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
     }
 
     // Final evaluation
-    let obj = problem.objective(&x, true);
+    let mut obj = 0.0;
+    problem.objective(&x, true, &mut obj);
     problem.constraints(&x, true, &mut g);
 
     SolveResult {
@@ -328,18 +342,18 @@ mod tests {
             x0[2] = 5.0;
             x0[3] = 1.0;
         }
-        fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
-            x[0] * x[3] * (x[0] + x[1] + x[2]) + x[2]
-        }
-        fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
+        fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool { *obj = x[0] * x[3] * (x[0] + x[1] + x[2]) + x[2]; true }
+        fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
             grad[0] = x[3] * (2.0 * x[0] + x[1] + x[2]);
             grad[1] = x[0] * x[3];
             grad[2] = x[0] * x[3] + 1.0;
             grad[3] = x[0] * (x[0] + x[1] + x[2]);
+            true
         }
-        fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
+        fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
             g[0] = x[0] * x[1] * x[2] * x[3];
             g[1] = x[0] * x[0] + x[1] * x[1] + x[2] * x[2] + x[3] * x[3];
+            true
         }
         fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
             (
@@ -347,7 +361,7 @@ mod tests {
                 vec![0, 1, 2, 3, 0, 1, 2, 3],
             )
         }
-        fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
+        fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
             vals[0] = x[1] * x[2] * x[3];
             vals[1] = x[0] * x[2] * x[3];
             vals[2] = x[0] * x[1] * x[3];
@@ -356,6 +370,7 @@ mod tests {
             vals[5] = 2.0 * x[1];
             vals[6] = 2.0 * x[2];
             vals[7] = 2.0 * x[3];
+            true
         }
         fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
             (
@@ -363,7 +378,7 @@ mod tests {
                 vec![0, 0, 1, 0, 2, 0, 1, 2, 3],
             )
         }
-        fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
+        fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) -> bool {
             vals[0] = obj_factor * 2.0 * x[3] + lambda[1] * 2.0; // d2f/dx0^2
             vals[1] = obj_factor * x[3] + lambda[0] * x[2] * x[3]; // d2f/dx0dx1
             vals[2] = lambda[1] * 2.0; // d2f/dx1^2
@@ -373,6 +388,7 @@ mod tests {
             vals[6] = obj_factor * x[0] + lambda[0] * x[0] * x[2]; // d2f/dx1dx3
             vals[7] = obj_factor * x[0] + lambda[0] * x[0] * x[1]; // d2f/dx2dx3
             vals[8] = lambda[1] * 2.0; // d2f/dx3^2
+            true
         }
     }
 
@@ -417,29 +433,31 @@ mod tests {
             x0[0] = 0.0;
             x0[1] = 0.0;
         }
-        fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
-            x[0] * x[0] + x[1] * x[1]
-        }
-        fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
+        fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool { *obj = x[0] * x[0] + x[1] * x[1]; true }
+        fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
             grad[0] = 2.0 * x[0];
             grad[1] = 2.0 * x[1];
+            true
         }
-        fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
+        fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
             g[0] = x[0] + x[1];
+            true
         }
         fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
             (vec![0, 0], vec![0, 1])
         }
-        fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) {
+        fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
             vals[0] = 1.0;
             vals[1] = 1.0;
+            true
         }
         fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
             (vec![0, 1], vec![0, 1])
         }
-        fn hessian_values(&self, _x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
+        fn hessian_values(&self, _x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) -> bool {
             vals[0] = 2.0 * obj_factor;
             vals[1] = 2.0 * obj_factor;
+            true
         }
     }
 

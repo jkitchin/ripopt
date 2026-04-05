@@ -66,18 +66,20 @@ impl NlpProblem for TP116 {
         x0[12] = 150.0;
     }
 
-    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
-        x[10] + x[11] + x[12]
+    fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+        *obj = x[10] + x[11] + x[12];
+        true
     }
 
-    fn gradient(&self, _x: &[f64], _new_x: bool, grad: &mut [f64]) {
+    fn gradient(&self, _x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
         for g in grad.iter_mut() { *g = 0.0; }
         grad[10] = 1.0;
         grad[11] = 1.0;
         grad[12] = 1.0;
+        true
     }
 
-    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
         g[0] = -x[1] + x[2];
         g[1] = -x[0] + x[1];
         g[2] = -0.002*x[6] + 0.002*x[7] + 1.0;
@@ -93,6 +95,7 @@ impl NlpProblem for TP116 {
         g[12] = 0.00975*x[0].powi(2) - 0.975*x[0]*x[3] - 0.03475*x[0] + x[3];
         g[13] = 1.231059*x[0]*x[7] + x[10] - 1.262626*x[7];
         g[14] = 1.231059*x[1]*x[8] + x[11] - 1.262626*x[8];
+        true
     }
 
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
@@ -100,7 +103,7 @@ impl NlpProblem for TP116 {
          vec![1, 2, 0, 1, 6, 7, 10, 11, 12, 10, 11, 12, 2, 9, 12, 1, 4, 2, 5, 0, 3, 4, 6, 7, 0, 1, 4, 5, 7, 8, 1, 2, 5, 8, 9, 1, 2, 9, 0, 3, 0, 7, 10, 1, 8, 11])
     }
 
-    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
         vals[0] = -1.0;
         vals[1] = 1.0;
         vals[2] = -1.0;
@@ -147,6 +150,7 @@ impl NlpProblem for TP116 {
         vals[43] = 1.231059*x[8];
         vals[44] = 1.231059*x[1] - 1.262626;
         vals[45] = 1.0;
+        true
     }
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
@@ -154,7 +158,7 @@ impl NlpProblem for TP116 {
          vec![0, 1, 2, 0, 1, 2, 3, 4, 0, 3, 4, 1, 5, 1, 2])
     }
 
-    fn hessian_values(&self, _x: &[f64], _new_x: bool, _obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, _x: &[f64], _new_x: bool, _obj_factor: f64, lambda: &[f64], vals: &mut [f64]) -> bool {
         vals[0] = lambda[12] * 0.0195;
         vals[1] = lambda[6] * 0.0195;
         vals[2] = lambda[7] * 0.0195;
@@ -170,6 +174,7 @@ impl NlpProblem for TP116 {
         vals[12] = lambda[9] * 0.002 + lambda[10] * (-1.0);
         vals[13] = lambda[10] * 1.0 + lambda[11] * (-0.002);
         vals[14] = lambda[5] * 1.231059 + lambda[10] * (-1.0) + lambda[11] * 0.002;
+        true
     }
 }
 

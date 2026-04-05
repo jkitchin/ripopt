@@ -118,28 +118,31 @@ impl NlpProblem for CachedHs071 {
         x0[3] = 1.0;
     }
 
-    fn objective(&self, x: &[f64], new_x: bool) -> f64 {
+    fn objective(&self, x: &[f64], new_x: bool, obj: &mut f64) -> bool {
         self.ensure_cache(x, new_x);
         let cache = self.cache.borrow();
         let c = cache.as_ref().unwrap();
         // f(x) = x0 * x3 * (x0 + x1 + x2) + x2
-        x[0] * x[3] * c.sum_first3 + x[2]
+        *obj = x[0] * x[3] * c.sum_first3 + x[2];
+        true
     }
 
-    fn gradient(&self, x: &[f64], new_x: bool, grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], new_x: bool, grad: &mut [f64]) -> bool {
         self.ensure_cache(x, new_x);
         grad[0] = x[3] * (2.0 * x[0] + x[1] + x[2]);
         grad[1] = x[0] * x[3];
         grad[2] = x[0] * x[3] + 1.0;
         grad[3] = x[0] * (x[0] + x[1] + x[2]);
+        true
     }
 
-    fn constraints(&self, x: &[f64], new_x: bool, g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], new_x: bool, g: &mut [f64]) -> bool {
         self.ensure_cache(x, new_x);
         let cache = self.cache.borrow();
         let c = cache.as_ref().unwrap();
         g[0] = c.prod_all;
         g[1] = c.sum_sq;
+        true
     }
 
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
@@ -149,7 +152,7 @@ impl NlpProblem for CachedHs071 {
         )
     }
 
-    fn jacobian_values(&self, x: &[f64], new_x: bool, vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], new_x: bool, vals: &mut [f64]) -> bool {
         self.ensure_cache(x, new_x);
         vals[0] = x[1] * x[2] * x[3];
         vals[1] = x[0] * x[2] * x[3];
@@ -159,6 +162,7 @@ impl NlpProblem for CachedHs071 {
         vals[5] = 2.0 * x[1];
         vals[6] = 2.0 * x[2];
         vals[7] = 2.0 * x[3];
+        true
     }
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
@@ -175,7 +179,7 @@ impl NlpProblem for CachedHs071 {
         obj_factor: f64,
         lambda: &[f64],
         vals: &mut [f64],
-    ) {
+    ) -> bool {
         self.ensure_cache(x, new_x);
         vals[0] = obj_factor * 2.0 * x[3] + lambda[1] * 2.0;
         vals[1] = obj_factor * x[3] + lambda[0] * x[2] * x[3];
@@ -187,6 +191,7 @@ impl NlpProblem for CachedHs071 {
         vals[7] = obj_factor * x[0] + lambda[0] * x[0] * x[2];
         vals[8] = obj_factor * x[0] + lambda[0] * x[0] * x[1];
         vals[9] = lambda[1] * 2.0;
+        true
     }
 }
 

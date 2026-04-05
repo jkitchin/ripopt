@@ -37,23 +37,26 @@ impl NlpProblem for Rosenbrock {
         x0[1] = 1.0;
     }
 
-    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
-        (1.0 - x[0]).powi(2) + 100.0 * (x[1] - x[0] * x[0]).powi(2)
+    fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+        *obj = (1.0 - x[0]).powi(2) + 100.0 * (x[1] - x[0] * x[0]).powi(2);
+        true
     }
 
-    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
         grad[0] = -2.0 * (1.0 - x[0]) - 400.0 * x[0] * (x[1] - x[0] * x[0]);
         grad[1] = 200.0 * (x[1] - x[0] * x[0]);
+        true
     }
 
-    fn constraints(&self, _x: &[f64], _new_x: bool, _g: &mut [f64]) {}
+    fn constraints(&self, _x: &[f64], _new_x: bool, _g: &mut [f64]) -> bool { true }
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
-    fn jacobian_values(&self, _x: &[f64], _new_x: bool, _vals: &mut [f64]) {}
+    fn jacobian_values(&self, _x: &[f64], _new_x: bool, _vals: &mut [f64]) -> bool { true }
 
     // Dummy Hessian — never called in limited-memory mode
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
-    fn hessian_values(&self, _x: &[f64], _new_x: bool, _: f64, _: &[f64], _: &mut [f64]) {
+    fn hessian_values(&self, _x: &[f64], _new_x: bool, _: f64, _: &[f64], _: &mut [f64]) -> bool {
         unreachable!("Hessian should not be called in limited-memory mode");
+        true
     }
 }
 
@@ -80,31 +83,35 @@ impl NlpProblem for Hs071NoHessian {
         x0[0] = 1.0; x0[1] = 5.0; x0[2] = 5.0; x0[3] = 1.0;
     }
 
-    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
-        x[0] * x[3] * (x[0] + x[1] + x[2]) + x[2]
+    fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+        *obj = x[0] * x[3] * (x[0] + x[1] + x[2]) + x[2];
+        true
     }
 
-    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
         grad[0] = x[3] * (2.0 * x[0] + x[1] + x[2]);
         grad[1] = x[0] * x[3];
         grad[2] = x[0] * x[3] + 1.0;
         grad[3] = x[0] * (x[0] + x[1] + x[2]);
+        true
     }
 
-    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
         g[0] = x[0] * x[1] * x[2] * x[3];
         g[1] = x[0] * x[0] + x[1] * x[1] + x[2] * x[2] + x[3] * x[3];
+        true
     }
 
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         (vec![0, 0, 0, 0, 1, 1, 1, 1], vec![0, 1, 2, 3, 0, 1, 2, 3])
     }
 
-    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
         vals[0] = x[1] * x[2] * x[3]; vals[1] = x[0] * x[2] * x[3];
         vals[2] = x[0] * x[1] * x[3]; vals[3] = x[0] * x[1] * x[2];
         vals[4] = 2.0 * x[0]; vals[5] = 2.0 * x[1];
         vals[6] = 2.0 * x[2]; vals[7] = 2.0 * x[3];
+        true
     }
 
     // Dummy Hessian — not called in limited-memory mode, but fallback solvers
@@ -120,8 +127,9 @@ impl NlpProblem for Hs071NoHessian {
         }
         (rows, cols)
     }
-    fn hessian_values(&self, _x: &[f64], _new_x: bool, _: f64, _: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, _x: &[f64], _new_x: bool, _: f64, _: &[f64], vals: &mut [f64]) -> bool {
         for v in vals.iter_mut() { *v = 0.0; }
+        true
     }
 }
 

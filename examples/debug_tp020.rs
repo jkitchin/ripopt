@@ -34,39 +34,44 @@ impl NlpProblem for HsTp020 {
         x0[0] = 0.1; x0[1] = 1.0;
     }
 
-    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
-        -2.0*x[0] + 100.0*x[0].powi(4) + 100.0*x[1].powi(2) - 200.0*x[1]*x[0].powi(2) + 1.0 + x[0].powi(2)
+    fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+        *obj = -2.0*x[0] + 100.0*x[0].powi(4) + 100.0*x[1].powi(2) - 200.0*x[1]*x[0].powi(2) + 1.0 + x[0].powi(2);
+        true
     }
 
-    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
         grad[0] = 2.0*x[0] + 400.0*x[0].powi(3) - 400.0*x[0]*x[1] - 2.0;
         grad[1] = -200.0*x[0].powi(2) + 200.0*x[1];
+        true
     }
 
-    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
         g[0] = x[0] + x[1].powi(2);
         g[1] = x[0].powi(2) + x[1];
         g[2] = -1.0 + x[0].powi(2) + x[1].powi(2);
+        true
     }
 
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         (vec![0, 0, 1, 1, 2, 2], vec![0, 1, 0, 1, 0, 1])
     }
 
-    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
         vals[0] = 1.0;       vals[1] = 2.0*x[1];
         vals[2] = 2.0*x[0];  vals[3] = 1.0;
         vals[4] = 2.0*x[0];  vals[5] = 2.0*x[1];
+        true
     }
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         (vec![0, 1, 1], vec![0, 0, 1])
     }
 
-    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) -> bool {
         vals[0] = obj_factor * (1200.0*x[0].powi(2) - 400.0*x[1] + 2.0) + lambda[1]*2.0 + lambda[2]*2.0;
         vals[1] = obj_factor * (-400.0*x[0]);
         vals[2] = obj_factor * 200.0 + lambda[0]*2.0 + lambda[2]*2.0;
+        true
     }
 }
 
@@ -86,7 +91,7 @@ fn main() {
 
     // Evaluate at starting point
     let x0 = [0.1, 1.0];
-    let f0 = problem.objective(&x0, true);
+    let mut f0 = 0.0; problem.objective(&x0, true, &mut f0);
     let mut g0 = [0.0; 3];
     problem.constraints(&x0, true, &mut g0);
     let mut grad0 = [0.0; 2];
@@ -117,7 +122,7 @@ fn main() {
     // Check what happens at the solution x* = (0.5, ~0.25)
     // The known optimal for TP020 is approximately x* = (0.5, 0.25), f* = 0.25 (bound active)
     let x_star = [0.5, 0.25];
-    let f_star = problem.objective(&x_star, true);
+    let mut f_star = 0.0; problem.objective(&x_star, true, &mut f_star);
     let mut g_star = [0.0; 3];
     problem.constraints(&x_star, true, &mut g_star);
     let mut grad_star = [0.0; 2];

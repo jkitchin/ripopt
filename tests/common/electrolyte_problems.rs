@@ -392,7 +392,7 @@ impl NlpProblem for WaterAutoionization {
         x0[0] = (1e-5_f64).ln(); // ~ -11.5
     }
 
-    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
         // x[0] = ln(m_H) = ln(m_OH), I = m_H (z=1 for both, equal conc)
         let m = x[0].exp();
         let i_s = m; // I = 0.5*(1^2*m + 1^2*m) = m
@@ -401,10 +401,11 @@ impl NlpProblem for WaterAutoionization {
         // f = m*(mu0_H + lg_H + ln(m)) + m*(mu0_OH + lg_OH + ln(m))
         // mu0_H + mu0_OH = -ln(Kw) so split: mu0_H = 0, mu0_OH = -LN_KW
         // f = m*(lg_H + x) + m*(-LN_KW + lg_OH + x)
-        m * (lg_h + x[0]) + m * (-LN_KW + lg_oh + x[0])
+        *obj = m * (lg_h + x[0]) + m * (-LN_KW + lg_oh + x[0]);
+        true
     }
 
-    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
         let m = x[0].exp();
         let i_s = m;
         let lg_h = ln_gamma_dh(1.0, 9.0, 0.0, i_s);
@@ -418,17 +419,18 @@ impl NlpProblem for WaterAutoionization {
         // (dI/dm = 1)
         let df_dm = (lg_h + lg_oh - LN_KW + 2.0 * x[0] + 2.0) + m * (dlg_h + dlg_oh);
         grad[0] = df_dm * m;
+        true
     }
 
-    fn constraints(&self, _x: &[f64], _new_x: bool, _g: &mut [f64]) {}
+    fn constraints(&self, _x: &[f64], _new_x: bool, _g: &mut [f64]) -> bool { true }
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
-    fn jacobian_values(&self, _x: &[f64], _new_x: bool, _vals: &mut [f64]) {}
+    fn jacobian_values(&self, _x: &[f64], _new_x: bool, _vals: &mut [f64]) -> bool { true }
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         (vec![0], vec![0])
     }
 
-    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) -> bool {
         // d²f/dx² = d/dx[m * df_dm] = m*df_dm + m*d(df_dm)/dx
         // d(df_dm)/dx = d(df_dm)/dm * m
         let m = x[0].exp();
@@ -448,6 +450,7 @@ impl NlpProblem for WaterAutoionization {
 
         // d²f/dx² = m*df_dm + m^2*d2f_dm2
         vals[0] = obj_factor * (m * df_dm + m * m * d2f_dm2);
+        true
     }
 }
 
@@ -494,19 +497,22 @@ impl NlpProblem for Co2WaterSpeciation {
         x0[4] = (1e-8_f64).ln();
     }
 
-    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
-        gibbs_objective(x, &Self::mu0(), &Self::CHARGES, &Self::DH_A, &Self::DH_B)
+    fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+        *obj = gibbs_objective(x, &Self::mu0(), &Self::CHARGES, &Self::DH_A, &Self::DH_B);
+        true
     }
 
-    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
         gibbs_gradient(x, &Self::mu0(), &Self::CHARGES, &Self::DH_A, &Self::DH_B, grad);
+        true
     }
 
-    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
         // g[0]: C balance: m_H2CO3 + m_HCO3 + m_CO3 = C_TOTAL
         g[0] = x[0].exp() + x[1].exp() + x[2].exp() - Self::C_TOTAL;
         // g[1]: electroneutrality: -m_HCO3 - 2*m_CO3 + m_H - m_OH = 0
         g[1] = -x[1].exp() - 2.0 * x[2].exp() + x[3].exp() - x[4].exp();
+        true
     }
 
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
@@ -516,21 +522,22 @@ impl NlpProblem for Co2WaterSpeciation {
         (rows, cols)
     }
 
-    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
         vals[0] = x[0].exp();        // dg0/dx0
         vals[1] = x[1].exp();        // dg0/dx1
         vals[2] = x[2].exp();        // dg0/dx2
         vals[3] = -x[1].exp();       // dg1/dx1
         vals[4] = -2.0 * x[2].exp(); // dg1/dx2
         vals[5] = x[3].exp();        // dg1/dx3
-        vals[6] = -x[4].exp();       // dg1/dx4
+        vals[6] = -x[4].exp();       // dg1/dx4;
+        true
     }
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         dense_lower_triangle(Self::N)
     }
 
-    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) -> bool {
         for v in vals.iter_mut() { *v = 0.0; }
         gibbs_hessian(x, &Self::mu0(), &Self::CHARGES, &Self::DH_A, &Self::DH_B, obj_factor, vals);
         // Constraint 0: g0 = e^x0 + e^x1 + e^x2 - C
@@ -540,6 +547,7 @@ impl NlpProblem for Co2WaterSpeciation {
         // Constraint 1: g1 = -e^x1 - 2*e^x2 + e^x3 - e^x4
         let coeffs1 = [0.0, -1.0, -2.0, 1.0, -1.0];
         add_constraint_hessian_exp(x, lambda[1], &coeffs1, vals);
+        true
     }
 }
 
@@ -581,18 +589,21 @@ impl NlpProblem for NaClSpeciation {
         x0[3] = (1e-7_f64).ln();
     }
 
-    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
-        gibbs_objective(x, &Self::mu0(), &Self::CHARGES, &Self::DH_A, &Self::DH_BDOT)
+    fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+        *obj = gibbs_objective(x, &Self::mu0(), &Self::CHARGES, &Self::DH_A, &Self::DH_BDOT);
+        true
     }
 
-    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
         gibbs_gradient(x, &Self::mu0(), &Self::CHARGES, &Self::DH_A, &Self::DH_BDOT, grad);
+        true
     }
 
-    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
         g[0] = x[0].exp() - 0.1;  // Na balance
         g[1] = x[1].exp() - 0.1;  // Cl balance
-        g[2] = x[0].exp() + x[2].exp() - x[1].exp() - x[3].exp(); // electroneutrality
+        g[2] = x[0].exp() + x[2].exp() - x[1].exp() - x[3].exp(); // electroneutrality;
+        true
     }
 
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
@@ -601,20 +612,21 @@ impl NlpProblem for NaClSpeciation {
         (rows, cols)
     }
 
-    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
         vals[0] = x[0].exp();
         vals[1] = x[1].exp();
         vals[2] = x[0].exp();
         vals[3] = -x[1].exp();
         vals[4] = x[2].exp();
         vals[5] = -x[3].exp();
+        true
     }
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         dense_lower_triangle(Self::N)
     }
 
-    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) -> bool {
         for v in vals.iter_mut() { *v = 0.0; }
         gibbs_hessian(x, &Self::mu0(), &Self::CHARGES, &Self::DH_A, &Self::DH_BDOT, obj_factor, vals);
         // g0: e^x0 - 0.1 → diagonal at (0,0)
@@ -626,6 +638,7 @@ impl NlpProblem for NaClSpeciation {
         vals[lt_idx(1, 1)] += lambda[2] * (-x[1].exp());
         vals[lt_idx(2, 2)] += lambda[2] * x[2].exp();
         vals[lt_idx(3, 3)] += lambda[2] * (-x[3].exp());
+        true
     }
 }
 
@@ -673,15 +686,17 @@ impl NlpProblem for CaCl2NaClMixed {
         x0[5] = (1e-6_f64).ln();
     }
 
-    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
-        gibbs_objective(x, &Self::mu0(), &Self::CHARGES, &Self::DH_A, &Self::DH_BDOT)
+    fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+        *obj = gibbs_objective(x, &Self::mu0(), &Self::CHARGES, &Self::DH_A, &Self::DH_BDOT);
+        true
     }
 
-    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
         gibbs_gradient(x, &Self::mu0(), &Self::CHARGES, &Self::DH_A, &Self::DH_BDOT, grad);
+        true
     }
 
-    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
         // Ca balance: m_Ca + m_CaOH = 0.05
         g[0] = x[0].exp() + x[5].exp() - 0.05;
         // Na balance: m_Na = 0.1
@@ -691,6 +706,7 @@ impl NlpProblem for CaCl2NaClMixed {
         // Electroneutrality: 2*m_Ca + m_Na + m_H + m_CaOH - m_Cl - m_OH = 0
         g[3] = 2.0 * x[0].exp() + x[1].exp() + x[3].exp() + x[5].exp()
             - x[2].exp() - x[4].exp();
+        true
     }
 
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
@@ -699,7 +715,7 @@ impl NlpProblem for CaCl2NaClMixed {
         (rows, cols)
     }
 
-    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
         vals[0] = x[0].exp();         // dg0/dx0
         vals[1] = x[5].exp();         // dg0/dx5
         vals[2] = x[1].exp();         // dg1/dx1
@@ -709,14 +725,15 @@ impl NlpProblem for CaCl2NaClMixed {
         vals[6] = -x[2].exp();        // dg3/dx2
         vals[7] = x[3].exp();         // dg3/dx3
         vals[8] = -x[4].exp();        // dg3/dx4
-        vals[9] = x[5].exp();         // dg3/dx5
+        vals[9] = x[5].exp();         // dg3/dx5;
+        true
     }
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         dense_lower_triangle(Self::N)
     }
 
-    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) -> bool {
         for v in vals.iter_mut() { *v = 0.0; }
         gibbs_hessian(x, &Self::mu0(), &Self::CHARGES, &Self::DH_A, &Self::DH_BDOT, obj_factor, vals);
         // g0: e^x0 + e^x5 - 0.05
@@ -733,6 +750,7 @@ impl NlpProblem for CaCl2NaClMixed {
         vals[lt_idx(3, 3)] += lambda[3] * x[3].exp();
         vals[lt_idx(4, 4)] += lambda[3] * (-x[4].exp());
         vals[lt_idx(5, 5)] += lambda[3] * x[5].exp();
+        true
     }
 }
 
@@ -788,19 +806,22 @@ impl NlpProblem for PhosphoricAcid {
         x0[5] = (1e-10_f64).ln();
     }
 
-    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
-        gibbs_objective(x, &Self::mu0(), &Self::CHARGES, &Self::DH_A, &Self::DH_BDOT)
+    fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+        *obj = gibbs_objective(x, &Self::mu0(), &Self::CHARGES, &Self::DH_A, &Self::DH_BDOT);
+        true
     }
 
-    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
         gibbs_gradient(x, &Self::mu0(), &Self::CHARGES, &Self::DH_A, &Self::DH_BDOT, grad);
+        true
     }
 
-    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
         // P balance
         g[0] = x[0].exp() + x[1].exp() + x[2].exp() + x[3].exp() - Self::P_TOTAL;
         // Electroneutrality
         g[1] = -x[1].exp() - 2.0 * x[2].exp() - 3.0 * x[3].exp() + x[4].exp() - x[5].exp();
+        true
     }
 
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
@@ -809,7 +830,7 @@ impl NlpProblem for PhosphoricAcid {
         (rows, cols)
     }
 
-    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
         vals[0] = x[0].exp();
         vals[1] = x[1].exp();
         vals[2] = x[2].exp();
@@ -819,19 +840,21 @@ impl NlpProblem for PhosphoricAcid {
         vals[6] = -3.0 * x[3].exp();
         vals[7] = x[4].exp();
         vals[8] = -x[5].exp();
+        true
     }
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         dense_lower_triangle(Self::N)
     }
 
-    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) -> bool {
         for v in vals.iter_mut() { *v = 0.0; }
         gibbs_hessian(x, &Self::mu0(), &Self::CHARGES, &Self::DH_A, &Self::DH_BDOT, obj_factor, vals);
         let c0 = [1.0, 1.0, 1.0, 1.0, 0.0, 0.0];
         add_constraint_hessian_exp(x, lambda[0], &c0, vals);
         let c1 = [0.0, -1.0, -2.0, -3.0, 1.0, -1.0];
         add_constraint_hessian_exp(x, lambda[1], &c1, vals);
+        true
     }
 }
 
@@ -866,30 +889,32 @@ impl NlpProblem for HclMeanActivity {
         x0[0] = 0.5;
     }
 
-    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
         let m = x[0];
         let ln_a = pitzer_ln_gamma_pm(m, Self::BETA0, Self::BETA1, Self::C_PHI) + m.ln();
         let r = ln_a - Self::target_ln_a();
-        r * r
+        *obj = r * r;
+        true
     }
 
-    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
         let m = x[0];
         let ln_a = pitzer_ln_gamma_pm(m, Self::BETA0, Self::BETA1, Self::C_PHI) + m.ln();
         let r = ln_a - Self::target_ln_a();
         let dr = d_pitzer_ln_gamma_pm_dm(m, Self::BETA0, Self::BETA1, Self::C_PHI) + 1.0 / m;
         grad[0] = 2.0 * r * dr;
+        true
     }
 
-    fn constraints(&self, _: &[f64], _new_x: bool, _: &mut [f64]) {}
+    fn constraints(&self, _: &[f64], _new_x: bool, _: &mut [f64]) -> bool { true }
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
-    fn jacobian_values(&self, _: &[f64], _new_x: bool, _: &mut [f64]) {}
+    fn jacobian_values(&self, _: &[f64], _new_x: bool, _: &mut [f64]) -> bool { true }
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         (vec![0], vec![0])
     }
 
-    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) -> bool {
         let m = x[0];
         let ln_a = pitzer_ln_gamma_pm(m, Self::BETA0, Self::BETA1, Self::C_PHI) + m.ln();
         let r = ln_a - Self::target_ln_a();
@@ -901,6 +926,7 @@ impl NlpProblem for HclMeanActivity {
         let drm = d_pitzer_ln_gamma_pm_dm(m - eps, Self::BETA0, Self::BETA1, Self::C_PHI) + 1.0 / (m - eps);
         let d2r = (drp - drm) / (2.0 * eps);
         vals[0] = obj_factor * (2.0 * dr * dr + 2.0 * r * d2r);
+        true
     }
 }
 
@@ -932,31 +958,33 @@ impl NlpProblem for NaClSolubility {
         x0[0] = 3.0;
     }
 
-    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
         let m = x[0];
         let r = 2.0 * pitzer_ln_gamma_pm(m, Self::BETA0, Self::BETA1, Self::C_PHI)
             + 2.0 * m.ln() - Self::LN_KSP;
-        r * r
+        *obj = r * r;
+        true
     }
 
-    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
         let m = x[0];
         let r = 2.0 * pitzer_ln_gamma_pm(m, Self::BETA0, Self::BETA1, Self::C_PHI)
             + 2.0 * m.ln() - Self::LN_KSP;
         let dr = 2.0 * d_pitzer_ln_gamma_pm_dm(m, Self::BETA0, Self::BETA1, Self::C_PHI)
             + 2.0 / m;
         grad[0] = 2.0 * r * dr;
+        true
     }
 
-    fn constraints(&self, _: &[f64], _new_x: bool, _: &mut [f64]) {}
+    fn constraints(&self, _: &[f64], _new_x: bool, _: &mut [f64]) -> bool { true }
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
-    fn jacobian_values(&self, _: &[f64], _new_x: bool, _: &mut [f64]) {}
+    fn jacobian_values(&self, _: &[f64], _new_x: bool, _: &mut [f64]) -> bool { true }
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         (vec![0], vec![0])
     }
 
-    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) -> bool {
         let m = x[0];
         let r = 2.0 * pitzer_ln_gamma_pm(m, Self::BETA0, Self::BETA1, Self::C_PHI)
             + 2.0 * m.ln() - Self::LN_KSP;
@@ -967,6 +995,7 @@ impl NlpProblem for NaClSolubility {
         let drm = 2.0 * d_pitzer_ln_gamma_pm_dm(m - eps, Self::BETA0, Self::BETA1, Self::C_PHI) + 2.0 / (m - eps);
         let d2r = (drp - drm) / (2.0 * eps);
         vals[0] = obj_factor * (2.0 * dr * dr + 2.0 * r * d2r);
+        true
     }
 }
 
@@ -1005,21 +1034,24 @@ impl NlpProblem for ButanolWaterLle {
     }
 
     // Small regularizer to avoid pure feasibility (helps the IPM)
-    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
-        1e-6 * ((x[0] - 0.006).powi(2) + (x[1] - 0.48).powi(2))
+    fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+        *obj = 1e-6 * ((x[0] - 0.006).powi(2) + (x[1] - 0.48).powi(2));
+        true
     }
-    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
         grad[0] = 2e-6 * (x[0] - 0.006);
         grad[1] = 2e-6 * (x[1] - 0.48);
+        true
     }
 
-    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
         let (lg1_aq, lg2_aq) = nrtl_binary(x[0], Self::TAU12, Self::TAU21, Self::ALPHA);
         let (lg1_org, lg2_org) = nrtl_binary(x[1], Self::TAU12, Self::TAU21, Self::ALPHA);
         // BuOH equilibrium (with Setchenow salting-out in aqueous phase)
         g[0] = lg1_aq + x[0].ln() + Self::KS * Self::M_NACL - lg1_org - x[1].ln();
         // Water equilibrium
         g[1] = lg2_aq + (1.0 - x[0]).ln() - lg2_org - (1.0 - x[1]).ln();
+        true
     }
 
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
@@ -1029,7 +1061,7 @@ impl NlpProblem for ButanolWaterLle {
         (rows, cols)
     }
 
-    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
         let dlg1_aq = d_nrtl_ln_gamma1_dx1(x[0], Self::TAU12, Self::TAU21, Self::ALPHA);
         let dlg1_org = d_nrtl_ln_gamma1_dx1(x[1], Self::TAU12, Self::TAU21, Self::ALPHA);
         let dlg2_aq = d_nrtl_ln_gamma2_dx1(x[0], Self::TAU12, Self::TAU21, Self::ALPHA);
@@ -1039,14 +1071,15 @@ impl NlpProblem for ButanolWaterLle {
         vals[1] = -dlg1_org - 1.0 / x[1];     // dg0/dx1
         // g1 = lg2_aq + ln(1-x0) - lg2_org - ln(1-x1)
         vals[2] = dlg2_aq - 1.0 / (1.0 - x[0]); // dg1/dx0
-        vals[3] = -dlg2_org + 1.0 / (1.0 - x[1]); // dg1/dx1
+        vals[3] = -dlg2_org + 1.0 / (1.0 - x[1]); // dg1/dx1;
+        true
     }
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         dense_lower_triangle(2)
     }
 
-    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) -> bool {
         // Objective Hessian (regularizer): d²f/dx_i² = 2e-6
         vals[0] = obj_factor * 2e-6; vals[1] = 0.0; vals[2] = obj_factor * 2e-6;
         let eps = 1e-7;
@@ -1074,6 +1107,7 @@ impl NlpProblem for ButanolWaterLle {
                 }
             }
         }
+        true
     }
 }
 
@@ -1111,10 +1145,15 @@ impl NlpProblem for SaturatedBrine {
         x0[2] = 2.5;
     }
 
-    fn objective(&self, _x: &[f64], _new_x: bool) -> f64 { 0.0 }
-    fn gradient(&self, _x: &[f64], _new_x: bool, grad: &mut [f64]) { for g in grad.iter_mut() { *g = 0.0; } }
+    fn objective(&self, _x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+        *obj = 0.0;
+        true
+    }
+    fn gradient(&self, _x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool { for g in grad.iter_mut() { *g = 0.0; }
+        true
+    }
 
-    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
         let m = x[0];
         let a_w = x[1];
         let p_w = x[2];
@@ -1126,6 +1165,7 @@ impl NlpProblem for SaturatedBrine {
         g[1] = a_w - (-phi * 2.0 * m * M_W).exp();
         // VLE: p_w = a_w * p_w_pure
         g[2] = p_w - a_w * Self::P_W_PURE;
+        true
     }
 
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
@@ -1135,7 +1175,7 @@ impl NlpProblem for SaturatedBrine {
         (rows, cols)
     }
 
-    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
         let m = x[0];
         // dg0/dm = 2*d_pitzer_ln_gamma_pm/dm + 2/m
         vals[0] = 2.0 * d_pitzer_ln_gamma_pm_dm(m, Self::BETA0, Self::BETA1, Self::C_PHI)
@@ -1153,13 +1193,14 @@ impl NlpProblem for SaturatedBrine {
         vals[3] = -Self::P_W_PURE;
         // dg2/dp_w = 1
         vals[4] = 1.0;
+        true
     }
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         dense_lower_triangle(3)
     }
 
-    fn hessian_values(&self, x: &[f64], _new_x: bool, _obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, _obj_factor: f64, lambda: &[f64], vals: &mut [f64]) -> bool {
         for v in vals.iter_mut() { *v = 0.0; }
         // Use numerical second derivatives for the constraint Hessian
         let eps = 1e-7;
@@ -1193,6 +1234,7 @@ impl NlpProblem for SaturatedBrine {
                 vals[lt_idx(i, j)] += lambda[e.con] * d2;
             }
         }
+        true
     }
 }
 
@@ -1233,17 +1275,18 @@ impl NlpProblem for PitzerNaClFit {
         x0[2] = 0.005;
     }
 
-    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
         let phi_d = Self::phi_data();
         let mut f = 0.0;
         for (k, &m) in Self::MOLALITIES.iter().enumerate() {
             let r = pitzer_osmotic(m, x[0], x[1], x[2]) - phi_d[k];
             f += r * r;
         }
-        f
+        *obj = f;
+        true
     }
 
-    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
         let phi_d = Self::phi_data();
         for g in grad.iter_mut() { *g = 0.0; }
         for (k, &m) in Self::MOLALITIES.iter().enumerate() {
@@ -1253,17 +1296,18 @@ impl NlpProblem for PitzerNaClFit {
             grad[1] += 2.0 * r * dp1;
             grad[2] += 2.0 * r * dp2;
         }
+        true
     }
 
-    fn constraints(&self, _: &[f64], _new_x: bool, _: &mut [f64]) {}
+    fn constraints(&self, _: &[f64], _new_x: bool, _: &mut [f64]) -> bool { true }
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
-    fn jacobian_values(&self, _: &[f64], _new_x: bool, _: &mut [f64]) {}
+    fn jacobian_values(&self, _: &[f64], _new_x: bool, _: &mut [f64]) -> bool { true }
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         dense_lower_triangle(3)
     }
 
-    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) -> bool {
         for v in vals.iter_mut() { *v = 0.0; }
         let phi_d = Self::phi_data();
         // f = sum r_k^2, H = 2*sum (J_k^T J_k + r_k * H_k)
@@ -1279,6 +1323,7 @@ impl NlpProblem for PitzerNaClFit {
                 }
             }
         }
+        true
     }
 }
 
@@ -1345,7 +1390,7 @@ impl NlpProblem for MultiSaltDhFit {
         }
     }
 
-    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
         let data = Self::data();
         let mut f = 0.0;
         for (k, &m) in Self::MOLALITIES.iter().enumerate() {
@@ -1360,32 +1405,34 @@ impl NlpProblem for MultiSaltDhFit {
             let r = Self::compute_ln_gamma_pm_cacl2(x, m) - data[16 + k];
             f += r * r;
         }
-        f
+        *obj = f;
+        true
     }
 
-    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
         // Numerical gradient
         for g in grad.iter_mut() { *g = 0.0; }
-        let f0 = self.objective(x, true);
+        let mut f0 = 0.0; self.objective(x, true, &mut f0);
         let mut xp = x.to_vec();
         for i in 0..8 {
             let h = 1e-7 * x[i].abs().max(1e-5);
             xp[i] = x[i] + h;
-            let fp = self.objective(&xp, true);
+            let mut fp = 0.0; self.objective(&xp, true, &mut fp);
             grad[i] = (fp - f0) / h;
             xp[i] = x[i];
         }
+        true
     }
 
-    fn constraints(&self, _: &[f64], _new_x: bool, _: &mut [f64]) {}
+    fn constraints(&self, _: &[f64], _new_x: bool, _: &mut [f64]) -> bool { true }
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
-    fn jacobian_values(&self, _: &[f64], _new_x: bool, _: &mut [f64]) {}
+    fn jacobian_values(&self, _: &[f64], _new_x: bool, _: &mut [f64]) -> bool { true }
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         dense_lower_triangle(8)
     }
 
-    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) -> bool {
         for v in vals.iter_mut() { *v = 0.0; }
         // Numerical Hessian
         let n = 8;
@@ -1402,6 +1449,7 @@ impl NlpProblem for MultiSaltDhFit {
             }
             xp[j] = x[j];
         }
+        true
     }
 }
 
@@ -1456,7 +1504,7 @@ impl NlpProblem for EnrtlTempFit {
         x0[3] = 1800.0;
     }
 
-    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
         let data = Self::data();
         let mut f = 0.0;
         let mut idx = 0;
@@ -1467,10 +1515,11 @@ impl NlpProblem for EnrtlTempFit {
                 idx += 1;
             }
         }
-        f
+        *obj = f;
+        true
     }
 
-    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
         for g in grad.iter_mut() { *g = 0.0; }
         let data = Self::data();
         let mut idx = 0;
@@ -1492,17 +1541,18 @@ impl NlpProblem for EnrtlTempFit {
                 idx += 1;
             }
         }
+        true
     }
 
-    fn constraints(&self, _: &[f64], _new_x: bool, _: &mut [f64]) {}
+    fn constraints(&self, _: &[f64], _new_x: bool, _: &mut [f64]) -> bool { true }
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
-    fn jacobian_values(&self, _: &[f64], _new_x: bool, _: &mut [f64]) {}
+    fn jacobian_values(&self, _: &[f64], _new_x: bool, _: &mut [f64]) -> bool { true }
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         dense_lower_triangle(4)
     }
 
-    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) -> bool {
         // Numerical Hessian via gradient finite differences
         for v in vals.iter_mut() { *v = 0.0; }
         let n = 4;
@@ -1519,6 +1569,7 @@ impl NlpProblem for EnrtlTempFit {
             }
             xp[j] = x[j];
         }
+        true
     }
 }
 
@@ -1604,7 +1655,7 @@ impl NlpProblem for SeawaterSpeciation {
         x0[14] = (1e-4_f64).ln();    // KSO4-
     }
 
-    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
         let mu0 = Self::mu0();
         // For neutral species use simple Setchenow: ln_gamma = 0.1 * I
         let i_s = ionic_strength(x, &Self::CHARGES);
@@ -1618,10 +1669,11 @@ impl NlpProblem for SeawaterSpeciation {
             };
             f += m_i * (mu0[i] + lg + x[i]);
         }
-        f
+        *obj = f;
+        true
     }
 
-    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
         let n = Self::N;
         let mu0 = Self::mu0();
         let i_s = ionic_strength(x, &Self::CHARGES);
@@ -1650,9 +1702,10 @@ impl NlpProblem for SeawaterSpeciation {
             let di_dxj = 0.5 * Self::CHARGES[j] * Self::CHARGES[j] * m_j;
             grad[j] = m_j * a_j + di_dxj * s1;
         }
+        true
     }
 
-    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
         // g[0]: Na = x0 + x13
         g[0] = x[0].exp() + x[13].exp() - Self::NA_TOTAL;
         // g[1]: K = x1 + x14
@@ -1672,6 +1725,7 @@ impl NlpProblem for SeawaterSpeciation {
         for i in 0..Self::N {
             g[7] += Self::CHARGES[i] * x[i].exp();
         }
+        true
     }
 
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
@@ -1709,7 +1763,7 @@ impl NlpProblem for SeawaterSpeciation {
         (rows, cols)
     }
 
-    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
         let mut idx = 0;
         // g0
         vals[idx] = x[0].exp(); idx += 1;
@@ -1740,13 +1794,14 @@ impl NlpProblem for SeawaterSpeciation {
             vals[idx] = Self::CHARGES[i] * x[i].exp();
             idx += 1;
         }
+        true
     }
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         dense_lower_triangle(Self::N)
     }
 
-    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) -> bool {
         let n = Self::N;
         let nnz = n * (n + 1) / 2;
         for v in vals[..nnz].iter_mut() { *v = 0.0; }
@@ -1828,6 +1883,7 @@ impl NlpProblem for SeawaterSpeciation {
         for i in 0..n {
             vals[lt_idx(i, i)] += lambda[7] * Self::CHARGES[i] * x[i].exp();
         }
+        true
     }
 }
 

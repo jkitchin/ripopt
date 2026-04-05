@@ -922,32 +922,37 @@ impl NlpProblem for {struct_name} {{
 {chr(10).join(x0_lines)}
     }}
 
-    fn objective(&self, x: &[f64]) -> f64 {{
-        {obj_rust}
+    fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {{
+        *obj = {obj_rust};
+        true
     }}
 
-    fn gradient(&self, x: &[f64], grad: &mut [f64]) {{
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {{
 {chr(10).join(grad_lines)}
+        true
     }}
 
-    fn constraints(&self, x: &[f64], g: &mut [f64]) {{
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {{
 {chr(10).join(con_lines) if con_lines else '        let _ = (x, g);'}
+        true
     }}
 
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {{
         (vec![{', '.join(jac_rows)}], vec![{', '.join(jac_cols)}])
     }}
 
-    fn jacobian_values(&self, x: &[f64], vals: &mut [f64]) {{
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {{
 {chr(10).join(jac_val_lines) if jac_val_lines else '        let _ = (x, vals);'}
+        true
     }}
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {{
         (vec![{', '.join(hess_rows)}], vec![{', '.join(hess_cols)}])
     }}
 
-    fn hessian_values(&self, x: &[f64], obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {{
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) -> bool {{
 {chr(10).join(hess_val_lines) if hess_val_lines else '        let _ = (x, obj_factor, lambda, vals);'}
+        true
     }}
 }}
 """

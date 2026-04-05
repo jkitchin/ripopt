@@ -52,9 +52,9 @@ impl RestorationPhase {
         m: usize,
         options: &SolverOptions,
         is_acceptable_to_filter: &dyn Fn(f64, f64) -> bool,
-        eval_constraints: &dyn Fn(&[f64], &mut [f64]),
-        eval_jacobian: &dyn Fn(&[f64], &mut [f64]),
-        eval_objective: Option<&dyn Fn(&[f64]) -> f64>,
+        eval_constraints: &dyn Fn(&[f64], &mut [f64]) -> bool,
+        eval_jacobian: &dyn Fn(&[f64], &mut [f64]) -> bool,
+        eval_objective: Option<&dyn Fn(&[f64], &mut f64) -> bool>,
         deadline: Option<Instant>,
     ) -> (Vec<f64>, bool) {
         self.active = true;
@@ -71,7 +71,10 @@ impl RestorationPhase {
         let mut jac_vals = vec![0.0; jac_nnz];
 
         // Record initial constraint violation for stricter success criteria
-        eval_constraints(&x_rest, &mut g);
+        if !eval_constraints(&x_rest, &mut g) {
+            self.active = false;
+            return (x.to_vec(), false);
+        }
         let theta_initial = convergence::primal_infeasibility(&g, g_l, g_u);
 
         // Track consecutive failed line searches — only break after 3 (not 1)
@@ -90,7 +93,7 @@ impl RestorationPhase {
             }
 
             // Evaluate constraints at current point
-            eval_constraints(&x_rest, &mut g);
+            if !eval_constraints(&x_rest, &mut g) { break; }
 
             // Compute constraint violation
             let theta = convergence::primal_infeasibility(&g, g_l, g_u);
@@ -101,7 +104,7 @@ impl RestorationPhase {
             }
 
             // Evaluate Jacobian at current point
-            eval_jacobian(&x_rest, &mut jac_vals);
+            if !eval_jacobian(&x_rest, &mut jac_vals) { break; }
 
             // Compute violation vector for each constraint
             let mut violation = vec![0.0; m];
@@ -205,7 +208,10 @@ impl RestorationPhase {
                     }
                 }
 
-                eval_constraints(&x_trial, &mut g_trial);
+                if !eval_constraints(&x_trial, &mut g_trial) {
+                    alpha *= 0.5;
+                    continue; // Eval failed, try shorter step
+                }
                 let theta_trial = convergence::primal_infeasibility(&g_trial, g_l, g_u);
 
                 if theta_trial < (1.0 - 1e-4 * alpha) * theta {
@@ -254,7 +260,10 @@ impl RestorationPhase {
                         }
                     }
 
-                    eval_constraints(&x_trial, &mut g_trial);
+                    if !eval_constraints(&x_trial, &mut g_trial) {
+                        gd_alpha *= 0.5;
+                        continue; // Eval failed, try shorter step
+                    }
                     let theta_trial = convergence::primal_infeasibility(&g_trial, g_l, g_u);
 
                     if theta_trial < (1.0 - 1e-4 * gd_alpha) * theta {
@@ -279,7 +288,10 @@ impl RestorationPhase {
         }
 
         // Check constraint violation after GN phase
-        eval_constraints(&x_rest, &mut g);
+        if !eval_constraints(&x_rest, &mut g) {
+            self.active = false;
+            return (x_rest, false);
+        }
         let theta_after_gn = convergence::primal_infeasibility(&g, g_l, g_u);
 
         // If GN didn't achieve adequate reduction, try penalty-regularized fallback.
@@ -289,13 +301,13 @@ impl RestorationPhase {
             let x_ref = x_rest.clone();
             for &rho in &[1e-6, 1e-4, 1e-2] {
                 for _pen_iter in 0..50 {
-                    eval_constraints(&x_rest, &mut g);
+                    if !eval_constraints(&x_rest, &mut g) { break; }
                     let theta_pen = convergence::primal_infeasibility(&g, g_l, g_u);
                     if theta_pen < options.constr_viol_tol {
                         break;
                     }
 
-                    eval_jacobian(&x_rest, &mut jac_vals);
+                    if !eval_jacobian(&x_rest, &mut jac_vals) { break; }
 
                     // Compute violation
                     let mut violation_pen = vec![0.0; m];
@@ -342,7 +354,10 @@ impl RestorationPhase {
                                 x_trial_pen[i] = x_trial_pen[i].min(x_u[i] - 1e-8);
                             }
                         }
-                        eval_constraints(&x_trial_pen, &mut g_trial_pen);
+                        if !eval_constraints(&x_trial_pen, &mut g_trial_pen) {
+                            pen_alpha *= 0.5;
+                            continue;
+                        }
                         let theta_trial_pen = convergence::primal_infeasibility(&g_trial_pen, g_l, g_u);
                         if theta_trial_pen < (1.0 - 1e-4 * pen_alpha) * theta_pen {
                             x_rest.copy_from_slice(&x_trial_pen);
@@ -357,7 +372,10 @@ impl RestorationPhase {
         }
 
         // Check final constraint violation
-        eval_constraints(&x_rest, &mut g);
+        if !eval_constraints(&x_rest, &mut g) {
+            self.active = false;
+            return (x_rest, false);
+        }
         let theta_final = convergence::primal_infeasibility(&g, g_l, g_u);
 
         self.active = false;
@@ -385,8 +403,13 @@ impl RestorationPhase {
         // restored point is acceptable to the filter before declaring full success.
         if success {
             if let Some(eval_obj) = eval_objective {
-                let phi_rest = eval_obj(&x_rest);
-                if !is_acceptable_to_filter(theta_final, phi_rest) {
+                let mut phi_rest = f64::INFINITY;
+                if !eval_obj(&x_rest, &mut phi_rest) {
+                    // Objective eval failed; treat as filter-rejected
+                    if !feasible {
+                        success = false;
+                    }
+                } else if !is_acceptable_to_filter(theta_final, phi_rest) {
                     // Point is not acceptable to the filter.
                     // Still succeed if we achieved feasibility (filter will be reset),
                     // but fail if we only got partial reduction.
@@ -502,8 +525,8 @@ mod tests {
             &x, &x_l, &x_u, &[], &[],
             &[], &[], 2, 0, &opts,
             &|_theta, _phi| true,
-            &|_x, _g| {},
-            &|_x, _vals| {},
+            &|_x, _g| true,
+            &|_x, _vals| true,
             None,
             None,
         );
@@ -529,8 +552,8 @@ mod tests {
             &x, &x_l, &x_u, &g_l, &g_u,
             &jac_rows, &jac_cols, 2, 1, &opts,
             &|_theta, _phi| true,
-            &|x, g| { g[0] = x[0] + x[1]; },
-            &|_x, vals| { vals[0] = 1.0; vals[1] = 1.0; },
+            &|x, g| { g[0] = x[0] + x[1]; true },
+            &|_x, vals| { vals[0] = 1.0; vals[1] = 1.0; true },
             None,
             None,
         );
@@ -555,8 +578,8 @@ mod tests {
             &x, &x_l, &x_u, &g_l, &g_u,
             &jac_rows, &jac_cols, 2, 1, &opts,
             &|_theta, _phi| true,
-            &|x, g| { g[0] = x[0] + x[1]; },
-            &|_x, vals| { vals[0] = 1.0; vals[1] = 1.0; },
+            &|x, g| { g[0] = x[0] + x[1]; true },
+            &|_x, vals| { vals[0] = 1.0; vals[1] = 1.0; true },
             None,
             None,
         );
@@ -584,8 +607,8 @@ mod tests {
             &x, &x_l, &x_u, &g_l, &g_u,
             &jac_rows, &jac_cols, 1, 1, &opts,
             &|_theta, _phi| true,
-            &|x, g| { g[0] = x[0]; },
-            &|_x, vals| { vals[0] = 1.0; },
+            &|x, g| { g[0] = x[0]; true },
+            &|_x, vals| { vals[0] = 1.0; true },
             None,
             None,
         );
@@ -612,8 +635,8 @@ mod tests {
             &x, &x_l, &x_u, &g_l, &g_u,
             &jac_rows, &jac_cols, 2, 1, &opts,
             &|_theta, _phi| true,
-            &|x, g| { g[0] = x[0] + x[1]; },
-            &|_x, vals| { vals[0] = 1.0; vals[1] = 1.0; },
+            &|x, g| { g[0] = x[0] + x[1]; true },
+            &|_x, vals| { vals[0] = 1.0; vals[1] = 1.0; true },
             None,
             None,
         );
@@ -639,8 +662,8 @@ mod tests {
             &x, &x_l, &x_u, &[], &[],
             &[], &[], 1, 0, &opts,
             &|_theta, _phi| true,
-            &|_x, _g| {},
-            &|_x, _vals| {},
+            &|_x, _g| true,
+            &|_x, _vals| true,
             None,
             None,
         );

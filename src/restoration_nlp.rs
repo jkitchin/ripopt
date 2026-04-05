@@ -97,7 +97,7 @@ impl<'a> RestorationNlp<'a> {
         // Compute initial p, n from constraint violations at x_r
         let mut g_r = vec![0.0; m];
         if m > 0 {
-            inner.constraints(x_r, true, &mut g_r);
+            let _ = inner.constraints(x_r, true, &mut g_r);
         }
         let mut g_l = vec![0.0; m];
         let mut g_u = vec![0.0; m];
@@ -182,26 +182,26 @@ impl NlpProblem for RestorationNlp<'_> {
         x0[n + m..n + 2 * m].copy_from_slice(&self.n_init);
     }
 
-    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
         let n = self.n_orig;
         let m = self.m_orig;
 
         // rho * (sum(p) + sum(n))
-        let mut obj = 0.0;
+        *obj = 0.0;
         for i in 0..2 * m {
-            obj += self.rho * x[n + i];
+            *obj += self.rho * x[n + i];
         }
 
         // (eta/2) * ||D_R(x - x_r)||^2
         for i in 0..n {
             let diff = x[i] - self.x_r[i];
-            obj += 0.5 * self.eta * self.d_r2[i] * diff * diff;
+            *obj += 0.5 * self.eta * self.d_r2[i] * diff * diff;
         }
 
-        obj
+        true
     }
 
-    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
         let n = self.n_orig;
         let m = self.m_orig;
 
@@ -214,17 +214,21 @@ impl NlpProblem for RestorationNlp<'_> {
         for i in 0..2 * m {
             grad[n + i] = self.rho;
         }
+        true
     }
 
-    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
         let n = self.n_orig;
         let m = self.m_orig;
 
         // g_resto[i] = g_orig[i] - p[i] + n[i]
-        self.inner.constraints(&x[..n], _new_x, g);
+        if !self.inner.constraints(&x[..n], _new_x, g) {
+            return false;
+        }
         for i in 0..m {
             g[i] = g[i] - x[n + i] + x[n + m + i];
         }
+        true
     }
 
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
@@ -256,13 +260,15 @@ impl NlpProblem for RestorationNlp<'_> {
         (rows, cols)
     }
 
-    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
         let n = self.n_orig;
         let m = self.m_orig;
         let inner_nnz = self.inner_jac_rows.len();
 
         // Inner Jacobian values
-        self.inner.jacobian_values(&x[..n], _new_x, &mut vals[..inner_nnz]);
+        if !self.inner.jacobian_values(&x[..n], _new_x, &mut vals[..inner_nnz]) {
+            return false;
+        }
 
         // -1 for p
         for i in 0..m {
@@ -273,20 +279,23 @@ impl NlpProblem for RestorationNlp<'_> {
         for i in 0..m {
             vals[inner_nnz + m + i] = 1.0;
         }
+        true
     }
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         (self.resto_hess_rows.clone(), self.resto_hess_cols.clone())
     }
 
-    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) -> bool {
         let n = self.n_orig;
 
         // Inner hessian: obj_factor=0 (restoration doesn't optimize original objective),
         // lambda passed through (constraint curvature).
         let mut inner_vals = vec![0.0; self.inner_hess_nnz];
-        self.inner
-            .hessian_values(&x[..n], _new_x, 0.0, lambda, &mut inner_vals);
+        if !self.inner
+            .hessian_values(&x[..n], _new_x, 0.0, lambda, &mut inner_vals) {
+            return false;
+        }
 
         // Copy inner values to output
         vals[..self.inner_hess_nnz].copy_from_slice(&inner_vals);
@@ -303,6 +312,7 @@ impl NlpProblem for RestorationNlp<'_> {
         }
 
         // p/n blocks have zero Hessian (barrier mu/s^2 is added by IPM automatically)
+        true
     }
 }
 
@@ -334,29 +344,31 @@ mod tests {
             x0[0] = 0.0;
             x0[1] = 0.0;
         }
-        fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
-            x[0] * x[0] + x[1] * x[1]
-        }
-        fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
+        fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool { *obj = x[0] * x[0] + x[1] * x[1]; true }
+        fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
             grad[0] = 2.0 * x[0];
             grad[1] = 2.0 * x[1];
+            true
         }
-        fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
+        fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
             g[0] = x[0] + x[1];
+            true
         }
         fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
             (vec![0, 0], vec![0, 1])
         }
-        fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) {
+        fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
             vals[0] = 1.0;
             vals[1] = 1.0;
+            true
         }
         fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
             (vec![0, 1], vec![0, 1])
         }
-        fn hessian_values(&self, _x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
+        fn hessian_values(&self, _x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) -> bool {
             vals[0] = 2.0 * obj_factor;
             vals[1] = 2.0 * obj_factor;
+            true
         }
     }
 
@@ -407,7 +419,8 @@ mod tests {
         let resto = RestorationNlp::new(&prob, &x_r, 0.1, 1000.0, 1.0);
         // At x=x_r, p=1, n=2: obj = rho*(1+2) + 0
         let x = vec![1.0, 2.0, 1.0, 2.0];
-        let obj = resto.objective(&x, true);
+        let mut obj = 0.0;
+        resto.objective(&x, true, &mut obj);
         assert!((obj - 3000.0).abs() < 1e-10, "obj = {}", obj);
     }
 

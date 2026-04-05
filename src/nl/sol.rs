@@ -9,8 +9,10 @@ fn solve_code(status: SolveStatus) -> i32 {
         SolveStatus::Unbounded => 300,
         SolveStatus::MaxIterations => 400,
         SolveStatus::NumericalError
+        | SolveStatus::EvaluationError
         | SolveStatus::RestorationFailed
         | SolveStatus::InternalError => 500,
+        SolveStatus::UserRequestedStop => 400,
     }
 }
 
@@ -22,6 +24,8 @@ fn status_message(status: SolveStatus) -> &'static str {
         SolveStatus::LocalInfeasibility => "Converged to a point of local infeasibility",
         SolveStatus::MaxIterations => "Maximum Number of Iterations Exceeded",
         SolveStatus::NumericalError => "Numerical Difficulties",
+        SolveStatus::EvaluationError => "Evaluation Error in User Callbacks",
+        SolveStatus::UserRequestedStop => "Optimization Stopped by User",
         SolveStatus::Unbounded => "Problem Appears Unbounded",
         SolveStatus::RestorationFailed => "Restoration Failed",
         SolveStatus::InternalError => "Internal Error",

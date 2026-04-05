@@ -346,7 +346,7 @@ impl NlpProblem for CutestProblem {
         x0.copy_from_slice(&self.x0);
     }
 
-    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
+    fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
         let mut status = 0i32;
         let n = self.n as i32;
         let mut f = 0.0f64;
@@ -360,10 +360,11 @@ impl NlpProblem for CutestProblem {
                 cutest_uofg(&mut status, &n, x.as_ptr(), &mut f, g.as_mut_ptr(), &grad);
             }
         }
-        f
+        *obj = f;
+        true
     }
 
-    fn gradient(&self, x: &[f64], grad_out: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad_out: &mut [f64]) -> bool {
         let mut status = 0i32;
         let n = self.n as i32;
         let mut f = 0.0f64;
@@ -389,11 +390,12 @@ impl NlpProblem for CutestProblem {
                 );
             }
         }
+        true
     }
 
-    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) {
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
         if self.m == 0 {
-            return;
+            return true;
         }
         let mut status = 0i32;
         let n = self.n as i32;
@@ -401,15 +403,16 @@ impl NlpProblem for CutestProblem {
         unsafe {
             cutest_ccf(&mut status, &n, &m, x.as_ptr(), g.as_mut_ptr());
         }
+        true
     }
 
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         (self.jac_rows.clone(), self.jac_cols.clone())
     }
 
-    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) {
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
         if self.m == 0 {
-            return;
+            return true;
         }
         let mut status = 0i32;
         let n = self.n as i32;
@@ -449,13 +452,14 @@ impl NlpProblem for CutestProblem {
                 vals[pos] = cjac[i];
             }
         }
+        true
     }
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         (self.hess_rows.clone(), self.hess_cols.clone())
     }
 
-    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) -> bool {
         let mut status = 0i32;
         let n = self.n as i32;
 
@@ -522,5 +526,6 @@ impl NlpProblem for CutestProblem {
                 }
             }
         }
+        true
     }
 }

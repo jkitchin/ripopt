@@ -83,6 +83,7 @@ typedef enum {
     RIPOPT_SOLVE_SUCCEEDED              =  0,
     RIPOPT_ACCEPTABLE_LEVEL             =  1,
     RIPOPT_INFEASIBLE_PROBLEM           =  2,
+    RIPOPT_USER_REQUESTED_STOP          =  3,
     RIPOPT_MAXITER_EXCEEDED             =  5,
     RIPOPT_RESTORATION_FAILED           =  6,
     RIPOPT_ERROR_IN_STEP_COMPUTATION    =  7,
@@ -141,6 +142,62 @@ typedef void (*RipoptLogCB)(const char *msg, void *user_data);
 void ripopt_set_log_callback(RipoptProblem problem,
                               RipoptLogCB callback,
                               void *user_data);
+
+/* -------------------------------------------------------------------------
+ * File logging
+ * ------------------------------------------------------------------------- */
+
+/** Open a log file for solver output.
+ *
+ * All solver output is written to the specified file.  Overrides any
+ * previously set log callback.  Returns 1 on success, 0 if the file
+ * cannot be opened.
+ */
+int ripopt_open_output_file(RipoptProblem problem,
+                            const char *filename,
+                            int print_level);
+
+/* -------------------------------------------------------------------------
+ * Intermediate callback
+ *
+ * Called once per IPM iteration with current solver state.
+ * Return 1 to continue, 0 to request early termination
+ * (solver returns RIPOPT_USER_REQUESTED_STOP).
+ * ------------------------------------------------------------------------- */
+
+typedef int (*RipoptIntermediateCB)(
+    int iter,
+    double obj_value,
+    double inf_pr,
+    double inf_du,
+    double mu,
+    double alpha_pr,
+    double alpha_du,
+    int ls_trials,
+    void *user_data);
+
+/** Register an intermediate callback.
+ *
+ * Must be called before ripopt_solve().  The callback and user_data pointers
+ * must remain valid for the duration of the solve.
+ */
+void ripopt_set_intermediate_callback(RipoptProblem problem,
+                                      RipoptIntermediateCB callback,
+                                      void *user_data);
+
+/* -------------------------------------------------------------------------
+ * Problem scaling
+ * ------------------------------------------------------------------------- */
+
+/** Set user-provided problem scaling.
+ *
+ * obj_scaling scales the objective.  g_scaling (length m) scales each
+ * constraint; pass NULL to scale only the objective.  Overrides automatic
+ * gradient-based scaling.
+ */
+void ripopt_set_scaling(RipoptProblem problem,
+                        double obj_scaling,
+                        const double *g_scaling);
 
 /* -------------------------------------------------------------------------
  * Post-solve statistics (valid after ripopt_solve() returns)

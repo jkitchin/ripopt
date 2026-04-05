@@ -35,33 +35,33 @@ impl NlpProblem for HsTp045 {
         x0[4] = 2.0;
     }
 
-    fn objective(&self, x: &[f64], _new_x: bool) -> f64 {
-        -0.00833333333333333*x[0]*x[1]*x[2]*x[3]*x[4] + 2.0
+    fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+        *obj = -0.00833333333333333*x[0]*x[1]*x[2]*x[3]*x[4] + 2.0;
+        true
     }
 
-    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) {
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
         grad[0] = -0.00833333333333333*x[1]*x[2]*x[3]*x[4];
         grad[1] = -0.00833333333333333*x[0]*x[2]*x[3]*x[4];
         grad[2] = -0.00833333333333333*x[0]*x[1]*x[3]*x[4];
         grad[3] = -0.00833333333333333*x[0]*x[1]*x[2]*x[4];
         grad[4] = -0.00833333333333333*x[0]*x[1]*x[2]*x[3];
+        true
     }
 
-    fn constraints(&self, _x: &[f64], _new_x: bool, _g: &mut [f64]) {
-    }
+    fn constraints(&self, _x: &[f64], _new_x: bool, _g: &mut [f64]) -> bool { true }
 
     fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         (vec![], vec![])
     }
 
-    fn jacobian_values(&self, _x: &[f64], _new_x: bool, _vals: &mut [f64]) {
-    }
+    fn jacobian_values(&self, _x: &[f64], _new_x: bool, _vals: &mut [f64]) -> bool { true }
 
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
         (vec![1, 2, 2, 3, 3, 3, 4, 4, 4, 4], vec![0, 0, 1, 0, 1, 2, 0, 1, 2, 3])
     }
 
-    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) {
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) -> bool {
         vals[0] = obj_factor * (-0.00833333333333333*x[2]*x[3]*x[4]);
         vals[1] = obj_factor * (-0.00833333333333333*x[1]*x[3]*x[4]);
         vals[2] = obj_factor * (-0.00833333333333333*x[0]*x[3]*x[4]);
@@ -72,6 +72,7 @@ impl NlpProblem for HsTp045 {
         vals[7] = obj_factor * (-0.00833333333333333*x[0]*x[2]*x[3]);
         vals[8] = obj_factor * (-0.00833333333333333*x[0]*x[1]*x[3]);
         vals[9] = obj_factor * (-0.00833333333333333*x[0]*x[1]*x[2]);
+        true
     }
 }
 

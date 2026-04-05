@@ -7,6 +7,13 @@
 /// since the last evaluation call. When `new_x` is `false`, cached intermediate
 /// results (e.g., phase equilibria, shared subexpressions) can be reused. This
 /// matches the semantics of IPOPT's C interface `new_x` flag.
+///
+/// Evaluation methods return `bool`: `true` on success, `false` when the function
+/// cannot be evaluated at the given point (e.g., log of a negative number). This
+/// matches the IPOPT C interface convention. During line search, the solver treats
+/// evaluation failure as trial-point rejection and shortens the step. If evaluation
+/// fails at the current iterate (not during line search), the solver returns
+/// `SolveStatus::EvaluationError`.
 pub trait NlpProblem {
     /// Number of primal variables.
     fn num_variables(&self) -> usize;
@@ -24,17 +31,20 @@ pub trait NlpProblem {
     /// Fill initial primal point.
     fn initial_point(&self, x0: &mut [f64]);
 
-    /// Evaluate objective f(x).
+    /// Evaluate objective f(x) into `obj`.
     /// `new_x` is `true` when `x` differs from the previous evaluation point.
-    fn objective(&self, x: &[f64], new_x: bool) -> f64;
+    /// Return `true` on success, `false` if evaluation fails at this point.
+    fn objective(&self, x: &[f64], new_x: bool, obj: &mut f64) -> bool;
 
     /// Fill gradient of objective: grad\[i\] = df/dx_i.
     /// `new_x` is `true` when `x` differs from the previous evaluation point.
-    fn gradient(&self, x: &[f64], new_x: bool, grad: &mut [f64]);
+    /// Return `true` on success, `false` if evaluation fails at this point.
+    fn gradient(&self, x: &[f64], new_x: bool, grad: &mut [f64]) -> bool;
 
     /// Evaluate constraints: g\[i\] = g_i(x).
     /// `new_x` is `true` when `x` differs from the previous evaluation point.
-    fn constraints(&self, x: &[f64], new_x: bool, g: &mut [f64]);
+    /// Return `true` on success, `false` if evaluation fails at this point.
+    fn constraints(&self, x: &[f64], new_x: bool, g: &mut [f64]) -> bool;
 
     /// Return the sparsity structure of the constraint Jacobian.
     /// Returns (row_indices, col_indices) in triplet format.
@@ -43,7 +53,8 @@ pub trait NlpProblem {
 
     /// Fill Jacobian values at x in the same order as jacobian_structure().
     /// `new_x` is `true` when `x` differs from the previous evaluation point.
-    fn jacobian_values(&self, x: &[f64], new_x: bool, vals: &mut [f64]);
+    /// Return `true` on success, `false` if evaluation fails at this point.
+    fn jacobian_values(&self, x: &[f64], new_x: bool, vals: &mut [f64]) -> bool;
 
     /// Return the sparsity structure of the Lagrangian Hessian (lower triangle only).
     /// Returns (row_indices, col_indices) in triplet format.
@@ -53,5 +64,6 @@ pub trait NlpProblem {
     /// Fill Hessian values at x with the given obj_factor and constraint multipliers lambda.
     /// Only lower triangle entries in the same order as hessian_structure().
     /// `new_x` is `true` when `x` differs from the previous evaluation point.
-    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]);
+    /// Return `true` on success, `false` if evaluation fails at this point.
+    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) -> bool;
 }
