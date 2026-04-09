@@ -516,7 +516,7 @@ fn lbfgs_ipm_c_api_option() {
         let nlp = ripopt::c_api::ripopt_create(
             2, x_l.as_ptr(), x_u.as_ptr(),
             0, std::ptr::null(), std::ptr::null(),
-            0, 0,
+            0, 0, 0,
             dummy_f, dummy_grad, dummy_g, dummy_jac, dummy_h,
         );
 

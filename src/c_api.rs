@@ -77,15 +77,19 @@ pub type EvalHCb = unsafe extern "C" fn(
 ) -> c_int;
 
 /// Intermediate callback, called once per iteration.
+/// Signature matches Ipopt's Intermediate_CB.
 /// Return 1 to continue, 0 to request early termination.
 pub type IntermediateCb = unsafe extern "C" fn(
+    alg_mod: c_int,             // 0 = regular, 1 = restoration
     iter: c_int,
     obj_value: c_double,
     inf_pr: c_double,
     inf_du: c_double,
     mu: c_double,
-    alpha_pr: c_double,
+    d_norm: c_double,           // infinity-norm of primal step
+    regularization_size: c_double, // Hessian regularization delta_w
     alpha_du: c_double,
+    alpha_pr: c_double,
     ls_trials: c_int,
     user_data: *mut c_void,
 ) -> c_int;
@@ -103,6 +107,8 @@ pub struct CApiProblem {
     g_u: Vec<f64>,
     nele_jac: usize,
     nele_hess: usize,
+    /// Index style: 0 = C (0-based), 1 = Fortran (1-based).
+    index_style: usize,
     eval_f: EvalFCb,
     eval_grad_f: EvalGradFCb,
     eval_g: EvalGCb,
@@ -223,9 +229,10 @@ impl NlpProblem for CApiProblem {
                 self.user_data,
             );
         }
+        let offset = self.index_style; // 0 for C, 1 for Fortran
         (
-            i_row.into_iter().map(|v| v as usize).collect(),
-            j_col.into_iter().map(|v| v as usize).collect(),
+            i_row.into_iter().map(|v| v as usize - offset).collect(),
+            j_col.into_iter().map(|v| v as usize - offset).collect(),
         )
     }
 
@@ -268,9 +275,10 @@ impl NlpProblem for CApiProblem {
                 self.user_data,
             );
         }
+        let offset = self.index_style; // 0 for C, 1 for Fortran
         (
-            i_row.into_iter().map(|v| v as usize).collect(),
-            j_col.into_iter().map(|v| v as usize).collect(),
+            i_row.into_iter().map(|v| v as usize - offset).collect(),
+            j_col.into_iter().map(|v| v as usize - offset).collect(),
         )
     }
 
@@ -300,17 +308,25 @@ impl NlpProblem for CApiProblem {
 // Return status (matches C header enum)
 // ---------------------------------------------------------------------------
 
+/// Return status codes matching Ipopt's ApplicationReturnStatus values.
 #[repr(C)]
 pub enum RipoptReturnStatus {
     SolveSucceeded = 0,
+    // SolvedToAcceptableLevel = 1,  // not currently returned
     InfeasibleProblem = 2,
-    MaxIterExceeded = 5,
-    RestorationFailed = 6,
-    ErrorInStepComputation = 7,
-    UserRequestedStop = 3,
-    NotEnoughDegreesOfFreedom = 10,
-    InvalidProblemDefinition = 11,
-    InternalError = -1,
+    SearchDirectionTooSmall = 3,
+    DivergingIterates = 4,
+    UserRequestedStop = 5,
+    // FeasiblePointFound = 6,       // not currently returned
+    MaxIterExceeded = -1,
+    RestorationFailed = -2,
+    ErrorInStepComputation = -3,
+    // MaxCpuTimeExceeded = -4,      // not currently returned
+    MaxWallTimeExceeded = -5,
+    NotEnoughDegreesOfFreedom = -10,
+    InvalidProblemDefinition = -11,
+    InvalidNumberDetected = -13,
+    InternalError = -199,
 }
 
 fn map_status(s: SolveStatus) -> RipoptReturnStatus {
@@ -321,11 +337,10 @@ fn map_status(s: SolveStatus) -> RipoptReturnStatus {
         }
         SolveStatus::MaxIterations => RipoptReturnStatus::MaxIterExceeded,
         SolveStatus::RestorationFailed => RipoptReturnStatus::RestorationFailed,
-        SolveStatus::NumericalError | SolveStatus::EvaluationError => {
-            RipoptReturnStatus::ErrorInStepComputation
-        }
+        SolveStatus::NumericalError => RipoptReturnStatus::ErrorInStepComputation,
+        SolveStatus::EvaluationError => RipoptReturnStatus::InvalidNumberDetected,
         SolveStatus::UserRequestedStop => RipoptReturnStatus::UserRequestedStop,
-        SolveStatus::Unbounded => RipoptReturnStatus::InvalidProblemDefinition,
+        SolveStatus::Unbounded => RipoptReturnStatus::DivergingIterates,
         SolveStatus::InternalError => RipoptReturnStatus::InternalError,
     }
 }
@@ -348,6 +363,7 @@ pub unsafe extern "C" fn ripopt_create(
     g_u: *const c_double,
     nele_jac: c_int,
     nele_hess: c_int,
+    index_style: c_int,
     eval_f: EvalFCb,
     eval_grad_f: EvalGradFCb,
     eval_g: EvalGCb,
@@ -373,6 +389,7 @@ pub unsafe extern "C" fn ripopt_create(
         g_u: g_u_vec,
         nele_jac: nele_jac as usize,
         nele_hess: nele_hess as usize,
+        index_style: index_style as usize,
         eval_f,
         eval_grad_f,
         eval_g,
@@ -831,13 +848,142 @@ pub unsafe extern "C" fn ripopt_set_intermediate_callback(
 pub unsafe extern "C" fn ripopt_set_scaling(
     problem: *mut CApiProblem,
     obj_scaling: c_double,
+    x_scaling: *const c_double,
     g_scaling: *const c_double,
 ) {
     let p = &mut *problem;
     p.options.user_obj_scaling = Some(obj_scaling);
+    if !x_scaling.is_null() && p.n > 0 {
+        p.options.user_x_scaling = Some(
+            std::slice::from_raw_parts(x_scaling, p.n).to_vec(),
+        );
+    }
     if !g_scaling.is_null() && p.m > 0 {
         p.options.user_g_scaling = Some(
             std::slice::from_raw_parts(g_scaling, p.m).to_vec(),
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Current iterate / violations (valid only during intermediate callback)
+// ---------------------------------------------------------------------------
+
+/// Retrieve the current iterate during an intermediate callback.
+///
+/// Matches Ipopt's `GetIpoptCurrentIterate`. Only valid when called from
+/// within an intermediate callback; returns 0 otherwise.
+///
+/// Pass NULL for any output array you don't need.
+///
+/// # Safety
+/// All non-null output arrays must have the indicated lengths (n or m).
+#[no_mangle]
+pub unsafe extern "C" fn ripopt_get_current_iterate(
+    _problem: *const CApiProblem,
+    n: c_int,
+    x: *mut c_double,
+    z_l: *mut c_double,
+    z_u: *mut c_double,
+    m: c_int,
+    g: *mut c_double,
+    lambda: *mut c_double,
+) -> c_int {
+    let n = n as usize;
+    let m = m as usize;
+    crate::intermediate::with_current_iterate(|snap| {
+        if !x.is_null() && snap.x.len() >= n {
+            std::slice::from_raw_parts_mut(x, n).copy_from_slice(&snap.x[..n]);
+        }
+        if !z_l.is_null() && snap.z_l.len() >= n {
+            std::slice::from_raw_parts_mut(z_l, n).copy_from_slice(&snap.z_l[..n]);
+        }
+        if !z_u.is_null() && snap.z_u.len() >= n {
+            std::slice::from_raw_parts_mut(z_u, n).copy_from_slice(&snap.z_u[..n]);
+        }
+        if !g.is_null() && snap.g.len() >= m {
+            std::slice::from_raw_parts_mut(g, m).copy_from_slice(&snap.g[..m]);
+        }
+        if !lambda.is_null() && snap.lambda.len() >= m {
+            std::slice::from_raw_parts_mut(lambda, m).copy_from_slice(&snap.lambda[..m]);
+        }
+    })
+    .map(|_| 1)
+    .unwrap_or(0)
+}
+
+/// Retrieve current violations during an intermediate callback.
+///
+/// Matches Ipopt's `GetIpoptCurrentViolations`. Only valid when called from
+/// within an intermediate callback; returns 0 otherwise.
+///
+/// Pass NULL for any output array you don't need.
+///
+/// # Safety
+/// All non-null output arrays must have the indicated lengths (n or m).
+#[no_mangle]
+pub unsafe extern "C" fn ripopt_get_current_violations(
+    _problem: *const CApiProblem,
+    n: c_int,
+    x_l_violation: *mut c_double,
+    x_u_violation: *mut c_double,
+    compl_x_l: *mut c_double,
+    compl_x_u: *mut c_double,
+    grad_lag_x: *mut c_double,
+    m: c_int,
+    constraint_violation: *mut c_double,
+    compl_g: *mut c_double,
+) -> c_int {
+    let n = n as usize;
+    let m = m as usize;
+    crate::intermediate::with_current_iterate(|snap| {
+        if !x_l_violation.is_null() && snap.x_l_violation.len() >= n {
+            std::slice::from_raw_parts_mut(x_l_violation, n).copy_from_slice(&snap.x_l_violation[..n]);
+        }
+        if !x_u_violation.is_null() && snap.x_u_violation.len() >= n {
+            std::slice::from_raw_parts_mut(x_u_violation, n).copy_from_slice(&snap.x_u_violation[..n]);
+        }
+        if !compl_x_l.is_null() && snap.compl_x_l.len() >= n {
+            std::slice::from_raw_parts_mut(compl_x_l, n).copy_from_slice(&snap.compl_x_l[..n]);
+        }
+        if !compl_x_u.is_null() && snap.compl_x_u.len() >= n {
+            std::slice::from_raw_parts_mut(compl_x_u, n).copy_from_slice(&snap.compl_x_u[..n]);
+        }
+        if !grad_lag_x.is_null() && snap.grad_lag_x.len() >= n {
+            std::slice::from_raw_parts_mut(grad_lag_x, n).copy_from_slice(&snap.grad_lag_x[..n]);
+        }
+        if !constraint_violation.is_null() && snap.constraint_violation.len() >= m {
+            std::slice::from_raw_parts_mut(constraint_violation, m).copy_from_slice(&snap.constraint_violation[..m]);
+        }
+        if !compl_g.is_null() && snap.compl_g.len() >= m {
+            std::slice::from_raw_parts_mut(compl_g, m).copy_from_slice(&snap.compl_g[..m]);
+        }
+    })
+    .map(|_| 1)
+    .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Version
+// ---------------------------------------------------------------------------
+
+/// Get the ripopt version (major, minor, patch).
+///
+/// # Safety
+/// All pointers must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn ripopt_get_version(
+    major: *mut c_int,
+    minor: *mut c_int,
+    patch: *mut c_int,
+) {
+    if !major.is_null() {
+        *major = env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap_or(0);
+    }
+    if !minor.is_null() {
+        *minor = env!("CARGO_PKG_VERSION_MINOR").parse().unwrap_or(0);
+    }
+    if !patch.is_null() {
+        *patch = env!("CARGO_PKG_VERSION_PATCH").parse().unwrap_or(0);
     }
 }

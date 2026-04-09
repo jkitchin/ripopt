@@ -239,7 +239,9 @@ pub fn solve<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
 
         // Evaluate constraint violation
         let mut g = vec![0.0; m];
-        if !problem.constraints(&x_current, true, &mut g) {
+        if !problem.constraints(&x_current, true, &mut g)
+            || g.iter().any(|v| !v.is_finite())
+        {
             return SolveResult {
                 x: x_current,
                 objective: f64::NAN,
@@ -258,7 +260,19 @@ pub fn solve<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             .fold(0.0, f64::max);
 
         let mut f_val = 0.0;
-        problem.objective(&x_current, false, &mut f_val);
+        if !problem.objective(&x_current, false, &mut f_val) || !f_val.is_finite() {
+            return SolveResult {
+                x: x_current,
+                objective: f64::NAN,
+                constraint_multipliers: lambda,
+                bound_multipliers_lower: vec![0.0; n],
+                bound_multipliers_upper: vec![0.0; n],
+                constraint_values: g,
+                status: SolveStatus::EvaluationError,
+                iterations: total_iters,
+                diagnostics: Default::default(),
+            };
+        }
 
         if print_level >= 5 {
             rip_log!(
@@ -312,11 +326,11 @@ pub fn solve<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         prev_violation = violation;
     }
 
-    // Did not converge
+    // Did not converge — best-effort final evaluation
     let mut f_val = 0.0;
-    problem.objective(&x_current, false, &mut f_val);
+    let _ = problem.objective(&x_current, false, &mut f_val);
     let mut g = vec![0.0; m];
-    problem.constraints(&x_current, true, &mut g);
+    let _ = problem.constraints(&x_current, true, &mut g);
 
     SolveResult {
         x: x_current,

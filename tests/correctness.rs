@@ -1709,9 +1709,9 @@ fn intermediate_callback_early_stop() {
     static ITER_COUNT: AtomicUsize = AtomicUsize::new(0);
 
     unsafe extern "C" fn stop_at_3(
-        iter: i32, _obj: f64, _inf_pr: f64, _inf_du: f64,
-        _mu: f64, _alpha_pr: f64, _alpha_du: f64, _ls: i32,
-        _user_data: *mut std::ffi::c_void,
+        _alg_mod: i32, iter: i32, _obj: f64, _inf_pr: f64, _inf_du: f64,
+        _mu: f64, _d_norm: f64, _reg: f64, _alpha_du: f64, _alpha_pr: f64,
+        _ls: i32, _user_data: *mut std::ffi::c_void,
     ) -> i32 {
         ITER_COUNT.store(iter as usize, Ordering::SeqCst);
         0 // always request stop

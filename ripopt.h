@@ -22,9 +22,9 @@
 
 /* Version information — keep in sync with Cargo.toml */
 #define RIPOPT_VERSION_MAJOR 0
-#define RIPOPT_VERSION_MINOR 2
-#define RIPOPT_VERSION_PATCH 0
-#define RIPOPT_VERSION "0.2.0"
+#define RIPOPT_VERSION_MINOR 6
+#define RIPOPT_VERSION_PATCH 1
+#define RIPOPT_VERSION "0.6.1"
 
 #ifdef __cplusplus
 extern "C" {
@@ -79,17 +79,24 @@ typedef int (*Eval_H_CB)(
 /* -------------------------------------------------------------------------
  * Return status codes
  * ------------------------------------------------------------------------- */
+/* Values match Ipopt's ApplicationReturnStatus for drop-in compatibility. */
 typedef enum {
-    RIPOPT_SOLVE_SUCCEEDED              =  0,
-    RIPOPT_ACCEPTABLE_LEVEL             =  1,
-    RIPOPT_INFEASIBLE_PROBLEM           =  2,
-    RIPOPT_USER_REQUESTED_STOP          =  3,
-    RIPOPT_MAXITER_EXCEEDED             =  5,
-    RIPOPT_RESTORATION_FAILED           =  6,
-    RIPOPT_ERROR_IN_STEP_COMPUTATION    =  7,
-    RIPOPT_NOT_ENOUGH_DEGREES_OF_FREEDOM = 10,
-    RIPOPT_INVALID_PROBLEM_DEFINITION   = 11,
-    RIPOPT_INTERNAL_ERROR               = -1
+    RIPOPT_SOLVE_SUCCEEDED              =   0,
+    /* RIPOPT_ACCEPTABLE_LEVEL          =   1, */  /* not currently returned */
+    RIPOPT_INFEASIBLE_PROBLEM           =   2,
+    RIPOPT_SEARCH_DIRECTION_TOO_SMALL   =   3,
+    RIPOPT_DIVERGING_ITERATES           =   4,
+    RIPOPT_USER_REQUESTED_STOP          =   5,
+    /* RIPOPT_FEASIBLE_POINT_FOUND      =   6, */  /* not currently returned */
+    RIPOPT_MAXITER_EXCEEDED             =  -1,
+    RIPOPT_RESTORATION_FAILED           =  -2,
+    RIPOPT_ERROR_IN_STEP_COMPUTATION    =  -3,
+    /* RIPOPT_MAX_CPUTIME_EXCEEDED      =  -4, */  /* not currently returned */
+    RIPOPT_MAX_WALLTIME_EXCEEDED        =  -5,
+    RIPOPT_NOT_ENOUGH_DEGREES_OF_FREEDOM = -10,
+    RIPOPT_INVALID_PROBLEM_DEFINITION   = -11,
+    RIPOPT_INVALID_NUMBER_DETECTED      = -13,
+    RIPOPT_INTERNAL_ERROR               = -199
 } RipoptReturnStatus;
 
 /* -------------------------------------------------------------------------
@@ -97,13 +104,14 @@ typedef enum {
  * -------------------------------------------------------------------------
  * ripopt_create — allocate and return a new problem handle.
  *
- *   n          number of primal variables
- *   x_l/x_u   variable lower/upper bounds (length n; use ±1e30 for ±∞)
- *   m          number of constraints
- *   g_l/g_u   constraint lower/upper bounds (length m)
- *   nele_jac  number of nonzeros in the Jacobian
- *   nele_hess number of nonzeros in the lower-triangular Hessian
- *   eval_*    callback function pointers (must remain valid until ripopt_free)
+ *   n           number of primal variables
+ *   x_l/x_u    variable lower/upper bounds (length n; use ±1e30 for ±∞)
+ *   m           number of constraints
+ *   g_l/g_u    constraint lower/upper bounds (length m)
+ *   nele_jac   number of nonzeros in the Jacobian
+ *   nele_hess  number of nonzeros in the lower-triangular Hessian
+ *   index_style 0 = C (0-based indices), 1 = Fortran (1-based indices)
+ *   eval_*     callback function pointers (must remain valid until ripopt_free)
  *
  * Returns NULL on allocation failure.
  * ------------------------------------------------------------------------- */
@@ -111,6 +119,7 @@ RipoptProblem ripopt_create(
     int n, const double *x_l, const double *x_u,
     int m, const double *g_l, const double *g_u,
     int nele_jac, int nele_hess,
+    int index_style,
     Eval_F_CB      eval_f,
     Eval_Grad_F_CB eval_grad_f,
     Eval_G_CB      eval_g,
@@ -165,14 +174,18 @@ int ripopt_open_output_file(RipoptProblem problem,
  * (solver returns RIPOPT_USER_REQUESTED_STOP).
  * ------------------------------------------------------------------------- */
 
+/* Signature matches Ipopt's Intermediate_CB. */
 typedef int (*RipoptIntermediateCB)(
+    int alg_mod,             /* 0 = regular, 1 = restoration */
     int iter,
     double obj_value,
     double inf_pr,
     double inf_du,
     double mu,
-    double alpha_pr,
+    double d_norm,           /* infinity-norm of primal step */
+    double regularization_size, /* Hessian regularization delta */
     double alpha_du,
+    double alpha_pr,
     int ls_trials,
     void *user_data);
 
@@ -189,15 +202,46 @@ void ripopt_set_intermediate_callback(RipoptProblem problem,
  * Problem scaling
  * ------------------------------------------------------------------------- */
 
-/** Set user-provided problem scaling.
+/** Set user-provided problem scaling (matches Ipopt's SetIpoptProblemScaling).
  *
- * obj_scaling scales the objective.  g_scaling (length m) scales each
- * constraint; pass NULL to scale only the objective.  Overrides automatic
- * gradient-based scaling.
+ * obj_scaling scales the objective.  x_scaling (length n) scales each
+ * variable; pass NULL for no variable scaling.  g_scaling (length m) scales
+ * each constraint; pass NULL for no constraint scaling.
  */
 void ripopt_set_scaling(RipoptProblem problem,
                         double obj_scaling,
+                        const double *x_scaling,
                         const double *g_scaling);
+
+/* -------------------------------------------------------------------------
+ * Current iterate / violations (valid ONLY during intermediate callback)
+ *
+ * These match Ipopt's GetIpoptCurrentIterate and GetIpoptCurrentViolations.
+ * Returns 1 on success, 0 if called outside of an intermediate callback.
+ * Pass NULL for any output array you don't need.
+ * ------------------------------------------------------------------------- */
+
+/** Retrieve the current iterate (primal and dual variables). */
+int ripopt_get_current_iterate(RipoptProblem problem,
+                               int n,
+                               double *x,       /* length n, or NULL */
+                               double *z_L,     /* length n, or NULL */
+                               double *z_U,     /* length n, or NULL */
+                               int m,
+                               double *g,       /* length m, or NULL */
+                               double *lambda);  /* length m, or NULL */
+
+/** Retrieve current constraint and optimality violations. */
+int ripopt_get_current_violations(RipoptProblem problem,
+                                  int n,
+                                  double *x_L_violation,    /* length n, or NULL */
+                                  double *x_U_violation,    /* length n, or NULL */
+                                  double *compl_x_L,        /* length n, or NULL */
+                                  double *compl_x_U,        /* length n, or NULL */
+                                  double *grad_lag_x,       /* length n, or NULL */
+                                  int m,
+                                  double *constraint_violation, /* length m, or NULL */
+                                  double *compl_g);             /* length m, or NULL */
 
 /* -------------------------------------------------------------------------
  * Post-solve statistics (valid after ripopt_solve() returns)
@@ -258,6 +302,13 @@ int ripopt_solve(
     double *mult_x_L,
     double *mult_x_U,
     void   *user_data);
+
+/* -------------------------------------------------------------------------
+ * Version
+ * ------------------------------------------------------------------------- */
+
+/** Get the ripopt version as major.minor.patch integers. */
+void ripopt_get_version(int *major, int *minor, int *patch);
 
 #ifdef __cplusplus
 }

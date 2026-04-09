@@ -697,9 +697,12 @@ impl SolverState {
     ) -> bool {
         let new_x = self.x != self.x_last_eval;
         if !problem.objective(&self.x, new_x, &mut self.obj) { return false; }
+        if !self.obj.is_finite() { return false; }
         if !problem.gradient(&self.x, false, &mut self.grad_f) { return false; }
+        if self.grad_f.iter().any(|v| !v.is_finite()) { return false; }
         if self.m > 0 {
             if !problem.constraints(&self.x, false, &mut self.g) { return false; }
+            if self.g.iter().any(|v| !v.is_finite()) { return false; }
             if !problem.jacobian_values(&self.x, false, &mut self.jac_vals) { return false; }
         }
         self.x_last_eval.copy_from_slice(&self.x);
@@ -2270,6 +2273,8 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
 
     // Line-search backtrack count for the previous iteration (printed in table).
     let mut ls_steps: usize = 0;
+    // Hessian regularization delta from previous iteration (for intermediate callback).
+    let mut prev_ic_delta_w: f64 = 0.0;
 
     // Primal divergence detection: track consecutive iterations where pr is growing.
     // When pr grows steadily post-restoration, re-trigger restoration rather than
@@ -2645,22 +2650,88 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             n,
         );
 
+        // Populate iterate snapshot for GetCurrentIterate/Violations access
+        {
+            use crate::intermediate::IterateSnapshot;
+            let mut x_l_viol = vec![0.0; n];
+            let mut x_u_viol = vec![0.0; n];
+            let mut compl_xl = vec![0.0; n];
+            let mut compl_xu = vec![0.0; n];
+            for i in 0..n {
+                if state.x_l[i].is_finite() {
+                    x_l_viol[i] = (state.x_l[i] - state.x[i]).max(0.0);
+                    compl_xl[i] = (state.x[i] - state.x_l[i]) * state.z_l[i];
+                }
+                if state.x_u[i].is_finite() {
+                    x_u_viol[i] = (state.x[i] - state.x_u[i]).max(0.0);
+                    compl_xu[i] = (state.x_u[i] - state.x[i]) * state.z_u[i];
+                }
+            }
+            // grad_lag = grad_f + J^T y - z_l + z_u
+            let mut grad_lag = state.grad_f.clone();
+            for (k, (&r, &c)) in state.jac_rows.iter().zip(state.jac_cols.iter()).enumerate() {
+                grad_lag[c] += state.jac_vals[k] * state.y[r];
+            }
+            for i in 0..n {
+                grad_lag[i] -= state.z_l[i];
+                grad_lag[i] += state.z_u[i];
+            }
+            let mut constr_viol = vec![0.0; m];
+            let mut compl_g_vec = vec![0.0; m];
+            for i in 0..m {
+                if state.g_l[i].is_finite() && state.g[i] < state.g_l[i] {
+                    constr_viol[i] = state.g_l[i] - state.g[i];
+                } else if state.g_u[i].is_finite() && state.g[i] > state.g_u[i] {
+                    constr_viol[i] = state.g[i] - state.g_u[i];
+                }
+                // Complementarity: lambda_i * c_i where c_i is the active constraint slack
+                if state.g_l[i].is_finite() && state.g_u[i].is_finite() {
+                    // Equality or range: use min slack
+                    compl_g_vec[i] = state.y[i] * (state.g[i] - state.g_l[i]).min(state.g_u[i] - state.g[i]);
+                } else if state.g_l[i].is_finite() {
+                    compl_g_vec[i] = state.y[i] * (state.g[i] - state.g_l[i]);
+                } else if state.g_u[i].is_finite() {
+                    compl_g_vec[i] = state.y[i] * (state.g_u[i] - state.g[i]);
+                }
+            }
+            crate::intermediate::set_current_iterate(Some(IterateSnapshot {
+                x: state.x.clone(),
+                z_l: state.z_l.clone(),
+                z_u: state.z_u.clone(),
+                g: state.g.clone(),
+                lambda: state.y.clone(),
+                x_l_violation: x_l_viol,
+                x_u_violation: x_u_viol,
+                compl_x_l: compl_xl,
+                compl_x_u: compl_xu,
+                grad_lag_x: grad_lag,
+                constraint_violation: constr_viol,
+                compl_g: compl_g_vec,
+            }));
+        }
+
         // Invoke intermediate callback (if registered)
+        let d_norm = state.dx.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
         if !crate::intermediate::invoke_intermediate(
+            0, // alg_mod: 0 = regular mode (not in restoration)
             iteration,
             state.obj / state.obj_scaling,
             primal_inf,
             dual_inf,
             state.mu,
-            state.alpha_primal,
+            d_norm,
+            prev_ic_delta_w,
             state.alpha_dual,
+            state.alpha_primal,
             ls_steps,
         ) {
+            crate::intermediate::set_current_iterate(None);
             if options.print_level >= 5 {
                 rip_log!("ripopt: User requested stop via intermediate callback");
             }
             return make_result(&state, SolveStatus::UserRequestedStop);
         }
+        crate::intermediate::set_current_iterate(None);
 
         // Compute multiplier scaling for convergence check
         let multiplier_sum: f64 = state.y.iter().map(|v| v.abs()).sum::<f64>()
@@ -3269,7 +3340,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         timings.factorization += t_fact.elapsed();
 
         match &inertia_result {
-            Ok((dw, dc)) => { ic_delta_w = *dw; ic_delta_c = *dc; }
+            Ok((dw, dc)) => { ic_delta_w = *dw; ic_delta_c = *dc; prev_ic_delta_w = *dw; }
             _ => {}
         }
 
@@ -3395,7 +3466,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                     }
                     let mut obj_trial = f64::INFINITY;
                     let obj_ok = problem.objective(&x_trial, true, &mut obj_trial);
-                    if obj_ok && !obj_trial.is_nan() && obj_trial < obj_current {
+                    if obj_ok && obj_trial.is_finite() && obj_trial < obj_current {
                         state.x = x_trial;
                         state.obj = obj_trial;
                         state.alpha_primal = alpha_fb;
@@ -4566,19 +4637,49 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
 
         state.alpha_dual = alpha_d;
 
-        // Re-evaluate at new point
+        // Re-evaluate at new point (evaluate_with_linear checks NaN/Inf on
+        // obj, grad_f, g — matching Ipopt's OrigIpoptNLP Eval_Error semantics)
         let t_eval = Instant::now();
-        if !state.evaluate_with_linear(problem, 1.0, linear_constraints.as_deref(), lbfgs_mode) {
-            return make_result(&state, SolveStatus::EvaluationError);
-        }
-        if let Some(ref mut lbfgs) = lbfgs_state {
-            let lag_grad = LbfgsIpmState::compute_lagrangian_gradient(
-                &state.grad_f, &state.jac_rows, &state.jac_cols, &state.jac_vals, &state.y, state.n,
-            );
-            lbfgs.update(&state.x, &lag_grad);
-            lbfgs.fill_hessian(&mut state.hess_vals);
+        let eval_ok = state.evaluate_with_linear(problem, 1.0, linear_constraints.as_deref(), lbfgs_mode);
+        if eval_ok {
+            if let Some(ref mut lbfgs) = lbfgs_state {
+                let lag_grad = LbfgsIpmState::compute_lagrangian_gradient(
+                    &state.grad_f, &state.jac_rows, &state.jac_cols, &state.jac_vals, &state.y, state.n,
+                );
+                lbfgs.update(&state.x, &lag_grad);
+                lbfgs.fill_hessian(&mut state.hess_vals);
+            }
         }
         timings.problem_eval += t_eval.elapsed();
+
+        if !eval_ok {
+            // Evaluation failed or produced NaN/Inf at accepted point.
+            // Try restoration before giving up.
+            let (x_rest, success) = restoration.restore(
+                &state.x, &state.x_l, &state.x_u, &state.g_l, &state.g_u,
+                &state.jac_rows, &state.jac_cols, n, m, options,
+                &|theta, phi| filter.is_acceptable(theta, phi),
+                &|x_eval, g_out| problem.constraints(x_eval, true, g_out),
+                &|x_eval, jac_out| problem.jacobian_values(x_eval, true, jac_out),
+                Some(&|x_eval: &[f64], obj_out: &mut f64| problem.objective(x_eval, true, obj_out)),
+                deadline,
+            );
+            if success {
+                state.x = x_rest;
+                state.alpha_primal = 0.0;
+                if state.evaluate_with_linear(problem, 1.0, linear_constraints.as_deref(), lbfgs_mode) {
+                    if let Some(ref mut lbfgs) = lbfgs_state {
+                        let lag_grad = LbfgsIpmState::compute_lagrangian_gradient(
+                            &state.grad_f, &state.jac_rows, &state.jac_cols, &state.jac_vals, &state.y, state.n,
+                        );
+                        lbfgs.update(&state.x, &lag_grad);
+                        lbfgs.fill_hessian(&mut state.hess_vals);
+                    }
+                    continue;
+                }
+            }
+            return make_result(&state, SolveStatus::EvaluationError);
+        }
 
         // Reset v_l, v_u from barrier equilibrium v = mu_ks / slack.
         // Simple reset rather than Newton update (our dv is approximate since we
@@ -4592,36 +4693,6 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 let slack = (state.g_u[i] - state.g[i]).max(1e-20);
                 state.v_u[i] = mu_ks / slack;
             }
-        }
-
-        // NaN/Inf guard on evaluation
-        if state.obj.is_nan() || state.obj.is_infinite() {
-            // Try restoration from current point
-            let (x_rest, success) = restoration.restore(
-                &state.x, &state.x_l, &state.x_u, &state.g_l, &state.g_u,
-                &state.jac_rows, &state.jac_cols, n, m, options,
-                &|theta, phi| filter.is_acceptable(theta, phi),
-                &|x_eval, g_out| problem.constraints(x_eval, true, g_out),
-                &|x_eval, jac_out| problem.jacobian_values(x_eval, true, jac_out),
-                Some(&|x_eval: &[f64], obj_out: &mut f64| problem.objective(x_eval, true, obj_out)),
-                deadline,
-            );
-            if success {
-                state.x = x_rest;
-                state.alpha_primal = 0.0;
-                let _ = state.evaluate_with_linear(problem, 1.0, linear_constraints.as_deref(), lbfgs_mode);
-        if let Some(ref mut lbfgs) = lbfgs_state {
-            let lag_grad = LbfgsIpmState::compute_lagrangian_gradient(
-                &state.grad_f, &state.jac_rows, &state.jac_cols, &state.jac_vals, &state.y, state.n,
-            );
-            lbfgs.update(&state.x, &lag_grad);
-            lbfgs.fill_hessian(&mut state.hess_vals);
-        }
-                if !state.obj.is_nan() && !state.obj.is_infinite() {
-                    continue;
-                }
-            }
-            return make_result(&state, SolveStatus::NumericalError);
         }
 
         // Track best feasible point for max_iter exit
@@ -5037,9 +5108,10 @@ fn attempt_soc<P: NlpProblem>(
         }
 
         let mut obj_soc = f64::INFINITY;
-        if !problem.objective(&x_soc, true, &mut obj_soc) { return None; }
+        if !problem.objective(&x_soc, true, &mut obj_soc) || !obj_soc.is_finite() { return None; }
         let mut g_soc = vec![0.0; m];
         if !problem.constraints(&x_soc, false, &mut g_soc) { return None; }
+        if g_soc.iter().any(|v| !v.is_finite()) { return None; }
 
         let theta_soc = convergence::primal_infeasibility(&g_soc, &state.g_l, &state.g_u);
 
@@ -5174,9 +5246,10 @@ fn attempt_soc_condensed<P: NlpProblem>(
         }
 
         let mut obj_soc = f64::INFINITY;
-        if !problem.objective(&x_soc, true, &mut obj_soc) { return None; }
+        if !problem.objective(&x_soc, true, &mut obj_soc) || !obj_soc.is_finite() { return None; }
         let mut g_soc = vec![0.0; m];
         if !problem.constraints(&x_soc, false, &mut g_soc) { return None; }
+        if g_soc.iter().any(|v| !v.is_finite()) { return None; }
 
         let theta_soc = convergence::primal_infeasibility(&g_soc, &state.g_l, &state.g_u);
 
@@ -5295,9 +5368,10 @@ fn attempt_soc_sparse_condensed<P: NlpProblem>(
         }
 
         let mut obj_soc = f64::INFINITY;
-        if !problem.objective(&x_soc, true, &mut obj_soc) { return None; }
+        if !problem.objective(&x_soc, true, &mut obj_soc) || !obj_soc.is_finite() { return None; }
         let mut g_soc = vec![0.0; m];
         if !problem.constraints(&x_soc, false, &mut g_soc) { return None; }
+        if g_soc.iter().any(|v| !v.is_finite()) { return None; }
 
         let theta_soc = convergence::primal_infeasibility(&g_soc, &state.g_l, &state.g_u);
         if theta_soc >= kappa_soc * theta_prev_soc { return None; }
@@ -5566,14 +5640,16 @@ fn attempt_nlp_restoration<P: NlpProblem>(
 
     // Evaluate original constraints at the restored point
     let mut g_new = vec![0.0; m];
-    if !problem.constraints(&x_nlp, true, &mut g_new) {
+    if !problem.constraints(&x_nlp, true, &mut g_new)
+        || g_new.iter().any(|v| !v.is_finite())
+    {
         return (x_nlp, RestorationOutcome::Failed);
     }
     let theta_new = convergence::primal_infeasibility(&g_new, &state.g_l, &state.g_u);
 
     // Evaluate original objective at the restored point
     let mut phi_new = f64::INFINITY;
-    if !problem.objective(&x_nlp, false, &mut phi_new) {
+    if !problem.objective(&x_nlp, false, &mut phi_new) || !phi_new.is_finite() {
         return (x_nlp, RestorationOutcome::Failed);
     }
 

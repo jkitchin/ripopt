@@ -93,7 +93,7 @@ int main(void)
     RipoptProblem nlp = ripopt_create(
         n, x_l, x_u,
         m, NULL, NULL,    /* no constraints */
-        0, 3,             /* 0 Jacobian entries, 3 Hessian entries */
+        0, 3, 0,          /* 0 Jacobian entries, 3 Hessian entries, C indexing */
         eval_f, eval_grad_f, eval_g, eval_jac_g, eval_h);
 
     if (!nlp) {

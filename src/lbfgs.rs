@@ -37,7 +37,9 @@ pub fn solve<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
 
     let mut grad = vec![0.0; n];
     let mut f = 0.0;
-    if !problem.objective(&x, true, &mut f) || !problem.gradient(&x, true, &mut grad) {
+    if !problem.objective(&x, true, &mut f) || !f.is_finite()
+        || !problem.gradient(&x, true, &mut grad) || grad.iter().any(|v| !v.is_finite())
+    {
         let g_out = vec![0.0; m];
         return SolveResult {
             x,
@@ -403,7 +405,9 @@ fn wolfe_line_search<P: NlpProblem>(
             continue;
         }
 
-        if !problem.gradient(&x_trial, true, &mut grad_trial) {
+        if !problem.gradient(&x_trial, true, &mut grad_trial)
+            || grad_trial.iter().any(|v| !v.is_finite())
+        {
             alpha_hi = alpha;
             alpha = if alpha_lo > 0.0 {
                 (alpha_lo + alpha) / 2.0

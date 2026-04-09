@@ -99,11 +99,14 @@ pub fn solve<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
     for k in 0..max_iter {
         iter = k + 1;
 
-        // Evaluate functions
+        // Evaluate functions (check NaN/Inf on f, grad_f, g like Ipopt's OrigIpoptNLP)
         let mut f = 0.0;
         if !problem.objective(&x, true, &mut f)
+            || !f.is_finite()
             || !problem.gradient(&x, true, &mut grad_f)
+            || grad_f.iter().any(|v| !v.is_finite())
             || !problem.constraints(&x, true, &mut g)
+            || g.iter().any(|v| !v.is_finite())
             || !problem.jacobian_values(&x, true, &mut jac_vals)
             || !problem.hessian_values(&x, true, 1.0, &lambda, &mut hess_vals)
         {
@@ -246,8 +249,10 @@ pub fn solve<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
 
             let mut f_trial = f64::INFINITY;
             let eval_ok = problem.objective(&x_trial, true, &mut f_trial);
-            problem.constraints(&x_trial, true, &mut g_trial);
-            if !eval_ok {
+            let constr_ok = problem.constraints(&x_trial, true, &mut g_trial);
+            if !eval_ok || !constr_ok || !f_trial.is_finite()
+                || g_trial.iter().any(|v| !v.is_finite())
+            {
                 alpha *= 0.5;
                 if alpha < 1e-16 {
                     break;

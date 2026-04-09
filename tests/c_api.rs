@@ -104,7 +104,7 @@ fn c_api_hs071_basic() {
         let nlp = ripopt_create(
             4, x_l.as_ptr(), x_u.as_ptr(),
             2, g_l.as_ptr(), g_u.as_ptr(),
-            8, 10,
+            8, 10, 0,
             hs071_eval_f, hs071_eval_grad_f, hs071_eval_g, hs071_eval_jac_g, hs071_eval_h,
         );
         assert!(!nlp.is_null());
@@ -132,7 +132,7 @@ fn c_api_hs071_multiplier_extraction() {
         let nlp = ripopt_create(
             4, x_l.as_ptr(), x_u.as_ptr(),
             2, g_l.as_ptr(), g_u.as_ptr(),
-            8, 10,
+            8, 10, 0,
             hs071_eval_f, hs071_eval_grad_f, hs071_eval_g, hs071_eval_jac_g, hs071_eval_h,
         );
         set_silent(nlp);
@@ -174,7 +174,7 @@ fn c_api_null_output_params() {
         let nlp = ripopt_create(
             4, x_l.as_ptr(), x_u.as_ptr(),
             2, g_l.as_ptr(), g_u.as_ptr(),
-            8, 10,
+            8, 10, 0,
             hs071_eval_f, hs071_eval_grad_f, hs071_eval_g, hs071_eval_jac_g, hs071_eval_h,
         );
         set_silent(nlp);
@@ -238,7 +238,7 @@ fn c_api_rosenbrock_unconstrained() {
         let nlp = ripopt_create(
             2, x_l.as_ptr(), x_u.as_ptr(),
             0, ptr::null(), ptr::null(),
-            0, 3,
+            0, 3, 0,
             rosen_eval_f, rosen_eval_grad_f, empty_eval_g, empty_eval_jac_g, rosen_eval_h,
         );
         assert!(!nlp.is_null());
@@ -299,7 +299,7 @@ fn c_api_bound_constrained_qp() {
         let nlp = ripopt_create(
             2, x_l.as_ptr(), x_u.as_ptr(),
             0, ptr::null(), ptr::null(),
-            0, 2,
+            0, 2, 0,
             bqp_eval_f, bqp_eval_grad_f, empty_eval_g, empty_eval_jac_g, bqp_eval_h,
         );
         set_silent(nlp);
@@ -381,7 +381,7 @@ fn c_api_equality_constrained() {
         let nlp = ripopt_create(
             2, x_l.as_ptr(), x_u.as_ptr(),
             1, g_l.as_ptr(), g_u.as_ptr(),
-            2, 2,
+            2, 2, 0,
             eq_eval_f, eq_eval_grad_f, eq_eval_g, eq_eval_jac_g, eq_eval_h,
         );
         set_silent(nlp);
@@ -415,7 +415,7 @@ fn c_api_option_known_returns_1() {
         let nlp = ripopt_create(
             1, x_l.as_ptr(), x_u.as_ptr(),
             0, ptr::null(), ptr::null(),
-            0, 1,
+            0, 1, 0,
             rosen_eval_f, rosen_eval_grad_f, empty_eval_g, empty_eval_jac_g, rosen_eval_h,
         );
 
@@ -452,7 +452,7 @@ fn c_api_option_unknown_returns_0() {
         let nlp = ripopt_create(
             1, x_l.as_ptr(), x_u.as_ptr(),
             0, ptr::null(), ptr::null(),
-            0, 1,
+            0, 1, 0,
             rosen_eval_f, rosen_eval_grad_f, empty_eval_g, empty_eval_jac_g, rosen_eval_h,
         );
 
@@ -510,7 +510,7 @@ fn c_api_user_data_passthrough() {
         let nlp = ripopt_create(
             2, x_l.as_ptr(), x_u.as_ptr(),
             0, ptr::null(), ptr::null(),
-            0, 2,
+            0, 2, 0,
             ud_eval_f, ud_eval_grad_f, empty_eval_g, empty_eval_jac_g, ud_eval_h,
         );
         set_silent(nlp);
@@ -602,7 +602,7 @@ fn c_api_hs035_inequality() {
         let nlp = ripopt_create(
             3, x_l.as_ptr(), x_u.as_ptr(),
             1, g_l.as_ptr(), g_u.as_ptr(),
-            3, 5,
+            3, 5, 0,
             hs035_eval_f, hs035_eval_grad_f, hs035_eval_g, hs035_eval_jac_g, hs035_eval_h,
         );
         set_silent(nlp);
@@ -632,7 +632,7 @@ fn c_api_max_iter_option() {
         let nlp = ripopt_create(
             2, x_l.as_ptr(), x_u.as_ptr(),
             0, ptr::null(), ptr::null(),
-            0, 3,
+            0, 3, 0,
             rosen_eval_f, rosen_eval_grad_f, empty_eval_g, empty_eval_jac_g, rosen_eval_h,
         );
         set_silent(nlp);
@@ -651,7 +651,7 @@ fn c_api_max_iter_option() {
         let mut x = [-1.0, 1.0];
         let status = ripopt_solve(nlp, x.as_mut_ptr(), ptr::null_mut(), ptr::null_mut(),
                                    ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
-        assert_eq!(status, 5, "Expected RIPOPT_MAXITER_EXCEEDED (5), got {status}");
+        assert_eq!(status, -1, "Expected RIPOPT_MAXITER_EXCEEDED (-1), got {status}");
 
         ripopt_free(nlp);
     }

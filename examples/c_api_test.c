@@ -156,7 +156,7 @@ int main(void)
     RipoptProblem nlp = ripopt_create(
         n, x_l, x_u,
         m, g_l, g_u,
-        nele_jac, nele_hess,
+        nele_jac, nele_hess, 0, /* C-style 0-based indexing */
         eval_f, eval_grad_f, eval_g, eval_jac_g, eval_h);
 
     if (!nlp) {

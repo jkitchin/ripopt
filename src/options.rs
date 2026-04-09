@@ -183,6 +183,9 @@ pub struct SolverOptions {
     /// User-provided constraint scaling factors (length m). When `Some`, bypasses
     /// automatic gradient-based constraint scaling.
     pub user_g_scaling: Option<Vec<f64>>,
+    /// User-provided variable scaling factors (length n). When `Some`, the solver
+    /// transforms variables as x_scaled = x / x_scaling before solving.
+    pub user_x_scaling: Option<Vec<f64>>,
     /// Initial constraint multipliers for warm starting.
     pub warm_start_y: Option<Vec<f64>>,
     /// Initial lower-bound multipliers for warm starting.
@@ -256,6 +259,7 @@ impl Default for SolverOptions {
             mu_oracle_quality_function: false,
             user_obj_scaling: None,
             user_g_scaling: None,
+            user_x_scaling: None,
             warm_start_y: None,
             warm_start_z_l: None,
             warm_start_z_u: None,

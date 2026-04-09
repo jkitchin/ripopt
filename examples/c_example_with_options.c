@@ -141,7 +141,7 @@ static int solve_and_report(const char *label,
     double g_u[2] = {HUGE_VAL, 40.0};
 
     RipoptProblem nlp = ripopt_create(
-        n, x_l, x_u, m, g_l, g_u, 8, 10,
+        n, x_l, x_u, m, g_l, g_u, 8, 10, 0, /* C-style 0-based indexing */
         eval_f, eval_grad_f, eval_g, eval_jac_g, eval_h);
 
     if (!nlp) return 1;
