@@ -82,32 +82,30 @@ struct ProblemWrapper<'a> {
 }
 
 extern "C" fn eval_f_cb(
-    n: i32, x: *const f64, _new_x: bool,
+    n: i32, x: *const f64, new_x: bool,
     obj_value: *mut f64, user_data: *mut c_void,
 ) -> bool {
     unsafe {
         let wrapper = &*(user_data as *const ProblemWrapper);
         let x_slice = std::slice::from_raw_parts(x, n as usize);
-        *obj_value = wrapper.problem.objective(x_slice);
-        true
+        wrapper.problem.objective(x_slice, new_x, &mut *obj_value)
     }
 }
 
 extern "C" fn eval_grad_f_cb(
-    n: i32, x: *const f64, _new_x: bool,
+    n: i32, x: *const f64, new_x: bool,
     grad_f: *mut f64, user_data: *mut c_void,
 ) -> bool {
     unsafe {
         let wrapper = &*(user_data as *const ProblemWrapper);
         let x_slice = std::slice::from_raw_parts(x, n as usize);
         let grad_slice = std::slice::from_raw_parts_mut(grad_f, n as usize);
-        wrapper.problem.gradient(x_slice, grad_slice);
-        true
+        wrapper.problem.gradient(x_slice, new_x, grad_slice)
     }
 }
 
 extern "C" fn eval_g_cb(
-    n: i32, x: *const f64, _new_x: bool,
+    n: i32, x: *const f64, new_x: bool,
     _m: i32, g: *mut f64, user_data: *mut c_void,
 ) -> bool {
     unsafe {
@@ -116,14 +114,15 @@ extern "C" fn eval_g_cb(
         let m = wrapper.problem.num_constraints();
         if m > 0 {
             let g_slice = std::slice::from_raw_parts_mut(g, m);
-            wrapper.problem.constraints(x_slice, g_slice);
+            wrapper.problem.constraints(x_slice, new_x, g_slice)
+        } else {
+            true
         }
-        true
     }
 }
 
 extern "C" fn eval_jac_g_cb(
-    n: i32, x: *const f64, _new_x: bool,
+    n: i32, x: *const f64, new_x: bool,
     _m: i32, _nele_jac: i32,
     i_row: *mut i32, j_col: *mut i32, values: *mut f64,
     user_data: *mut c_void,
@@ -138,18 +137,18 @@ extern "C" fn eval_jac_g_cb(
                 rows[k] = wrapper.jac_rows[k];
                 cols[k] = wrapper.jac_cols[k];
             }
+            true
         } else {
             let x_slice = std::slice::from_raw_parts(x, n as usize);
             let nele = wrapper.jac_rows.len();
             let vals = std::slice::from_raw_parts_mut(values, nele);
-            wrapper.problem.jacobian_values(x_slice, vals);
+            wrapper.problem.jacobian_values(x_slice, new_x, vals)
         }
-        true
     }
 }
 
 extern "C" fn eval_h_cb(
-    n: i32, x: *const f64, _new_x: bool,
+    n: i32, x: *const f64, new_x: bool,
     obj_factor: f64, _m: i32, lambda: *const f64, _new_lambda: bool,
     _nele_hess: i32,
     i_row: *mut i32, j_col: *mut i32, values: *mut f64,
@@ -165,6 +164,7 @@ extern "C" fn eval_h_cb(
                 rows[k] = wrapper.hess_rows[k];
                 cols[k] = wrapper.hess_cols[k];
             }
+            true
         } else {
             let x_slice = std::slice::from_raw_parts(x, n as usize);
             let m = wrapper.problem.num_constraints();
@@ -175,9 +175,8 @@ extern "C" fn eval_h_cb(
             };
             let nele = wrapper.hess_rows.len();
             let vals = std::slice::from_raw_parts_mut(values, nele);
-            wrapper.problem.hessian_values(x_slice, obj_factor, lambda_slice, vals);
+            wrapper.problem.hessian_values(x_slice, new_x, obj_factor, lambda_slice, vals)
         }
-        true
     }
 }
 
@@ -307,7 +306,7 @@ fn solve_with_ipopt(problem: &dyn NlpProblem) -> IpoptResult {
         // Compute constraint violation
         let cv = if m > 0 {
             let mut c = vec![0.0; m];
-            problem.constraints(&x, &mut c);
+            let _ = problem.constraints(&x, true, &mut c);
             let mut g_l2 = vec![0.0; m];
             let mut g_u2 = vec![0.0; m];
             problem.constraint_bounds(&mut g_l2, &mut g_u2);
@@ -350,6 +349,8 @@ fn ripopt_status_to_string(status: SolveStatus) -> String {
         SolveStatus::RestorationFailed => "RestorationFailed".to_string(),
         SolveStatus::InternalError => "InternalError".to_string(),
         SolveStatus::LocalInfeasibility => "LocalInfeasibility".to_string(),
+        SolveStatus::EvaluationError => "EvaluationError".to_string(),
+        SolveStatus::UserRequestedStop => "UserRequestedStop".to_string(),
     }
 }
 
