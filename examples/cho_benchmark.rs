@@ -93,11 +93,16 @@ struct BenchEntry {
 }
 
 fn solve_ripopt(problem: &NlProblem, tol: f64, max_iter: usize) -> SolveResult {
+    let neg_curv_test_tol: f64 = std::env::var("RIPOPT_NEG_CURV_TEST_TOL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
     let options = SolverOptions {
         tol,
         max_iter,
         max_wall_time: 300.0,
         print_level: 0,
+        neg_curv_test_tol,
         ..SolverOptions::default()
     };
     let t0 = Instant::now();

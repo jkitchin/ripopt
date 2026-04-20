@@ -3617,8 +3617,26 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             };
             rip_log!("ripopt: Factoring KKT dim={} nnz={}...", dim, nnz);
         }
-        let inertia_result =
-            kkt::factor_with_inertia_correction(kkt_system, lin_solver.as_mut(), &mut inertia_params);
+        let mut curv_eval_count: usize = 0;
+        let inertia_result = if options.neg_curv_test_tol > 0.0 {
+            let mut curv_cfg = kkt::CurvatureTestCfg {
+                tol: options.neg_curv_test_tol,
+                use_reg: options.neg_curv_test_reg,
+                hess_rows: &state.hess_rows,
+                hess_cols: &state.hess_cols,
+                hess_vals: &state.hess_vals,
+                sigma: &sigma,
+                eval_counter: Some(&mut curv_eval_count),
+            };
+            kkt::factor_with_inertia_correction_with_curv(
+                kkt_system, lin_solver.as_mut(), &mut inertia_params, Some(&mut curv_cfg),
+            )
+        } else {
+            kkt::factor_with_inertia_correction(kkt_system, lin_solver.as_mut(), &mut inertia_params)
+        };
+        if options.print_level >= 5 && curv_eval_count > 0 {
+            rip_log!("ripopt: IFRd curvature test evaluated {} time(s) this iteration", curv_eval_count);
+        }
         if options.print_level >= 5 {
             rip_log!("ripopt: KKT factorization took {:.3}s (ok={})",
                 t_fact.elapsed().as_secs_f64(), inertia_result.is_ok());

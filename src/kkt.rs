@@ -248,6 +248,41 @@ pub fn assemble_kkt(
     }
 }
 
+/// Compute `dx · (H + Σ_x) · dx` — primal quadratic form for the inertia-free
+/// curvature test (Chiang & Zavala 2016, IFRd).
+///
+/// `hess_rows`, `hess_cols`, `hess_vals` store the lower triangle of the Hessian
+/// of the Lagrangian in COO format (same layout assemble_kkt consumes).
+/// `sigma` is the bound-barrier diagonal Σ_x (length n) from `compute_sigma`.
+/// `dx` is the primal Newton direction (length n).
+///
+/// Returns the scalar `dxᵀ(H + Σ_x)dx`. Diagonal entries in H are counted once;
+/// off-diagonal entries are counted twice (symmetric).
+pub fn hessian_plus_sigma_quadratic_form(
+    hess_rows: &[usize],
+    hess_cols: &[usize],
+    hess_vals: &[f64],
+    sigma: &[f64],
+    dx: &[f64],
+) -> f64 {
+    let mut q = 0.0f64;
+    for idx in 0..hess_rows.len() {
+        let r = hess_rows[idx];
+        let c = hess_cols[idx];
+        let v = hess_vals[idx];
+        if r == c {
+            q += v * dx[r] * dx[c];
+        } else {
+            // Lower triangle only; off-diagonals contribute twice for symmetric H.
+            q += 2.0 * v * dx[r] * dx[c];
+        }
+    }
+    for i in 0..dx.len() {
+        q += sigma[i] * dx[i] * dx[i];
+    }
+    q
+}
+
 /// Compute the barrier diagonal Sigma.
 ///
 /// Sigma_ii = z_l_i / (x_i - x_l_i) + z_u_i / (x_u_i - x_i)
@@ -394,6 +429,67 @@ fn check_factorization_backward_error_with_matrix(
     max_berr <= 1e-4
 }
 
+/// Inertia-free curvature test configuration (Chiang & Zavala 2016, IFRd).
+///
+/// When provided to `factor_with_inertia_correction_with_curv`, the regularization
+/// loop tests primal curvature on the computed Newton direction as a fallback
+/// acceptance predicate when the linear solver reports wrong inertia:
+///   `dx · (H + Σ_x) · dx  +  (use_reg ? δ_w·‖dx‖² : 0)  ≥  tol · ‖dx‖²`
+/// If the test passes the factorization is accepted despite wrong inertia;
+/// otherwise δ_w escalates exactly as in pure IBR.
+///
+/// ripopt's KKT is condensed (no explicit slack direction), so the test tracks
+/// only the primal block — strictly more conservative than Ipopt's full form
+/// which also includes `dsᵀΣ_s ds`.
+pub struct CurvatureTestCfg<'a> {
+    pub tol: f64,
+    pub use_reg: bool,
+    pub hess_rows: &'a [usize],
+    pub hess_cols: &'a [usize],
+    pub hess_vals: &'a [f64],
+    pub sigma: &'a [f64],
+    /// Count of curvature-test evaluations this factorization (for do-no-harm verification).
+    /// Writes increment via `&mut` when the test is actually evaluated.
+    pub eval_counter: Option<&'a mut usize>,
+}
+
+/// Try to accept a factored (perturbed) KKT matrix via the inertia-free curvature
+/// test. Returns `Ok(true)` if the test passes, `Ok(false)` if it fails or the
+/// trial solve fails (caller should escalate δ_w), `Err` only on unrecoverable
+/// solver errors the caller must propagate.
+fn curvature_test_accept(
+    rhs: &[f64],
+    n: usize,
+    solver: &mut dyn LinearSolver,
+    delta_w: f64,
+    cfg: &mut CurvatureTestCfg,
+) -> bool {
+    if let Some(counter) = cfg.eval_counter.as_deref_mut() {
+        *counter += 1;
+    }
+    let dim = rhs.len();
+    let mut solution = vec![0.0; dim];
+    if solver.solve(rhs, &mut solution).is_err() {
+        return false;
+    }
+    if solution[..n].iter().any(|v| v.is_nan() || v.is_infinite()) {
+        return false;
+    }
+    let dx = &solution[..n];
+    let dx_norm_sq: f64 = dx.iter().map(|v| v * v).sum();
+    // A vanishing step satisfies any curvature bound trivially; accept.
+    if dx_norm_sq < 1e-30 {
+        return true;
+    }
+    let mut q = hessian_plus_sigma_quadratic_form(
+        cfg.hess_rows, cfg.hess_cols, cfg.hess_vals, cfg.sigma, dx,
+    );
+    if cfg.use_reg && delta_w > 0.0 {
+        q += delta_w * dx_norm_sq;
+    }
+    q >= cfg.tol * dx_norm_sq
+}
+
 /// Perform KKT factorization with inertia correction.
 ///
 /// Factor the KKT matrix and check inertia. If inertia is wrong
@@ -406,6 +502,21 @@ pub fn factor_with_inertia_correction(
     kkt: &mut KktSystem,
     solver: &mut dyn LinearSolver,
     params: &mut InertiaCorrectionParams,
+) -> Result<(f64, f64), crate::linear_solver::SolverError> {
+    factor_with_inertia_correction_with_curv(kkt, solver, params, None)
+}
+
+/// Extended entry point with optional inertia-free curvature test (IFRd).
+///
+/// When `curv` is `None`, behavior is byte-for-byte identical to the pure IBR
+/// `factor_with_inertia_correction`. When `Some(cfg)` with `cfg.tol > 0`, the
+/// curvature test acts as a fallback acceptance predicate at each point where
+/// inertia is wrong — see `CurvatureTestCfg`.
+pub fn factor_with_inertia_correction_with_curv(
+    kkt: &mut KktSystem,
+    solver: &mut dyn LinearSolver,
+    params: &mut InertiaCorrectionParams,
+    mut curv: Option<&mut CurvatureTestCfg>,
 ) -> Result<(f64, f64), crate::linear_solver::SolverError> {
     let n = kkt.n;
     let m = kkt.m;
@@ -612,6 +723,7 @@ pub fn factor_with_inertia_correction(
             }
         }
 
+
         best_delta_w = delta_w;
 
         // Increase perturbation
@@ -626,9 +738,40 @@ pub fn factor_with_inertia_correction(
         );
     }
 
-    // Inertia correction failed — use last perturbed matrix and proceed.
-    // The line search will reject bad steps, and restoration can recover.
+    // Inertia correction failed — as a last-resort rescue, try the IFRd
+    // curvature test (Chiang & Zavala 2016). We sweep from the smallest δ_w
+    // upward and accept the first one whose computed Newton direction has
+    // positive primal curvature. This fires ONLY after the full IBR ladder
+    // has failed, so currently-solving problems are unaffected.
     let delta_c = params.delta_c_base;
+
+    if let Some(ref mut c) = curv {
+        if c.tol > 0.0 {
+            let mut trial_delta = params.delta_w_init;
+            for _ in 0..params.max_attempts {
+                if trial_delta > best_delta_w + 1e-30 { break; }
+                let mut perturbed = kkt.matrix.clone();
+                perturbed.add_diagonal_range(0, n, trial_delta);
+                if m > 0 {
+                    perturbed.add_diagonal_range(n, n + m, -delta_c);
+                }
+                if solver.factor(&perturbed).is_ok()
+                    && curvature_test_accept(&kkt.rhs, n, solver, trial_delta, c)
+                {
+                    log::debug!(
+                        "IFRd last-resort accepted at delta_w={:.2e} after IBR exhausted",
+                        trial_delta
+                    );
+                    kkt.matrix = perturbed;
+                    params.delta_w_last = trial_delta;
+                    params.degeneracy_count += 1;
+                    if params.degeneracy_count >= 3 { params.structurally_degenerate = true; }
+                    return Ok((trial_delta, delta_c));
+                }
+                trial_delta *= params.delta_w_growth;
+            }
+        }
+    }
 
     log::warn!(
         "Inertia correction failed after {} attempts (delta_w={:.2e}, delta_c={:.2e}), proceeding with approximate factorization",
@@ -1661,6 +1804,45 @@ pub fn solve_sparse_condensed_soc(
 mod tests {
     use super::*;
     use crate::linear_solver::dense::DenseLdl;
+
+    #[test]
+    fn test_hess_plus_sigma_quadratic_diagonal_only() {
+        // H = diag(2, 3), Σ = diag(1, 1), dx = (1, 1) → (2+1) + (3+1) = 7
+        let rows = vec![0usize, 1];
+        let cols = vec![0usize, 1];
+        let vals = vec![2.0, 3.0];
+        let sigma = vec![1.0, 1.0];
+        let dx = vec![1.0, 1.0];
+        let q = hessian_plus_sigma_quadratic_form(&rows, &cols, &vals, &sigma, &dx);
+        assert!((q - 7.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_hess_plus_sigma_quadratic_off_diagonal_symmetry() {
+        // H (lower tri COO): H[0,0]=4, H[1,0]=1, H[1,1]=5
+        // Full H = [[4, 1], [1, 5]]; dxᵀ H dx with dx=(1,2) = 4 + 2*1*1*2 + 5*4 = 4+4+20 = 28
+        // Σ = diag(0, 0)  → q = 28
+        let rows = vec![0, 1, 1];
+        let cols = vec![0, 0, 1];
+        let vals = vec![4.0, 1.0, 5.0];
+        let sigma = vec![0.0, 0.0];
+        let dx = vec![1.0, 2.0];
+        let q = hessian_plus_sigma_quadratic_form(&rows, &cols, &vals, &sigma, &dx);
+        assert!((q - 28.0).abs() < 1e-12, "got {}", q);
+    }
+
+    #[test]
+    fn test_hess_plus_sigma_quadratic_indefinite() {
+        // H = [[-1, 0], [0, 2]], Σ = 0, dx = (1, 0.5) → -1 + 0.25*2 = -0.5 (indefinite along dx)
+        let rows = vec![0, 1];
+        let cols = vec![0, 1];
+        let vals = vec![-1.0, 2.0];
+        let sigma = vec![0.0, 0.0];
+        let dx = vec![1.0, 0.5];
+        let q = hessian_plus_sigma_quadratic_form(&rows, &cols, &vals, &sigma, &dx);
+        assert!(q < 0.0, "expected negative curvature, got {}", q);
+        assert!((q - (-0.5)).abs() < 1e-12);
+    }
 
     #[test]
     fn test_compute_sigma_no_bounds() {

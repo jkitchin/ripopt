@@ -80,12 +80,26 @@ fn main() {
         .unwrap_or(1);
 
     let force_sparse = std::env::var("RIPOPT_FORCE_SPARSE").is_ok();
+    let neg_curv_test_tol: f64 = std::env::var("RIPOPT_NEG_CURV_TEST_TOL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+    let neg_curv_test_reg: bool = std::env::var("RIPOPT_NEG_CURV_TEST_REG")
+        .ok()
+        .and_then(|s| match s.as_str() {
+            "0" | "false" | "no" => Some(false),
+            "1" | "true" | "yes" => Some(true),
+            _ => None,
+        })
+        .unwrap_or(true);
     let options = SolverOptions {
         tol: 1e-8,
         max_iter: 3000,
         print_level: 0,
         mu_strategy_adaptive: true,
         sparse_threshold: if force_sparse { 0 } else { 100 },
+        neg_curv_test_tol,
+        neg_curv_test_reg,
         ..SolverOptions::default()
     };
 

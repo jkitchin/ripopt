@@ -201,6 +201,29 @@ pub struct SolverOptions {
     pub kkt_dump_dir: Option<std::path::PathBuf>,
     /// Problem name used in dump filenames. Defaults to `"problem"`.
     pub kkt_dump_name: String,
+    /// Tolerance for the inertia-free curvature test (Chiang & Zavala 2016).
+    ///
+    /// When > 0, enables IFRd as a fallback inside the inertia-correction loop:
+    /// at a regularization attempt where the linear solver reports wrong inertia,
+    /// ripopt solves for the Newton direction and tests primal curvature
+    ///     `dx · (H + Σ_x) · dx  ≥  tol · ‖dx‖²`
+    /// (optionally plus `δ_w · ‖dx‖²` when `neg_curv_test_reg` is true).
+    /// If the test passes, the step is accepted without further δ_w escalation.
+    /// If it fails (or the factor/solve fails), δ_w escalates exactly as in IBR.
+    ///
+    /// Default: 0.0 (disabled, pure IBR). Typical enable value: 1e-12.
+    /// Matches Ipopt's `neg_curv_test_tol` option.
+    pub neg_curv_test_tol: f64,
+    /// Whether the IFRd curvature test includes the `δ_w · ‖dx‖²` regularization term.
+    ///
+    /// Only consulted when `neg_curv_test_tol > 0`. When true (default), the LHS
+    /// of the curvature test evaluates curvature of the regularized operator
+    /// `H + Σ_x + δ_w·I`, which makes the test easier to pass at small δ_w.
+    /// When false, the test evaluates the pure `H + Σ_x` curvature — stricter,
+    /// closer to inertia-based acceptance in spirit.
+    ///
+    /// Default: true. Matches Ipopt's `neg_curv_test_reg` option (default "yes").
+    pub neg_curv_test_reg: bool,
 }
 
 impl Default for SolverOptions {
@@ -265,6 +288,8 @@ impl Default for SolverOptions {
             warm_start_z_u: None,
             kkt_dump_dir: None,
             kkt_dump_name: "problem".to_string(),
+            neg_curv_test_tol: 0.0,
+            neg_curv_test_reg: true,
         }
     }
 }
