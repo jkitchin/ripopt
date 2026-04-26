@@ -2,19 +2,21 @@
 ///
 /// Mirrors Ipopt 3.14's `fixed_variable_treatment` (`TNLPAdapter`).
 /// Ipopt's default is `MakeParameter`: fixed variables are removed from
-/// the optimization. ripopt currently defaults to `RelaxBounds` (the
-/// pre-v0.8 behavior); `MakeParameter` is a TODO — the option exists
-/// so callers can configure it once it lands.
+/// the optimization. ripopt defaults to `RelaxBounds` for backward
+/// compatibility with pre-v0.8 callers; `MakeParameter` activates a
+/// fixed-var-only preprocessing pass (`PreprocessedProblem::new_fixed_only`)
+/// even when `enable_preprocessing` is off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FixedVariableTreatment {
     /// Widen `[x_L, x_U]` by ±1e-8·max(|c|, 1) around the fixed value
     /// `c = x_L = x_U` so the IPM has a non-empty interior. Adds one
     /// degree of freedom per fixed variable.
     RelaxBounds,
-    /// (TODO, not implemented) Remove fixed variables from the working
-    /// problem. Picking this currently falls back to `RelaxBounds` —
-    /// chosen so callers can opt in without breaking once support
-    /// lands. Tracked under T0.X-fixed-var in the v0.8 alignment plan.
+    /// Remove fixed variables from the working problem before solving.
+    /// Routes the user's NLP through `PreprocessedProblem::new_fixed_only`,
+    /// which eliminates fixed vars without performing full preprocessing
+    /// (no redundant-constraint detection, no bound tightening). Mirrors
+    /// Ipopt 3.14's TNLPAdapter `make_parameter` mode.
     MakeParameter,
 }
 
@@ -323,8 +325,9 @@ pub struct SolverOptions {
     /// Default: 1.0 (Ipopt 3.14 default).
     pub bound_mult_init_val: f64,
     /// Treatment of fixed variables (`x_L[i] == x_U[i]`).
-    /// Default: `RelaxBounds`. `MakeParameter` is a TODO (currently
-    /// falls back to `RelaxBounds`).
+    /// Default: `RelaxBounds`. `MakeParameter` activates fixed-var
+    /// elimination via `PreprocessedProblem::new_fixed_only` regardless
+    /// of `enable_preprocessing`.
     pub fixed_variable_treatment: FixedVariableTreatment,
     /// Acceptable-level relative objective-change gate. The acceptable
     /// status only fires when `|f_k - f_{k-1}| / max(1, |f_k|) ≤

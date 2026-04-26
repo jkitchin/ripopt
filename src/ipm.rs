@@ -1416,10 +1416,23 @@ fn try_preprocessed_solve<P: NlpProblem>(
     options: &SolverOptions,
     solve_start: Instant,
 ) -> Option<SolveResult> {
-    if !options.enable_preprocessing {
+    let make_parameter = matches!(
+        options.fixed_variable_treatment,
+        FixedVariableTreatment::MakeParameter
+    );
+    let prep = if options.enable_preprocessing {
+        crate::preprocessing::PreprocessedProblem::new(
+            problem as &dyn NlpProblem,
+            options.bound_push,
+        )
+    } else if make_parameter {
+        // `fixed_variable_treatment = make_parameter` activates fixed-var
+        // elimination even when full preprocessing is disabled. Mirrors
+        // Ipopt 3.14's `TNLPAdapter` behavior.
+        crate::preprocessing::PreprocessedProblem::new_fixed_only(problem as &dyn NlpProblem)
+    } else {
         return None;
-    }
-    let prep = crate::preprocessing::PreprocessedProblem::new(problem as &dyn NlpProblem, options.bound_push);
+    };
     if !prep.did_reduce() {
         return None;
     }
@@ -10225,9 +10238,12 @@ mod tests {
     }
 
     #[test]
-    fn test_relax_fixed_variable_bounds_make_parameter_falls_back() {
-        // MakeParameter is not implemented yet: it should behave the same
-        // as RelaxBounds (the documented fallback).
+    fn test_relax_fixed_variable_bounds_make_parameter_widens_at_solver_layer() {
+        // MakeParameter eliminates fixed vars upstream via PreprocessedProblem.
+        // If bounds still reach the solver-layer `relax_fixed_variable_bounds`
+        // (e.g. when the user disables preprocessing AND MakeParameter
+        // elimination didn't run), they are widened identically to RelaxBounds
+        // so the IPM has a non-empty interior either way.
         let mut opts = SolverOptions::default();
         opts.fixed_variable_treatment = FixedVariableTreatment::MakeParameter;
         let mut x_l = vec![5.0];
