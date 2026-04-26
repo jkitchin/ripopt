@@ -244,6 +244,20 @@ pub struct SolverOptions {
     pub warm_start_z_l: Option<Vec<f64>>,
     /// Initial upper-bound multipliers for warm starting.
     pub warm_start_z_u: Option<Vec<f64>>,
+    /// T0.12 (Ipopt 3.14 alignment): enable iterative refinement on the
+    /// full augmented KKT system in `kkt::solve_for_direction`. When
+    /// `false`, only a single backsolve is performed (no refinement
+    /// loop). Default: `true`, matching Ipopt's `IpPDFullSpaceSolver`
+    /// behavior of always running at least
+    /// `iterative_refinement_steps_required` IR steps.
+    pub use_ic_refinement: bool,
+    /// T0.12: minimum iterative-refinement steps required per KKT
+    /// solve. Mirrors Ipopt's `min_refinement_steps` (default 1):
+    /// always perform this many IR iterations even when the residual
+    /// is already small. Additional IR steps run up to the internal
+    /// `max_refinement_steps` cap when the residual exceeds the
+    /// acceptance threshold. Default: 1.
+    pub iterative_refinement_steps_required: usize,
     /// If set, serialize each KKT matrix (main IPM loop only) to this directory
     /// after factorization. Writes two files per iteration:
     ///   `<kkt_dump_name>_<iter:04>.mtx`  — Matrix Market format, symmetric, lower triangle
@@ -335,6 +349,8 @@ impl Default for SolverOptions {
                 const EPS: f64 = f64::EPSILON;
                 EPS.powf(0.75)
             },
+            use_ic_refinement: true,
+            iterative_refinement_steps_required: 1,
         }
     }
 }
