@@ -10165,15 +10165,16 @@ fn compute_tau(
 /// E_mu = max( dual_inf / s_d , primal_inf , compl_inf / s_c )
 /// ```
 ///
-/// where `s_d = max(s_max, sum|y, z_l, z_u| / (m+2n)) / s_max` and
-/// `s_c = max(s_max, sum|z_l, z_u| / (2n)) / s_max` with `s_max = 100`.
+/// where `s_d = max(s_max, sum|y, z_l, z_u| / N_d) / s_max` and
+/// `s_c = max(s_max, sum|z_l, z_u| / N_c) / s_max` with `s_max = 100`.
+/// `N_d` / `N_c` are the finite-bound counts (matching Ipopt's
+/// `IpIpoptCalculatedQuantities.cpp:3050-3104`, where the denominators
+/// are the active multiplier counts, not structural `m+2n` / `2n`).
 /// Used by the Free-mode τ formula so it tracks the same scaled error
 /// the convergence test uses.
 fn compute_e_mu(state: &SolverState, primal_inf: f64, dual_inf: f64, compl_inf: f64) -> f64 {
-    let n = state.n;
-    let m = state.m;
-    let s_d = compute_residual_scaling(compute_multiplier_sum(state), m + 2 * n);
-    let s_c = compute_residual_scaling(compute_bound_multiplier_sum(state), 2 * n);
+    let s_d = compute_residual_scaling(compute_multiplier_sum(state), compute_multiplier_count(state));
+    let s_c = compute_residual_scaling(compute_bound_multiplier_sum(state), compute_bound_multiplier_count(state));
     (dual_inf / s_d).max(primal_inf).max(compl_inf / s_c)
 }
 
