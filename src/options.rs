@@ -1,3 +1,29 @@
+/// Treatment of variables with `x_L[i] == x_U[i]` (fixed variables).
+///
+/// Mirrors Ipopt 3.14's `fixed_variable_treatment` (`TNLPAdapter`).
+/// Ipopt's default is `MakeParameter`: fixed variables are removed from
+/// the optimization. ripopt currently defaults to `RelaxBounds` (the
+/// pre-v0.8 behavior); `MakeParameter` is a TODO — the option exists
+/// so callers can configure it once it lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixedVariableTreatment {
+    /// Widen `[x_L, x_U]` by ±1e-8·max(|c|, 1) around the fixed value
+    /// `c = x_L = x_U` so the IPM has a non-empty interior. Adds one
+    /// degree of freedom per fixed variable.
+    RelaxBounds,
+    /// (TODO, not implemented) Remove fixed variables from the working
+    /// problem. Picking this currently falls back to `RelaxBounds` —
+    /// chosen so callers can opt in without breaking once support
+    /// lands. Tracked under T0.X-fixed-var in the v0.8 alignment plan.
+    MakeParameter,
+}
+
+impl Default for FixedVariableTreatment {
+    fn default() -> Self {
+        Self::RelaxBounds
+    }
+}
+
 /// Bound multiplier initialization method.
 ///
 /// Mirrors Ipopt 3.14's `bound_mult_init_method`
@@ -256,6 +282,10 @@ pub struct SolverOptions {
     /// Initial value used when `bound_mult_init_method = Constant`.
     /// Default: 1.0 (Ipopt 3.14 default).
     pub bound_mult_init_val: f64,
+    /// Treatment of fixed variables (`x_L[i] == x_U[i]`).
+    /// Default: `RelaxBounds`. `MakeParameter` is a TODO (currently
+    /// falls back to `RelaxBounds`).
+    pub fixed_variable_treatment: FixedVariableTreatment,
 }
 
 impl Default for SolverOptions {
@@ -324,6 +354,7 @@ impl Default for SolverOptions {
             kkt_dump_name: "problem".to_string(),
             bound_mult_init_method: BoundMultInitMethod::Constant,
             bound_mult_init_val: 1.0,
+            fixed_variable_treatment: FixedVariableTreatment::RelaxBounds,
         }
     }
 }

@@ -72,6 +72,7 @@ fn new_fallback_solver(use_sparse: bool) -> Box<dyn LinearSolver> {
     }
 }
 use crate::options::BoundMultInitMethod;
+use crate::options::FixedVariableTreatment;
 use crate::options::SolverOptions;
 use crate::problem::NlpProblem;
 use crate::restoration::RestorationPhase;
@@ -794,7 +795,7 @@ impl SolverState {
         let mut x = vec![0.0; n];
         problem.initial_point(&mut x);
 
-        relax_fixed_variable_bounds(&mut x_l, &mut x_u);
+        relax_fixed_variable_bounds(&mut x_l, &mut x_u, options);
 
         push_initial_point_from_bounds(&mut x, &x_l, &x_u, options);
 
@@ -8919,17 +8920,30 @@ fn init_bound_multipliers(
     (z_l, z_u)
 }
 
-/// Relax fixed variables (x_l == x_u) by widening bounds to a tiny
-/// interval centered on the fixed value. Interior-point methods require
-/// strictly interior starting points; without this fixed variables would
-/// have zero feasible interior. Mirrors Ipopt's relax_bounds approach.
-fn relax_fixed_variable_bounds(x_l: &mut [f64], x_u: &mut [f64]) {
-    for i in 0..x_l.len() {
-        if x_l[i].is_finite() && x_u[i].is_finite() && (x_u[i] - x_l[i]).abs() < 1e-10 {
-            let center = (x_l[i] + x_u[i]) / 2.0;
-            let relax = 1e-8 * center.abs().max(1.0);
-            x_l[i] = center - relax;
-            x_u[i] = center + relax;
+/// Apply the configured `fixed_variable_treatment` to entries with
+/// `x_l[i] == x_u[i]`.
+///
+/// `RelaxBounds` (current default): widen the bounds by ±1e-8·max(|c|, 1)
+/// around the fixed value `c`. Mirrors Ipopt 3.14's `relax_bounds`.
+///
+/// `MakeParameter` (Ipopt default; not yet implemented): would substitute
+/// out fixed variables. Falls back to `RelaxBounds` here so the option
+/// is a no-op for callers — see TODO in `FixedVariableTreatment` doc.
+fn relax_fixed_variable_bounds(
+    x_l: &mut [f64],
+    x_u: &mut [f64],
+    options: &SolverOptions,
+) {
+    match options.fixed_variable_treatment {
+        FixedVariableTreatment::RelaxBounds | FixedVariableTreatment::MakeParameter => {
+            for i in 0..x_l.len() {
+                if x_l[i].is_finite() && x_u[i].is_finite() && (x_u[i] - x_l[i]).abs() < 1e-10 {
+                    let center = (x_l[i] + x_u[i]) / 2.0;
+                    let relax = 1e-8 * center.abs().max(1.0);
+                    x_l[i] = center - relax;
+                    x_u[i] = center + relax;
+                }
+            }
         }
     }
 }
@@ -10609,6 +10623,43 @@ mod tests {
             opts.bound_push,
             x[0]
         );
+    }
+
+    #[test]
+    fn test_relax_fixed_variable_bounds_default_widens() {
+        // Default option: RelaxBounds. x_l = x_u = 5.0 should be widened
+        // to [5 - 5e-8, 5 + 5e-8].
+        let opts = SolverOptions::default();
+        let mut x_l = vec![5.0];
+        let mut x_u = vec![5.0];
+        relax_fixed_variable_bounds(&mut x_l, &mut x_u, &opts);
+        let expected_relax = 1e-8 * 5.0;
+        assert!((x_l[0] - (5.0 - expected_relax)).abs() < 1e-15);
+        assert!((x_u[0] - (5.0 + expected_relax)).abs() < 1e-15);
+    }
+
+    #[test]
+    fn test_relax_fixed_variable_bounds_make_parameter_falls_back() {
+        // MakeParameter is not implemented yet: it should behave the same
+        // as RelaxBounds (the documented fallback).
+        let mut opts = SolverOptions::default();
+        opts.fixed_variable_treatment = FixedVariableTreatment::MakeParameter;
+        let mut x_l = vec![5.0];
+        let mut x_u = vec![5.0];
+        relax_fixed_variable_bounds(&mut x_l, &mut x_u, &opts);
+        assert!(x_l[0] < 5.0 && x_u[0] > 5.0);
+    }
+
+    #[test]
+    fn test_relax_fixed_variable_bounds_skips_non_fixed() {
+        let opts = SolverOptions::default();
+        let mut x_l = vec![1.0, f64::NEG_INFINITY];
+        let mut x_u = vec![3.0, f64::INFINITY];
+        relax_fixed_variable_bounds(&mut x_l, &mut x_u, &opts);
+        assert_eq!(x_l[0], 1.0);
+        assert_eq!(x_u[0], 3.0);
+        assert_eq!(x_l[1], f64::NEG_INFINITY);
+        assert_eq!(x_u[1], f64::INFINITY);
     }
 
     #[test]
