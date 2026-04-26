@@ -71,6 +71,7 @@ fn new_fallback_solver(use_sparse: bool) -> Box<dyn LinearSolver> {
         Box::new(DenseLdl::new())
     }
 }
+use crate::options::BoundMultInitMethod;
 use crate::options::SolverOptions;
 use crate::problem::NlpProblem;
 use crate::restoration::RestorationPhase;
@@ -805,7 +806,7 @@ impl SolverState {
             (true, Some(mu)) if mu > 0.0 => mu,
             _ => options.mu_init,
         };
-        let (mut z_l, mut z_u) = init_bound_multipliers(&x, &x_l, &x_u, initial_mu);
+        let (mut z_l, mut z_u) = init_bound_multipliers(&x, &x_l, &x_u, initial_mu, options);
 
         let (jac_rows, jac_cols) = problem.jacobian_structure();
         let jac_nnz = jac_rows.len();
@@ -8871,28 +8872,48 @@ fn apply_warm_start_multipliers<P: NlpProblem>(
     }
 }
 
-/// Initialize bound multipliers from complementarity at mu_init:
-/// z_l[i] = mu / (x[i] - x_l[i]), z_u[i] = mu / (x_u[i] - x[i]).
-/// Multipliers stay at 0 for inactive (infinite) bounds. Slack is
-/// floored at 1e-20 to avoid division by zero in pathological cases
-/// where the bound-push didn't move x off the bound.
+/// Initialize bound multipliers `z_l`, `z_u`. The method is selected
+/// by `options.bound_mult_init_method` (Ipopt 3.14
+/// `IpDefaultIterateInitializer.cpp:254-288`):
+///
+/// - `Constant` (Ipopt default): every finite-bounded entry is set to
+///   `options.bound_mult_init_val` (Ipopt default 1.0). Inactive
+///   (infinite) bounds stay at 0.
+/// - `MuBased`: `z_l = mu_init / (x − x_l)`, `z_u = mu_init / (x_u − x)`.
+///   Slack is floored at 1e-20 to avoid division by zero.
 fn init_bound_multipliers(
     x: &[f64],
     x_l: &[f64],
     x_u: &[f64],
     mu_init: f64,
+    options: &SolverOptions,
 ) -> (Vec<f64>, Vec<f64>) {
     let n = x.len();
     let mut z_l = vec![0.0; n];
     let mut z_u = vec![0.0; n];
-    for i in 0..n {
-        if x_l[i].is_finite() {
-            let slack = (x[i] - x_l[i]).max(1e-20);
-            z_l[i] = mu_init / slack;
+    match options.bound_mult_init_method {
+        BoundMultInitMethod::Constant => {
+            let v = options.bound_mult_init_val;
+            for i in 0..n {
+                if x_l[i].is_finite() {
+                    z_l[i] = v;
+                }
+                if x_u[i].is_finite() {
+                    z_u[i] = v;
+                }
+            }
         }
-        if x_u[i].is_finite() {
-            let slack = (x_u[i] - x[i]).max(1e-20);
-            z_u[i] = mu_init / slack;
+        BoundMultInitMethod::MuBased => {
+            for i in 0..n {
+                if x_l[i].is_finite() {
+                    let slack = (x[i] - x_l[i]).max(1e-20);
+                    z_l[i] = mu_init / slack;
+                }
+                if x_u[i].is_finite() {
+                    let slack = (x_u[i] - x[i]).max(1e-20);
+                    z_u[i] = mu_init / slack;
+                }
+            }
         }
     }
     (z_l, z_u)
@@ -10588,6 +10609,31 @@ mod tests {
             opts.bound_push,
             x[0]
         );
+    }
+
+    #[test]
+    fn test_init_bound_multipliers_default_is_constant_one() {
+        // Default options: bound_mult_init_method = Constant, val = 1.0.
+        // mu_init = 0.1 should NOT appear in z_l[0]; the constant 1.0 should.
+        let opts = SolverOptions::default();
+        let x = vec![1.5];
+        let x_l = vec![0.0];
+        let x_u = vec![f64::INFINITY];
+        let (z_l, z_u) = init_bound_multipliers(&x, &x_l, &x_u, 0.1, &opts);
+        assert_eq!(z_l[0], 1.0, "constant default should give z_l = 1.0");
+        assert_eq!(z_u[0], 0.0, "no upper bound -> z_u stays at 0");
+    }
+
+    #[test]
+    fn test_init_bound_multipliers_mu_based_uses_mu_over_slack() {
+        let mut opts = SolverOptions::default();
+        opts.bound_mult_init_method = BoundMultInitMethod::MuBased;
+        let x = vec![1.5];
+        let x_l = vec![0.5];
+        let x_u = vec![f64::INFINITY];
+        let (z_l, _z_u) = init_bound_multipliers(&x, &x_l, &x_u, 0.1, &opts);
+        // slack = 1.5 - 0.5 = 1.0 -> z_l = 0.1 / 1.0 = 0.1
+        assert!((z_l[0] - 0.1).abs() < 1e-12, "got z_l = {}", z_l[0]);
     }
 
     #[test]

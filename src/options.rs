@@ -1,3 +1,24 @@
+/// Bound multiplier initialization method.
+///
+/// Mirrors Ipopt 3.14's `bound_mult_init_method`
+/// (`IpDefaultIterateInitializer.cpp:254-288`). Ipopt's default is
+/// `Constant` with `bound_mult_init_val = 1.0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundMultInitMethod {
+    /// `z_l = z_u = bound_mult_init_val` for every finite bound.
+    /// Ipopt default.
+    Constant,
+    /// `z_l = μ_init / (x − x_l)`, `z_u = μ_init / (x_u − x)`.
+    /// Mirrors Ipopt's `mu-based`. Pre-v0.8 ripopt default.
+    MuBased,
+}
+
+impl Default for BoundMultInitMethod {
+    fn default() -> Self {
+        Self::Constant
+    }
+}
+
 /// Choice of linear solver for the KKT system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinearSolverChoice {
@@ -229,6 +250,12 @@ pub struct SolverOptions {
     pub kkt_dump_dir: Option<std::path::PathBuf>,
     /// Problem name used in dump filenames. Defaults to `"problem"`.
     pub kkt_dump_name: String,
+    /// Method used to initialize the bound multipliers `z_l`, `z_u`.
+    /// Default: `Constant` (Ipopt 3.14 default).
+    pub bound_mult_init_method: BoundMultInitMethod,
+    /// Initial value used when `bound_mult_init_method = Constant`.
+    /// Default: 1.0 (Ipopt 3.14 default).
+    pub bound_mult_init_val: f64,
 }
 
 impl Default for SolverOptions {
@@ -295,6 +322,8 @@ impl Default for SolverOptions {
             warm_start_z_u: None,
             kkt_dump_dir: None,
             kkt_dump_name: "problem".to_string(),
+            bound_mult_init_method: BoundMultInitMethod::Constant,
+            bound_mult_init_val: 1.0,
         }
     }
 }
