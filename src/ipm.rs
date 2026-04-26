@@ -5802,7 +5802,6 @@ impl IterateAveragingState {
 struct ConvergenceWorkspace<'a> {
     avg: &'a mut IterateAveragingState,
     tried_active_set: &'a mut bool,
-    tried_compl_polish: &'a mut bool,
 }
 
 /// Check convergence status and, on Acceptable, try three promotion
@@ -5951,68 +5950,9 @@ fn try_iterate_averaging_promotion<P: NlpProblem>(
     None
 }
 
-/// Strategy 4 (Acceptable promotion): when complementarity is the
-/// bottleneck (primal_inf and dual_inf already within 100x tol but
-/// compl_inf > tol*s_d), snap bound multipliers to reduce
-/// complementarity. For each variable that is clearly interior to a
-/// bound (gap > 1e-6), zero out the corresponding z; keep z otherwise.
-/// Re-check convergence with the snapped multipliers; on success return
-/// Optimal, otherwise restore z and return None. One-shot via
-/// `ws.tried_compl_polish`.
-fn try_complementarity_polish_promotion(
-    state: &mut SolverState,
-    options: &SolverOptions,
-    conv_info: &ConvergenceInfo,
-    ws: &mut ConvergenceWorkspace,
-    n: usize,
-    m: usize,
-) -> Option<SolveResult> {
-    if *ws.tried_compl_polish {
-        return None;
-    }
-    let compl_inf_now = conv_info.compl_inf;
-    let s_d_now = compute_residual_scaling(conv_info.multiplier_sum, conv_info.multiplier_count);
-    let s_c_now =
-        compute_residual_scaling(conv_info.bound_multiplier_sum, conv_info.bound_multiplier_count);
-    let compl_tol_scaled = options.tol * s_c_now;
-    if !(compl_inf_now > compl_tol_scaled
-        && conv_info.primal_inf <= 100.0 * options.tol
-        && conv_info.dual_inf <= 100.0 * options.tol * s_d_now)
-    {
-        return None;
-    }
-    *ws.tried_compl_polish = true;
-    let saved_zl = state.z_l.clone();
-    let saved_zu = state.z_u.clone();
-    let gap_tol = 1e-6;
-    for i in 0..n {
-        let gap_l = if state.x_l[i].is_finite() { state.x[i] - state.x_l[i] } else { f64::INFINITY };
-        let gap_u = if state.x_u[i].is_finite() { state.x_u[i] - state.x[i] } else { f64::INFINITY };
-        if gap_l > gap_tol {
-            state.z_l[i] = 0.0;
-        }
-        if gap_u > gap_tol {
-            state.z_u[i] = 0.0;
-        }
-    }
-    let snap_conv = compute_convergence_info_from_state(state, state.mu, n, m);
-    if let ConvergenceStatus::Converged = check_convergence(&snap_conv, options, 0) {
-        if options.print_level >= 3 {
-            rip_log!(
-                "ripopt: Complementarity snap promoted near-tolerance -> Optimal (compl {:.2e} -> {:.2e}, du {:.2e})",
-                compl_inf_now, snap_conv.compl_inf, snap_conv.dual_inf
-            );
-        }
-        return Some(make_result(state, SolveStatus::Optimal));
-    }
-    state.z_l.copy_from_slice(&saved_zl);
-    state.z_u.copy_from_slice(&saved_zu);
-    None
-}
-
-/// Handle the `ConvergenceStatus::Acceptable` branch: try the three
-/// promotion strategies (iterate averaging, active set, complementarity
-/// polish) and, if none succeed, return `SolveStatus::Acceptable`.
+/// Handle the `ConvergenceStatus::Acceptable` branch: try the
+/// promotion strategies (iterate averaging, active set) and, if none
+/// succeed, return `SolveStatus::Acceptable`.
 ///
 /// Previously inlined in `check_convergence_and_handle_promotions`.
 #[allow(clippy::too_many_arguments)]
@@ -6020,7 +5960,6 @@ fn handle_acceptable_status_with_promotions<P: NlpProblem>(
     state: &mut SolverState,
     problem: &P,
     options: &SolverOptions,
-    conv_info: &ConvergenceInfo,
     ws: &mut ConvergenceWorkspace,
     timings: &PhaseTimings,
     iteration: usize,
@@ -6047,13 +5986,6 @@ fn handle_acceptable_status_with_promotions<P: NlpProblem>(
             }
             return result;
         }
-    }
-
-    // Strategy 4: Complementarity polishing via multiplier snap
-    if let Some(result) = try_complementarity_polish_promotion(
-        state, options, conv_info, ws, n, m,
-    ) {
-        return result;
     }
 
     if options.print_level >= 5 {
@@ -6123,7 +6055,7 @@ fn check_convergence_and_handle_promotions<P: NlpProblem>(
             Some(make_result(state, SolveStatus::Optimal))
         }
         ConvergenceStatus::Acceptable => Some(handle_acceptable_status_with_promotions(
-            state, problem, options, &conv_info, ws, timings,
+            state, problem, options, ws, timings,
             iteration, ipm_start, n, m,
             linear_constraints, lbfgs_mode,
         )),
@@ -7841,9 +7773,6 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
     // Strategy 3: Active set reduced KKT solve
     let mut tried_active_set: bool = false;
 
-    // Strategy 4: Complementarity polishing — force mu small when compl is bottleneck
-    let mut _tried_compl_polish: bool = false;
-
     // Initial evaluation with NaN/Inf recovery by bound-push perturbation.
     if let Err(result) = initial_evaluate_with_recovery(
         &mut state, problem, &mut lbfgs_state, linear_constraints.as_deref(), lbfgs_mode, n, options,
@@ -7969,7 +7898,6 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         let mut conv_ws = ConvergenceWorkspace {
             avg: &mut avg_state,
             tried_active_set: &mut tried_active_set,
-            tried_compl_polish: &mut _tried_compl_polish,
         };
         if let Some(result) = check_convergence_and_handle_promotions(
             &mut state,
