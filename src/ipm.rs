@@ -345,6 +345,60 @@ impl<P: NlpProblem> NlpProblem for XScaledProblem<'_, P> {
     }
 }
 
+/// Snapshot of the most recent iterate that satisfied the acceptable-level
+/// thresholds (Ipopt's `RestoreAcceptablePoint`). When restoration would
+/// otherwise be triggered on a near-feasible iterate (where the resto NLP
+/// is ill-defined), the IPM rolls back to this point and exits with
+/// `SolveStatus::Acceptable`. Mirrors Ipopt's `STOP_AT_ACCEPTABLE_POINT`
+/// path in `IpIpoptAlgorithm.cpp`.
+struct IterateSnapshot {
+    x: Vec<f64>,
+    y: Vec<f64>,
+    z_l: Vec<f64>,
+    z_u: Vec<f64>,
+    v_l: Vec<f64>,
+    v_u: Vec<f64>,
+    mu: f64,
+    obj: f64,
+    g: Vec<f64>,
+    grad_f: Vec<f64>,
+    filter_entries: Vec<FilterEntry>,
+    iteration: usize,
+}
+
+impl IterateSnapshot {
+    fn capture(state: &SolverState, filter: &Filter, iteration: usize) -> Self {
+        Self {
+            x: state.x.clone(),
+            y: state.y.clone(),
+            z_l: state.z_l.clone(),
+            z_u: state.z_u.clone(),
+            v_l: state.v_l.clone(),
+            v_u: state.v_u.clone(),
+            mu: state.mu,
+            obj: state.obj,
+            g: state.g.clone(),
+            grad_f: state.grad_f.clone(),
+            filter_entries: filter.save_entries(),
+            iteration,
+        }
+    }
+
+    fn restore(&self, state: &mut SolverState, filter: &mut Filter) {
+        state.x = self.x.clone();
+        state.y = self.y.clone();
+        state.z_l = self.z_l.clone();
+        state.z_u = self.z_u.clone();
+        state.v_l = self.v_l.clone();
+        state.v_u = self.v_u.clone();
+        state.mu = self.mu;
+        state.obj = self.obj;
+        state.g = self.g.clone();
+        state.grad_f = self.grad_f.clone();
+        filter.restore_entries(self.filter_entries.clone());
+    }
+}
+
 /// Saved state for the watchdog mechanism.
 struct WatchdogSavedState {
     x: Vec<f64>,
@@ -480,6 +534,12 @@ pub(crate) struct SolverState {
     /// (IpIpoptCalculatedQuantities.cpp:3732). Set once at setup
     /// after bound preprocessing and read-only thereafter.
     pub is_square: bool,
+    /// Most recent iterate that met the acceptable-level thresholds.
+    /// Overwritten every time the convergence helpers see acceptable
+    /// quality; consumed by the restoration trigger to fall back to
+    /// `Acceptable` instead of attempting a singular resto NLP on a
+    /// near-feasible iterate.
+    acceptable_iterate: Option<IterateSnapshot>,
 }
 
 /// Barrier parameter mode (Ipopt's adaptive mu strategy).
@@ -902,6 +962,7 @@ impl SolverState {
             x_last_eval: vec![f64::NAN; n],
             adjusted_slacks_count: 0,
             is_square,
+            acceptable_iterate: None,
         }
     }
 
@@ -6253,6 +6314,73 @@ fn track_consecutive_acceptable(
     s_d_for_acc
 }
 
+/// Capture an `IterateSnapshot` if the current iterate meets the
+/// acceptable-level thresholds. Overwrites any previous snapshot so the
+/// stored point is always the most recent acceptable one.
+fn store_acceptable_iterate(
+    state: &mut SolverState,
+    filter: &Filter,
+    iteration: usize,
+    primal_inf: f64,
+    dual_inf: f64,
+    dual_inf_unscaled: f64,
+    compl_inf: f64,
+    multiplier_sum: f64,
+    multiplier_count: usize,
+    bound_multiplier_sum: f64,
+    bound_multiplier_count: usize,
+) {
+    let info = ConvergenceInfo {
+        primal_inf,
+        dual_inf,
+        dual_inf_unscaled,
+        compl_inf,
+        mu: state.mu,
+        objective: state.obj,
+        multiplier_sum,
+        multiplier_count,
+        bound_multiplier_sum,
+        bound_multiplier_count,
+    };
+    if convergence::meets_acceptable_thresholds(&info) {
+        state.acceptable_iterate = Some(IterateSnapshot::capture(state, filter, iteration));
+    }
+}
+
+/// Just before triggering full restoration, attempt to restore the most
+/// recent acceptable iterate. Returns `Some(SolveResult)` with status
+/// `Acceptable` when (a) a snapshot exists and (b) the current iterate
+/// is near-feasible (`primal_inf < 1e-2 * options.tol` and
+/// `constr_viol_max < 1e-1 * options.constr_viol_tol`) — the regime in
+/// which the restoration NLP is ill-defined because constraints are
+/// already nearly satisfied. Mirrors Ipopt's `RestoreAcceptablePoint` /
+/// `STOP_AT_ACCEPTABLE_POINT` exit in `IpIpoptAlgorithm.cpp`.
+fn try_restore_acceptable_iterate(
+    state: &mut SolverState,
+    options: &SolverOptions,
+    filter: &mut Filter,
+    primal_inf: f64,
+    primal_inf_max: f64,
+) -> Option<SolveResult> {
+    if state.acceptable_iterate.is_none() {
+        return None;
+    }
+    if !(primal_inf < 1e-2 * options.tol
+        && primal_inf_max < 1e-1 * options.constr_viol_tol)
+    {
+        return None;
+    }
+    let snap = state.acceptable_iterate.take().unwrap();
+    if options.print_level >= 3 {
+        rip_log!(
+            "ripopt: Restoring acceptable iterate from iter {} (pr={:.2e}, pr_max={:.2e}) -> Acceptable",
+            snap.iteration, primal_inf, primal_inf_max
+        );
+    }
+    snap.restore(state, filter);
+    Some(make_result(state, SolveStatus::Acceptable))
+}
+
 /// Snapshot of the best-dual-feasibility iterate seen so far.
 ///
 /// Used by the overall-progress stall detector to revert before a
@@ -7828,6 +7956,20 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             bound_multiplier_sum,
         );
 
+        store_acceptable_iterate(
+            &mut state,
+            &filter,
+            iteration,
+            primal_inf,
+            dual_inf,
+            dual_inf_unscaled,
+            compl_inf,
+            multiplier_sum,
+            multiplier_count,
+            bound_multiplier_sum,
+            bound_multiplier_count,
+        );
+
         update_best_du_iterate(&state, dual_inf, &mut best_du);
 
         if let Some(result) = track_feasibility_and_detect_infeasibility(
@@ -8086,6 +8228,15 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         }
 
         if !step_accepted {
+            if let Some(result) = try_restore_acceptable_iterate(
+                &mut state,
+                options,
+                &mut filter,
+                primal_inf,
+                primal_inf_max,
+            ) {
+                return result;
+            }
             match run_post_ls_restoration_cascade(
                 &mut state,
                 problem,
@@ -10640,7 +10791,91 @@ mod tests {
             x_last_eval: vec![f64::NAN; n],
             adjusted_slacks_count: 0,
             is_square: false,
+            acceptable_iterate: None,
         }
+    }
+
+    #[test]
+    fn test_iterate_snapshot_capture_and_restore() {
+        let mut state = minimal_state(2, 1);
+        state.x = vec![1.5, 2.5];
+        state.y = vec![0.7];
+        state.z_l = vec![0.1, 0.2];
+        state.z_u = vec![0.3, 0.4];
+        state.mu = 1e-3;
+        state.obj = 42.0;
+        let mut filter = Filter::new(1e4);
+        filter.add(0.5, 10.0);
+        let snap = IterateSnapshot::capture(&state, &filter, 7);
+        // Mutate state and filter to simulate further iterations.
+        state.x = vec![9.0, 9.0];
+        state.y = vec![9.0];
+        state.mu = 1.0;
+        state.obj = 0.0;
+        filter.add(99.0, 99.0);
+        // Restore and verify.
+        snap.restore(&mut state, &mut filter);
+        assert_eq!(state.x, vec![1.5, 2.5]);
+        assert_eq!(state.y, vec![0.7]);
+        assert_eq!(state.z_l, vec![0.1, 0.2]);
+        assert_eq!(state.z_u, vec![0.3, 0.4]);
+        assert_eq!(state.mu, 1e-3);
+        assert_eq!(state.obj, 42.0);
+        assert_eq!(snap.iteration, 7);
+        assert_eq!(filter.entries().len(), 1);
+        assert!((filter.entries()[0].theta - 0.5).abs() < 1e-15);
+    }
+
+    #[test]
+    fn test_try_restore_acceptable_iterate_no_snapshot() {
+        let mut state = minimal_state(1, 0);
+        let mut filter = Filter::new(1e4);
+        let opts = SolverOptions::default();
+        // No snapshot stored; restore should return None even when predicate holds.
+        let result = try_restore_acceptable_iterate(
+            &mut state, &opts, &mut filter,
+            1e-12, 1e-12,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_try_restore_acceptable_iterate_predicate_blocks_restore() {
+        let mut state = minimal_state(1, 0);
+        state.x = vec![1.0];
+        let mut filter = Filter::new(1e4);
+        state.acceptable_iterate = Some(IterateSnapshot::capture(&state, &filter, 0));
+        // Mutate x to ensure restore would be observable.
+        state.x = vec![5.0];
+        let opts = SolverOptions::default();
+        // Predicate fails: primal_inf large.
+        let result = try_restore_acceptable_iterate(
+            &mut state, &opts, &mut filter,
+            1.0, 1.0,
+        );
+        assert!(result.is_none());
+        // Snapshot retained because restore did not fire.
+        assert!(state.acceptable_iterate.is_some());
+        assert_eq!(state.x, vec![5.0]);
+    }
+
+    #[test]
+    fn test_try_restore_acceptable_iterate_fires() {
+        let mut state = minimal_state(1, 0);
+        state.x = vec![1.0];
+        let mut filter = Filter::new(1e4);
+        state.acceptable_iterate = Some(IterateSnapshot::capture(&state, &filter, 3));
+        state.x = vec![5.0];
+        let opts = SolverOptions::default();
+        // Predicate holds: pinf < 1e-2 * tol = 1e-10, pinf_max < 1e-1 * 1e-4 = 1e-5
+        let result = try_restore_acceptable_iterate(
+            &mut state, &opts, &mut filter,
+            1e-12, 1e-12,
+        );
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().status, SolveStatus::Acceptable);
+        assert_eq!(state.x, vec![1.0]);
+        assert!(state.acceptable_iterate.is_none());
     }
 
     #[test]

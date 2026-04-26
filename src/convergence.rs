@@ -48,6 +48,45 @@ pub struct ConvergenceInfo {
     pub bound_multiplier_count: usize,
 }
 
+/// Acceptable-level thresholds matching Ipopt defaults
+/// (`IpOptErrorConvCheck.cpp:70-121`):
+///   acceptable_tol = 1e-6, acceptable_dual_inf_tol = 1e10,
+///   acceptable_constr_viol_tol = 1e-2, acceptable_compl_inf_tol = 1e-2.
+pub const ACCEPTABLE_TOL: f64 = 1e-6;
+pub const ACCEPTABLE_DUAL_INF_TOL: f64 = 1e10;
+pub const ACCEPTABLE_CONSTR_VIOL_TOL: f64 = 1e-2;
+pub const ACCEPTABLE_COMPL_INF_TOL: f64 = 1e-2;
+/// Number of consecutive acceptable iterations required for the
+/// `Acceptable` exit (Ipopt's `acceptable_iter`).
+pub const NEAR_TOL_ITERS: usize = 15;
+
+/// Test whether the current iterate meets the acceptable-level
+/// thresholds (without requiring the consecutive-iteration count).
+/// Used by the IPM loop to decide when to take an
+/// `IterateSnapshot` for the `RestoreAcceptablePoint` mechanism.
+pub fn meets_acceptable_thresholds(
+    info: &ConvergenceInfo,
+) -> bool {
+    let s_max: f64 = 100.0;
+    let s_d = if info.multiplier_count > 0 {
+        s_max.max(info.multiplier_sum / info.multiplier_count as f64) / s_max
+    } else {
+        1.0
+    };
+    let s_c = if info.bound_multiplier_count > 0 {
+        s_max.max(info.bound_multiplier_sum / info.bound_multiplier_count as f64) / s_max
+    } else {
+        1.0
+    };
+    let scaled_ok = info.primal_inf <= ACCEPTABLE_TOL
+        && info.dual_inf <= ACCEPTABLE_TOL * s_d
+        && info.compl_inf <= ACCEPTABLE_TOL * s_c;
+    let unscaled_ok = info.primal_inf <= ACCEPTABLE_CONSTR_VIOL_TOL
+        && info.dual_inf_unscaled <= ACCEPTABLE_DUAL_INF_TOL
+        && info.compl_inf <= ACCEPTABLE_COMPL_INF_TOL;
+    scaled_ok && unscaled_ok
+}
+
 /// Check convergence of the IPM algorithm.
 ///
 /// Returns the convergence status based on current optimality measures.
@@ -90,30 +129,7 @@ pub fn check_convergence(
         return ConvergenceStatus::Converged;
     }
 
-    // Acceptable-level check matching Ipopt defaults
-    // (IpOptErrorConvCheck.cpp:70-121):
-    //   acceptable_tol = 1e-6
-    //   acceptable_iter = 15 consecutive iterations
-    //   acceptable_dual_inf_tol = 1e10   (effectively disabled)
-    //   acceptable_constr_viol_tol = 1e-2
-    //   acceptable_compl_inf_tol = 1e-2
-    // Ipopt's acceptable_obj_change_tol = 1e20 (disabled by default).
-    const NEAR_TOL_ITERS: usize = 15;
-    const ACCEPTABLE_TOL: f64 = 1e-6;
-    const ACCEPTABLE_DUAL_INF_TOL: f64 = 1e10;
-    const ACCEPTABLE_CONSTR_VIOL_TOL: f64 = 1e-2;
-    const ACCEPTABLE_COMPL_INF_TOL: f64 = 1e-2;
-
-    let near_scaled_ok = info.primal_inf <= ACCEPTABLE_TOL
-        && info.dual_inf <= ACCEPTABLE_TOL * s_d
-        && info.compl_inf <= ACCEPTABLE_TOL * s_c;
-    let near_unscaled_ok = info.primal_inf <= ACCEPTABLE_CONSTR_VIOL_TOL
-        && info.dual_inf_unscaled <= ACCEPTABLE_DUAL_INF_TOL
-        && info.compl_inf <= ACCEPTABLE_COMPL_INF_TOL;
-
-    if near_scaled_ok && near_unscaled_ok
-        && consecutive_acceptable >= NEAR_TOL_ITERS
-    {
+    if meets_acceptable_thresholds(info) && consecutive_acceptable >= NEAR_TOL_ITERS {
         return ConvergenceStatus::Acceptable;
     }
 
@@ -395,6 +411,40 @@ mod tests {
             check_convergence(&info, &opts, 0),
             ConvergenceStatus::Diverging
         );
+    }
+
+    #[test]
+    fn test_meets_acceptable_thresholds_ignores_count() {
+        let info = ConvergenceInfo {
+            primal_inf: 1e-7,
+            dual_inf: 1e-7,
+            dual_inf_unscaled: 1e-7,
+            compl_inf: 1e-7,
+            mu: 1e-8,
+            objective: 5.0,
+            multiplier_sum: 0.0,
+            multiplier_count: 0,
+            bound_multiplier_sum: 0.0,
+            bound_multiplier_count: 0,
+        };
+        assert!(meets_acceptable_thresholds(&info));
+    }
+
+    #[test]
+    fn test_meets_acceptable_thresholds_rejects_violated() {
+        let info = ConvergenceInfo {
+            primal_inf: 1e-1,
+            dual_inf: 1e-7,
+            dual_inf_unscaled: 1e-7,
+            compl_inf: 1e-7,
+            mu: 1e-8,
+            objective: 5.0,
+            multiplier_sum: 0.0,
+            multiplier_count: 0,
+            bound_multiplier_sum: 0.0,
+            bound_multiplier_count: 0,
+        };
+        assert!(!meets_acceptable_thresholds(&info));
     }
 
     #[test]
