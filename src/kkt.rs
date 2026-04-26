@@ -216,32 +216,25 @@ pub fn assemble_kkt(
         }
     }
 
-    // Quasidefinite regularization: add -delta_c to constraint diagonals that are
-    // zero or near-zero. This makes the (2,2) block strictly negative definite,
-    // guaranteeing the factorization has no zero pivots from the constraint block.
-    // Iterative refinement in solve_for_direction recovers the true Newton direction.
+    // T0.13 (Ipopt 3.14 alignment): δ_c is NOT added unconditionally at assembly
+    // time. Ipopt's `IpPDPerturbationHandler` distinguishes two modes:
+    //   - PerturbForWrongInertia: augmented system has the wrong number of
+    //     negative eigenvalues. Increase δ_w (Hessian perturbation). Do NOT
+    //     touch δ_c.
+    //   - PerturbForSingularity: factorization detects a numerically singular
+    //     system (zero pivot). Add δ_c (equality block perturbation) to lift
+    //     the singularity, possibly with δ_w too.
+    // (See `IpPDPerturbationHandler.cpp` `delta_c_curr_` assignment paths.)
     //
-    // This is critical for problems like gas40 where many constraint rows have zero
-    // Jacobian entries at the current iterate, producing zero (2,2) diagonal entries.
-    // Without regularization, the factorization produces zero pivots that the IC loop
-    // cannot fix (adding delta_w to the (1,1) block doesn't help zero constraint pivots).
-    //
-    // mu-dependent scaling matches Ipopt's PDPerturbationHandler::delta_cd
-    // (IpPDPerturbationHandler.cpp:465-468): delta_c = bar_delta_c * mu^kappa_c
-    // with bar_delta_c = jacobian_regularization_value (default 1e-8) and
-    // kappa_c = jacobian_regularization_exponent (default 0.25). Without this
-    // scaling, a fixed 1e-8 dominates the converged system at mu = 1e-10,
-    // biasing final multipliers by O(delta_c / ||J||).
-    let delta_c_base = 1e-8 * mu.max(0.0).powf(0.25);
-    let mut delta_c_diag = vec![0.0; m];
-    for i in 0..m {
-        if !has_sigma_s[i] {
-            // No Sigma_s contribution: diagonal is zero (equality or infeasible inequality).
-            // Add regularization to prevent zero pivots.
-            matrix.add(n + i, n + i, -delta_c_base);
-            delta_c_diag[i] = delta_c_base;
-        }
-    }
+    // The previous behavior — unconditionally adding `delta_c_base = 1e-8·μ^0.25`
+    // to every equality / infeasible-inequality row at assembly time — biased
+    // the KKT residual on well-conditioned systems and degraded convergence
+    // rate near the optimum. Singularity-driven δ_c is now applied exclusively
+    // by `factor_with_inertia_correction` (see the PerturbForSingularity path
+    // there). `_has_sigma_s` is retained as a marker for future use but no
+    // longer drives perturbation.
+    let _has_sigma_s = has_sigma_s;
+    let delta_c_diag = vec![0.0; m];
 
     // Debug: check for NaN in matrix and RHS
     if rhs.iter().any(|v| v.is_nan() || v.is_infinite()) {
@@ -549,21 +542,33 @@ pub fn factor_with_inertia_correction(
     }
 
     // Selective delta_c-only perturbation (Ipopt's PerturbForSingularity path).
-    // When n_neg < m by a small amount, the (1,1) block is likely already positive
-    // (semi)definite and a few eigenvalues near the saddle-point boundary flipped sign
-    // due to GEMM rounding. Adding only -delta_c to the (2,2) block pushes those
-    // borderline eigenvalues negative without perturbing the primal block.
+    //
+    // T0.13 (Ipopt 3.14 alignment): δ_c is added here, on the
+    // PerturbForSingularity path, rather than unconditionally during
+    // assembly. We enter this path under two conditions:
+    //
+    //   (a) singularity_detected: `inertia.zero > 0` — the factorization
+    //       reports zero pivots, i.e. the augmented system is numerically
+    //       singular. This is the canonical PerturbForSingularity trigger.
+    //   (b) small inertia deficit: `n_neg < m` by ≤ max(5, m/100) and
+    //       total = n+m exactly, i.e. a few eigenvalues near the saddle-
+    //       point boundary flipped sign due to floating-point rounding.
+    //       Adding only -δ_c to the (2,2) block pushes those borderline
+    //       eigenvalues negative without touching the primal block.
+    //
+    // δ_w is not bumped in either branch — that is the
+    // PerturbForWrongInertia regime, handled by the escalation loop below.
     if m > 0 {
         let last_inertia = solver.factor(&kkt.matrix)?;
         if let Some(inertia) = last_inertia {
             let total = inertia.positive + inertia.negative + inertia.zero;
             let deficit = m as isize - inertia.negative as isize;
-            // Too few negatives by a small amount: try delta_c only
-            if deficit > 0
+            let singularity_detected = inertia.zero > 0;
+            let small_deficit = deficit > 0
                 && deficit <= 5.max((m / 100) as isize)
                 && inertia.zero == 0
-                && (total as isize - (n + m) as isize).unsigned_abs() <= 2
-            {
+                && (total as isize - (n + m) as isize).unsigned_abs() <= 2;
+            if singularity_detected || small_deficit {
                 let mut delta_c = delta_c_active;
                 for _ in 0..4 {
                     let mut perturbed = kkt.matrix.clone();
@@ -574,7 +579,9 @@ pub fn factor_with_inertia_correction(
                             && inertia.zero == 0;
                         if ok {
                             log::debug!(
-                                "Selective delta_c-only correction succeeded: delta_c={:.2e}",
+                                "Selective delta_c-only correction succeeded \
+                                 ({}): delta_c={:.2e}",
+                                if singularity_detected { "singularity" } else { "small deficit" },
                                 delta_c
                             );
                             kkt.matrix = perturbed;
@@ -1875,12 +1882,12 @@ mod tests {
         // Verify J block: matrix[2,0] and matrix[2,1] should be 1.0
         assert!((kkt.matrix.get(2, 0) - 1.0).abs() < 1e-12);
         assert!((kkt.matrix.get(2, 1) - 1.0).abs() < 1e-12);
-        // Equality constraint: (2,2) block has Ipopt-style quasidefinite
-        // regularization delta_c = 1e-8 * mu^0.25. At mu = 0.1 this is
-        // 1e-8 * 0.1^0.25 ≈ 5.6234e-9.
-        let expected_dc = 1e-8 * 0.1f64.powf(0.25);
-        assert!((kkt.matrix.get(2, 2) - (-expected_dc)).abs() < 1e-15);
-        assert!((kkt.delta_c_diag[0] - expected_dc).abs() < 1e-15);
+        // T0.13: equality constraint (2,2) block is exactly 0 — no
+        // unconditional δ_c regularization. δ_c is applied only by the
+        // PerturbForSingularity path inside factor_with_inertia_correction
+        // when the augmented system is detected as singular.
+        assert!(kkt.matrix.get(2, 2).abs() < 1e-15);
+        assert!(kkt.delta_c_diag[0].abs() < 1e-15);
         // Primal residual: -(g - g_l) = -(0.7 - 1.0) = 0.3
         assert!((kkt.rhs[2] - 0.3).abs() < 1e-12);
     }
@@ -2011,6 +2018,73 @@ mod tests {
 
         let (delta_w, _delta_c) = factor_with_inertia_correction(&mut kkt, &mut solver, &mut params, 1e-4).unwrap();
         assert!(delta_w > 0.0, "Wrong inertia should require delta_w > 0");
+    }
+
+    /// T0.13: δ_c remains 0 on a non-singular system. The KKT matrix here
+    /// has the correct inertia (n positives, m negatives, no zero pivots),
+    /// so neither PerturbForWrongInertia nor PerturbForSingularity should
+    /// fire — `factor_with_inertia_correction` should return (0, 0).
+    #[test]
+    fn test_factor_no_delta_c_when_nonsingular() {
+        let n = 2;
+        let m = 1;
+        let mut matrix = SymmetricMatrix::zeros(3);
+        matrix.set(0, 0, 2.0);
+        matrix.set(1, 1, 3.0);
+        matrix.set(2, 0, 1.0);
+        matrix.set(2, 1, 0.5);
+        // (2,2) intentionally 0 — equality block. With well-conditioned J this
+        // produces a non-singular augmented system with inertia (2, 1, 0).
+
+        let mut kkt = KktSystem {
+            dim: 3, n, m,
+            matrix: KktMatrix::Dense(matrix),
+            rhs: vec![1.0, 2.0, 3.0],
+            delta_c_diag: vec![0.0; m],
+            scale_factors: None,
+        };
+        let mut solver = DenseLdl::new();
+        let mut params = InertiaCorrectionParams::default();
+
+        let (delta_w, delta_c) = factor_with_inertia_correction(
+            &mut kkt, &mut solver, &mut params, 1e-4,
+        ).unwrap();
+        assert!(delta_w.abs() < 1e-15, "non-singular: no delta_w needed");
+        assert!(delta_c.abs() < 1e-15, "non-singular: no delta_c (T0.13)");
+    }
+
+    /// T0.13: δ_c is bumped on a synthetically singular system. With a
+    /// rank-deficient Jacobian (all-zero row), the (2,2) block factorization
+    /// reports a zero pivot — singularity_detected — and the
+    /// PerturbForSingularity path adds δ_c > 0 to lift the singularity.
+    #[test]
+    fn test_factor_delta_c_on_singular() {
+        let n = 2;
+        let m = 1;
+        let mut matrix = SymmetricMatrix::zeros(3);
+        matrix.set(0, 0, 2.0);
+        matrix.set(1, 1, 3.0);
+        // Jacobian row is all zero ⇒ augmented system is singular.
+        // (2,0) and (2,1) are both 0; (2,2) is 0 (no assembly-time δ_c).
+
+        let mut kkt = KktSystem {
+            dim: 3, n, m,
+            matrix: KktMatrix::Dense(matrix),
+            rhs: vec![1.0, 2.0, 3.0],
+            delta_c_diag: vec![0.0; m],
+            scale_factors: None,
+        };
+        let mut solver = DenseLdl::new();
+        let mut params = InertiaCorrectionParams::default();
+
+        let result = factor_with_inertia_correction(
+            &mut kkt, &mut solver, &mut params, 1e-4,
+        );
+        // The factorization should succeed (perturbation handler lifts the
+        // singularity), and δ_c should have been bumped above 0.
+        let (_delta_w, delta_c) = result.expect("factorization should recover from singularity");
+        assert!(delta_c > 0.0,
+            "singular system: delta_c must be > 0 (PerturbForSingularity)");
     }
 
     #[test]
