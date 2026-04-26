@@ -164,17 +164,29 @@ pub fn assemble_kkt(
         let mut any_feasible = false;
         let mut rhs_infeasible = 0.0;
 
+        // T0.11 (Ipopt 3.14 alignment): synthetic slack-bound multipliers
+        // v_L, v_U use the explicit positive parts of the combined
+        // multiplier y, then apply Ipopt's κ_σ safeguard. Sign convention
+        // here: with y on the slack equality g(x) − s = 0 and v_L, v_U ≥ 0
+        // on the slack box, stationarity gives y = v_U − v_L, so
+        //   v_L = max(−y, 0)  (lower-bound slack multiplier)
+        //   v_U = max( y, 0)  (upper-bound slack multiplier)
+        // The earlier `max(|y|, μ/s)` floor masked degenerate y by injecting
+        // a barrier surrogate, but if y is degenerate the issue is upstream
+        // (filter, line search), not the synthetic floor. Replace with
+        // κ_σ = 1e10 clamp of v_L·s_L (resp. v_U·s_U) into [μ/κ_σ, κ_σ·μ],
+        // matching Ipopt's bound-multiplier reset (Wächter & Biegler 2006
+        // eq. (16); IpIpoptCalculatedQuantities ComputePDSystem).
+        let kappa_sigma = 1e10_f64;
         if g_l[i].is_finite() {
             let slack = g[i] - g_l[i];
             if slack >= -1e-8 {
-                // Feasible or at bound: use barrier with safeguarded slack
                 let safe_slack = slack.max(mu.max(1e-10));
-                // Heuristic: use |y| when y has correct sign, else barrier estimate mu/s
-                let z_sl = if y[i] < -1e-20 {
-                    -y[i]
-                } else {
-                    mu / safe_slack
-                };
+                // v_L = max(-y, 0), then κ_σ-clamp to [μ/(κ_σ·s), κ_σ·μ/s].
+                let mut z_sl = (-y[i]).max(0.0);
+                let z_lo = mu / (kappa_sigma * safe_slack);
+                let z_hi = kappa_sigma * mu / safe_slack;
+                z_sl = z_sl.clamp(z_lo, z_hi);
                 sigma_s += z_sl / safe_slack;
                 rhs_correction += mu / safe_slack;
                 any_feasible = true;
@@ -186,14 +198,12 @@ pub fn assemble_kkt(
         if g_u[i].is_finite() {
             let slack = g_u[i] - g[i];
             if slack >= -1e-8 {
-                // Feasible or at bound: use barrier with safeguarded slack
                 let safe_slack = slack.max(mu.max(1e-10));
-                // Heuristic: use |y| when y has correct sign, else barrier estimate mu/s
-                let z_su = if y[i] > 1e-20 {
-                    y[i]
-                } else {
-                    mu / safe_slack
-                };
+                // v_U = max(y, 0), then κ_σ-clamp to [μ/(κ_σ·s), κ_σ·μ/s].
+                let mut z_su = y[i].max(0.0);
+                let z_lo = mu / (kappa_sigma * safe_slack);
+                let z_hi = kappa_sigma * mu / safe_slack;
+                z_su = z_su.clamp(z_lo, z_hi);
                 sigma_s += z_su / safe_slack;
                 rhs_correction -= mu / safe_slack;
                 any_feasible = true;
@@ -1342,11 +1352,17 @@ pub fn assemble_condensed_kkt(
         let mut any_feasible = false;
         let mut rhs_infeasible = 0.0;
 
+        // T0.11: synthetic v_L / v_U use explicit positive parts of y
+        // with κ_σ = 1e10 clamp (see assemble_kkt for derivation).
+        let kappa_sigma = 1e10_f64;
         if g_l[i].is_finite() {
             let slack = g[i] - g_l[i];
             if slack >= -1e-8 {
                 let safe_slack = slack.max(mu.max(1e-10));
-                let z_sl = if y[i] < -1e-20 { -y[i] } else { mu / safe_slack };
+                let mut z_sl = (-y[i]).max(0.0);
+                let z_lo = mu / (kappa_sigma * safe_slack);
+                let z_hi = kappa_sigma * mu / safe_slack;
+                z_sl = z_sl.clamp(z_lo, z_hi);
                 sigma_s += z_sl / safe_slack;
                 rhs_correction += mu / safe_slack;
                 any_feasible = true;
@@ -1358,7 +1374,10 @@ pub fn assemble_condensed_kkt(
             let slack = g_u[i] - g[i];
             if slack >= -1e-8 {
                 let safe_slack = slack.max(mu.max(1e-10));
-                let z_su = if y[i] > 1e-20 { y[i] } else { mu / safe_slack };
+                let mut z_su = y[i].max(0.0);
+                let z_lo = mu / (kappa_sigma * safe_slack);
+                let z_hi = kappa_sigma * mu / safe_slack;
+                z_su = z_su.clamp(z_lo, z_hi);
                 sigma_s += z_su / safe_slack;
                 rhs_correction -= mu / safe_slack;
                 any_feasible = true;
@@ -1704,11 +1723,17 @@ pub fn assemble_sparse_condensed_kkt(
         let mut any_feasible = false;
         let mut rhs_infeasible = 0.0;
 
+        // T0.11: synthetic v_L / v_U use explicit positive parts of y
+        // with κ_σ = 1e10 clamp (see assemble_kkt for derivation).
+        let kappa_sigma = 1e10_f64;
         if g_l[i].is_finite() {
             let slack = g[i] - g_l[i];
             if slack >= -1e-8 {
                 let safe_slack = slack.max(mu.max(1e-10));
-                let z_sl = if y[i] < -1e-20 { -y[i] } else { mu / safe_slack };
+                let mut z_sl = (-y[i]).max(0.0);
+                let z_lo = mu / (kappa_sigma * safe_slack);
+                let z_hi = kappa_sigma * mu / safe_slack;
+                z_sl = z_sl.clamp(z_lo, z_hi);
                 sigma_s += z_sl / safe_slack;
                 rhs_correction += mu / safe_slack;
                 any_feasible = true;
@@ -1720,7 +1745,10 @@ pub fn assemble_sparse_condensed_kkt(
             let slack = g_u[i] - g[i];
             if slack >= -1e-8 {
                 let safe_slack = slack.max(mu.max(1e-10));
-                let z_su = if y[i] > 1e-20 { y[i] } else { mu / safe_slack };
+                let mut z_su = y[i].max(0.0);
+                let z_lo = mu / (kappa_sigma * safe_slack);
+                let z_hi = kappa_sigma * mu / safe_slack;
+                z_su = z_su.clamp(z_lo, z_hi);
                 sigma_s += z_su / safe_slack;
                 rhs_correction -= mu / safe_slack;
                 any_feasible = true;
@@ -2011,6 +2039,86 @@ mod tests {
         // Then subtract J^T * y: -3.0 - 2.0*1.0 = -5.0
         assert!((kkt.rhs[0] - (-5.0)).abs() < 1e-12,
             "RHS sign convention: expected -5.0, got {}", kkt.rhs[0]);
+    }
+
+    /// T0.11: synthetic v_L = max(-y, 0) is used (not the μ/s floor)
+    /// when y is degenerate. Old code with `max(-y, μ/s)` would inject
+    /// the barrier surrogate even when -y > 0; the new code uses the
+    /// explicit positive part of -y, then κ_σ-clamps.
+    ///
+    /// Setup: single inequality constraint g(x) ≥ g_l with y = -1.5
+    /// (negative ⇒ v_L is positive in ripopt's sign convention),
+    /// slack s = 0.3, μ = 0.01.  v_L = max(-y, 0) = max(1.5, 0) = 1.5.
+    /// κ_σ-clamp: bounds = [μ/(κ_σ·s), κ_σ·μ/s] = [3.3e-12, 3.3e8],
+    /// 1.5 sits inside, so v_L = 1.5. Σ_s = v_L/s = 5.0.
+    /// (2,2) block = -1/Σ_s = -0.2.
+    #[test]
+    fn test_assemble_kkt_synthetic_vL_uses_positive_part() {
+        let n = 1;
+        let m = 1;
+        let hess_rows = vec![0]; let hess_cols = vec![0]; let hess_vals = vec![1.0];
+        let jac_rows = vec![0]; let jac_cols = vec![0]; let jac_vals = vec![1.0];
+        let sigma = vec![0.0];
+        let grad_f = vec![0.0];
+        // x = 1.3, g(x) = x = 1.3, g_l = 1.0, slack = 0.3.
+        let g = vec![1.3];
+        let g_l = vec![1.0];
+        let g_u = vec![f64::INFINITY];
+        let y = vec![-1.5]; // negative y ⇒ v_L = -y = 1.5
+        let x = vec![1.3];
+        let x_l = vec![f64::NEG_INFINITY];
+        let x_u = vec![f64::INFINITY];
+        let z_l = vec![0.0]; let z_u = vec![0.0];
+        let v_l = vec![0.0; m]; let v_u = vec![0.0; m];
+        let mu = 0.01;
+
+        let kkt = assemble_kkt(
+            n, m, &hess_rows, &hess_cols, &hess_vals,
+            &jac_rows, &jac_cols, &jac_vals, &sigma, &grad_f,
+            &g, &g_l, &g_u, &y, &z_l, &z_u,
+            &x, &x_l, &x_u, mu, false, &v_l, &v_u,
+        );
+        // Σ_s = v_L / s = 1.5 / 0.3 = 5.0  ⇒ (2,2) = -1/5 = -0.2
+        let d_22 = kkt.matrix.get(1, 1);
+        assert!((d_22 - (-0.2)).abs() < 1e-9,
+            "T0.11: (2,2) block should be -1/Σ_s = -0.2 with v_L = max(-y,0) = 1.5; got {}", d_22);
+    }
+
+    /// T0.11: degenerate y (here y = 0) yields v_L = max(-y, 0) = 0,
+    /// which is then κ_σ-clamped UP to μ/(κ_σ·s) — the lower clamp
+    /// bound, not the old `μ/s` floor. Σ_s ends up tiny and the
+    /// (2,2) block accordingly large in magnitude.
+    #[test]
+    fn test_assemble_kkt_synthetic_vL_kappa_sigma_clamp() {
+        let n = 1;
+        let m = 1;
+        let hess_rows = vec![0]; let hess_cols = vec![0]; let hess_vals = vec![1.0];
+        let jac_rows = vec![0]; let jac_cols = vec![0]; let jac_vals = vec![1.0];
+        let sigma = vec![0.0];
+        let grad_f = vec![0.0];
+        let g = vec![1.3];
+        let g_l = vec![1.0];
+        let g_u = vec![f64::INFINITY];
+        let y = vec![0.0]; // degenerate
+        let x = vec![1.3];
+        let x_l = vec![f64::NEG_INFINITY];
+        let x_u = vec![f64::INFINITY];
+        let z_l = vec![0.0]; let z_u = vec![0.0];
+        let v_l = vec![0.0; m]; let v_u = vec![0.0; m];
+        let mu = 0.01;
+
+        let kkt = assemble_kkt(
+            n, m, &hess_rows, &hess_cols, &hess_vals,
+            &jac_rows, &jac_cols, &jac_vals, &sigma, &grad_f,
+            &g, &g_l, &g_u, &y, &z_l, &z_u,
+            &x, &x_l, &x_u, mu, false, &v_l, &v_u,
+        );
+        // v_L = max(0, 0) = 0 ⇒ clamped UP to μ/(κ_σ·s) = 0.01/(1e10·0.3) ≈ 3.33e-12.
+        // Σ_s ≈ 1.11e-11 ⇒ (2,2) ≈ -9e10.
+        // Old code would have used μ/s = 0.0333 ⇒ Σ_s ≈ 0.111 ⇒ (2,2) ≈ -9.0.
+        let d_22 = kkt.matrix.get(1, 1);
+        assert!(d_22 < -1e9,
+            "T0.11: degenerate y with κ_σ clamp should produce huge |(2,2)| (got {}); old μ/s floor would give ≈ -9.0", d_22);
     }
 
     #[test]
