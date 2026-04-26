@@ -4231,12 +4231,16 @@ fn try_nlp_restoration_phase<P: NlpProblem>(
     );
     match outcome {
         RestorationOutcome::Success => {
+            // T0.9: apply_restoration_success now filter-gates the
+            // restored iterate. If the filter rejects (theta_new,
+            // phi_new), commit nothing and fall through to recovery
+            // — matches Ipopt RestoFilterConvCheck::TestOrigProgress
+            // returning CONTINUE instead of CONVERGED.
             apply_restoration_success(
                 state, filter, mu_state, options, n, m,
                 problem, &x_nlp, resto_z.as_ref(),
                 linear_constraints, lbfgs_mode, lbfgs_state,
-            );
-            true
+            )
         }
         RestorationOutcome::LocalInfeasibility | RestorationOutcome::Failed => {
             // Fall through to continue recovery. Don't immediately return
@@ -4289,12 +4293,13 @@ fn try_gn_restoration<P: NlpProblem>(
         // Gauss-Newton restoration is primal-only; no z is returned.
         // Pass None so apply_restoration_success falls back to the
         // μ/slack reset (T0.8 only applies when the resto NLP path
-        // produced fresh bound multipliers).
+        // produced fresh bound multipliers). T0.9: the function now
+        // returns false if the filter rejects the restored point;
+        // propagate that to fall through to recovery.
         apply_restoration_success(
             state, filter, mu_state, options, n, m, problem, &x_rest, None,
             linear_constraints, lbfgs_mode, lbfgs_state,
-        );
-        true
+        )
     } else {
         false
     }
@@ -8571,7 +8576,17 @@ fn reset_constraint_slack_multipliers_after_restoration(
     }
 }
 
-/// Apply post-restoration success handling: update state, reset multipliers, filter, and mu.
+/// Apply post-restoration success handling: update state, reset multipliers, and mu.
+///
+/// T0.9: the existing filter is NOT cleared (Ipopt
+/// IpRestoFilterConvCheck::TestOrigProgress requires the trial point
+/// to be acceptable to the *current* filter — including the entry
+/// added at restoration entry by `Filter::augment_for_restoration`).
+/// If the resto-returned (θ, φ) is not filter-acceptable, this
+/// function returns `false` and does not commit any state changes;
+/// the caller must treat that as a restoration failure. On
+/// acceptance, the filter is left untouched and `true` is returned.
+#[must_use]
 fn apply_restoration_success<P: NlpProblem>(
     state: &mut SolverState,
     filter: &mut Filter,
@@ -8585,7 +8600,29 @@ fn apply_restoration_success<P: NlpProblem>(
     linear_constraints: Option<&[bool]>,
     lbfgs_mode: bool,
     lbfgs_state: &mut Option<LbfgsIpmState>,
-) {
+) -> bool {
+    // T0.9 filter gate: evaluate (θ, φ) for the trial restored point
+    // and verify it is acceptable to the existing filter BEFORE
+    // mutating any state. The "feasibility recovery" exemption
+    // (θ < constr_viol_tol) is preserved because Ipopt itself
+    // bypasses the filter test on feasibility (the feasibility-
+    // restoration check resets the filter implicitly when the
+    // recovered point is feasible).
+    {
+        let mut g_check = vec![0.0; m];
+        let mut phi_check = f64::INFINITY;
+        let g_ok = m == 0 || problem.constraints(x_new, true, &mut g_check);
+        let phi_ok = problem.objective(x_new, true, &mut phi_check) && phi_check.is_finite();
+        if !g_ok || !phi_ok {
+            return false;
+        }
+        let theta_check = if m == 0 { 0.0 } else { theta_for_g(state, &g_check) };
+        let feasible = theta_check < options.constr_viol_tol;
+        if !feasible && !filter.is_acceptable(theta_check, phi_check) {
+            return false;
+        }
+    }
+
     state.x.copy_from_slice(x_new);
     state.alpha_primal = 0.0;
 
@@ -8605,8 +8642,10 @@ fn apply_restoration_success<P: NlpProblem>(
 
     reset_constraint_slack_multipliers_after_restoration(state, m, nuclear_reset);
 
-    // Reset filter and re-initialize from restored point
-    reset_filter_with_current_theta(state, filter);
+    // T0.9: do NOT clear the filter — Ipopt keeps the existing entries
+    // (including the augmentation added at resto entry) so future
+    // iterations cannot revisit the pre-resto basin. Only the
+    // consecutive_acceptable counter is reset.
     state.consecutive_acceptable = 0;
 
     // Recompute mu from current complementarity after restoration
@@ -8623,6 +8662,7 @@ fn apply_restoration_success<P: NlpProblem>(
     mu_state.first_iter_in_mode = true;
     mu_state.ref_vals.clear();
     mu_state.consecutive_restoration_failures = 0;
+    true
 }
 
 /// Outcome of the NLP restoration attempt.
@@ -10681,5 +10721,144 @@ mod tests {
         let z_hi = 1e10 * 1e-6 / 0.1;
         assert!((state.z_l[0] - z_hi).abs() / z_hi < 1e-12,
             "z_l should be clamped to κ_σ·μ/s = {}, got {}", z_hi, state.z_l[0]);
+    }
+
+    /// Trivial 1-D NLP for filter-gating tests. Objective and
+    /// constraints are user-pluggable closures (boxed-fn'd into
+    /// the trait via the wrapper).
+    struct MockNlp {
+        n: usize,
+        m: usize,
+        obj_at: Box<dyn Fn(&[f64]) -> f64>,
+        cons_at: Box<dyn Fn(&[f64], &mut [f64])>,
+    }
+
+    impl NlpProblem for MockNlp {
+        fn num_variables(&self) -> usize { self.n }
+        fn num_constraints(&self) -> usize { self.m }
+        fn bounds(&self, x_l: &mut [f64], x_u: &mut [f64]) {
+            for v in x_l.iter_mut() { *v = f64::NEG_INFINITY; }
+            for v in x_u.iter_mut() { *v = f64::INFINITY; }
+        }
+        fn constraint_bounds(&self, g_l: &mut [f64], g_u: &mut [f64]) {
+            for v in g_l.iter_mut() { *v = 0.0; }
+            for v in g_u.iter_mut() { *v = 0.0; }
+        }
+        fn initial_point(&self, x0: &mut [f64]) { for v in x0.iter_mut() { *v = 0.0; } }
+        fn objective(&self, x: &[f64], _: bool, obj: &mut f64) -> bool { *obj = (self.obj_at)(x); true }
+        fn gradient(&self, _: &[f64], _: bool, grad: &mut [f64]) -> bool { for v in grad.iter_mut() { *v = 0.0; } true }
+        fn constraints(&self, x: &[f64], _: bool, g: &mut [f64]) -> bool { (self.cons_at)(x, g); true }
+        fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![0; self.m], (0..self.m).collect()) }
+        fn jacobian_values(&self, _: &[f64], _: bool, vals: &mut [f64]) -> bool { for v in vals.iter_mut() { *v = 1.0; } true }
+        fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
+        fn hessian_values(&self, _: &[f64], _: bool, _: f64, _: &[f64], _: &mut [f64]) -> bool { true }
+    }
+
+    /// T0.9: when the resto-returned iterate is rejected by the
+    /// existing filter (and is not feasibility-recovery), the
+    /// success handler must commit nothing and return false. The
+    /// pre-existing filter entries must remain intact (Ipopt
+    /// IpRestoFilterConvCheck::TestOrigProgress). This is the
+    /// behavior that the old code obscured by clearing the filter
+    /// before checking.
+    #[test]
+    fn test_apply_restoration_success_filter_rejects_dominated_iterate() {
+        let mut state = minimal_state(1, 1);
+        // Old x; constraint g(x) = x; equality g = 0.
+        state.x = vec![0.5];
+        state.g = vec![0.5];
+        state.g_l = vec![0.0];
+        state.g_u = vec![0.0];
+        state.x_l = vec![f64::NEG_INFINITY];
+        state.x_u = vec![f64::INFINITY];
+        state.mu = 0.1;
+
+        // Mock NLP: objective = x[0], constraints = x[0] = 0.
+        // Trial restored point x = 2.0 → theta = 2.0, phi = 2.0.
+        let problem = MockNlp {
+            n: 1, m: 1,
+            obj_at: Box::new(|x| x[0]),
+            cons_at: Box::new(|x, g| { g[0] = x[0]; }),
+        };
+
+        let mut filter = Filter::new(1e4);
+        // Seed the filter with an entry that DOMINATES (theta=2, phi=2):
+        //   theta_e=1, phi_e=1. With gamma_theta=1e-5, gamma_phi=1e-8,
+        //   acceptance demands theta < (1-γθ)·1 ≈ 1 OR phi < 1 - γφ·1.
+        //   Trial (2, 2) fails both → not acceptable.
+        filter.add(1.0, 1.0);
+        let entries_before = filter.entries().to_vec();
+        let theta_min_before = filter.theta_max(); // proxy for filter state
+
+        let mut mu_state = MuState::new();
+        let opts = SolverOptions::default();
+        let mut lbfgs_state: Option<LbfgsIpmState> = None;
+
+        let x_new = vec![2.0]; // theta=2, phi=2 → filter-rejected
+        let committed = apply_restoration_success(
+            &mut state, &mut filter, &mut mu_state, &opts, 1, 1,
+            &problem, &x_new, None,
+            None, false, &mut lbfgs_state,
+        );
+
+        assert!(!committed,
+            "filter-dominated iterate must NOT commit (T0.9)");
+        // x must NOT be updated.
+        assert!((state.x[0] - 0.5).abs() < 1e-15,
+            "state.x must be unchanged on rejection, got {}", state.x[0]);
+        // Filter entries must be intact (no reset occurred).
+        assert_eq!(filter.entries().len(), entries_before.len(),
+            "filter must NOT be cleared on rejected resto (T0.9)");
+        assert!((filter.entries()[0].theta - 1.0).abs() < 1e-15,
+            "pre-existing filter entry theta must persist");
+        assert!((filter.entries()[0].phi - 1.0).abs() < 1e-15,
+            "pre-existing filter entry phi must persist");
+        // theta_max unchanged
+        assert!((filter.theta_max() - theta_min_before).abs() < 1e-15);
+    }
+
+    /// T0.9: when the restored iterate IS acceptable to the filter,
+    /// the success handler commits and leaves filter entries
+    /// untouched (no reset).
+    #[test]
+    fn test_apply_restoration_success_filter_accepts_and_preserves_entries() {
+        let mut state = minimal_state(1, 1);
+        state.x = vec![0.5];
+        state.g = vec![0.5];
+        state.g_l = vec![0.0];
+        state.g_u = vec![0.0];
+        state.x_l = vec![f64::NEG_INFINITY];
+        state.x_u = vec![f64::INFINITY];
+        state.mu = 0.1;
+
+        // Trial point: x = 1e-3 → theta = 1e-3, phi = 1e-3. Better
+        // than entry (1.0, 1.0) on both axes → acceptable.
+        let problem = MockNlp {
+            n: 1, m: 1,
+            obj_at: Box::new(|x| x[0]),
+            cons_at: Box::new(|x, g| { g[0] = x[0]; }),
+        };
+
+        let mut filter = Filter::new(1e4);
+        filter.add(1.0, 1.0);
+        let entries_before_len = filter.entries().len();
+
+        let mut mu_state = MuState::new();
+        let opts = SolverOptions::default();
+        let mut lbfgs_state: Option<LbfgsIpmState> = None;
+
+        let x_new = vec![1.0e-3];
+        let committed = apply_restoration_success(
+            &mut state, &mut filter, &mut mu_state, &opts, 1, 1,
+            &problem, &x_new, None,
+            None, false, &mut lbfgs_state,
+        );
+
+        assert!(committed, "acceptable iterate must commit");
+        assert!((state.x[0] - 1.0e-3).abs() < 1e-15, "state.x must be updated");
+        // T0.9: filter must NOT be cleared on success either.
+        assert_eq!(filter.entries().len(), entries_before_len,
+            "filter must retain entries on resto success (T0.9)");
+        assert!((filter.entries()[0].theta - 1.0).abs() < 1e-15);
     }
 }
