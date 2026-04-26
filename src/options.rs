@@ -37,6 +37,23 @@ pub struct SolverOptions {
     pub mu_superlinear_decrease_power: f64,
     /// Print level (0 = silent, 5 = verbose).
     pub print_level: u8,
+    /// Outward relaxation factor applied to every finite variable
+    /// bound `x_l`/`x_u` and constraint bound `g_l`/`g_u` at problem
+    /// setup, before `bound_push` and `relax_fixed_variable_bounds`.
+    /// Mirrors Ipopt 3.14's `bound_relax_factor` (default `1e-8`).
+    /// For each finite bound `b`, the relaxation magnitude is
+    /// `min(constr_viol_tol, bound_relax_factor * max(|b|, 1.0))`.
+    /// Set to `0.0` to disable.
+    pub bound_relax_factor: f64,
+    /// Linear damping coefficient for variables with exactly one finite
+    /// bound (XOR). Mirrors Ipopt 3.14's `kappa_d` (default `1e-5`).
+    /// Adds `+ kappa_d * mu * slack` to the barrier objective and
+    /// `± kappa_d * mu` to the corresponding row of the dual residual
+    /// (Newton RHS), keeping one-sided-bounded variables from drifting
+    /// to infinity along the barrier's unbounded direction. Convergence
+    /// (`||r_d||_inf`) is computed from the UN-damped gradient.
+    /// Set to `0.0` to disable.
+    pub kappa_d: f64,
     /// Bound push for initial point (kappa_1 in Ipopt).
     pub bound_push: f64,
     /// Bound fraction for initial point (kappa_2 in Ipopt).
@@ -229,14 +246,6 @@ pub struct SolverOptions {
     pub kkt_dump_dir: Option<std::path::PathBuf>,
     /// Problem name used in dump filenames. Defaults to `"problem"`.
     pub kkt_dump_name: String,
-    /// `kappa_d` damping coefficient for one-sided-bound variables (Ipopt 3.14
-    /// default `1e-5`). For each variable that has exactly one finite bound,
-    /// the barrier objective gains `+ kappa_d * mu * slack_oneside[i]`, with
-    /// the corresponding `± kappa_d * mu` term added to the barrier gradient.
-    /// Without this damping the log-barrier is unbounded below as the variable
-    /// drifts toward the open side. Set to `0.0` to disable.
-    /// Default: `1e-5`.
-    pub kappa_d: f64,
     /// Threshold below which a primal slack `x[i] - x_l[i]` (or its
     /// upper-bound mirror) is considered too small. After every
     /// accepted iterate, undersized slacks are widened by nudging the
@@ -258,6 +267,8 @@ impl Default for SolverOptions {
             mu_linear_decrease_factor: 0.2,
             mu_superlinear_decrease_power: 1.5,
             print_level: 5,
+            bound_relax_factor: 1e-8,
+            kappa_d: 1e-5,
             bound_push: 1e-2,
             bound_frac: 1e-2,
             slack_bound_push: 1e-2,
@@ -311,7 +322,6 @@ impl Default for SolverOptions {
             warm_start_z_u: None,
             kkt_dump_dir: None,
             kkt_dump_name: "problem".to_string(),
-            kappa_d: 1e-5,
             slack_move: {
                 // f64::EPSILON.powf(0.75) ≈ 1.83e-12
                 const EPS: f64 = f64::EPSILON;

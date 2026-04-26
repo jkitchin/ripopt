@@ -807,6 +807,20 @@ impl SolverState {
         sentinel_bounds_to_infinity(&mut x_l, &mut x_u, options);
         sentinel_bounds_to_infinity(&mut g_l, &mut g_u, options);
 
+        // Ipopt's bound_relax_factor: widen every finite variable AND
+        // constraint bound outward by min(constr_viol_tol, factor·max(|b|,1)).
+        // Mirrors IpOrigIpoptNLP.cpp:355-358. Must run AFTER infinity
+        // sentinels (so we don't relax 1e30) and BEFORE bound_push /
+        // fixed-variable handling.
+        apply_bound_relax_factor(
+            &mut x_l, &mut x_u,
+            options.bound_relax_factor, options.constr_viol_tol,
+        );
+        apply_bound_relax_factor(
+            &mut g_l, &mut g_u,
+            options.bound_relax_factor, options.constr_viol_tol,
+        );
+
         let mut x = vec![0.0; n];
         problem.initial_point(&mut x);
 
@@ -2898,6 +2912,7 @@ fn assemble_kkt_systems(
     m: usize,
     use_sparse: bool,
     disable_sparse_condensed: bool,
+    kappa_d: f64,
 ) -> AssembledKkt {
     let sigma = compute_sigma_from_state(state);
 
@@ -2911,7 +2926,7 @@ fn assemble_kkt_systems(
             &state.jac_rows, &state.jac_cols, &state.jac_vals,
             &sigma, &state.grad_f, &state.g, &state.g_l, &state.g_u,
             &state.y, &state.z_l, &state.z_u,
-            &state.x, &state.x_l, &state.x_u, state.mu,
+            &state.x, &state.x_l, &state.x_u, state.mu, kappa_d,
             &state.v_l, &state.v_u,
         ))
     } else {
@@ -2925,7 +2940,7 @@ fn assemble_kkt_systems(
             &state.jac_rows, &state.jac_cols, &state.jac_vals,
             &sigma, &state.grad_f, &state.g, &state.g_l, &state.g_u,
             &state.y, &state.z_l, &state.z_u,
-            &state.x, &state.x_l, &state.x_u, state.mu,
+            &state.x, &state.x_l, &state.x_u, state.mu, kappa_d,
             &state.v_l, &state.v_u,
         ))
     } else {
@@ -2933,7 +2948,7 @@ fn assemble_kkt_systems(
     };
 
     let kkt_system_opt = if !use_condensed && !use_sparse_condensed {
-        Some(assemble_kkt_from_state(state, n, m, &sigma, use_sparse))
+        Some(assemble_kkt_from_state(state, n, m, &sigma, use_sparse, kappa_d))
     } else {
         None
     };
@@ -2970,10 +2985,33 @@ fn assemble_kkt_systems(
 /// mu mode, μ_KS uses `max(avg_compl, μ)` (capped at 1e3) so the
 /// clamp tracks actual centrality rather than the lagging μ. Returns
 /// the μ_KS used (printed in the diagnostics row).
+/// Advance bound multipliers to the trial step `z + alpha_d·dz`, with a
+/// floor of `1e-20` to keep them strictly positive. Mirrors Ipopt's
+/// trial-iterate construction (the line-search applies the same step
+/// internally before AcceptTrialPoint commits). Split out from
+/// `apply_kappa_sigma_bound_multiplier_reset` so that
+/// `apply_slack_move` (which fires between this and the kappa_sigma
+/// clamp, per Ipopt order) sees the trial z, not the previous-iter z.
+fn advance_z_to_trial(state: &mut SolverState, alpha_d: f64) {
+    let n = state.n;
+    for i in 0..n {
+        if state.x_l[i].is_finite() {
+            state.z_l[i] = (state.z_l[i] + alpha_d * state.dz_l[i]).max(1e-20);
+        }
+        if state.x_u[i].is_finite() {
+            state.z_u[i] = (state.z_u[i] + alpha_d * state.dz_u[i]).max(1e-20);
+        }
+    }
+}
+
+/// Apply the kappa_sigma reset to bound multipliers (Ipopt's
+/// `correct_bound_multiplier` at `IpIpoptAlg.cpp:716-767`):
+/// clamp each `z` into `[mu_ks/(kappa_sigma·s), kappa_sigma·mu_ks/s]`.
+/// Assumes z has already been advanced to the trial step (see
+/// `advance_z_to_trial`) and any pending slack_move has run.
 fn apply_kappa_sigma_bound_multiplier_reset(
     state: &mut SolverState,
     mu_state: &MuState,
-    alpha_d: f64,
 ) -> f64 {
     let n = state.n;
     let kappa_sigma = 1e10;
@@ -2986,18 +3024,16 @@ fn apply_kappa_sigma_bound_multiplier_reset(
     };
     for i in 0..n {
         if state.x_l[i].is_finite() {
-            let z_new = (state.z_l[i] + alpha_d * state.dz_l[i]).max(1e-20);
             let s_l = slack_xl(state, i);
             let z_lo = mu_ks / (kappa_sigma * s_l);
             let z_hi = kappa_sigma * mu_ks / s_l;
-            state.z_l[i] = z_new.clamp(z_lo, z_hi);
+            state.z_l[i] = state.z_l[i].clamp(z_lo, z_hi);
         }
         if state.x_u[i].is_finite() {
-            let z_new = (state.z_u[i] + alpha_d * state.dz_u[i]).max(1e-20);
             let s_u = slack_xu(state, i);
             let z_lo = mu_ks / (kappa_sigma * s_u);
             let z_hi = kappa_sigma * mu_ks / s_u;
-            state.z_u[i] = z_new.clamp(z_lo, z_hi);
+            state.z_u[i] = state.z_u[i].clamp(z_lo, z_hi);
         }
     }
     mu_ks
@@ -3005,15 +3041,22 @@ fn apply_kappa_sigma_bound_multiplier_reset(
 
 /// Apply Ipopt 3.14's `slack_move` runtime slack adjustment.
 ///
-/// After every accepted iterate (and after the bound multipliers
-/// `z_l` / `z_u` have been updated), if a primal slack
-/// `s_l = x[i] - x_l[i]` (or upper-bound mirror `s_u = x_u[i] - x[i]`)
-/// has fallen below `options.slack_move = ε^0.75 ≈ 1.83e-12`, the
-/// corresponding *bound* (not the variable) is nudged outward to widen
-/// the slack to
-///   `new_s = min(max(mu / z, slack_move),
-///                slack_move * max(1.0, |bound|))`.
-/// When `z <= 0`, the formula falls back to `new_s = slack_move`.
+/// Mirrors `IpoptCalculatedQuantities::CalculateSafeSlack`
+/// (`ref/Ipopt/src/Algorithm/IpIpoptCalculatedQuantities.cpp:455-537`).
+///
+/// Trigger: a primal slack `s_l = x[i] - x_l[i]` (or upper mirror
+/// `s_u = x_u[i] - x[i]`) is "unsafe" when it falls below
+///   `s_min = max(eps * min(1, mu), f64::MIN_POSITIVE)`.
+/// At unsafe slacks, the corresponding *bound* (not the variable) is
+/// nudged outward so the new slack equals
+///   `new_s = min(max(mu / z, s_min),
+///                slack_move * max(1.0, |bound|) + s_old)`.
+/// When `z <= 0`, the `mu / z` term is treated as `+infinity`, so the
+/// upper cap binds.
+///
+/// Per Ipopt: this fires BEFORE the kappa_sigma bound-multiplier reset,
+/// so `apply_kappa_sigma_bound_multiplier_reset` sees the corrected
+/// slacks when it clamps `z_l` / `z_u` against `mu / s`.
 ///
 /// Returns the number of components adjusted on this call. The
 /// cumulative count is also accumulated into
@@ -3024,35 +3067,30 @@ fn apply_slack_move(state: &mut SolverState, options: &SolverOptions) -> usize {
     if !(slack_move > 0.0) {
         return 0;
     }
-    let mut adjusted = 0usize;
     let mu = state.mu;
+    // Ipopt: s_min = eps * min(1, mu); fallback to MIN_POSITIVE if mu is
+    // so small that s_min underflows. See IpIpoptCalculatedQuantities.cpp:469-477.
+    let s_min = (f64::EPSILON * mu.min(1.0)).max(f64::MIN_POSITIVE);
+    let mut adjusted = 0usize;
     for i in 0..n {
         if state.x_l[i].is_finite() {
             let s_l = state.x[i] - state.x_l[i];
-            if s_l < slack_move {
+            if s_l < s_min {
                 let z = state.z_l[i];
-                let new_s_base = if z > 0.0 {
-                    (mu / z).max(slack_move)
-                } else {
-                    slack_move
-                };
-                let cap = slack_move * state.x_l[i].abs().max(1.0);
-                let new_s = new_s_base.min(cap);
+                let from_mu = if z > 0.0 { mu / z } else { f64::INFINITY };
+                let cap = slack_move * state.x_l[i].abs().max(1.0) + s_l;
+                let new_s = from_mu.max(s_min).min(cap);
                 state.x_l[i] -= new_s - s_l;
                 adjusted += 1;
             }
         }
         if state.x_u[i].is_finite() {
             let s_u = state.x_u[i] - state.x[i];
-            if s_u < slack_move {
+            if s_u < s_min {
                 let z = state.z_u[i];
-                let new_s_base = if z > 0.0 {
-                    (mu / z).max(slack_move)
-                } else {
-                    slack_move
-                };
-                let cap = slack_move * state.x_u[i].abs().max(1.0);
-                let new_s = new_s_base.min(cap);
+                let from_mu = if z > 0.0 { mu / z } else { f64::INFINITY };
+                let cap = slack_move * state.x_u[i].abs().max(1.0) + s_u;
+                let new_s = from_mu.max(s_min).min(cap);
                 state.x_u[i] += new_s - s_u;
                 adjusted += 1;
             }
@@ -3127,7 +3165,11 @@ fn update_dual_variables(
 
     apply_damped_y_update(state, alpha_y, tracker);
 
-    let mu_ks = apply_kappa_sigma_bound_multiplier_reset(state, mu_state, alpha_d);
+    // Ipopt post-step order (IpIpoptAlg.cpp:652-770):
+    //   1. Advance z to trial step.
+    //   2. slack_move on trial (slack, z) pair (mutates x_l/x_u).
+    //   3. kappa_sigma clamps z using the post-slack-move slacks.
+    advance_z_to_trial(state, alpha_d);
 
     let n_adjusted = apply_slack_move(state, options);
     if n_adjusted > 0 && options.print_level >= 6 {
@@ -3136,6 +3178,8 @@ fn update_dual_variables(
             state.iter, n_adjusted, state.adjusted_slacks_count
         );
     }
+
+    let mu_ks = apply_kappa_sigma_bound_multiplier_reset(state, mu_state);
 
     state.alpha_dual = alpha_d;
     mu_ks
@@ -3826,7 +3870,7 @@ fn try_mehrotra_predictor(
     last_mehrotra_sigma: &mut Option<f64>,
 ) -> Option<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, f64)> {
     let rhs_aff = kkt::affine_predictor_rhs(
-        &kkt.rhs, &state.x, &state.x_l, &state.x_u, state.mu,
+        &kkt.rhs, &state.x, &state.x_l, &state.x_u, state.mu, options.kappa_d,
     );
     let (dx_aff, _) = kkt::solve_with_custom_rhs_refined(
         &kkt.matrix, kkt.n, kkt.dim, lin_solver, &rhs_aff,
@@ -3845,7 +3889,7 @@ fn try_mehrotra_predictor(
     );
     let new_rhs = kkt::rebuild_rhs_with_mu(
         &kkt.rhs, &state.x, &state.x_l, &state.x_u,
-        state.mu, mu_pc,
+        state.mu, mu_pc, options.kappa_d,
     );
     Some((new_rhs, dx_aff, dz_l_aff, dz_u_aff, mu_pc))
 }
@@ -3867,6 +3911,7 @@ fn solve_sparse_condensed_direction(
     use_sparse: bool,
     lin_solver: &mut dyn LinearSolver,
     inertia_params: &mut InertiaCorrectionParams,
+    kappa_d: f64,
 ) -> (Vec<f64>, Vec<f64>) {
     let kkt_sc = KktMatrix::Sparse(sc.matrix.clone());
     let factor_ok = lin_solver.factor(&kkt_sc).is_ok();
@@ -3876,7 +3921,7 @@ fn solve_sparse_condensed_direction(
             Err(_) => {}
         }
     }
-    let mut kkt = assemble_kkt_from_state(state, n, m, sigma, use_sparse);
+    let mut kkt = assemble_kkt_from_state(state, n, m, sigma, use_sparse, kappa_d);
     let mut fallback_solver = new_fallback_solver(use_sparse);
     if let Ok((fb_dw, fb_dc)) = kkt::factor_with_inertia_correction(
         &mut kkt, fallback_solver.as_mut(), inertia_params, state.mu,
@@ -3994,7 +4039,7 @@ fn fall_back_to_full_kkt_after_condensed_failure<P: NlpProblem>(
     linear_constraints: Option<&[bool]>,
     deadline: Option<Instant>,
 ) -> CondensedDirectionOutcome {
-    let mut kkt = assemble_kkt_from_state(state, n, m, sigma, use_sparse);
+    let mut kkt = assemble_kkt_from_state(state, n, m, sigma, use_sparse, options.kappa_d);
     let fb_ic = kkt::factor_with_inertia_correction(
         &mut kkt, lin_solver, inertia_params, state.mu,
     );
@@ -4181,7 +4226,7 @@ fn solve_for_search_direction<P: NlpProblem>(
         }
     } else if let Some(sc) = sparse_condensed_system.as_ref() {
         solve_sparse_condensed_direction(
-            state, sc, sigma, n, m, use_sparse, lin_solver, inertia_params,
+            state, sc, sigma, n, m, use_sparse, lin_solver, inertia_params, options.kappa_d,
         )
     } else {
         match solve_full_augmented_direction(
@@ -4250,7 +4295,7 @@ fn adjust_sparse_condensed_bandwidth<P: NlpProblem>(
         }
         *disable_sparse_condensed = true;
         *sparse_condensed_system = None;
-        *kkt_system_opt = Some(assemble_kkt_from_state(state, n, m, sigma, use_sparse));
+        *kkt_system_opt = Some(assemble_kkt_from_state(state, n, m, sigma, use_sparse, options.kappa_d));
     } else if bw * bw <= n {
         if options.print_level >= 5 {
             rip_log!("ripopt: Sparse condensed S has bandwidth {} for n={}, using banded solver", bw, n);
@@ -5055,6 +5100,7 @@ fn try_early_perturbation_recovery<P: NlpProblem>(
     filter: &mut Filter,
     linear_constraints: Option<&[bool]>,
     lbfgs_mode: bool,
+    kappa_d: f64,
 ) -> bool {
     if iteration >= 5 {
         return false;
@@ -5075,7 +5121,7 @@ fn try_early_perturbation_recovery<P: NlpProblem>(
         let pert_eval_ok = evaluate_and_refresh_lbfgs(state, problem, lbfgs_state, linear_constraints, lbfgs_mode);
         if pert_eval_ok && obj_and_grad_finite(state) {
             let sigma_p = compute_sigma_from_state(state);
-            let mut kkt_p = assemble_kkt_from_state(state, n, m, &sigma_p, use_sparse);
+            let mut kkt_p = assemble_kkt_from_state(state, n, m, &sigma_p, use_sparse, kappa_d);
             if kkt::factor_with_inertia_correction(
                 &mut kkt_p, lin_solver, inertia_params, state.mu,
             ).is_ok() {
@@ -5164,7 +5210,7 @@ fn recover_from_factor_failure<P: NlpProblem>(
     if try_early_perturbation_recovery(
         state, problem, iteration, n, m, use_sparse,
         lin_solver, inertia_params, lbfgs_state, filter,
-        linear_constraints, lbfgs_mode,
+        linear_constraints, lbfgs_mode, options.kappa_d,
     ) {
         return FactorDecision::Continue;
     }
@@ -7821,7 +7867,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             condensed_system,
             mut sparse_condensed_system,
             mut kkt_system_opt,
-        } = assemble_kkt_systems(&state, n, m, use_sparse, disable_sparse_condensed);
+        } = assemble_kkt_systems(&state, n, m, use_sparse, disable_sparse_condensed, options.kappa_d);
         timings.kkt_assembly += t_kkt.elapsed();
 
         // On first iteration with sparse condensed, detect bandwidth and pick
@@ -9021,6 +9067,45 @@ fn init_bound_multipliers(
     (z_l, z_u)
 }
 
+/// Apply Ipopt 3.14's `bound_relax_factor` mechanism: relax every
+/// finite bound outward by `min(constr_viol_tol, factor·max(|bound|, 1))`
+/// — the cap is `constr_viol_tol`, not a machine-eps floor (matching
+/// `IpOrigIpoptNLP.cpp:459-481`). Applied to both variable bounds
+/// `x_l`/`x_u` and constraint bounds `g_l`/`g_u` (Ipopt relaxes
+/// `d_L`/`d_U` the same way at `IpOrigIpoptNLP.cpp:355-358`).
+///
+/// Equality pairs (`lower[i] == upper[i]`) are left UNTOUCHED. Ipopt
+/// represents equality constraints separately from inequality bounds and
+/// never relaxes them; in ripopt they live in the same `g_l`/`g_u`
+/// arrays, so we must guard explicitly. Same rule applies to fixed
+/// variables (which `relax_fixed_variable_bounds` handles afterward).
+///
+/// `factor <= 0.0` is a no-op (option-disable path).
+fn apply_bound_relax_factor(
+    lower: &mut [f64],
+    upper: &mut [f64],
+    factor: f64,
+    constr_viol_tol: f64,
+) {
+    if !(factor > 0.0) {
+        return;
+    }
+    debug_assert_eq!(lower.len(), upper.len());
+    for i in 0..lower.len() {
+        if lower[i].is_finite() && upper[i].is_finite() && lower[i] == upper[i] {
+            continue;
+        }
+        if lower[i].is_finite() {
+            let delta = (factor * lower[i].abs().max(1.0)).min(constr_viol_tol);
+            lower[i] -= delta;
+        }
+        if upper[i].is_finite() {
+            let delta = (factor * upper[i].abs().max(1.0)).min(constr_viol_tol);
+            upper[i] += delta;
+        }
+    }
+}
+
 /// Relax fixed variables (x_l == x_u) by widening bounds to a tiny
 /// interval centered on the fixed value. Interior-point methods require
 /// strictly interior starting points; without this fixed variables would
@@ -9928,6 +10013,7 @@ fn assemble_kkt_from_state(
     m: usize,
     sigma: &[f64],
     use_sparse: bool,
+    kappa_d: f64,
 ) -> kkt::KktSystem {
     kkt::assemble_kkt(
         n, m,
@@ -9935,7 +10021,7 @@ fn assemble_kkt_from_state(
         &state.jac_rows, &state.jac_cols, &state.jac_vals,
         sigma, &state.grad_f, &state.g, &state.g_l, &state.g_u,
         &state.y, &state.z_l, &state.z_u,
-        &state.x, &state.x_l, &state.x_u, state.mu,
+        &state.x, &state.x_l, &state.x_u, state.mu, kappa_d,
         use_sparse, &state.v_l, &state.v_u,
     )
 }

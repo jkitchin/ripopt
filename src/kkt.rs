@@ -70,6 +70,7 @@ pub fn assemble_kkt(
     x_l: &[f64],
     x_u: &[f64],
     mu: f64,
+    kappa_d: f64,
     use_sparse: bool,
     _v_l: &[f64],
     _v_u: &[f64],
@@ -126,11 +127,23 @@ pub fn assemble_kkt(
     // in z_L at the active bound and prevented stationarity convergence.
     for i in 0..n {
         let mut rd = -grad_f[i];
-        if x_l[i].is_finite() {
+        let l_fin = x_l[i].is_finite();
+        let u_fin = x_u[i].is_finite();
+        if l_fin {
             rd += mu / (x[i] - x_l[i]);
         }
-        if x_u[i].is_finite() {
+        if u_fin {
             rd -= mu / (x_u[i] - x[i]);
+        }
+        // kappa_d damping: penalize drift toward open side of one-sided bounds.
+        // Adds ±kappa_d*mu to grad_phi; r_d = -grad_lag, so subtract for lower-only,
+        // add for upper-only. Mirrors Ipopt IpoptCalculatedQuantities.cpp:1044-1092.
+        if kappa_d > 0.0 && (l_fin ^ u_fin) {
+            if l_fin {
+                rd -= kappa_d * mu;
+            } else {
+                rd += kappa_d * mu;
+            }
         }
         rhs[i] = rd;
     }
@@ -928,18 +941,29 @@ pub fn affine_predictor_rhs(
     x_l: &[f64],
     x_u: &[f64],
     mu: f64,
+    kappa_d: f64,
 ) -> Vec<f64> {
     let n = x.len();
     let mut rhs_aff = rhs.to_vec();
-    // Remove the μ/s centering terms from the primal block
+    // Remove the μ/s centering terms from the primal block. Also remove the
+    // kappa_d damping term, which is proportional to μ.
     for i in 0..n {
-        if x_l[i].is_finite() {
+        let l_fin = x_l[i].is_finite();
+        let u_fin = x_u[i].is_finite();
+        if l_fin {
             let s_l = (x[i] - x_l[i]).max(1e-20);
             rhs_aff[i] -= mu / s_l;
         }
-        if x_u[i].is_finite() {
+        if u_fin {
             let s_u = (x_u[i] - x[i]).max(1e-20);
             rhs_aff[i] += mu / s_u;
+        }
+        if kappa_d > 0.0 && (l_fin ^ u_fin) {
+            if l_fin {
+                rhs_aff[i] += kappa_d * mu;
+            } else {
+                rhs_aff[i] -= kappa_d * mu;
+            }
         }
     }
     rhs_aff
@@ -957,18 +981,28 @@ pub fn rebuild_rhs_with_mu(
     x_u: &[f64],
     mu_old: f64,
     mu_new: f64,
+    kappa_d: f64,
 ) -> Vec<f64> {
     let n = x.len();
     let mut rhs_new = rhs.to_vec();
     let delta_mu = mu_new - mu_old;
     for i in 0..n {
-        if x_l[i].is_finite() {
+        let l_fin = x_l[i].is_finite();
+        let u_fin = x_u[i].is_finite();
+        if l_fin {
             let s_l = (x[i] - x_l[i]).max(1e-20);
             rhs_new[i] += delta_mu / s_l;
         }
-        if x_u[i].is_finite() {
+        if u_fin {
             let s_u = (x_u[i] - x[i]).max(1e-20);
             rhs_new[i] -= delta_mu / s_u;
+        }
+        if kappa_d > 0.0 && (l_fin ^ u_fin) {
+            if l_fin {
+                rhs_new[i] -= kappa_d * delta_mu;
+            } else {
+                rhs_new[i] += kappa_d * delta_mu;
+            }
         }
     }
     rhs_new
@@ -998,9 +1032,10 @@ pub fn mehrotra_corrector_rhs(
     dz_u_aff: &[f64],
     mu_old: f64,
     mu_new: f64,
+    kappa_d: f64,
 ) -> Vec<f64> {
     let n = x.len();
-    let mut rhs_new = rebuild_rhs_with_mu(rhs, x, x_l, x_u, mu_old, mu_new);
+    let mut rhs_new = rebuild_rhs_with_mu(rhs, x, x_l, x_u, mu_old, mu_new, kappa_d);
     for i in 0..n {
         if x_l[i].is_finite() {
             let s_l = (x[i] - x_l[i]).max(1e-20);
@@ -1198,6 +1233,7 @@ pub fn assemble_condensed_kkt(
     x_l: &[f64],
     x_u: &[f64],
     mu: f64,
+    kappa_d: f64,
     _v_l: &[f64],
     _v_u: &[f64],
 ) -> CondensedKktSystem {
@@ -1223,11 +1259,20 @@ pub fn assemble_condensed_kkt(
     let mut rhs_primal = vec![0.0; n];
     for i in 0..n {
         let mut rd = -grad_f[i];
-        if x_l[i].is_finite() {
+        let l_fin = x_l[i].is_finite();
+        let u_fin = x_u[i].is_finite();
+        if l_fin {
             rd += mu / (x[i] - x_l[i]);
         }
-        if x_u[i].is_finite() {
+        if u_fin {
             rd -= mu / (x_u[i] - x[i]);
+        }
+        if kappa_d > 0.0 && (l_fin ^ u_fin) {
+            if l_fin {
+                rd -= kappa_d * mu;
+            } else {
+                rd += kappa_d * mu;
+            }
         }
         rhs_primal[i] = rd;
     }
@@ -1533,6 +1578,7 @@ pub fn assemble_sparse_condensed_kkt(
     x_l: &[f64],
     x_u: &[f64],
     mu: f64,
+    kappa_d: f64,
     _v_l: &[f64],
     _v_u: &[f64],
 ) -> SparseCondensedKktSystem {
@@ -1578,11 +1624,20 @@ pub fn assemble_sparse_condensed_kkt(
     let mut rhs_primal = vec![0.0; n];
     for i in 0..n {
         let mut rd = -grad_f[i];
-        if x_l[i].is_finite() {
+        let l_fin = x_l[i].is_finite();
+        let u_fin = x_u[i].is_finite();
+        if l_fin {
             rd += mu / (x[i] - x_l[i]);
         }
-        if x_u[i].is_finite() {
+        if u_fin {
             rd -= mu / (x_u[i] - x[i]);
+        }
+        if kappa_d > 0.0 && (l_fin ^ u_fin) {
+            if l_fin {
+                rd -= kappa_d * mu;
+            } else {
+                rd += kappa_d * mu;
+            }
         }
         rhs_primal[i] = rd;
     }
@@ -1830,7 +1885,7 @@ mod tests {
             n, m, &hess_rows, &hess_cols, &hess_vals,
             &[], &[], &[], &sigma, &grad_f,
             &[], &[], &[], &[], &z_l, &z_u,
-            &x, &x_l, &x_u, 0.1, false, &[], &[],
+            &x, &x_l, &x_u, 0.1, 0.0, false, &[], &[],
         );
 
         assert_eq!(kkt.dim, 2);
@@ -1868,7 +1923,7 @@ mod tests {
             n, m, &hess_rows, &hess_cols, &hess_vals,
             &jac_rows, &jac_cols, &jac_vals, &sigma, &grad_f,
             &g, &g_l, &g_u, &y, &z_l, &z_u,
-            &x, &x_l, &x_u, 0.1, false, &v_l, &v_u,
+            &x, &x_l, &x_u, 0.1, 0.0, false, &v_l, &v_u,
         );
 
         assert_eq!(kkt.dim, 3);
@@ -1914,7 +1969,7 @@ mod tests {
             n, m, &hess_rows, &hess_cols, &hess_vals,
             &jac_rows, &jac_cols, &jac_vals, &sigma, &grad_f,
             &g, &g_l, &g_u, &y, &z_l, &z_u,
-            &x, &x_l, &x_u, 0.1, false, &v_l, &v_u,
+            &x, &x_l, &x_u, 0.1, 0.0, false, &v_l, &v_u,
         );
 
         // r_d = -grad_f + z_l - z_u = -3.0 + 0 - 0 = -3.0
@@ -1953,7 +2008,7 @@ mod tests {
             n, m, &hess_rows, &hess_cols, &hess_vals,
             &jac_rows, &jac_cols, &jac_vals, &sigma, &grad_f,
             &g, &g_l, &g_u, &y, &z_l, &z_u,
-            &x, &x_l, &x_u, mu, false, &v_l, &v_u,
+            &x, &x_l, &x_u, mu, 0.0, false, &v_l, &v_u,
         );
 
         // (2,2) block should be negative (from -Σ_s^{-1})
@@ -2392,7 +2447,7 @@ mod tests {
         let mut full_kkt = assemble_kkt(
             n, m, &hess_rows, &hess_cols, &hess_vals,
             &jac_rows, &jac_cols, &jac_vals, &sigma, &grad_f,
-            &g, &g_l, &g_u, &y, &z_l, &z_u, &x, &x_l, &x_u, mu, false,
+            &g, &g_l, &g_u, &y, &z_l, &z_u, &x, &x_l, &x_u, mu, 0.0, false,
             &v_l, &v_u,
         );
         let mut full_solver = DenseLdl::new();
@@ -2404,7 +2459,7 @@ mod tests {
         let condensed = assemble_condensed_kkt(
             n, m, &hess_rows, &hess_cols, &hess_vals,
             &jac_rows, &jac_cols, &jac_vals, &sigma, &grad_f,
-            &g, &g_l, &g_u, &y, &z_l, &z_u, &x, &x_l, &x_u, mu,
+            &g, &g_l, &g_u, &y, &z_l, &z_u, &x, &x_l, &x_u, mu, 0.0,
             &v_l, &v_u,
         );
         let mut cond_solver = DenseLdl::new();
