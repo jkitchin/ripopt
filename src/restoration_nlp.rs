@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use crate::problem::NlpProblem;
 
 /// NLP problem wrapper for the restoration phase.
@@ -22,7 +24,16 @@ pub struct RestorationNlp<'a> {
     x_r: Vec<f64>,
     d_r2: Vec<f64>,
     rho: f64,
-    eta: f64,
+    /// η is computed dynamically per-evaluation as
+    /// `eta_factor * sqrt(current_mu)` (Ipopt
+    /// `RestoIpoptNLP::Eta`, IpRestoIpoptNLP.cpp:759). The current
+    /// μ is updated by the inner IPM via `notify_mu` so that as μ
+    /// drops during the restoration solve, the proximity weight η
+    /// tracks it instead of remaining frozen at the entry value.
+    eta_factor: f64,
+    /// Current barrier μ feeding the η computation. Interior
+    /// mutability so `notify_mu(&self, ...)` can refresh it.
+    current_mu: Cell<f64>,
     inner_jac_rows: Vec<usize>,
     inner_jac_cols: Vec<usize>,
     resto_hess_rows: Vec<usize>,
@@ -53,7 +64,9 @@ impl<'a> RestorationNlp<'a> {
     ) -> Self {
         let n = inner.num_variables();
         let m = inner.num_constraints();
-        let eta = eta_f * mu_entry.sqrt();
+        // η is recomputed each evaluation from current_mu (see
+        // `eta()` below). At construction we seed current_mu with
+        // mu_entry; the inner IPM refreshes it via `notify_mu`.
 
         // D_R[i] = 1/max(1, |x_r[i]|), d_r2[i] = D_R[i]^2
         let d_r2: Vec<f64> = x_r
@@ -144,7 +157,8 @@ impl<'a> RestorationNlp<'a> {
             x_r: x_r.to_vec(),
             d_r2,
             rho,
-            eta,
+            eta_factor: eta_f,
+            current_mu: Cell::new(mu_entry.max(0.0)),
             inner_jac_rows,
             inner_jac_cols,
             resto_hess_rows,
@@ -154,6 +168,12 @@ impl<'a> RestorationNlp<'a> {
             p_init,
             n_init,
         }
+    }
+
+    /// Current η = η_factor · √μ, with μ tracked by `notify_mu`.
+    /// Mirrors Ipopt `RestoIpoptNLP::Eta(mu)` (IpRestoIpoptNLP.cpp:759).
+    fn eta(&self) -> f64 {
+        self.eta_factor * self.current_mu.get().max(0.0).sqrt()
     }
 }
 
@@ -204,9 +224,10 @@ impl NlpProblem for RestorationNlp<'_> {
         }
 
         // (eta/2) * ||D_R(x - x_r)||^2
+        let eta = self.eta();
         for i in 0..n {
             let diff = x[i] - self.x_r[i];
-            *obj += 0.5 * self.eta * self.d_r2[i] * diff * diff;
+            *obj += 0.5 * eta * self.d_r2[i] * diff * diff;
         }
 
         true
@@ -217,8 +238,9 @@ impl NlpProblem for RestorationNlp<'_> {
         let m = self.m_orig;
 
         // x part: eta * D_R^2 * (x - x_r)
+        let eta = self.eta();
         for i in 0..n {
-            grad[i] = self.eta * self.d_r2[i] * (x[i] - self.x_r[i]);
+            grad[i] = eta * self.d_r2[i] * (x[i] - self.x_r[i]);
         }
 
         // p and n parts: rho
@@ -317,13 +339,24 @@ impl NlpProblem for RestorationNlp<'_> {
         }
 
         // Add obj_factor * eta * d_r2[i] to each diagonal
+        let eta = self.eta();
         for i in 0..n {
             let idx = self.diag_indices[i];
-            vals[idx] += obj_factor * self.eta * self.d_r2[i];
+            vals[idx] += obj_factor * eta * self.d_r2[i];
         }
 
         // p/n blocks have zero Hessian (barrier mu/s^2 is added by IPM automatically)
         true
+    }
+
+    /// Refresh `current_mu` so subsequent `objective` / `gradient` /
+    /// `hessian_values` calls compute η = η_factor·√μ at the new μ
+    /// instead of the entry-time value (Ipopt
+    /// `RestoIpoptNLP::Eta(mu)` reads μ dynamically per evaluation).
+    fn notify_mu(&self, mu: f64) {
+        if mu.is_finite() && mu >= 0.0 {
+            self.current_mu.set(mu);
+        }
     }
 }
 
@@ -482,6 +515,57 @@ mod tests {
         assert!((vals[1] - 1.0).abs() < 1e-10);
         assert!((vals[2] - (-1.0)).abs() < 1e-10);
         assert!((vals[3] - 1.0).abs() < 1e-10);
+    }
+
+    /// T0.10: η must NOT be frozen at restoration entry. After
+    /// `notify_mu` the proximity term in `objective` and `gradient`
+    /// must use the new μ (Ipopt RestoIpoptNLP::Eta reads μ
+    /// dynamically per evaluation; IpRestoIpoptNLP.cpp:759).
+    #[test]
+    fn test_eta_tracks_notify_mu() {
+        let prob = SimpleConstrained;
+        // x_r = (1,2) so D_R^2 = (1, 1/4).
+        let x_r = vec![1.0, 2.0];
+        // mu_entry = 0.1, eta_factor = 1.0 → η_entry = sqrt(0.1).
+        let resto = RestorationNlp::new(&prob, &x_r, 0.1, 1000.0, 1.0);
+
+        // Evaluate objective at x = (2, 4, 0, 0): only proximity term contributes.
+        // Proximity = 0.5 * η * (D_R^2[0] * (2-1)^2 + D_R^2[1] * (4-2)^2)
+        //           = 0.5 * η * (1*1 + 0.25*4) = η.
+        let x = vec![2.0, 4.0, 0.0, 0.0];
+        let mut obj_entry = 0.0;
+        resto.objective(&x, true, &mut obj_entry);
+        let eta_entry = 0.1f64.sqrt();
+        assert!(
+            (obj_entry - eta_entry).abs() < 1e-12,
+            "obj_entry = {}, expected {}",
+            obj_entry, eta_entry
+        );
+
+        // Drop μ → η must shrink.
+        resto.notify_mu(0.01);
+        let mut obj_after = 0.0;
+        resto.objective(&x, true, &mut obj_after);
+        let eta_after = 0.01f64.sqrt();
+        assert!(
+            (obj_after - eta_after).abs() < 1e-12,
+            "obj_after = {}, expected {} (η must track current μ, not entry μ)",
+            obj_after, eta_after
+        );
+        assert!(
+            obj_after < obj_entry,
+            "lower μ must give smaller proximity term (η ∝ √μ)"
+        );
+
+        // Gradient at x = (1+ε, 2, 0, 0): grad[0] = η * D_R^2[0] * (x[0]-x_r[0]) = η.
+        let x2 = vec![2.0, 2.0, 0.0, 0.0];
+        let mut grad = vec![0.0; resto.num_variables()];
+        resto.gradient(&x2, true, &mut grad);
+        assert!(
+            (grad[0] - eta_after).abs() < 1e-12,
+            "grad[0] = {}, expected {} after notify_mu(0.01)",
+            grad[0], eta_after
+        );
     }
 
     #[test]
