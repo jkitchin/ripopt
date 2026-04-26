@@ -6274,14 +6274,19 @@ fn check_time_limits(
     None
 }
 
-/// Reset the filter and re-seed `theta_min` from the current iterate's
-/// constraint violation. Standard "fresh-start" sequence after μ
-/// changes, restoration, stall recovery, or watchdog promotions.
-/// Mirrors Ipopt IpFilterLSAcceptor.cpp:524-532.
-fn reset_filter_with_current_theta(state: &SolverState, filter: &mut Filter) {
+/// Reset the filter (clear all entries). Standard "fresh-start" sequence
+/// after μ changes, restoration, stall recovery, or watchdog promotions.
+/// Mirrors Ipopt IpFilterLSAcceptor.cpp:524-532 (Reset()), which clears
+/// the filter list but does NOT touch `theta_max`/`theta_min` — those
+/// are seeded once from the initial iterate at IpFilterLSAcceptor.cpp:325-339
+/// and remain fixed for the entire solve. T0.7: previously this helper
+/// also called `set_theta_min_from_initial` on every μ change, letting
+/// the filter envelope grow and admit iterates earlier filter entries
+/// had rejected. The `set_theta_min_from_initial` method is now
+/// one-shot, so even if it is called here it is a no-op after the first
+/// solver-init seeding; the call is omitted for clarity.
+fn reset_filter_with_current_theta(_state: &SolverState, filter: &mut Filter) {
     filter.reset();
-    let theta = state.constraint_violation();
-    filter.set_theta_min_from_initial(theta);
 }
 
 /// Overall-progress stall tracker: best primal/dual infeasibility seen
