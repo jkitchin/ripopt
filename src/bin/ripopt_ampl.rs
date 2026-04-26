@@ -187,7 +187,7 @@ fn print_help() {
     println!("    hessian_approximation=<str>          exact or limited-memory (L-BFGS) [exact]");
     println!("    linear_solver=<str>                  direct, iterative (MINRES), or hybrid [direct]");
     println!("    sparse_threshold=<int>               Sparse solver if n+m >= threshold [110]");
-    println!("    mehrotra_pc=<bool>                   Mehrotra predictor-corrector [yes]");
+    println!("    mehrotra_pc=<bool>                   Mehrotra predictor-corrector [no]");
     println!("    gondzio_mcc_max=<int>                Max Gondzio centrality corrections [3]");
     println!();
     println!("  Fallback Strategies");

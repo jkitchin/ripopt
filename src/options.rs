@@ -193,7 +193,7 @@ pub struct SolverOptions {
     ///
     /// Expected effect: 20–40% fewer iterations on convex-like problems.
     /// Applies to the full sparse/dense KKT path.
-    /// Default: true.
+    /// Default: false (matches Ipopt 3.14's `mehrotra_algorithm = no`).
     pub mehrotra_pc: bool,
     /// Maximum number of Gondzio multiple centrality corrections per iteration.
     ///
@@ -336,7 +336,7 @@ impl Default for SolverOptions {
             enable_sqp_fallback: true,
             hessian_approximation_lbfgs: false,
             enable_lbfgs_hessian_fallback: true,
-            mehrotra_pc: true,
+            mehrotra_pc: false,
             gondzio_mcc_max: 3,
             proactive_infeasibility_detection: false,
             linear_solver: LinearSolverChoice::default(),
