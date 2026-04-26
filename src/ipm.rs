@@ -2234,8 +2234,6 @@ fn solve_inner<P: NlpProblem>(
         }
     }
 
-    apply_late_optimality_promotion(&mut result, options);
-
     result.diagnostics.wall_time_secs = solve_start.elapsed().as_secs_f64();
     result
 }
@@ -2327,48 +2325,6 @@ fn try_conservative_ipm_retry<P: NlpProblem>(
     }
     let candidate = solve_ipm(problem, &opts);
     adopt_candidate_if_better(result, candidate, options, "Conservative retry", "conservative_ipm");
-}
-
-/// Promote a stalled result (NumericalError/MaxIterations/Acceptable) to
-/// Optimal or Acceptable when the final iterative-z residuals already meet
-/// the KKT gates. Applied AFTER all fallbacks so conservative retries can
-/// fix wrong local minima before we accept them.
-///
-/// Uses Ipopt-style residual checks:
-///   * Optimal if pr ≤ `constr_viol_tol`, co ≤ `compl_inf_tol`, du strict.
-///   * Acceptable (if not already) when du ≤ 1e-6, pr ≤ 1e-2, co ≤ 1e-2
-///     (Ipopt's `acceptable_tol`).
-fn apply_late_optimality_promotion(result: &mut SolveResult, options: &SolverOptions) {
-    if !matches!(result.status, SolveStatus::NumericalError | SolveStatus::MaxIterations | SolveStatus::Acceptable) {
-        return;
-    }
-    let d = &result.diagnostics;
-    let pr_ok = d.final_primal_inf <= options.constr_viol_tol;
-    let co_ok = d.final_compl <= options.compl_inf_tol;
-    let du_strict_ok = d.final_dual_inf <= options.dual_inf_tol
-        && d.final_dual_inf <= options.tol * 1000.0;
-    if pr_ok && co_ok && du_strict_ok {
-        if options.print_level >= 5 {
-            rip_log!(
-                "ripopt: Late-optimal (pr={:.2e}, du={:.2e}, co={:.2e}), returning Optimal",
-                d.final_primal_inf, d.final_dual_inf, d.final_compl
-            );
-        }
-        result.status = SolveStatus::Optimal;
-    } else if !matches!(result.status, SolveStatus::Acceptable) {
-        let du_acc_ok = d.final_dual_inf <= 1e-6
-            && d.final_primal_inf <= 1e-2
-            && d.final_compl <= 1e-2;
-        if du_acc_ok {
-            if options.print_level >= 5 {
-                rip_log!(
-                    "ripopt: Late-acceptable (pr={:.2e}, du={:.2e}, co={:.2e}), returning Acceptable",
-                    d.final_primal_inf, d.final_dual_inf, d.final_compl
-                );
-            }
-            result.status = SolveStatus::Acceptable;
-        }
-    }
 }
 
 /// Check if a problem has any inequality constraints (g_l[i] != g_u[i]).

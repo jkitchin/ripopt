@@ -46,6 +46,25 @@
 
 **Tests must be honest:** If the solver cannot solve a problem to `Optimal`, the test should either fail (exposing the real limitation), be marked `#[ignore]` with a clear explanation, or be removed. A failing test that documents a real limitation is more valuable than a passing test that hides one.
 
+### Alignment-work exception: regressions are expected and acceptable
+During the v0.8 Ipopt-alignment effort (`docs/V0.8_IPOPT_ALIGNMENT_PLAN.md`), the
+goal is **correctness of the implementation against the Ipopt 3.14 reference**,
+not preservation of the HS pass-rate. When a planned heuristic deletion regresses
+the HS suite, that regression is the expected, honest signal that the deleted
+heuristic was a benchmark-tuning crutch — exactly the thing this effort is meant
+to retire.
+
+**Do not** revert correct alignment changes just because the HS count drops.
+**Do not** silently re-document a deleted heuristic as "load-bearing" to keep it
+alive. If a deletion is correct against the Ipopt reference, ship it and record
+the regression in the plan's evidence column. Re-anchoring (§3.2) is reserved
+for cases where the heuristic is actually present in Ipopt (or a documented
+ripopt-specific kernel difference) and ripopt was just misplacing it — not for
+"this heuristic happens to fix N benchmark problems".
+
+The HS pass rate is a downstream metric we will recover by fixing root causes
+(convergence test, restoration, scaling), not by keeping post-hoc promotions.
+
 ## Working on the solver: efficiency rules
 
 These are rules distilled from sessions that burned time on avoidable mistakes. Follow them for any non-trivial change to `src/ipm.rs`, `src/restoration*.rs`, `src/filter.rs`, `src/convergence.rs`, or `src/kkt.rs`.
