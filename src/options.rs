@@ -246,6 +246,22 @@ pub struct SolverOptions {
     /// 0.0 disables early stall detection.
     /// Default: 10.0.
     pub early_stall_timeout: f64,
+    /// Recompute equality multipliers `y` via the augmented least-squares
+    /// system after each accepted step once the iterate is sufficiently
+    /// feasible (`||c||_∞ < recalc_y_feas_tol`). Mirrors Ipopt 3.14
+    /// `IpIpoptAlg.cpp:652-819` step 5 (spec §5 / P27). The effective
+    /// runtime gate is `(recalc_y || hessian_approximation_lbfgs)` so
+    /// that L-BFGS callers get the recompute by default — without it,
+    /// quasi-Newton multiplier estimates drift.
+    /// Default: `false` (auto-on with L-BFGS Hessian).
+    pub recalc_y: bool,
+    /// Constraint-violation threshold below which `recalc_y` actually
+    /// recomputes y. Above this threshold, recomputing y from a
+    /// least-squares fit to a non-feasible iterate hurts more than it
+    /// helps (the LS multipliers absorb infeasibility into y, biasing
+    /// the Newton direction).
+    /// Default: 1e-6.
+    pub recalc_y_feas_tol: f64,
     /// Use quality function for barrier parameter selection in adaptive mode.
     /// Evaluates Q(mu) = barrier KKT error for several candidate mu values and
     /// picks the minimizer. Allows more aggressive mu decreases than the Loqo
@@ -395,6 +411,8 @@ impl Default for SolverOptions {
             linear_solver: LinearSolverChoice::default(),
             stall_iter_limit: 30,
             early_stall_timeout: 120.0,
+            recalc_y: false,
+            recalc_y_feas_tol: 1e-6,
             mu_oracle_quality_function: true,
             quality_function_centrality: false,
             user_obj_scaling: None,

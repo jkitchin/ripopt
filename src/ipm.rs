@@ -7317,6 +7317,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         }
 
         reset_slack_multipliers(&mut state, mu_ks);
+        maybe_recalc_y_post_step(&mut state, options, n, m, lbfgs_mode);
         track_best_feasible(&state, options, &mut best_feasible);
 
         // --- Barrier parameter update (free/fixed mode) ---
@@ -7883,6 +7884,34 @@ fn recompute_y_after_restoration(
     } else {
         state.y.fill(0.0);
     }
+}
+
+/// Spec §5 step 5 (`IpIpoptAlg.cpp:652-819`, P27): once an accepted iterate
+/// is sufficiently feasible, recompute y via least-squares to keep the
+/// equality multipliers aligned with the current x and z. Default-on under
+/// L-BFGS (where quasi-Newton multiplier estimates drift), opt-in otherwise.
+///
+/// The `recalc_y_feas_tol` gate is essential: at infeasible iterates, the
+/// LS y absorbs constraint violation into the dual variables, biasing the
+/// next Newton direction. Spec default tol is `1e-6`.
+fn maybe_recalc_y_post_step(
+    state: &mut SolverState,
+    options: &SolverOptions,
+    n: usize,
+    m: usize,
+    lbfgs_mode: bool,
+) {
+    if m == 0 {
+        return;
+    }
+    let gate_on = options.recalc_y || lbfgs_mode;
+    if !gate_on {
+        return;
+    }
+    if state.constraint_violation() >= options.recalc_y_feas_tol {
+        return;
+    }
+    recompute_y_after_restoration(state, options, n, m);
 }
 
 /// Reset constraint-slack barrier multipliers v_L, v_U after restoration,
@@ -10357,5 +10386,59 @@ mod tests {
         push_initial_point_from_bounds(&mut x, &x_l, &x_u, &opts);
         // p_l = min(0.01, 1e-4) = 1e-4
         assert!((x[0] - 1e-4).abs() < 1e-12, "got x = {}", x[0]);
+    }
+
+    /// Set up a 1×1 LS system whose augmented solve yields y = 2.
+    ///
+    /// System:
+    ///   [ I  J^T ] [r]   [grad_f - z_L + z_U]
+    ///   [ J   0  ] [y] = [0                 ]
+    /// With grad_f=2, J=1, z=0 → r=0, y=2.
+    fn ls_y_equals_two_state(g: f64, g_eq: bool) -> SolverState {
+        let mut s = minimal_state(1, 1);
+        s.grad_f = vec![2.0];
+        s.jac_rows = vec![0];
+        s.jac_cols = vec![0];
+        s.jac_vals = vec![1.0];
+        s.g = vec![g];
+        s.y = vec![999.0];          // sentinel; recalc must overwrite
+        if g_eq {
+            s.g_l = vec![0.0];
+            s.g_u = vec![0.0];
+        }
+        s
+    }
+
+    #[test]
+    fn test_recalc_y_off_by_default_does_not_overwrite() {
+        let mut state = ls_y_equals_two_state(0.0, true);
+        let opts = SolverOptions::default();
+        maybe_recalc_y_post_step(&mut state, &opts, 1, 1, false);
+        assert_eq!(state.y, vec![999.0], "default off must not touch y");
+    }
+
+    #[test]
+    fn test_recalc_y_lbfgs_mode_recomputes_when_feasible() {
+        let mut state = ls_y_equals_two_state(0.0, true); // viol = 0 < tol
+        let opts = SolverOptions::default();
+        maybe_recalc_y_post_step(&mut state, &opts, 1, 1, true);
+        assert!((state.y[0] - 2.0).abs() < 1e-10, "lbfgs gate must recompute, got {}", state.y[0]);
+    }
+
+    #[test]
+    fn test_recalc_y_explicit_on_recomputes_when_feasible() {
+        let mut state = ls_y_equals_two_state(0.0, true);
+        let opts = SolverOptions { recalc_y: true, ..SolverOptions::default() };
+        maybe_recalc_y_post_step(&mut state, &opts, 1, 1, false);
+        assert!((state.y[0] - 2.0).abs() < 1e-10, "recalc_y=true must recompute, got {}", state.y[0]);
+    }
+
+    #[test]
+    fn test_recalc_y_skipped_when_constraint_violation_above_tol() {
+        // g = 1e-3, equality constraint => constraint_violation = 1e-3 > recalc_y_feas_tol (1e-6)
+        let mut state = ls_y_equals_two_state(1e-3, true);
+        let opts = SolverOptions { recalc_y: true, ..SolverOptions::default() };
+        maybe_recalc_y_post_step(&mut state, &opts, 1, 1, false);
+        assert_eq!(state.y, vec![999.0], "infeasible iterate must skip recalc_y");
     }
 }
