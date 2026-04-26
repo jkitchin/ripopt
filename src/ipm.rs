@@ -8913,24 +8913,38 @@ fn relax_fixed_variable_bounds(x_l: &mut [f64], x_u: &mut [f64]) {
     }
 }
 
-/// Push the initial point strictly inside finite variable bounds. For
-/// two-sided bounds, the push is min(bound_push, bound_frac * range);
-/// for one-sided bounds it is bound_push.
+/// Push the initial point strictly inside finite variable bounds.
+///
+/// Ipopt 3.14 (`IpDefaultIterateInitializer.cpp:526-599`):
+///   pL = min(κ1·max(|x_L|, 1), κ2·(x_U − x_L))   [two-sided]
+///   pL = κ1·max(|x_L|, 1)                         [one-sided lower]
+///   pU = κ1·max(|x_U|, 1)                         [one-sided upper]
+/// where κ1 = `bound_push` and κ2 = `bound_frac`. The `max(|x|, 1)`
+/// scaling matters for one-sided bounds at large magnitude: without it,
+/// `x ≥ 1e3` gets pushed by only 0.01 absolute and the slack-driven
+/// initial multipliers `z = μ/slack` blow up the KKT factorization.
 fn push_initial_point_from_bounds(
     x: &mut [f64],
     x_l: &[f64],
     x_u: &[f64],
     options: &SolverOptions,
 ) {
+    let kappa1 = options.bound_push;
+    let kappa2 = options.bound_frac;
     for i in 0..x.len() {
-        if x_l[i].is_finite() && x_u[i].is_finite() {
+        let lower_finite = x_l[i].is_finite();
+        let upper_finite = x_u[i].is_finite();
+        if lower_finite && upper_finite {
             let range = x_u[i] - x_l[i];
-            let push = options.bound_push.min(options.bound_frac * range);
-            x[i] = x[i].max(x_l[i] + push).min(x_u[i] - push);
-        } else if x_l[i].is_finite() {
-            x[i] = x[i].max(x_l[i] + options.bound_push);
-        } else if x_u[i].is_finite() {
-            x[i] = x[i].min(x_u[i] - options.bound_push);
+            let p_l = (kappa1 * x_l[i].abs().max(1.0)).min(kappa2 * range);
+            let p_u = (kappa1 * x_u[i].abs().max(1.0)).min(kappa2 * range);
+            x[i] = x[i].max(x_l[i] + p_l).min(x_u[i] - p_u);
+        } else if lower_finite {
+            let p_l = kappa1 * x_l[i].abs().max(1.0);
+            x[i] = x[i].max(x_l[i] + p_l);
+        } else if upper_finite {
+            let p_u = kappa1 * x_u[i].abs().max(1.0);
+            x[i] = x[i].min(x_u[i] - p_u);
         }
     }
 }
@@ -10541,5 +10555,51 @@ mod tests {
         // 1/xi steers away from aggressive small-mu candidates).
         assert!(mu_on >= mu_off,
             "centrality should raise mu, off={mu_off:e} on={mu_on:e}");
+    }
+
+    #[test]
+    fn test_push_initial_point_one_sided_lower_large_magnitude() {
+        // Variable with x_L = 1e3 and no upper bound, starting at x = 1e3.
+        // Ipopt pushes by κ1 · max(|x_L|, 1) = 0.01 · 1e3 = 10, so x ≥ 1010.
+        // The pre-fix formula pushed by only `bound_push = 0.01` absolute.
+        let opts = SolverOptions::default();
+        let mut x = vec![1e3];
+        let x_l = vec![1e3];
+        let x_u = vec![f64::INFINITY];
+        push_initial_point_from_bounds(&mut x, &x_l, &x_u, &opts);
+        assert!(
+            x[0] >= 1e3 + 0.01 * 1e3 - 1e-12,
+            "expected x >= 1010 after magnitude-scaled push, got x = {}",
+            x[0]
+        );
+    }
+
+    #[test]
+    fn test_push_initial_point_one_sided_lower_unit_magnitude() {
+        // |x_L| < 1 falls back to max(|x_L|, 1) = 1, so push is bound_push.
+        let opts = SolverOptions::default();
+        let mut x = vec![0.0];
+        let x_l = vec![0.0];
+        let x_u = vec![f64::INFINITY];
+        push_initial_point_from_bounds(&mut x, &x_l, &x_u, &opts);
+        assert!(
+            (x[0] - opts.bound_push).abs() < 1e-12,
+            "expected x = bound_push = {}, got x = {}",
+            opts.bound_push,
+            x[0]
+        );
+    }
+
+    #[test]
+    fn test_push_initial_point_two_sided_uses_min_of_kappa1_kappa2() {
+        // Two-sided narrow range: [0, 0.01]. κ2·range = 0.01·0.01 = 1e-4
+        // vs κ1·max(|x_L|, 1) = 0.01·1 = 0.01. The min picks 1e-4.
+        let opts = SolverOptions::default();
+        let mut x = vec![0.0];
+        let x_l = vec![0.0];
+        let x_u = vec![0.01];
+        push_initial_point_from_bounds(&mut x, &x_l, &x_u, &opts);
+        // p_l = min(0.01, 1e-4) = 1e-4
+        assert!((x[0] - 1e-4).abs() < 1e-12, "got x = {}", x[0]);
     }
 }
