@@ -457,6 +457,10 @@ pub(crate) struct SolverState {
     /// Last point at which evaluations were performed (for new_x tracking).
     /// Initialized to NaN so the first evaluation always gets new_x = true.
     x_last_eval: Vec<f64>,
+    /// Objective value of the previous iterate, used by the
+    /// acceptable-level relative-change gate
+    /// (`acceptable_obj_change_tol`). `None` on iteration 0.
+    pub last_obj_for_acceptable: Option<f64>,
 }
 
 /// Barrier parameter mode (Ipopt's adaptive mu strategy).
@@ -860,6 +864,7 @@ impl SolverState {
             g_scaling: vec![1.0; m],
             diagnostics: SolverDiagnostics::default(),
             x_last_eval: vec![f64::NAN; n],
+            last_obj_for_acceptable: None,
         }
     }
 
@@ -5873,7 +5878,9 @@ fn check_convergence_and_handle_promotions<P: NlpProblem>(
         ws.avg.iterate_history.remove(0);
     }
 
-    match check_convergence(&conv_info, options, state.consecutive_acceptable) {
+    match crate::convergence::check_convergence_with_last_obj(
+        &conv_info, options, state.consecutive_acceptable, state.last_obj_for_acceptable,
+    ) {
         ConvergenceStatus::Converged => {
             if options.print_level >= 5 {
                 timings.print_summary(iteration + 1, ipm_start.elapsed());
@@ -6043,6 +6050,7 @@ fn compute_optimality_measures(state: &SolverState) -> OptimalityMeasures {
 /// `detect_and_handle_progress_stall`.
 fn track_consecutive_acceptable(
     state: &mut SolverState,
+    options: &SolverOptions,
     primal_inf: f64,
     dual_inf: f64,
     dual_inf_unscaled: f64,
@@ -6058,7 +6066,15 @@ fn track_consecutive_acceptable(
     let meets_acc_unscaled = primal_inf <= 1e-2
         && dual_inf_unscaled <= 1e10
         && compl_inf <= 1e-2;
-    if meets_acc_scaled && meets_acc_unscaled {
+    // Ipopt acceptable_obj_change_tol gate: |Δf| / max(1, |f|) ≤ tol.
+    let obj_change_ok = match state.last_obj_for_acceptable {
+        Some(prev) => {
+            let denom = state.obj.abs().max(1.0);
+            (state.obj - prev).abs() / denom <= options.acceptable_obj_change_tol
+        }
+        None => true,
+    };
+    if meets_acc_scaled && meets_acc_unscaled && obj_change_ok {
         state.consecutive_acceptable += 1;
     } else {
         state.consecutive_acceptable = 0;
@@ -7634,6 +7650,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
 
         let s_d_for_acc = track_consecutive_acceptable(
             &mut state,
+            options,
             primal_inf,
             dual_inf,
             dual_inf_unscaled,
@@ -7641,6 +7658,10 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             multiplier_sum,
             bound_multiplier_sum,
         );
+
+        // Record current objective so the next iteration's
+        // acceptable_obj_change_tol gate has a previous f to diff against.
+        state.last_obj_for_acceptable = Some(state.obj);
 
         update_best_du_iterate(&state, dual_inf, &mut best_du);
 
@@ -10468,6 +10489,7 @@ mod tests {
             g_scaling: vec![1.0; m],
             diagnostics: SolverDiagnostics::default(),
             x_last_eval: vec![f64::NAN; n],
+            last_obj_for_acceptable: None,
         }
     }
 

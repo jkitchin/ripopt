@@ -229,6 +229,20 @@ pub struct SolverOptions {
     pub kkt_dump_dir: Option<std::path::PathBuf>,
     /// Problem name used in dump filenames. Defaults to `"problem"`.
     pub kkt_dump_name: String,
+    /// Acceptable-level relative objective-change gate. The acceptable
+    /// status only fires when `|f_k - f_{k-1}| / max(1, |f_k|) ≤
+    /// acceptable_obj_change_tol`. Default 1e20 disables the gate
+    /// (matches Ipopt 3.14 `IpOptErrorConvCheck.cpp:115`). Lowering
+    /// this below 1.0 forces the acceptable check to also see the
+    /// objective settle, useful when quasi-Newton stalls leave dual
+    /// infeasibility large but the iterate has plateaued.
+    pub acceptable_obj_change_tol: f64,
+    /// Threshold on `‖x‖_∞` above which the iterate is declared
+    /// diverging. Default 1e20 matches Ipopt
+    /// `IpOptErrorConvCheck.cpp:123`. Lower this on bounded problems
+    /// where you want an early abort if the IPM walks far outside the
+    /// expected feasible region.
+    pub diverging_iterates_tol: f64,
 }
 
 impl Default for SolverOptions {
@@ -295,6 +309,8 @@ impl Default for SolverOptions {
             warm_start_z_u: None,
             kkt_dump_dir: None,
             kkt_dump_name: "problem".to_string(),
+            acceptable_obj_change_tol: 1e20,
+            diverging_iterates_tol: 1e20,
         }
     }
 }

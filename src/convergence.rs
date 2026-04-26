@@ -48,6 +48,41 @@ pub struct ConvergenceInfo {
     pub bound_multiplier_count: usize,
 }
 
+/// Test whether the iterate meets Ipopt's acceptable-level thresholds,
+/// including the relative objective-change gate
+/// `|f_k − f_{k-1}| / max(1, |f_k|) ≤ acceptable_obj_change_tol`
+/// (`IpOptErrorConvCheck.cpp:115, 322-330`). When `last_obj` is `None`
+/// (iteration 0, no previous objective) the obj-change gate is skipped.
+pub fn meets_acceptable_thresholds(
+    info: &ConvergenceInfo,
+    options: &SolverOptions,
+    s_d: f64,
+    s_c: f64,
+    last_obj: Option<f64>,
+) -> bool {
+    const ACCEPTABLE_TOL: f64 = 1e-6;
+    const ACCEPTABLE_DUAL_INF_TOL: f64 = 1e10;
+    const ACCEPTABLE_CONSTR_VIOL_TOL: f64 = 1e-2;
+    const ACCEPTABLE_COMPL_INF_TOL: f64 = 1e-2;
+
+    let scaled_ok = info.primal_inf <= ACCEPTABLE_TOL
+        && info.dual_inf <= ACCEPTABLE_TOL * s_d
+        && info.compl_inf <= ACCEPTABLE_TOL * s_c;
+    let unscaled_ok = info.primal_inf <= ACCEPTABLE_CONSTR_VIOL_TOL
+        && info.dual_inf_unscaled <= ACCEPTABLE_DUAL_INF_TOL
+        && info.compl_inf <= ACCEPTABLE_COMPL_INF_TOL;
+
+    let obj_change_ok = match last_obj {
+        Some(prev) => {
+            let denom = info.objective.abs().max(1.0);
+            (info.objective - prev).abs() / denom <= options.acceptable_obj_change_tol
+        }
+        None => true,
+    };
+
+    scaled_ok && unscaled_ok && obj_change_ok
+}
+
 /// Check convergence of the IPM algorithm.
 ///
 /// Returns the convergence status based on current optimality measures.
@@ -55,6 +90,18 @@ pub fn check_convergence(
     info: &ConvergenceInfo,
     options: &SolverOptions,
     consecutive_acceptable: usize,
+) -> ConvergenceStatus {
+    check_convergence_with_last_obj(info, options, consecutive_acceptable, None)
+}
+
+/// Variant of `check_convergence` that threads the previous iterate's
+/// objective for the acceptable-level relative-change gate. Iteration 0
+/// callers pass `None`; subsequent iterations pass the prior `f`.
+pub fn check_convergence_with_last_obj(
+    info: &ConvergenceInfo,
+    options: &SolverOptions,
+    consecutive_acceptable: usize,
+    last_obj: Option<f64>,
 ) -> ConvergenceStatus {
     // Ipopt-style scaling factors (IpIpoptCalculatedQuantities.cpp:3663-3700):
     //   s_d = max(s_max, sum|y, z_l, z_u| / (m+2n)) / s_max  — for dual residual
@@ -91,27 +138,15 @@ pub fn check_convergence(
     }
 
     // Acceptable-level check matching Ipopt defaults
-    // (IpOptErrorConvCheck.cpp:70-121):
+    // (IpOptErrorConvCheck.cpp:70-121, 322-330):
     //   acceptable_tol = 1e-6
     //   acceptable_iter = 15 consecutive iterations
     //   acceptable_dual_inf_tol = 1e10   (effectively disabled)
     //   acceptable_constr_viol_tol = 1e-2
     //   acceptable_compl_inf_tol = 1e-2
-    // Ipopt's acceptable_obj_change_tol = 1e20 (disabled by default).
+    //   acceptable_obj_change_tol = 1e20 (disabled by default)
     const NEAR_TOL_ITERS: usize = 15;
-    const ACCEPTABLE_TOL: f64 = 1e-6;
-    const ACCEPTABLE_DUAL_INF_TOL: f64 = 1e10;
-    const ACCEPTABLE_CONSTR_VIOL_TOL: f64 = 1e-2;
-    const ACCEPTABLE_COMPL_INF_TOL: f64 = 1e-2;
-
-    let near_scaled_ok = info.primal_inf <= ACCEPTABLE_TOL
-        && info.dual_inf <= ACCEPTABLE_TOL * s_d
-        && info.compl_inf <= ACCEPTABLE_TOL * s_c;
-    let near_unscaled_ok = info.primal_inf <= ACCEPTABLE_CONSTR_VIOL_TOL
-        && info.dual_inf_unscaled <= ACCEPTABLE_DUAL_INF_TOL
-        && info.compl_inf <= ACCEPTABLE_COMPL_INF_TOL;
-
-    if near_scaled_ok && near_unscaled_ok
+    if meets_acceptable_thresholds(info, options, s_d, s_c, last_obj)
         && consecutive_acceptable >= NEAR_TOL_ITERS
     {
         return ConvergenceStatus::Acceptable;
@@ -395,6 +430,53 @@ mod tests {
             check_convergence(&info, &opts, 0),
             ConvergenceStatus::Diverging
         );
+    }
+
+    #[test]
+    fn test_meets_acceptable_thresholds_obj_change_passes() {
+        // T0.5: |Δf| / max(1, |f|) = |10.001 - 10.0| / 10.001 ≈ 1e-4.
+        // With acceptable_obj_change_tol = 1e-2, gate passes.
+        let info = ConvergenceInfo {
+            primal_inf: 1e-7, dual_inf: 1e-7, dual_inf_unscaled: 1e-7,
+            compl_inf: 1e-7, mu: 0.0, objective: 10.001,
+            multiplier_sum: 0.0, multiplier_count: 0,
+            bound_multiplier_sum: 0.0, bound_multiplier_count: 0,
+        };
+        let mut opts = SolverOptions::default();
+        opts.acceptable_obj_change_tol = 1e-2;
+        assert!(meets_acceptable_thresholds(&info, &opts, 1.0, 1.0, Some(10.0)),
+            "|Δf|/|f| ≈ 1e-4 ≤ 1e-2 should pass");
+    }
+
+    #[test]
+    fn test_meets_acceptable_thresholds_obj_change_blocks() {
+        // T0.5: |Δf| / max(1, |f|) = |11.0 - 10.0| / 11.0 ≈ 0.091.
+        // With acceptable_obj_change_tol = 1e-2, gate blocks.
+        let info = ConvergenceInfo {
+            primal_inf: 1e-7, dual_inf: 1e-7, dual_inf_unscaled: 1e-7,
+            compl_inf: 1e-7, mu: 0.0, objective: 11.0,
+            multiplier_sum: 0.0, multiplier_count: 0,
+            bound_multiplier_sum: 0.0, bound_multiplier_count: 0,
+        };
+        let mut opts = SolverOptions::default();
+        opts.acceptable_obj_change_tol = 1e-2;
+        assert!(!meets_acceptable_thresholds(&info, &opts, 1.0, 1.0, Some(10.0)),
+            "|Δf|/|f| ≈ 0.09 > 1e-2 should block");
+    }
+
+    #[test]
+    fn test_meets_acceptable_thresholds_no_prev_obj_skips_gate() {
+        // T0.5: last_obj = None (iter 0) skips the gate.
+        let info = ConvergenceInfo {
+            primal_inf: 1e-7, dual_inf: 1e-7, dual_inf_unscaled: 1e-7,
+            compl_inf: 1e-7, mu: 0.0, objective: 11.0,
+            multiplier_sum: 0.0, multiplier_count: 0,
+            bound_multiplier_sum: 0.0, bound_multiplier_count: 0,
+        };
+        let mut opts = SolverOptions::default();
+        opts.acceptable_obj_change_tol = 1e-12; // would block any change
+        assert!(meets_acceptable_thresholds(&info, &opts, 1.0, 1.0, None),
+            "iter-0 None should bypass the gate");
     }
 
     #[test]
