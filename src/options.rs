@@ -229,6 +229,22 @@ pub struct SolverOptions {
     pub kkt_dump_dir: Option<std::path::PathBuf>,
     /// Problem name used in dump filenames. Defaults to `"problem"`.
     pub kkt_dump_name: String,
+    /// `kappa_d` damping coefficient for one-sided-bound variables (Ipopt 3.14
+    /// default `1e-5`). For each variable that has exactly one finite bound,
+    /// the barrier objective gains `+ kappa_d * mu * slack_oneside[i]`, with
+    /// the corresponding `± kappa_d * mu` term added to the barrier gradient.
+    /// Without this damping the log-barrier is unbounded below as the variable
+    /// drifts toward the open side. Set to `0.0` to disable.
+    /// Default: `1e-5`.
+    pub kappa_d: f64,
+    /// Threshold below which a primal slack `x[i] - x_l[i]` (or its
+    /// upper-bound mirror) is considered too small. After every
+    /// accepted iterate, undersized slacks are widened by nudging the
+    /// corresponding *bound* outward to
+    /// `min(max(mu/z, slack_move), slack_move * max(1, |bound|))`.
+    /// Mirrors Ipopt 3.14's `slack_move` option. Default
+    /// `f64::EPSILON.powf(0.75) ≈ 1.83e-12`.
+    pub slack_move: f64,
 }
 
 impl Default for SolverOptions {
@@ -295,6 +311,12 @@ impl Default for SolverOptions {
             warm_start_z_u: None,
             kkt_dump_dir: None,
             kkt_dump_name: "problem".to_string(),
+            kappa_d: 1e-5,
+            slack_move: {
+                // f64::EPSILON.powf(0.75) ≈ 1.83e-12
+                const EPS: f64 = f64::EPSILON;
+                EPS.powf(0.75)
+            },
         }
     }
 }

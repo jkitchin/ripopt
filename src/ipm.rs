@@ -469,6 +469,11 @@ pub(crate) struct SolverState {
     /// Last point at which evaluations were performed (for new_x tracking).
     /// Initialized to NaN so the first evaluation always gets new_x = true.
     x_last_eval: Vec<f64>,
+    /// Cumulative count of slack adjustments performed by
+    /// `apply_slack_move` (Ipopt 3.14's `slack_move`). Each undersized
+    /// primal slack found after an accepted step contributes one
+    /// increment; surfaced for diagnostics only.
+    pub adjusted_slacks_count: usize,
 }
 
 /// Barrier parameter mode (Ipopt's adaptive mu strategy).
@@ -872,6 +877,7 @@ impl SolverState {
             g_scaling: vec![1.0; m],
             diagnostics: SolverDiagnostics::default(),
             x_last_eval: vec![f64::NAN; n],
+            adjusted_slacks_count: 0,
         }
     }
 
@@ -927,6 +933,7 @@ impl SolverState {
         compute_barrier_phi(
             self.obj, &self.x, &self.g, self,
             self.n, self.m, options.constraint_slack_barrier,
+            options.kappa_d,
         )
     }
 
@@ -941,13 +948,26 @@ impl SolverState {
     /// Optionally includes constraint slack derivative terms when enabled.
     fn barrier_directional_derivative(&self, options: &SolverOptions) -> f64 {
         let mut grad_phi_dx = 0.0;
+        let kappa_d = options.kappa_d;
         for i in 0..self.n {
+            let l_fin = self.x_l[i].is_finite();
+            let u_fin = self.x_u[i].is_finite();
             let mut grad_phi_i = self.grad_f[i];
-            if self.x_l[i].is_finite() {
+            if l_fin {
                 grad_phi_i -= self.mu / slack_xl(self, i);
             }
-            if self.x_u[i].is_finite() {
+            if u_fin {
                 grad_phi_i += self.mu / slack_xu(self, i);
+            }
+            // kappa_d damping gradient: +kappa_d*mu if only x_l finite
+            // (slack = x - x_l), -kappa_d*mu if only x_u finite
+            // (slack = x_u - x).
+            if kappa_d > 0.0 && (l_fin ^ u_fin) {
+                if l_fin {
+                    grad_phi_i += kappa_d * self.mu;
+                } else {
+                    grad_phi_i -= kappa_d * self.mu;
+                }
             }
             grad_phi_dx += grad_phi_i * self.dx[i];
         }
@@ -2588,6 +2608,11 @@ enum LineSearchOutcome {
 /// `constraint_slack_barrier` is on, all finite inequality-constraint
 /// bounds via g whose slack exceeds mu*1e-2 (the small-slack guard
 /// matches the line-search loop and the SOC routines).
+///
+/// When `kappa_d > 0`, also adds Ipopt's `kappa_d` damping term
+/// `+ kappa_d * mu * Σ slack_oneside[i]` for each variable with exactly
+/// one finite bound. Without this term the barrier is unbounded below
+/// for one-sided-bound variables (Ipopt 3.14 default `kappa_d = 1e-5`).
 fn compute_barrier_phi(
     obj: f64,
     x: &[f64],
@@ -2596,16 +2621,30 @@ fn compute_barrier_phi(
     n: usize,
     m: usize,
     constraint_slack_barrier: bool,
+    kappa_d: f64,
 ) -> f64 {
     let mut phi = obj;
     for i in 0..n {
-        if state.x_l[i].is_finite() {
+        let l_fin = state.x_l[i].is_finite();
+        let u_fin = state.x_u[i].is_finite();
+        if l_fin {
             let slack = (x[i] - state.x_l[i]).max(1e-20);
             phi -= state.mu * slack.ln();
         }
-        if state.x_u[i].is_finite() {
+        if u_fin {
             let slack = (state.x_u[i] - x[i]).max(1e-20);
             phi -= state.mu * slack.ln();
+        }
+        // kappa_d damping: penalize drift toward the open side for
+        // variables with exactly one finite bound. Mirrors Ipopt 3.14
+        // CalcBarrierTerm in IpIpoptCalculatedQuantities.cpp.
+        if kappa_d > 0.0 && (l_fin ^ u_fin) {
+            let s_oneside = if l_fin {
+                (x[i] - state.x_l[i]).max(0.0)
+            } else {
+                (state.x_u[i] - x[i]).max(0.0)
+            };
+            phi += kappa_d * state.mu * s_oneside;
         }
     }
     if constraint_slack_barrier {
@@ -2796,6 +2835,7 @@ fn run_line_search_loop<P: NlpProblem>(
         // Barrier objective at trial
         let phi_trial = compute_barrier_phi(
             obj_trial, &x_trial, &g_trial, state, n, m, options.constraint_slack_barrier,
+            options.kappa_d,
         );
 
         let (acceptable, used_switching) = filter.check_acceptability(
@@ -2963,6 +3003,65 @@ fn apply_kappa_sigma_bound_multiplier_reset(
     mu_ks
 }
 
+/// Apply Ipopt 3.14's `slack_move` runtime slack adjustment.
+///
+/// After every accepted iterate (and after the bound multipliers
+/// `z_l` / `z_u` have been updated), if a primal slack
+/// `s_l = x[i] - x_l[i]` (or upper-bound mirror `s_u = x_u[i] - x[i]`)
+/// has fallen below `options.slack_move = ε^0.75 ≈ 1.83e-12`, the
+/// corresponding *bound* (not the variable) is nudged outward to widen
+/// the slack to
+///   `new_s = min(max(mu / z, slack_move),
+///                slack_move * max(1.0, |bound|))`.
+/// When `z <= 0`, the formula falls back to `new_s = slack_move`.
+///
+/// Returns the number of components adjusted on this call. The
+/// cumulative count is also accumulated into
+/// `state.adjusted_slacks_count`.
+fn apply_slack_move(state: &mut SolverState, options: &SolverOptions) -> usize {
+    let n = state.n;
+    let slack_move = options.slack_move;
+    if !(slack_move > 0.0) {
+        return 0;
+    }
+    let mut adjusted = 0usize;
+    let mu = state.mu;
+    for i in 0..n {
+        if state.x_l[i].is_finite() {
+            let s_l = state.x[i] - state.x_l[i];
+            if s_l < slack_move {
+                let z = state.z_l[i];
+                let new_s_base = if z > 0.0 {
+                    (mu / z).max(slack_move)
+                } else {
+                    slack_move
+                };
+                let cap = slack_move * state.x_l[i].abs().max(1.0);
+                let new_s = new_s_base.min(cap);
+                state.x_l[i] -= new_s - s_l;
+                adjusted += 1;
+            }
+        }
+        if state.x_u[i].is_finite() {
+            let s_u = state.x_u[i] - state.x[i];
+            if s_u < slack_move {
+                let z = state.z_u[i];
+                let new_s_base = if z > 0.0 {
+                    (mu / z).max(slack_move)
+                } else {
+                    slack_move
+                };
+                let cap = slack_move * state.x_u[i].abs().max(1.0);
+                let new_s = new_s_base.min(cap);
+                state.x_u[i] += new_s - s_u;
+                adjusted += 1;
+            }
+        }
+    }
+    state.adjusted_slacks_count += adjusted;
+    adjusted
+}
+
 /// Per-component sign-flip damping state for the y multiplier update.
 /// `prev_dy` holds the previous iterate's dy (for sign comparison) and
 /// `sign_change_count[i]` accumulates consecutive sign flips on row i;
@@ -3021,6 +3120,7 @@ fn update_dual_variables(
     mu_state: &MuState,
     alpha_dual_max: f64,
     tracker: &mut DyOscillationTracker,
+    options: &SolverOptions,
 ) -> f64 {
     let alpha_y = state.alpha_primal;
     let alpha_d = alpha_dual_max;
@@ -3028,6 +3128,14 @@ fn update_dual_variables(
     apply_damped_y_update(state, alpha_y, tracker);
 
     let mu_ks = apply_kappa_sigma_bound_multiplier_reset(state, mu_state, alpha_d);
+
+    let n_adjusted = apply_slack_move(state, options);
+    if n_adjusted > 0 && options.print_level >= 6 {
+        eprintln!(
+            "  [slack_move] iter={}: adjusted {} bound(s) (cumulative {})",
+            state.iter, n_adjusted, state.adjusted_slacks_count
+        );
+    }
 
     state.alpha_dual = alpha_d;
     mu_ks
@@ -4782,6 +4890,7 @@ fn attempt_soft_restoration<P: NlpProblem>(
     let theta_trial = theta_for_g(state, &state.g);
     let phi_trial = compute_barrier_phi(
         state.obj, &state.x, &state.g, state, n, m, options.constraint_slack_barrier,
+        options.kappa_d,
     );
 
     let filter_ok = filter.is_acceptable(theta_trial, phi_trial);
@@ -7971,6 +8080,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             &mu_state,
             alpha_dual_max,
             &mut dy_tracker,
+            options,
         );
 
         match reevaluate_after_step(
@@ -8213,6 +8323,7 @@ fn evaluate_soc_trial_and_check<P: NlpProblem>(
 
     let phi_soc = compute_barrier_phi(
         obj_soc, &x_soc, &g_soc, state, n, m, options.constraint_slack_barrier,
+        options.kappa_d,
     );
 
     // Pass ORIGINAL alpha (alpha_primal_test), not alpha_primal_soc.
@@ -10422,6 +10533,7 @@ mod tests {
             g_scaling: vec![1.0; m],
             diagnostics: SolverDiagnostics::default(),
             x_last_eval: vec![f64::NAN; n],
+            adjusted_slacks_count: 0,
         }
     }
 
