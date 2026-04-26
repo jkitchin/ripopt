@@ -158,8 +158,8 @@ fn print_help() {
     println!("    slack_bound_push=<float>             Slack variable bound push [1e-2]");
     println!("    slack_bound_frac=<float>             Slack variable bound fraction [1e-2]");
     println!("    tau_min=<float>                      Fraction-to-boundary minimum [0.99]");
-    println!("    nlp_lower_bound_inf=<float>          Treat bounds below this as -inf [-1e20]");
-    println!("    nlp_upper_bound_inf=<float>          Treat bounds above this as +inf [1e20]");
+    println!("    nlp_lower_bound_inf=<float>          Treat bounds below this as -inf [-1e19]");
+    println!("    nlp_upper_bound_inf=<float>          Treat bounds above this as +inf [1e19]");
     println!();
     println!("  Warm Start");
     println!("    warm_start_init_point=<bool>         Enable warm-start initialization [no]");
