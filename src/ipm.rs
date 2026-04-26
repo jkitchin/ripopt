@@ -9188,20 +9188,27 @@ fn classify_restoration_outcome(
 }
 
 /// Quality-function barrier-parameter oracle (Ipopt
-/// `IpQualityFunctionMuOracle.cpp:507-664`).
+/// `IpQualityFunctionMuOracle.cpp:507-829`).
 ///
 /// Evaluates `q(mu) = dual_inf + primal_inf + compl_inf [+ centrality]`
-/// for log-spaced candidate mu values and returns the minimizer.
-/// `dual_inf` and `primal_inf` are fixed at the current iterate (the
-/// affine direction is not reused here); only `compl_inf` and the
-/// optional centrality term vary with mu. Norms follow the Ipopt
-/// 2-norm-averaged convention (`sqrt(sum_sq) / sqrt(n_*)`), so the
-/// three terms are commensurate and additive.
+/// and returns the minimizer over `[mu_lower, mu_upper]` via golden
+/// section search (`gfac = (3 - sqrt(5))/2`). `dual_inf` and
+/// `primal_inf` are fixed at the current iterate (the affine direction
+/// is not reused here); only `compl_inf` and the optional centrality
+/// term vary with mu. Search runs in linear mu-space, matching Ipopt
+/// `PerformGoldenSection` (`IpQualityFunctionMuOracle.cpp:668-829`)
+/// with `ScaleSigma`/`UnscaleSigma` as identities (lines 836-848).
+///
+/// Stop criteria mirror Ipopt:
+///   - relative width: `(up - lo) < section_sigma_tol * up`
+///   - max sections: `quality_function_max_section_steps` (default 8)
+/// Defaults match `RegisterOptions` (lines 102-117): tol = 1e-2, max
+/// steps = 8.
 ///
 /// When `options.quality_function_centrality` is true, adds the
-/// `CEN_RECIPROCAL` penalty `compl_inf / xi`, where
-/// `xi = min(z·s) / avg(z·s)` is the centrality measure at the trial
-/// mu. Default is false (matching Ipopt's `centrality=none`).
+/// `CEN_RECIPROCAL` penalty `compl_inf / xi` (line 638-640), with xi
+/// the current-iterate centrality measure. Default is false (Ipopt's
+/// `centrality=none`, line 84-91).
 ///
 /// Reference implementation; the production Free-mode oracle is the
 /// Loqo σ = 0.1·min(0.05·(1-ξ)/ξ, 2)³ formula at `compute_loqo_mu`,
@@ -9212,51 +9219,93 @@ fn quality_function_mu(
     options: &SolverOptions,
     mu_lower: f64,
     mu_upper: f64,
-    n_candidates: usize,
 ) -> f64 {
-    if mu_upper <= mu_lower || n_candidates < 2 {
-        return mu_upper;
+    // Project plan T3.3: bracket clamped to [1e-6, 1e2]; sigma_tol = 1e-2;
+    // max_sections = 8. Matches Ipopt RegisterOptions lines 54-117.
+    const SIGMA_MIN: f64 = 1e-6;
+    const SIGMA_MAX: f64 = 1e2;
+    const SECTION_SIGMA_TOL: f64 = 1e-2;
+    const MAX_SECTIONS: usize = 8;
+
+    let lo = mu_lower.max(SIGMA_MIN);
+    let up = mu_upper.min(SIGMA_MAX);
+    if up <= lo {
+        return up.max(lo);
     }
 
     let pi = state.constraint_violation();
     let di = compute_dual_inf_at_state(state);
+    let avg = if options.quality_function_centrality {
+        compute_avg_complementarity(state)
+    } else {
+        0.0
+    };
+    let xi_current = if options.quality_function_centrality {
+        compute_centrality_xi(state, avg)
+    } else {
+        1.0
+    };
 
-    let log_min = mu_lower.max(1e-20).ln();
-    let log_max = mu_upper.ln();
-
-    let mut best_mu = mu_upper;
-    let mut best_q = f64::INFINITY;
-
-    for k in 0..n_candidates {
-        let t = k as f64 / (n_candidates - 1) as f64;
-        let mu_candidate = (log_min + t * (log_max - log_min)).exp();
-
+    let q_at = |mu: f64| -> f64 {
         let ci = convergence::complementarity_error(
-            &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u, mu_candidate,
+            &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u, mu,
         );
-
         let mut q = pi + di + ci;
-
         if options.quality_function_centrality {
-            // Centrality at the candidate mu: xi = min(z·s)/avg(z·s).
-            // Both products are taken at the current iterate (consistent
-            // with Ipopt's affine-projection formula at mu_candidate).
-            let avg = compute_avg_complementarity(state);
-            let xi = compute_centrality_xi(state, avg);
-            if xi > 1e-20 {
-                q += ci / xi;
+            if xi_current > 1e-20 {
+                q += ci / xi_current;
             } else {
                 q = f64::INFINITY;
             }
         }
+        q
+    };
 
-        if q < best_q {
-            best_q = q;
-            best_mu = mu_candidate;
+    // Golden section: gfac = (3 - sqrt(5))/2 ≈ 0.381966 (line 701).
+    let gfac = (3.0 - 5.0_f64.sqrt()) / 2.0;
+    let mut sigma_lo = lo;
+    let mut sigma_up = up;
+    let mut q_lo = q_at(sigma_lo);
+    let mut q_up = q_at(sigma_up);
+    let mut sigma_mid1 = sigma_lo + gfac * (sigma_up - sigma_lo);
+    let mut sigma_mid2 = sigma_lo + (1.0 - gfac) * (sigma_up - sigma_lo);
+    let mut q_mid1 = q_at(sigma_mid1);
+    let mut q_mid2 = q_at(sigma_mid2);
+
+    let mut nsections = 0;
+    while (sigma_up - sigma_lo) >= SECTION_SIGMA_TOL * sigma_up && nsections < MAX_SECTIONS {
+        nsections += 1;
+        if q_mid1 > q_mid2 {
+            sigma_lo = sigma_mid1;
+            q_lo = q_mid1;
+            sigma_mid1 = sigma_mid2;
+            q_mid1 = q_mid2;
+            sigma_mid2 = sigma_lo + (1.0 - gfac) * (sigma_up - sigma_lo);
+            q_mid2 = q_at(sigma_mid2);
+        } else {
+            sigma_up = sigma_mid2;
+            q_up = q_mid2;
+            sigma_mid2 = sigma_mid1;
+            q_mid2 = q_mid1;
+            sigma_mid1 = sigma_lo + gfac * (sigma_up - sigma_lo);
+            q_mid1 = q_at(sigma_mid1);
         }
     }
 
-    best_mu
+    // Pick the best of the four candidates (line 776-785, 786-825).
+    let candidates = [
+        (sigma_lo, q_lo),
+        (sigma_mid1, q_mid1),
+        (sigma_mid2, q_mid2),
+        (sigma_up, q_up),
+    ];
+    let mut best = candidates[0];
+    for &c in &candidates[1..] {
+        if c.1 < best.1 {
+            best = c;
+        }
+    }
+    best.0
 }
 
 /// Build the RHS `b = -J·(grad_f − z_L + z_U)` for the normal-equations
@@ -11066,42 +11115,35 @@ mod tests {
 
     #[test]
     fn test_quality_function_mu_degenerate_range() {
-        // mu_upper <= mu_lower → returns mu_upper unchanged
+        // mu_upper <= mu_lower → returns the collapsed bracket
         let state = minimal_state(1, 0);
         let opts = SolverOptions::default();
-        let mu = quality_function_mu(&state, &opts, 1.0, 1.0, 5);
+        let mu = quality_function_mu(&state, &opts, 1.0, 1.0);
         assert_eq!(mu, 1.0);
-        let mu2 = quality_function_mu(&state, &opts, 2.0, 1.0, 5);
-        assert_eq!(mu2, 1.0, "lower > upper still returns upper");
+        // lo > up after sigma clamp: returns the larger of the two clamped
+        // endpoints (i.e. the lower bound, since up gets clamped down).
+        let mu2 = quality_function_mu(&state, &opts, 2.0, 1.0);
+        assert_eq!(mu2, 2.0, "lower > upper returns the (clamped) bracket endpoint");
     }
 
     #[test]
-    fn test_quality_function_mu_too_few_candidates() {
-        // n_candidates < 2 → returns mu_upper
-        let state = minimal_state(1, 0);
-        let opts = SolverOptions::default();
-        let mu = quality_function_mu(&state, &opts, 1e-6, 1e-3, 1);
-        assert_eq!(mu, 1e-3);
-        let mu0 = quality_function_mu(&state, &opts, 1e-6, 1e-3, 0);
-        assert_eq!(mu0, 1e-3);
-    }
-
-    #[test]
-    fn test_quality_function_mu_picks_candidate_in_range() {
-        // Well-posed state: 1 lower-bound-active variable. The quality
-        // function q(mu) = pi + di + ci(mu) where ci is the
-        // 2-norm-averaged complementarity error.  With pi=di=0 and
-        // slack*z = 0.5*0.2 = 0.1, ci(mu) is minimized at mu ≈ 0.1.
+    fn test_quality_function_mu_picks_minimum_in_range() {
+        // 1 lower-bound-active variable. With pi=di=0 and slack*z = 0.5*0.2 = 0.1,
+        // ci(mu) = |slack*z - mu| / sqrt(n_comp) is minimized at mu = 0.1.
+        // Bracket [1e-3, 1e0] reflects a realistic per-iteration window
+        // (Ipopt's effective bracket after mu_min/avrg_compl clamping).
         let mut state = minimal_state(1, 0);
         state.x = vec![1.5];
         state.x_l = vec![1.0];
         state.z_l = vec![0.2];
         let opts = SolverOptions::default();
-        let mu = quality_function_mu(&state, &opts, 1e-6, 1e-1, 11);
-        assert!(mu >= 1e-6 * (1.0 - 1e-12) && mu <= 1e-1 * (1.0 + 1e-12),
-            "mu must lie in range, got {}", mu);
-        // The exact optimum 0.1 is grid point k=10 with n_candidates=11.
-        assert!((mu - 0.1).abs() < 1e-10, "expected mu≈0.1, got {}", mu);
+        let mu = quality_function_mu(&state, &opts, 1e-3, 1e0);
+        assert!(mu >= 1e-3 - 1e-12 && mu <= 1e0 + 1e-12,
+            "mu must lie in clamped bracket, got {}", mu);
+        // Golden section with 8 sections over [1e-3, 1] converges
+        // within ~5% of the true minimum at 0.1.
+        assert!((mu - 0.1).abs() / 0.1 < 5e-2,
+            "expected mu≈0.1, got {}", mu);
     }
 
     #[test]
@@ -11119,16 +11161,33 @@ mod tests {
 
         let mut opts_off = SolverOptions::default();
         opts_off.quality_function_centrality = false;
-        let mu_off = quality_function_mu(&state, &opts_off, 1e-6, 1.0, 21);
+        let mu_off = quality_function_mu(&state, &opts_off, 1e-6, 1.0);
 
         let mut opts_on = SolverOptions::default();
         opts_on.quality_function_centrality = true;
-        let mu_on = quality_function_mu(&state, &opts_on, 1e-6, 1.0, 21);
+        let mu_on = quality_function_mu(&state, &opts_on, 1e-6, 1.0);
 
-        // Centrality on must pick a strictly larger mu (penalty on
-        // 1/xi steers away from aggressive small-mu candidates).
+        // Centrality on should pick a strictly larger (or equal) mu (penalty
+        // on 1/xi steers away from aggressive small-mu candidates).
         assert!(mu_on >= mu_off,
-            "centrality should raise mu, off={mu_off:e} on={mu_on:e}");
+            "centrality should not lower mu, off={mu_off:e} on={mu_on:e}");
+    }
+
+    #[test]
+    fn test_quality_function_mu_golden_section_converges() {
+        // Synthetic 1-D test: with pi=di=0 and slack*z = 0.05, ci(mu) is a
+        // V-shape with unique minimum at mu = 0.05. Verify golden section
+        // converges within 5% relative tolerance over [1e-3, 1] in 8 sections.
+        let mut state = minimal_state(1, 0);
+        state.x = vec![1.5];
+        state.x_l = vec![1.0];
+        state.z_l = vec![0.1]; // slack*z = 0.5 * 0.1 = 0.05
+        let opts = SolverOptions::default();
+        let mu = quality_function_mu(&state, &opts, 1e-3, 1e0);
+        assert!(mu >= 1e-3 - 1e-12 && mu <= 1e0 + 1e-12,
+            "mu out of bracket: {}", mu);
+        assert!((mu - 0.05).abs() / 0.05 < 5e-2,
+            "golden section should converge near 0.05, got {}", mu);
     }
 
     /// Minimal `NlpProblem` whose evaluations return user-controlled
