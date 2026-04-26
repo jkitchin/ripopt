@@ -9913,10 +9913,19 @@ fn compute_convergence_info_from_state(
     let primal_inf = compute_primal_inf_max_at_state(state);
     let dual_inf = compute_dual_inf_at_state(state);
     let compl_inf = compute_compl_err_at_state(state);
+    // Ipopt's unscaled_curr_dual_infeasibility removes the obj_scaling
+    // factor that was applied to ∇f and J^T y in the internal scaled
+    // problem (`IpOrigIpoptNLP::unscaled_curr_dual_infeasibility`). For
+    // ripopt's uniform obj scaling that reduces to a single division.
+    let dual_inf_unscaled = if state.obj_scaling != 1.0 && state.obj_scaling != 0.0 {
+        dual_inf / state.obj_scaling
+    } else {
+        dual_inf
+    };
     ConvergenceInfo {
         primal_inf,
         dual_inf,
-        dual_inf_unscaled: dual_inf,
+        dual_inf_unscaled,
         compl_inf,
         mu,
         objective: state.obj,
@@ -10552,6 +10561,33 @@ mod tests {
         state.g_u[1] = 5.0;
         let count = compute_bound_multiplier_count(&state);
         assert_eq!(count, 3, "expected 3 finite bounds, got {}", count);
+    }
+
+    #[test]
+    fn test_convergence_info_dual_inf_unscaled_with_obj_scaling() {
+        // T0.4: when obj_scaling = 0.5, dual_inf_unscaled = dual_inf / 0.5 = 2 * dual_inf.
+        // Build a state with grad_f = [1.0] (scaled), no constraints, no z.
+        // dual_inf = max|grad_f - z_l + z_u| = 1.0.
+        // dual_inf_unscaled = 1.0 / 0.5 = 2.0.
+        let mut state = minimal_state(1, 0);
+        state.obj_scaling = 0.5;
+        state.grad_f = vec![1.0];
+        let info = compute_convergence_info_from_state(&state, 0.0, 1, 0);
+        assert!((info.dual_inf - 1.0).abs() < 1e-12, "dual_inf = {}", info.dual_inf);
+        assert!((info.dual_inf_unscaled - 2.0).abs() < 1e-12,
+            "dual_inf_unscaled with obj_scaling=0.5 should be 2*dual_inf, got {}",
+            info.dual_inf_unscaled);
+    }
+
+    #[test]
+    fn test_convergence_info_dual_inf_unscaled_obj_scaling_one() {
+        // T0.4: obj_scaling = 1.0 leaves dual_inf_unscaled == dual_inf.
+        let mut state = minimal_state(1, 0);
+        state.obj_scaling = 1.0;
+        state.grad_f = vec![3.0];
+        let info = compute_convergence_info_from_state(&state, 0.0, 1, 0);
+        assert!((info.dual_inf - info.dual_inf_unscaled).abs() < 1e-15);
+        assert!((info.dual_inf - 3.0).abs() < 1e-12);
     }
 
     #[test]
