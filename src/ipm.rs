@@ -6050,10 +6050,8 @@ fn track_consecutive_acceptable(
     multiplier_sum: f64,
     bound_multiplier_sum: f64,
 ) -> f64 {
-    let n = state.n;
-    let m = state.m;
-    let s_d_for_acc = compute_residual_scaling(multiplier_sum, m + 2 * n);
-    let s_c_for_acc = compute_residual_scaling(bound_multiplier_sum, 2 * n);
+    let s_d_for_acc = compute_residual_scaling(multiplier_sum, compute_multiplier_count(state));
+    let s_c_for_acc = compute_residual_scaling(bound_multiplier_sum, compute_bound_multiplier_count(state));
     let meets_acc_scaled = primal_inf <= 1e-6
         && dual_inf <= 1e-6 * s_d_for_acc
         && compl_inf <= 1e-6 * s_c_for_acc;
@@ -7600,10 +7598,12 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
 
         // Compute multiplier scaling (also used by the consecutive-acceptable
         // tracker further below, so kept here rather than inside the helper).
+        // Counts are finite-bound counts to match Ipopt
+        // `IpIpoptCalculatedQuantities.cpp:3677-3699`.
         let multiplier_sum = compute_multiplier_sum(&state);
-        let multiplier_count = m + 2 * n;
+        let multiplier_count = compute_multiplier_count(&state);
         let bound_multiplier_sum = compute_bound_multiplier_sum(&state);
-        let bound_multiplier_count = 2 * n;
+        let bound_multiplier_count = compute_bound_multiplier_count(&state);
 
         let mut conv_ws = ConvergenceWorkspace {
             avg: &mut avg_state,
@@ -9315,9 +9315,10 @@ fn compute_residual_scaling(sum: f64, count: usize) -> f64 {
 }
 
 /// Dual residual scaling s_d evaluated at the current iterate, using
-/// the full multiplier sum (y, z_l, z_u) and count m + 2n.
+/// the full multiplier sum (y, z_l, z_u) and the finite-bound multiplier
+/// count (Ipopt `IpIpoptCalculatedQuantities.cpp:3689-3690`).
 fn compute_s_d_at_state(state: &SolverState) -> f64 {
-    compute_residual_scaling(compute_multiplier_sum(state), state.m + 2 * state.n)
+    compute_residual_scaling(compute_multiplier_sum(state), compute_multiplier_count(state))
 }
 
 /// Constraint violation theta evaluated at an arbitrary `g` against
@@ -9843,10 +9844,52 @@ fn compute_multiplier_sum(state: &SolverState) -> f64 {
 }
 
 /// Sum of absolute values of bound multipliers only (`z_l`, `z_u`).
-/// Used with `bound_multiplier_count = 2n` to compute the
+/// Used with `bound_multiplier_count` (finite-bound count) to compute the
 /// complementarity scaling factor `s_c` via `compute_residual_scaling`.
 fn compute_bound_multiplier_sum(state: &SolverState) -> f64 {
     l1_norm(&state.z_l) + l1_norm(&state.z_u)
+}
+
+/// Count of finite variable bounds (z_L.Dim() + z_U.Dim() in Ipopt) plus
+/// finite constraint bounds (v_L.Dim() + v_U.Dim()) used as the
+/// denominator for `s_c` per `IpIpoptCalculatedQuantities.cpp:3677-3687`.
+/// In ripopt's combined-y representation, each finite g_L[i] contributes
+/// one unit (the v_L slot) and each finite g_U[i] contributes one
+/// (the v_U slot). Equality constraints have both finite but they
+/// represent a single dual, so they each still contribute their two
+/// counts separately, matching Ipopt's bookkeeping where equality
+/// constraints don't appear in v_L/v_U at all — only inequalities do.
+fn compute_bound_multiplier_count(state: &SolverState) -> usize {
+    let mut n_bound = 0usize;
+    for i in 0..state.n {
+        if state.x_l[i].is_finite() {
+            n_bound += 1;
+        }
+        if state.x_u[i].is_finite() {
+            n_bound += 1;
+        }
+    }
+    for i in 0..state.m {
+        if constraint_is_equality(state, i) {
+            continue;
+        }
+        if state.g_l[i].is_finite() {
+            n_bound += 1;
+        }
+        if state.g_u[i].is_finite() {
+            n_bound += 1;
+        }
+    }
+    n_bound
+}
+
+/// Count of all dual components contributing to `s_d` per
+/// `IpIpoptCalculatedQuantities.cpp:3689-3690`:
+/// y_c.Dim() + y_d.Dim() + z_L.Dim() + z_U.Dim() + v_L.Dim() + v_U.Dim().
+/// The `y` count is `m` (each constraint has one combined y). The bound
+/// counts come from [`compute_bound_multiplier_count`].
+fn compute_multiplier_count(state: &SolverState) -> usize {
+    state.m + compute_bound_multiplier_count(state)
 }
 
 /// Build a `ConvergenceInfo` from the current iterate by computing the
@@ -9858,8 +9901,8 @@ fn compute_bound_multiplier_sum(state: &SolverState) -> f64 {
 fn compute_convergence_info_from_state(
     state: &SolverState,
     mu: f64,
-    n: usize,
-    m: usize,
+    _n: usize,
+    _m: usize,
 ) -> ConvergenceInfo {
     let primal_inf = compute_primal_inf_max_at_state(state);
     let dual_inf = compute_dual_inf_at_state(state);
@@ -9872,9 +9915,9 @@ fn compute_convergence_info_from_state(
         mu,
         objective: state.obj,
         multiplier_sum: compute_multiplier_sum(state),
-        multiplier_count: m + 2 * n,
+        multiplier_count: compute_multiplier_count(state),
         bound_multiplier_sum: compute_bound_multiplier_sum(state),
-        bound_multiplier_count: 2 * n,
+        bound_multiplier_count: compute_bound_multiplier_count(state),
     }
 }
 
@@ -10474,6 +10517,45 @@ mod tests {
         let state = minimal_state(3, 0);
         let avg = compute_avg_complementarity(&state);
         assert_eq!(avg, 0.0);
+    }
+
+    #[test]
+    fn test_bound_multiplier_count_finite_bounds_only() {
+        // T0.2: 3 vars but only 1 finite bound; count must be 1, not 6.
+        let mut state = minimal_state(3, 0);
+        state.x_l[0] = 0.0; // finite lower on var 0
+        // var 1 and var 2: x_l = -inf, x_u = +inf (default)
+        let count = compute_bound_multiplier_count(&state);
+        assert_eq!(count, 1, "only 1 finite variable bound; got {}", count);
+    }
+
+    #[test]
+    fn test_bound_multiplier_count_with_constraint_bounds() {
+        // T0.2: variable bounds + inequality constraint bounds.
+        //   x_l[0] finite, x_u[0] finite => 2
+        //   x_l[1] = -inf, x_u[1] = -inf, x_u[1] = +inf => 0
+        //   constraint 0: g_l finite, g_u = inf, ineq => +1
+        //   constraint 1: g_l = g_u (equality) => 0 (skipped)
+        // Total = 3.
+        let mut state = minimal_state(2, 2);
+        state.x_l[0] = 0.0;
+        state.x_u[0] = 10.0;
+        state.g_l[0] = 0.0;
+        state.g_u[0] = f64::INFINITY;
+        state.g_l[1] = 5.0;
+        state.g_u[1] = 5.0;
+        let count = compute_bound_multiplier_count(&state);
+        assert_eq!(count, 3, "expected 3 finite bounds, got {}", count);
+    }
+
+    #[test]
+    fn test_multiplier_count_includes_all_y() {
+        // T0.2: multiplier_count = m + finite_bound_count.
+        // m=2, 1 finite var bound => count = 2 + 1 = 3.
+        let mut state = minimal_state(3, 2);
+        state.x_l[0] = 0.0;
+        let count = compute_multiplier_count(&state);
+        assert_eq!(count, 3);
     }
 
     #[test]
