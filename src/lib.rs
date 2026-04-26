@@ -70,11 +70,10 @@
 //! - Mehrotra predictor-corrector IPM with Gondzio corrections
 //! - Filter line search with second-order corrections
 //! - Gauss-Newton and NLP restoration phases
-//! - Fallback cascade: IPM → L-BFGS → Augmented Lagrangian → SQP → slack reformulation
+//! - Fallback cascade: IPM → L-BFGS → SQP → slack reformulation
 //! - Sparse (multifrontal LDL^T) and dense (Bunch-Kaufman LDL^T) linear solvers
 //! - Parametric sensitivity analysis ([`solve_with_sensitivity`])
 
-pub mod augmented_lagrangian;
 pub mod intermediate;
 pub(crate) mod logging;
 pub mod c_api;

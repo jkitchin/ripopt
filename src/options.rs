@@ -185,9 +185,6 @@ pub struct SolverOptions {
     /// Enable L-BFGS fallback for unconstrained problems. When IPM fails with
     /// MaxIterations or NumericalError, retry with L-BFGS. Default: true.
     pub enable_lbfgs_fallback: bool,
-    /// Enable Augmented Lagrangian fallback for equality-only problems. When IPM
-    /// fails, retry with AL method using L-BFGS inner solver. Default: true.
-    pub enable_al_fallback: bool,
     /// Enable preprocessing to eliminate fixed variables and redundant constraints.
     /// Default: true.
     pub enable_preprocessing: bool,
@@ -388,7 +385,6 @@ impl Default for SolverOptions {
             disable_nlp_restoration: false,
             enable_slack_fallback: true,
             enable_lbfgs_fallback: true,
-            enable_al_fallback: true,
             enable_preprocessing: true,
             detect_linear_constraints: true,
             enable_sqp_fallback: true,

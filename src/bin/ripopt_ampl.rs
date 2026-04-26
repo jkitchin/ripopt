@@ -193,7 +193,6 @@ fn print_help() {
     println!("  Fallback Strategies");
     println!("    enable_slack_fallback=<bool>         Retry with explicit slack variables [yes]");
     println!("    enable_lbfgs_fallback=<bool>         L-BFGS fallback for unconstrained [yes]");
-    println!("    enable_al_fallback=<bool>            Augmented Lagrangian fallback [yes]");
     println!("    enable_sqp_fallback=<bool>           SQP fallback for constrained [yes]");
     println!("    enable_lbfgs_hessian_fallback=<bool> Retry with L-BFGS Hessian [yes]");
     println!();
@@ -383,9 +382,6 @@ fn apply_option(opts: &mut SolverOptions, key: &str, value: &str) {
         }
         "lbfgs_fallback" | "enable_lbfgs_fallback" => {
             opts.enable_lbfgs_fallback = value == "yes" || value == "true" || value == "1";
-        }
-        "al_fallback" | "enable_al_fallback" => {
-            opts.enable_al_fallback = value == "yes" || value == "true" || value == "1";
         }
         "sqp_fallback" | "enable_sqp_fallback" => {
             opts.enable_sqp_fallback = value == "yes" || value == "true" || value == "1";

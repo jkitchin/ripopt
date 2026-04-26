@@ -130,7 +130,6 @@ fn lbfgs_ipm_hs071_constrained() {
         hessian_approximation_lbfgs: true,
         // Disable fallbacks that would call hessian_values on the original problem
         enable_sqp_fallback: false,
-        enable_al_fallback: false,
         enable_slack_fallback: false,
         enable_lbfgs_fallback: false,
         enable_lbfgs_hessian_fallback: false,
@@ -310,7 +309,6 @@ fn lbfgs_hessian_fallback_recovers_bad_hessian() {
         print_level: 0,
         // Keep other fallbacks disabled so only L-BFGS Hessian fallback can help
         enable_lbfgs_fallback: false,
-        enable_al_fallback: false,
         enable_sqp_fallback: false,
         enable_slack_fallback: false,
         enable_lbfgs_hessian_fallback: true,
@@ -334,7 +332,6 @@ fn lbfgs_hessian_fallback_disabled() {
     let options = SolverOptions {
         print_level: 0,
         enable_lbfgs_fallback: false,
-        enable_al_fallback: false,
         enable_sqp_fallback: false,
         enable_slack_fallback: false,
         enable_lbfgs_hessian_fallback: false,
@@ -474,7 +471,6 @@ fn lbfgs_hessian_fallback_constrained() {
     let options = SolverOptions {
         print_level: 0,
         enable_lbfgs_fallback: false,
-        enable_al_fallback: false,
         enable_sqp_fallback: false,
         enable_slack_fallback: false,
         enable_lbfgs_hessian_fallback: true,

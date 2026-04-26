@@ -301,7 +301,6 @@ fn ipm_unbounded_detection() {
     let options = SolverOptions {
         print_level: 0,
         enable_lbfgs_fallback: false,
-        enable_al_fallback: false,
         enable_sqp_fallback: false,
         ..SolverOptions::default()
     };

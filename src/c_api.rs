@@ -555,9 +555,6 @@ pub unsafe extern "C" fn ripopt_add_str_option(
         "enable_lbfgs_fallback" => {
             p.options.enable_lbfgs_fallback = value == "yes";
         }
-        "enable_al_fallback" => {
-            p.options.enable_al_fallback = value == "yes";
-        }
         "enable_preprocessing" => {
             p.options.enable_preprocessing = value == "yes";
         }
