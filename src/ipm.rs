@@ -1630,28 +1630,6 @@ fn try_lbfgs_hessian_fallback<P: NlpProblem>(
     adopt_candidate_if_better(result, candidate, options, "L-BFGS Hessian fallback", "lbfgs_hessian");
 }
 
-/// Augmented Lagrangian fallback: solve via `crate::augmented_lagrangian`.
-/// Only fires for constrained problems; primarily used for
-/// `SlowConvergence` failures.
-fn try_al_fallback<P: NlpProblem>(
-    result: &mut SolveResult,
-    problem: &P,
-    options: &SolverOptions,
-    solve_start: Instant,
-    diagnosis: FailureDiagnosis,
-    has_constraints: bool,
-) {
-    if !options.enable_al_fallback || !has_constraints {
-        return;
-    }
-    let Some(opts) = prepare_fallback_opts(options, &solve_start) else { return };
-    if options.print_level >= 5 {
-        rip_log!("ripopt: Trying AL fallback ({:?})", diagnosis);
-    }
-    let candidate = crate::augmented_lagrangian::solve(problem, &opts);
-    adopt_candidate_if_better(result, candidate, options, "AL fallback", "augmented_lagrangian");
-}
-
 /// SQP fallback: solve via `crate::sqp`. Only fires for constrained
 /// problems. Used for `StallAtInfeasibility`, `SlowConvergence`, and
 /// `StallNearOptimal` (where SQP refines a near-optimal IPM iterate).
@@ -1758,10 +1736,7 @@ fn dispatch_failure_recovery<P: NlpProblem>(
             try_lbfgs_hessian_fallback(result, problem, options, solve_start, diagnosis);
         }
         FailureDiagnosis::SlowConvergence => {
-            try_al_fallback(result, problem, options, solve_start, diagnosis, has_constraints);
-            if !matches!(result.status, SolveStatus::Optimal) {
-                try_sqp_fallback(result, problem, options, solve_start, diagnosis, has_constraints);
-            }
+            try_sqp_fallback(result, problem, options, solve_start, diagnosis, has_constraints);
         }
         FailureDiagnosis::StallNearOptimal => {
             // A stall *at* a near-feasible point with growing Hessian
