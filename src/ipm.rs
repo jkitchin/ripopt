@@ -9577,9 +9577,13 @@ fn push_initial_point_from_bounds(
     }
 }
 
-/// Compute initial constraint multipliers via least-squares estimate when
-/// enabled and the problem is small enough (m <= 500). Returns vec![0.0; m]
-/// when LS init is disabled, m == 0, m > 500, or evaluation fails.
+/// Compute initial constraint multipliers via least-squares estimate.
+/// Solves the normal equations `(J·Jᵀ) y = -J·grad_f` (Ipopt convention
+/// `L = f + yᵀ g`); the inner `compute_ls_multiplier_estimate_with_z`
+/// dispatches to a sparse `J·Jᵀ` factorization for `m > 500` so this
+/// scales without an outer cap (T2.2: prior `m ≤ 500` cutoff dropped).
+/// Returns `vec![0.0; m]` when LS init is disabled, m == 0, evaluation
+/// fails, the LS solve fails, or estimates exceed `constr_mult_init_max`.
 #[allow(clippy::too_many_arguments)]
 fn compute_initial_y_with_ls<P: NlpProblem>(
     problem: &P,
@@ -9593,7 +9597,7 @@ fn compute_initial_y_with_ls<P: NlpProblem>(
     m: usize,
     jac_nnz: usize,
 ) -> Vec<f64> {
-    if !(options.least_squares_mult_init && m > 0 && m <= 500) {
+    if !(options.least_squares_mult_init && m > 0) {
         return vec![0.0; m];
     }
     let mut grad_f_init = vec![0.0; n];
