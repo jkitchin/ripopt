@@ -9748,7 +9748,10 @@ fn recover_active_set_z(state: &SolverState, gj: &[f64], n: usize) -> (Vec<f64>,
 
 /// Fraction-to-boundary `tau` factor used by the main step and the
 /// Gondzio multiple-centrality corrections. Free mode uses
-/// `1 - NLP_error` (Wächter & Biegler 2006 eq. 8); fixed mode uses
+/// `1 - E_mu` where `E_mu` is Ipopt's unified scaled KKT-error
+/// `max(dual_inf/s_d, primal_inf, compl_inf/s_c)`
+/// (`IpIpoptCalculatedQuantities::curr_nlp_error`,
+/// `IpAdaptiveMuUpdate.cpp:397`); fixed mode uses
 /// `1 - mu` (Ipopt's standard `IpAlgorithmRegOp::tau_min`). Both are
 /// floored at `options.tau_min` so the primal/dual fraction-to-
 /// boundary scan stays strictly positive.
@@ -9761,11 +9764,31 @@ fn compute_tau(
     compl_inf: f64,
 ) -> f64 {
     if mu_state.mode == MuMode::Free {
-        let nlp_error = primal_inf + dual_inf + compl_inf;
-        (1.0 - nlp_error).max(options.tau_min)
+        let e_mu = compute_e_mu(state, primal_inf, dual_inf, compl_inf);
+        (1.0 - e_mu).max(options.tau_min)
     } else {
         (1.0 - state.mu).max(options.tau_min)
     }
+}
+
+/// Unified scaled KKT-error `E_mu` matching Ipopt's
+/// `IpoptCalculatedQuantities::curr_nlp_error`
+/// (`IpIpoptCalculatedQuantities.cpp:3050-3104`):
+///
+/// ```text
+/// E_mu = max( dual_inf / s_d , primal_inf , compl_inf / s_c )
+/// ```
+///
+/// where `s_d = max(s_max, sum|y, z_l, z_u| / (m+2n)) / s_max` and
+/// `s_c = max(s_max, sum|z_l, z_u| / (2n)) / s_max` with `s_max = 100`.
+/// Used by the Free-mode τ formula so it tracks the same scaled error
+/// the convergence test uses.
+fn compute_e_mu(state: &SolverState, primal_inf: f64, dual_inf: f64, compl_inf: f64) -> f64 {
+    let n = state.n;
+    let m = state.m;
+    let s_d = compute_residual_scaling(compute_multiplier_sum(state), m + 2 * n);
+    let s_c = compute_residual_scaling(compute_bound_multiplier_sum(state), 2 * n);
+    (dual_inf / s_d).max(primal_inf).max(compl_inf / s_c)
 }
 
 /// Fraction-to-boundary cap on the dual step `α·(dz_l, dz_u)` against
