@@ -1802,43 +1802,6 @@ fn dispatch_failure_recovery<P: NlpProblem>(
     None
 }
 
-/// Slow-optimal slack fallback: if the initial IPM was Optimal but
-/// started from a feasible point and the objective worsened (or didn't
-/// improve) while consuming > 5% of the wall-time budget, it likely
-/// converged to a bad local minimum — try slack reformulation.
-fn try_slow_optimal_slack_fallback<P: NlpProblem>(
-    result: &mut SolveResult,
-    problem: &P,
-    options: &SolverOptions,
-    solve_start: Instant,
-    diagnosis: FailureDiagnosis,
-    has_inequalities: bool,
-    initial_feasible: bool,
-    initial_obj: f64,
-) -> Option<SolveResult> {
-    if !(matches!(result.status, SolveStatus::Optimal)
-        && has_inequalities
-        && options.enable_slack_fallback
-        && options.max_wall_time > 0.0)
-    {
-        return None;
-    }
-    let time_used = solve_start.elapsed().as_secs_f64();
-    let worsened_from_feasible = initial_feasible
-        && initial_obj.is_finite()
-        && result.objective > initial_obj - 1e-3 * initial_obj.abs().max(1.0);
-    if !(time_used > 0.05 * options.max_wall_time && worsened_from_feasible) {
-        return None;
-    }
-    if options.print_level >= 5 {
-        rip_log!(
-            "ripopt: Slow-optimal detected (obj={:.4e}, init_obj={:.4e}, time={:.1}s/{:.1}s), trying slack fallback",
-            result.objective, initial_obj, time_used, options.max_wall_time
-        );
-    }
-    try_slack_fallback(result, problem, options, solve_start, diagnosis, has_inequalities)
-}
-
 /// Run preprocessing (fixed-variable and redundant-constraint elimination)
 /// and, if it reduces the problem, recursively `solve` the smaller problem
 /// then unmap the solution. Returns `Some(result)` only when the
@@ -2333,10 +2296,6 @@ fn solve_inner<P: NlpProblem>(
     options: &SolverOptions,
     solve_start: Instant,
 ) -> SolveResult {
-    // Capture initial objective and feasibility for slow-optimal detection.
-    // NOTE: disabled -- extra problem evaluations here change CUTEst FP state and cause regressions.
-    let (initial_obj, initial_feasible) = (f64::INFINITY, false);
-
     if let Some(result) = try_preprocessed_solve(problem, options, solve_start) {
         return result;
     }
@@ -2364,13 +2323,6 @@ fn solve_inner<P: NlpProblem>(
         ) {
             return slack_result;
         }
-    }
-
-    if let Some(slack_result) = try_slow_optimal_slack_fallback(
-        &mut result, problem, options, solve_start, diagnosis,
-        has_inequalities, initial_feasible, initial_obj,
-    ) {
-        return slack_result;
     }
 
     apply_late_optimality_promotion(&mut result, options);
