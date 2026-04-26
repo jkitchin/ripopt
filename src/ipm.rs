@@ -158,6 +158,9 @@ impl<P: NlpProblem> NlpProblem for ScaledProblem<'_, P> {
         self.inner
             .hessian_values(x, _new_x, obj_factor * self.obj_scaling, &scaled_lambda, vals)
     }
+    fn notify_mu(&self, mu: f64) {
+        self.inner.notify_mu(mu);
+    }
 }
 
 /// NLP problem wrapper that applies user-supplied primal scaling
@@ -330,6 +333,9 @@ impl<P: NlpProblem> NlpProblem for XScaledProblem<'_, P> {
             vals[idx] *= self.inv_dx[r] * self.inv_dx[c];
         }
         true
+    }
+    fn notify_mu(&self, mu: f64) {
+        self.inner.notify_mu(mu);
     }
 }
 
@@ -7526,6 +7532,13 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
     // Main IPM loop
     for iteration in 0..options.max_iter {
         state.iter = iteration;
+
+        // Notify the problem of the current barrier μ before any
+        // evaluation calls. Used by `RestorationNlp` so its η weight
+        // tracks the inner IPM's μ instead of staying frozen at the
+        // restoration entry value (Ipopt `RestoIpoptNLP::Eta(mu)`,
+        // IpRestoIpoptNLP.cpp:759). Default no-op for normal NLPs.
+        problem.notify_mu(state.mu);
 
         // Early-stall timeout scaled by problem size: medium-scale problems
         // (n+m > 1000) can legitimately spend 30-60s on restoration or line

@@ -88,4 +88,13 @@ pub trait NlpProblem {
     /// `new_x` is `true` when `x` differs from the previous evaluation point.
     /// Return `true` on success, `false` if evaluation fails at this point.
     fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) -> bool;
+
+    /// Optional hook: notify the problem of the current barrier parameter μ.
+    ///
+    /// Default: no-op. Override when the objective depends on μ (the
+    /// restoration NLP has `(η/2)·‖D_R(x − x_R)‖²` with η = η_factor·√μ
+    /// per Ipopt `RestoIpoptNLP::Eta`; see `IpRestoIpoptNLP.cpp:759`).
+    /// The IPM calls this once per outer iteration, before any objective
+    /// / gradient / Hessian evaluations.
+    fn notify_mu(&self, _mu: f64) {}
 }
