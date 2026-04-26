@@ -322,7 +322,7 @@ impl Default for SolverOptions {
             constraint_slack_barrier: true,
             max_wall_time: 0.0,
             watchdog_shortened_iter_trigger: 10,
-            watchdog_trial_iter_max: 3,
+            watchdog_trial_iter_max: 5,
             sparse_threshold: 110,
             barrier_tol_factor: 10.0,
             adaptive_mu_monotone_init_factor: 0.8,

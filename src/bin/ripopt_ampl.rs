@@ -175,7 +175,7 @@ fn print_help() {
     println!("  Step Control & Line Search");
     println!("    max_soc=<int>                        Max second-order correction steps [4]");
     println!("    watchdog_shortened_iter_trigger=<int> Shortened steps before watchdog [10]");
-    println!("    watchdog_trial_iter_max=<int>        Max watchdog trial iterations [3]");
+    println!("    watchdog_trial_iter_max=<int>        Max watchdog trial iterations [5]");
     println!();
     println!("  Constraint Handling");
     println!("    constraint_slack_barrier=<bool>      Slack log-barriers in filter merit [yes]");
