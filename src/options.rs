@@ -332,6 +332,15 @@ pub struct SolverOptions {
     /// Default: `RelaxBounds`. `MakeParameter` is a TODO (currently
     /// falls back to `RelaxBounds`).
     pub fixed_variable_treatment: FixedVariableTreatment,
+    /// Acceptable-level relative objective-change gate. The acceptable
+    /// status only fires when `|f_k - f_{k-1}| / max(1, |f_k|) ≤
+    /// acceptable_obj_change_tol`. Default 1e20 disables the gate
+    /// (matches Ipopt 3.14 `IpOptErrorConvCheck.cpp:115`).
+    pub acceptable_obj_change_tol: f64,
+    /// Threshold on `‖x‖_∞` above which the iterate is declared
+    /// diverging. Default 1e20 matches Ipopt
+    /// `IpOptErrorConvCheck.cpp:123`.
+    pub diverging_iterates_tol: f64,
 }
 
 impl Default for SolverOptions {
@@ -411,6 +420,8 @@ impl Default for SolverOptions {
             bound_mult_init_method: BoundMultInitMethod::Constant,
             bound_mult_init_val: 1.0,
             fixed_variable_treatment: FixedVariableTreatment::RelaxBounds,
+            acceptable_obj_change_tol: 1e20,
+            diverging_iterates_tol: 1e20,
         }
     }
 }

@@ -2168,7 +2168,7 @@ mod tests {
             n, m, &hess_rows, &hess_cols, &hess_vals,
             &jac_rows, &jac_cols, &jac_vals, &sigma, &grad_f,
             &g, &g_l, &g_u, &y, &z_l, &z_u,
-            &x, &x_l, &x_u, mu, false, &v_l, &v_u,
+            &x, &x_l, &x_u, mu, 0.0, false, &v_l, &v_u,
         );
         // Σ_s = v_L / s = 1.5 / 0.3 = 5.0  ⇒ (2,2) = -1/5 = -0.2
         let d_22 = kkt.matrix.get(1, 1);
@@ -2203,7 +2203,7 @@ mod tests {
             n, m, &hess_rows, &hess_cols, &hess_vals,
             &jac_rows, &jac_cols, &jac_vals, &sigma, &grad_f,
             &g, &g_l, &g_u, &y, &z_l, &z_u,
-            &x, &x_l, &x_u, mu, false, &v_l, &v_u,
+            &x, &x_l, &x_u, mu, 0.0, false, &v_l, &v_u,
         );
         // v_L = max(0, 0) = 0 ⇒ clamped UP to μ/(κ_σ·s) = 0.01/(1e10·0.3) ≈ 3.33e-12.
         // Σ_s ≈ 1.11e-11 ⇒ (2,2) ≈ -9e10.

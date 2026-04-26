@@ -46,6 +46,46 @@ pub struct ConvergenceInfo {
     pub bound_multiplier_sum: f64,
     /// Total number of bound-multiplier components (2n) — denominator for s_c.
     pub bound_multiplier_count: usize,
+    /// `‖x‖_∞` of the current iterate, used by the divergence gate
+    /// against `options.diverging_iterates_tol` (Ipopt
+    /// `IpOptErrorConvCheck.cpp:255`). Default `0.0` when an upstream
+    /// caller cannot supply x; that value never triggers divergence.
+    pub x_max_abs: f64,
+}
+
+/// Test whether the iterate meets Ipopt's acceptable-level thresholds,
+/// including the relative objective-change gate
+/// `|f_k − f_{k-1}| / max(1, |f_k|) ≤ acceptable_obj_change_tol`
+/// (`IpOptErrorConvCheck.cpp:115, 322-330`). When `last_obj` is `None`
+/// (iteration 0, no previous objective) the obj-change gate is skipped.
+pub fn meets_acceptable_thresholds(
+    info: &ConvergenceInfo,
+    options: &SolverOptions,
+    s_d: f64,
+    s_c: f64,
+    last_obj: Option<f64>,
+) -> bool {
+    const ACCEPTABLE_TOL: f64 = 1e-6;
+    const ACCEPTABLE_DUAL_INF_TOL: f64 = 1e10;
+    const ACCEPTABLE_CONSTR_VIOL_TOL: f64 = 1e-2;
+    const ACCEPTABLE_COMPL_INF_TOL: f64 = 1e-2;
+
+    let scaled_ok = info.primal_inf <= ACCEPTABLE_TOL
+        && info.dual_inf <= ACCEPTABLE_TOL * s_d
+        && info.compl_inf <= ACCEPTABLE_TOL * s_c;
+    let unscaled_ok = info.primal_inf <= ACCEPTABLE_CONSTR_VIOL_TOL
+        && info.dual_inf_unscaled <= ACCEPTABLE_DUAL_INF_TOL
+        && info.compl_inf <= ACCEPTABLE_COMPL_INF_TOL;
+
+    let obj_change_ok = match last_obj {
+        Some(prev) => {
+            let denom = info.objective.abs().max(1.0);
+            (info.objective - prev).abs() / denom <= options.acceptable_obj_change_tol
+        }
+        None => true,
+    };
+
+    scaled_ok && unscaled_ok && obj_change_ok
 }
 
 /// Acceptable-level thresholds matching Ipopt defaults
@@ -60,33 +100,6 @@ pub const ACCEPTABLE_COMPL_INF_TOL: f64 = 1e-2;
 /// `Acceptable` exit (Ipopt's `acceptable_iter`).
 pub const NEAR_TOL_ITERS: usize = 15;
 
-/// Test whether the current iterate meets the acceptable-level
-/// thresholds (without requiring the consecutive-iteration count).
-/// Used by the IPM loop to decide when to take an
-/// `IterateSnapshot` for the `RestoreAcceptablePoint` mechanism.
-pub fn meets_acceptable_thresholds(
-    info: &ConvergenceInfo,
-) -> bool {
-    let s_max: f64 = 100.0;
-    let s_d = if info.multiplier_count > 0 {
-        s_max.max(info.multiplier_sum / info.multiplier_count as f64) / s_max
-    } else {
-        1.0
-    };
-    let s_c = if info.bound_multiplier_count > 0 {
-        s_max.max(info.bound_multiplier_sum / info.bound_multiplier_count as f64) / s_max
-    } else {
-        1.0
-    };
-    let scaled_ok = info.primal_inf <= ACCEPTABLE_TOL
-        && info.dual_inf <= ACCEPTABLE_TOL * s_d
-        && info.compl_inf <= ACCEPTABLE_TOL * s_c;
-    let unscaled_ok = info.primal_inf <= ACCEPTABLE_CONSTR_VIOL_TOL
-        && info.dual_inf_unscaled <= ACCEPTABLE_DUAL_INF_TOL
-        && info.compl_inf <= ACCEPTABLE_COMPL_INF_TOL;
-    scaled_ok && unscaled_ok
-}
-
 /// Check convergence of the IPM algorithm.
 ///
 /// Returns the convergence status based on current optimality measures.
@@ -94,6 +107,18 @@ pub fn check_convergence(
     info: &ConvergenceInfo,
     options: &SolverOptions,
     consecutive_acceptable: usize,
+) -> ConvergenceStatus {
+    check_convergence_with_last_obj(info, options, consecutive_acceptable, None)
+}
+
+/// Variant of `check_convergence` that threads the previous iterate's
+/// objective for the acceptable-level relative-change gate. Iteration 0
+/// callers pass `None`; subsequent iterations pass the prior `f`.
+pub fn check_convergence_with_last_obj(
+    info: &ConvergenceInfo,
+    options: &SolverOptions,
+    consecutive_acceptable: usize,
+    last_obj: Option<f64>,
 ) -> ConvergenceStatus {
     // Ipopt-style scaling factors (IpIpoptCalculatedQuantities.cpp:3663-3700):
     //   s_d = max(s_max, sum|y, z_l, z_u| / (m+2n)) / s_max  — for dual residual
@@ -129,13 +154,16 @@ pub fn check_convergence(
         return ConvergenceStatus::Converged;
     }
 
-    if meets_acceptable_thresholds(info) && consecutive_acceptable >= NEAR_TOL_ITERS {
+    if meets_acceptable_thresholds(info, options, s_d, s_c, last_obj)
+        && consecutive_acceptable >= NEAR_TOL_ITERS
+    {
         return ConvergenceStatus::Acceptable;
     }
 
-    // Check divergence (use 1e50 — constrained problems can have large feasible objectives,
-    // and transient excursions to large |obj| can occur during interior point iterations)
-    if info.objective.abs() > 1e50 {
+    // Divergence gate: ‖x‖_∞ > diverging_iterates_tol (Ipopt 3.14
+    // IpOptErrorConvCheck.cpp:255). Earlier ripopt tested |f| > 1e50,
+    // which fired on legitimate large-objective constrained problems.
+    if info.x_max_abs > options.diverging_iterates_tol {
         return ConvergenceStatus::Diverging;
     }
 
@@ -363,6 +391,7 @@ mod tests {
             multiplier_count: 0,
             bound_multiplier_sum: 0.0,
             bound_multiplier_count: 0,
+            x_max_abs: 0.0,
         };
         let opts = SolverOptions::default();
         assert_eq!(
@@ -384,6 +413,7 @@ mod tests {
             multiplier_count: 0,
             bound_multiplier_sum: 0.0,
             bound_multiplier_count: 0,
+            x_max_abs: 0.0,
         };
         let opts = SolverOptions::default();
         assert_eq!(
@@ -394,17 +424,20 @@ mod tests {
 
     #[test]
     fn test_convergence_diverging() {
+        // T0.6: divergence is gated by ‖x‖_∞ > diverging_iterates_tol,
+        // not |f| (Ipopt IpOptErrorConvCheck.cpp:255).
         let info = ConvergenceInfo {
             primal_inf: 1e-3,
             dual_inf: 1e-3,
             dual_inf_unscaled: 1e-3,
             compl_inf: 1e-3,
             mu: 1e-11,
-            objective: 1e51,
+            objective: 1.0,
             multiplier_sum: 0.0,
             multiplier_count: 0,
             bound_multiplier_sum: 0.0,
             bound_multiplier_count: 0,
+            x_max_abs: 1e25,
         };
         let opts = SolverOptions::default();
         assert_eq!(
@@ -414,37 +447,67 @@ mod tests {
     }
 
     #[test]
-    fn test_meets_acceptable_thresholds_ignores_count() {
+    fn test_convergence_diverging_uses_x_not_obj() {
+        // T0.6: |f| huge but ‖x‖_∞ small ⇒ NOT diverging.
         let info = ConvergenceInfo {
-            primal_inf: 1e-7,
-            dual_inf: 1e-7,
-            dual_inf_unscaled: 1e-7,
-            compl_inf: 1e-7,
-            mu: 1e-8,
-            objective: 5.0,
-            multiplier_sum: 0.0,
-            multiplier_count: 0,
-            bound_multiplier_sum: 0.0,
-            bound_multiplier_count: 0,
+            primal_inf: 1e-3, dual_inf: 1e-3, dual_inf_unscaled: 1e-3,
+            compl_inf: 1e-3, mu: 1e-11, objective: 1e60,
+            multiplier_sum: 0.0, multiplier_count: 0,
+            bound_multiplier_sum: 0.0, bound_multiplier_count: 0,
+            x_max_abs: 1e15,
         };
-        assert!(meets_acceptable_thresholds(&info));
+        let opts = SolverOptions::default();
+        assert_ne!(check_convergence(&info, &opts, 0), ConvergenceStatus::Diverging);
     }
 
     #[test]
-    fn test_meets_acceptable_thresholds_rejects_violated() {
+    fn test_meets_acceptable_thresholds_obj_change_passes() {
+        // T0.5: |Δf| / max(1, |f|) = |10.001 - 10.0| / 10.001 ≈ 1e-4.
+        // With acceptable_obj_change_tol = 1e-2, gate passes.
         let info = ConvergenceInfo {
-            primal_inf: 1e-1,
-            dual_inf: 1e-7,
-            dual_inf_unscaled: 1e-7,
-            compl_inf: 1e-7,
-            mu: 1e-8,
-            objective: 5.0,
-            multiplier_sum: 0.0,
-            multiplier_count: 0,
-            bound_multiplier_sum: 0.0,
-            bound_multiplier_count: 0,
+            primal_inf: 1e-7, dual_inf: 1e-7, dual_inf_unscaled: 1e-7,
+            compl_inf: 1e-7, mu: 0.0, objective: 10.001,
+            multiplier_sum: 0.0, multiplier_count: 0,
+            bound_multiplier_sum: 0.0, bound_multiplier_count: 0,
+            x_max_abs: 0.0,
         };
-        assert!(!meets_acceptable_thresholds(&info));
+        let mut opts = SolverOptions::default();
+        opts.acceptable_obj_change_tol = 1e-2;
+        assert!(meets_acceptable_thresholds(&info, &opts, 1.0, 1.0, Some(10.0)),
+            "|Δf|/|f| ≈ 1e-4 ≤ 1e-2 should pass");
+    }
+
+    #[test]
+    fn test_meets_acceptable_thresholds_obj_change_blocks() {
+        // T0.5: |Δf| / max(1, |f|) = |11.0 - 10.0| / 11.0 ≈ 0.091.
+        // With acceptable_obj_change_tol = 1e-2, gate blocks.
+        let info = ConvergenceInfo {
+            primal_inf: 1e-7, dual_inf: 1e-7, dual_inf_unscaled: 1e-7,
+            compl_inf: 1e-7, mu: 0.0, objective: 11.0,
+            multiplier_sum: 0.0, multiplier_count: 0,
+            bound_multiplier_sum: 0.0, bound_multiplier_count: 0,
+            x_max_abs: 0.0,
+        };
+        let mut opts = SolverOptions::default();
+        opts.acceptable_obj_change_tol = 1e-2;
+        assert!(!meets_acceptable_thresholds(&info, &opts, 1.0, 1.0, Some(10.0)),
+            "|Δf|/|f| ≈ 0.09 > 1e-2 should block");
+    }
+
+    #[test]
+    fn test_meets_acceptable_thresholds_no_prev_obj_skips_gate() {
+        // T0.5: last_obj = None (iter 0) skips the gate.
+        let info = ConvergenceInfo {
+            primal_inf: 1e-7, dual_inf: 1e-7, dual_inf_unscaled: 1e-7,
+            compl_inf: 1e-7, mu: 0.0, objective: 11.0,
+            multiplier_sum: 0.0, multiplier_count: 0,
+            bound_multiplier_sum: 0.0, bound_multiplier_count: 0,
+            x_max_abs: 0.0,
+        };
+        let mut opts = SolverOptions::default();
+        opts.acceptable_obj_change_tol = 1e-12; // would block any change
+        assert!(meets_acceptable_thresholds(&info, &opts, 1.0, 1.0, None),
+            "iter-0 None should bypass the gate");
     }
 
     #[test]
@@ -460,6 +523,7 @@ mod tests {
             multiplier_count: 0,
             bound_multiplier_sum: 0.0,
             bound_multiplier_count: 0,
+            x_max_abs: 0.0,
         };
         let opts = SolverOptions::default();
         // Need enough consecutive near-tolerance iterations (hardcoded NEAR_TOL_ITERS=15).
@@ -482,6 +546,7 @@ mod tests {
             multiplier_count: 0,
             bound_multiplier_sum: 0.0,
             bound_multiplier_count: 0,
+            x_max_abs: 0.0,
         };
         let opts = SolverOptions::default();
         // Not enough consecutive iterations (14 < 15)
@@ -508,6 +573,7 @@ mod tests {
             // arithmetic check below valid.
             bound_multiplier_sum: 1e6,
             bound_multiplier_count: 10,
+            x_max_abs: 0.0,
         };
         let opts = SolverOptions::default();
         // s_d = max(100, 1e6/10)/100 = 1e5/100 = 1000
@@ -544,6 +610,7 @@ mod tests {
             multiplier_count: 0,
             bound_multiplier_sum: 0.0,
             bound_multiplier_count: 0,
+            x_max_abs: 0.0,
         };
         let opts = SolverOptions::default();
         assert_eq!(
