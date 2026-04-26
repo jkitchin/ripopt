@@ -118,6 +118,13 @@ pub struct SolverOptions {
     pub sparse_threshold: usize,
     /// Barrier tolerance factor for fixed-mode mu decrease. Default: 10.0.
     pub barrier_tol_factor: f64,
+    /// Allow multiple consecutive μ decreases per outer iteration in
+    /// monotone (Fixed) mode when the barrier subproblem is already
+    /// solved at the new μ. Mirrors Ipopt 3.14's
+    /// `mu_allow_fast_monotone_decrease` (default `yes`). Capped at
+    /// 4 consecutive decreases per iteration to bound work.
+    /// Set to `false` to revert to one decrease per iteration.
+    pub mu_allow_fast_monotone_decrease: bool,
     /// Initial factor for mu in fixed mode: mu = this * avg_compl. Default: 0.8.
     pub adaptive_mu_monotone_init_factor: f64,
     /// Maximum iterations for restoration NLP subproblem. Default: 200.
@@ -295,6 +302,7 @@ impl Default for SolverOptions {
             watchdog_trial_iter_max: 3,
             sparse_threshold: 110,
             barrier_tol_factor: 10.0,
+            mu_allow_fast_monotone_decrease: true,
             adaptive_mu_monotone_init_factor: 0.8,
             restoration_max_iter: 200,
             disable_nlp_restoration: false,

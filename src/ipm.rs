@@ -5763,17 +5763,32 @@ fn update_barrier_parameter_fixed_mode(
         mu_state.remember_accepted(kkt_error);
     } else {
         mu_state.first_iter_in_mode = false;
-        // Check if subproblem is solved (barrier error small enough)
-        let barrier_err = compute_barrier_error(state);
-        if barrier_err <= options.barrier_tol_factor * state.mu || mu_state.tiny_step {
+        // Mirrors Ipopt's IpMonotoneMuUpdate.cpp:130-200: while the barrier
+        // subproblem is solved at the current μ (or a tiny step was taken),
+        // decrease μ. With `mu_allow_fast_monotone_decrease`, allow several
+        // consecutive decreases per outer iteration; otherwise stop after one.
+        // Cap at 4 to bound work.
+        const MAX_FAST_DECREASES: usize = 4;
+        let mut decreases = 0usize;
+        let mut tiny_step = mu_state.tiny_step;
+        loop {
+            let barrier_err = compute_barrier_error(state);
+            let solved = barrier_err <= options.barrier_tol_factor * state.mu;
+            if !(solved || tiny_step) { break; }
             let new_mu = (options.mu_linear_decrease_factor * state.mu)
                 .min(state.mu.powf(options.mu_superlinear_decrease_power))
                 .max(options.mu_min);
-            if !(mu_state.tiny_step && (new_mu - state.mu).abs() < 1e-20) {
-                state.mu = new_mu;
-                reset_filter_with_current_theta(state, filter);
-                log::debug!("Fixed mode: mu decreased to {:.2e}", state.mu);
-            }
+            let mu_changed = (new_mu - state.mu).abs() > 1e-20;
+            if !mu_changed { break; }
+            state.mu = new_mu;
+            decreases += 1;
+            tiny_step = false;
+            log::debug!("Fixed mode: mu decreased to {:.2e}", state.mu);
+            if !options.mu_allow_fast_monotone_decrease { break; }
+            if decreases >= MAX_FAST_DECREASES { break; }
+        }
+        if decreases > 0 {
+            reset_filter_with_current_theta(state, filter);
         }
     }
 }
