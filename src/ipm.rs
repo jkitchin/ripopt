@@ -3182,10 +3182,12 @@ fn apply_kappa_sigma_bound_multiplier_reset(
 ) -> f64 {
     let n = state.n;
     let kappa_sigma = 1e10;
+    // T2.3: drop the ripopt-specific `.max(state.mu)` clamp on the Free-mode
+    // mu_ks; Ipopt's `correct_bound_multiplier` uses the current barrier
+    // parameter directly. Keep the `1e3` upper cap as a numerical safety
+    // (avg_compl spikes can produce wildly wide z-clamps otherwise).
     let mu_ks = if mu_state.mode == MuMode::Free {
-        compute_avg_complementarity(state)
-            .max(state.mu)
-            .min(1e3)
+        compute_avg_complementarity(state).min(1e3)
     } else {
         state.mu
     };
@@ -5594,21 +5596,15 @@ fn compute_centrality_xi(state: &SolverState, avg_compl: f64) -> f64 {
 /// floored from below by Ipopt's monotone schedule
 /// `min(κ_μ·μ, μ^sldp)` (so the Loqo-proposed μ can't undershoot
 /// a gradual monotone schedule on a single step) and from above
-/// by 1e5. The lower clamp `mu_floor` is `mu_min` when the
-/// barrier subproblem is approximately solved
-/// (`barrier_err ≤ kappa_eps · μ`) and `μ/5` otherwise.
+/// by 1e5. The hard floor is `options.mu_min` (T2.3: removed the
+/// ripopt-specific `μ/5` ramp that fired when the barrier subproblem
+/// was not approximately solved; Ipopt's `IpLoqoMuOracle::CalculateMu`
+/// has no such conditional).
 fn compute_loqo_mu(
     state: &SolverState,
     options: &SolverOptions,
     avg_compl: f64,
 ) -> f64 {
-    let barrier_err = compute_barrier_error(state);
-    let mu_floor = if barrier_err <= options.barrier_tol_factor * state.mu {
-        options.mu_min
-    } else {
-        (state.mu / 5.0).max(options.mu_min)
-    };
-
     let xi = compute_centrality_xi(state, avg_compl);
 
     let ratio = if xi > 1e-20 {
@@ -5623,7 +5619,7 @@ fn compute_loqo_mu(
             .min(state.mu.powf(options.mu_superlinear_decrease_power));
     let new_mu = loqo_mu
         .max(monotone_floor)
-        .clamp(mu_floor, 1e5);
+        .clamp(options.mu_min, 1e5);
 
     if options.print_level >= 5 {
         rip_log!("ripopt: mu loqo: xi={:.4} sigma={:.4} avg_compl={:.3e} floor={:.3e} -> mu={:.3e}",
@@ -5776,13 +5772,10 @@ fn apply_free_mode_sufficient_progress_update(
     if options.mu_oracle_quality_function && avg_compl > 0.0 {
         state.mu = compute_loqo_mu(state, options, avg_compl);
     } else if avg_compl > 0.0 {
-        let barrier_err = compute_barrier_error(state);
-        let mu_floor = if barrier_err <= options.barrier_tol_factor * state.mu {
-            options.mu_min
-        } else {
-            (state.mu / 5.0).max(options.mu_min)
-        };
-        state.mu = (avg_compl / options.kappa).clamp(mu_floor, 1e5);
+        // T2.3: dropped the ripopt-specific `μ/5` floor that fired when
+        // barrier_err > κ_eps·μ; Ipopt's monotone-mode update uses only
+        // `mu_min` as the lower clamp.
+        state.mu = (avg_compl / options.kappa).clamp(options.mu_min, 1e5);
     } else {
         state.mu = (options.mu_linear_decrease_factor * state.mu)
             .max(options.mu_min);
