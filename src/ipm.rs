@@ -1729,27 +1729,6 @@ fn try_slack_fallback<P: NlpProblem>(
     None
 }
 
-/// Plain-IPM retry for `DualDivergence`: re-run IPM with Gondzio MCC,
-/// Mehrotra PC, and stall detection disabled. Large dual infeasibility
-/// often means the advanced Newton corrections steered the solver into
-/// a bad basin.
-fn try_plain_ipm_retry<P: NlpProblem>(
-    result: &mut SolveResult,
-    problem: &P,
-    options: &SolverOptions,
-    solve_start: Instant,
-) {
-    let Some(mut opts) = prepare_fallback_opts(options, &solve_start) else { return };
-    opts.gondzio_mcc_max = 0;
-    opts.mehrotra_pc = false;
-    opts.stall_iter_limit = 0;
-    if options.print_level >= 5 {
-        rip_log!("ripopt: Trying plain IPM retry (no corrections) for DualDivergence");
-    }
-    let candidate = solve_ipm(problem, &opts);
-    adopt_candidate_if_better(result, candidate, options, "Plain IPM retry", "plain_ipm");
-}
-
 /// Dispatch failure-recovery fallbacks based on the diagnosis. Returns
 /// `Some(SolveResult)` if the slack fallback fires for
 /// `StallAtInfeasibility` and produces a result we want to return early.
@@ -1776,10 +1755,7 @@ fn dispatch_failure_recovery<P: NlpProblem>(
             try_lbfgs_hessian_fallback(result, problem, options, solve_start, diagnosis);
         }
         FailureDiagnosis::DualDivergence => {
-            try_plain_ipm_retry(result, problem, options, solve_start);
-            if !matches!(result.status, SolveStatus::Optimal) {
-                try_lbfgs_hessian_fallback(result, problem, options, solve_start, diagnosis);
-            }
+            try_lbfgs_hessian_fallback(result, problem, options, solve_start, diagnosis);
         }
         FailureDiagnosis::SlowConvergence => {
             try_al_fallback(result, problem, options, solve_start, diagnosis, has_constraints);
