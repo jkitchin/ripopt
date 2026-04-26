@@ -1630,28 +1630,6 @@ fn try_lbfgs_hessian_fallback<P: NlpProblem>(
     adopt_candidate_if_better(result, candidate, options, "L-BFGS Hessian fallback", "lbfgs_hessian");
 }
 
-/// SQP fallback: solve via `crate::sqp`. Only fires for constrained
-/// problems. Used for `StallAtInfeasibility`, `SlowConvergence`, and
-/// `StallNearOptimal` (where SQP refines a near-optimal IPM iterate).
-fn try_sqp_fallback<P: NlpProblem>(
-    result: &mut SolveResult,
-    problem: &P,
-    options: &SolverOptions,
-    solve_start: Instant,
-    diagnosis: FailureDiagnosis,
-    has_constraints: bool,
-) {
-    if !options.enable_sqp_fallback || !has_constraints {
-        return;
-    }
-    let Some(opts) = prepare_fallback_opts(options, &solve_start) else { return };
-    if options.print_level >= 5 {
-        rip_log!("ripopt: Trying SQP fallback ({:?})", diagnosis);
-    }
-    let candidate = crate::sqp::solve(problem, &opts);
-    adopt_candidate_if_better(result, candidate, options, "SQP fallback", "sqp");
-}
-
 /// Slack reformulation fallback: re-run IPM on `SlackFormulation::new`,
 /// adding explicit slack variables for inequality constraints. Returns
 /// `Some(SolveResult)` (with x truncated back to the original variable
@@ -1717,7 +1695,6 @@ fn dispatch_failure_recovery<P: NlpProblem>(
     options: &SolverOptions,
     solve_start: Instant,
     diagnosis: FailureDiagnosis,
-    has_constraints: bool,
     has_inequalities: bool,
 ) -> Option<SolveResult> {
     match diagnosis {
@@ -1727,7 +1704,6 @@ fn dispatch_failure_recovery<P: NlpProblem>(
             ) {
                 return Some(slack_result);
             }
-            try_sqp_fallback(result, problem, options, solve_start, diagnosis, has_constraints);
         }
         FailureDiagnosis::NumericalBreakdown => {
             try_lbfgs_hessian_fallback(result, problem, options, solve_start, diagnosis);
@@ -1735,19 +1711,9 @@ fn dispatch_failure_recovery<P: NlpProblem>(
         FailureDiagnosis::DualDivergence => {
             try_lbfgs_hessian_fallback(result, problem, options, solve_start, diagnosis);
         }
-        FailureDiagnosis::SlowConvergence => {
-            try_sqp_fallback(result, problem, options, solve_start, diagnosis, has_constraints);
-        }
+        FailureDiagnosis::SlowConvergence => {}
         FailureDiagnosis::StallNearOptimal => {
-            // A stall *at* a near-feasible point with growing Hessian
-            // perturbation often indicates the user-provided Hessian has
-            // wrong curvature: inertia correction recovers definiteness
-            // but at the cost of vanishing step sizes. Try the L-BFGS
-            // Hessian fallback first (cheap, often diagnostic), then SQP.
             try_lbfgs_hessian_fallback(result, problem, options, solve_start, diagnosis);
-            if !matches!(result.status, SolveStatus::Optimal) {
-                try_sqp_fallback(result, problem, options, solve_start, diagnosis, has_constraints);
-            }
         }
     }
     None
@@ -2258,7 +2224,6 @@ fn solve_inner<P: NlpProblem>(
     let mut result = run_initial_solve(problem, options);
 
     let diagnosis = diagnose_failure(&result);
-    let has_constraints = problem.num_constraints() > 0;
     let has_inequalities = has_inequality_constraints(problem);
 
     if options.print_level >= 5 && !matches!(result.status, SolveStatus::Optimal) {
@@ -2270,7 +2235,7 @@ fn solve_inner<P: NlpProblem>(
     if !matches!(result.status, SolveStatus::Optimal) {
         if let Some(slack_result) = dispatch_failure_recovery(
             &mut result, problem, options, solve_start, diagnosis,
-            has_constraints, has_inequalities,
+            has_inequalities,
         ) {
             return slack_result;
         }
