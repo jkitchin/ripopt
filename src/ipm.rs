@@ -4160,6 +4160,112 @@ fn reset_slack_multipliers(state: &mut SolverState, mu_ks: f64) {
     }
 }
 
+/// Compute the per-component "magic step" delta for an explicit slack
+/// vector `s` against constraint values `d` and finite slack bounds
+/// `[d_L, d_U]`. Mirrors Ipopt 3.14
+/// `BacktrackingLineSearch::PerformMagicStep`
+/// (`IpBacktrackingLineSearch.cpp:1013-1111`).
+///
+/// The magic step minimizes the constraint residual `d - s` along the
+/// `s` coordinate while holding `x` (and therefore `d`) and all
+/// multipliers fixed. For each component `i`:
+///
+/// - If `i` has only a lower bound (`d_L[i]` finite, `d_U[i]` not):
+///   `delta_i = max(0, d_i - s_i)` — push `s` up if `d > s`.
+/// - If `i` has only an upper bound (`d_U[i]` finite, `d_L[i]` not):
+///   `delta_i = min(0, d_i - s_i)` — push `s` down if `d < s`.
+/// - If `i` has both bounds: take the candidate `delta_i`, then
+///   suppress (zero out) when the candidate would *not* reduce
+///   `|d_L + d_U - 2 s|` (the symmetric centering measure used by Ipopt
+///   to avoid pushing `s` against the opposite bound).
+///
+/// `delta` is written component-wise. `s_in` is read-only; the caller
+/// applies `s_new = s_in + delta`. Returns the number of strictly
+/// non-zero components in `delta`.
+///
+/// The helper is generic over slack representation: it accepts plain
+/// slices of the slack value, constraint value, and bounds, so it can
+/// be reused by both ripopt's `SlackFormulation` (where slacks are
+/// appended to `x`) and any future explicit-slack path. ripopt's
+/// standard implicit-slack mode has no `s` distinct from `x`, so the
+/// helper is not invoked there. Marked `allow(dead_code)` outside test
+/// builds because the only current caller is the unit tests; the
+/// helper is intentionally retained as the wiring point for future
+/// explicit-slack code paths (T2.24, spec §5.3).
+#[cfg_attr(not(test), allow(dead_code))]
+fn compute_magic_step_delta(
+    s: &[f64],
+    d: &[f64],
+    d_l: &[f64],
+    d_u: &[f64],
+    delta: &mut [f64],
+) -> usize {
+    let m = s.len();
+    debug_assert_eq!(d.len(), m);
+    debug_assert_eq!(d_l.len(), m);
+    debug_assert_eq!(d_u.len(), m);
+    debug_assert_eq!(delta.len(), m);
+    let mut nnz = 0usize;
+    for i in 0..m {
+        let has_l = d_l[i].is_finite();
+        let has_u = d_u[i].is_finite();
+        let r = d[i] - s[i]; // residual we'd like to drive to zero
+        let cand = if has_l && has_u {
+            // candidate is the unbounded magic step (push s toward d):
+            //   max(0, r) along the lower side, min(0, r) along the upper side.
+            // For doubly-bounded entries, Ipopt then suppresses the step
+            // when |d_L + d_U - 2*(s + cand)| > |d_L + d_U - 2*s|.
+            let lower_part = if r > 0.0 { r } else { 0.0 };
+            let upper_part = if r < 0.0 { r } else { 0.0 };
+            let c = lower_part + upper_part; // exactly one of these is non-zero
+            let center_now = (d_l[i] + d_u[i] - 2.0 * s[i]).abs();
+            let center_after = (d_l[i] + d_u[i] - 2.0 * (s[i] + c)).abs();
+            if center_after <= center_now { c } else { 0.0 }
+        } else if has_l {
+            if r > 0.0 { r } else { 0.0 }
+        } else if has_u {
+            if r < 0.0 { r } else { 0.0 }
+        } else {
+            0.0
+        };
+        delta[i] = cand;
+        if cand != 0.0 {
+            nnz += 1;
+        }
+    }
+    nnz
+}
+
+/// Apply Ipopt 3.14's magic step (spec §5.3,
+/// `IpBacktrackingLineSearch.cpp:1013-1111`) to the explicit
+/// inequality-constraint slack vector `s`, holding `x` and all
+/// multipliers fixed.
+///
+/// **ripopt no-op.** ripopt uses an implicit-slack formulation (see
+/// `.crucible/wiki/concepts/implicit-slack-formulation.org`): there is
+/// no slack vector `s` in `SolverState` — the inequality side is
+/// represented by `g(x)` directly with `v_l`, `v_u` carrying the
+/// barrier multipliers. The magic step's degree of freedom (move `s`
+/// while holding `x` fixed) does not exist in this representation, so
+/// this function is a no-op on the standard solve path. The flag is
+/// honored for spec compliance and future explicit-slack paths
+/// (`slack_formulation.rs`); the closed-form delta is implemented in
+/// [`compute_magic_step_delta`] and tested independently.
+///
+/// Returns the number of slack components updated (always 0 in the
+/// standard implicit-slack path).
+fn apply_magic_step(_state: &mut SolverState, options: &SolverOptions) -> usize {
+    if !options.magic_step {
+        return 0;
+    }
+    // ripopt has no explicit `s` to adjust here — the implicit-slack
+    // formulation embeds the slack value in `g(x)`, which would change
+    // `x` if mutated. The helper `compute_magic_step_delta` provides
+    // the Ipopt-faithful per-component formula for callers that hold
+    // an explicit slack representation (e.g. `SlackFormulation`).
+    0
+}
+
 /// Cap on consecutive accepted soft-restoration iterates before forcing
 /// the full GN/NLP restoration cascade. Matches Ipopt's
 /// `max_soft_resto_iters = 10` (`IpBacktrackingLineSearch.cpp:442-444`).
@@ -7316,6 +7422,16 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             PostStepEvalDecision::Return(result) => return result,
         }
 
+        // Magic step (spec §5.3, T2.24). Ipopt's
+        // `BacktrackingLineSearch::PerformMagicStep` mutates the
+        // explicit slack `s` to drive the residual `d(x) - s` toward
+        // zero along the slack coordinate while holding `x` fixed
+        // (`IpBacktrackingLineSearch.cpp:1013-1111`). ripopt's
+        // implicit-slack formulation has no `s` distinct from `x`, so
+        // `apply_magic_step` is a no-op on this path (see its docs);
+        // the call is retained for spec-compliance and as the hook
+        // for any future explicit-slack solve path.
+        let _ = apply_magic_step(&mut state, options);
         reset_slack_multipliers(&mut state, mu_ks);
         maybe_recalc_y_post_step(&mut state, options, n, m, lbfgs_mode);
         track_best_feasible(&state, options, &mut best_feasible);
@@ -10440,5 +10556,139 @@ mod tests {
         let opts = SolverOptions { recalc_y: true, ..SolverOptions::default() };
         maybe_recalc_y_post_step(&mut state, &opts, 1, 1, false);
         assert_eq!(state.y, vec![999.0], "infeasible iterate must skip recalc_y");
+    }
+
+    // ---- Magic step (T2.24, spec §5.3) ----
+
+    /// Lower-bound-only entries push s up by `d - s` when `d > s`, and
+    /// take no step when `d <= s`. Mirrors the `delta_s_magic_L`
+    /// branch of `BacktrackingLineSearch::PerformMagicStep`
+    /// (`IpBacktrackingLineSearch.cpp:1028-1032`).
+    #[test]
+    fn test_magic_step_delta_lower_only() {
+        let s = vec![1.0, 1.0, 1.0];
+        let d = vec![2.5, 0.5, 1.0]; // d > s, d < s, d == s
+        let d_l = vec![0.0, 0.0, 0.0];
+        let d_u = vec![f64::INFINITY; 3];
+        let mut delta = vec![0.0; 3];
+        let nnz = compute_magic_step_delta(&s, &d, &d_l, &d_u, &mut delta);
+        assert_eq!(delta, vec![1.5, 0.0, 0.0], "lower-only: push up only when d > s");
+        assert_eq!(nnz, 1);
+    }
+
+    /// Upper-bound-only entries push s down by `d - s` when `d < s`,
+    /// and take no step when `d >= s`. Mirrors the `delta_s_magic_U`
+    /// branch (`IpBacktrackingLineSearch.cpp:1036-1040`).
+    #[test]
+    fn test_magic_step_delta_upper_only() {
+        let s = vec![1.0, 1.0, 1.0];
+        let d = vec![0.4, 1.5, 1.0];
+        let d_l = vec![f64::NEG_INFINITY; 3];
+        let d_u = vec![10.0, 10.0, 10.0];
+        let mut delta = vec![0.0; 3];
+        let nnz = compute_magic_step_delta(&s, &d, &d_l, &d_u, &mut delta);
+        assert_eq!(delta, vec![-0.6, 0.0, 0.0], "upper-only: push down only when d < s");
+        assert_eq!(nnz, 1);
+    }
+
+    /// Doubly-bounded entries: take the candidate when it reduces the
+    /// centering measure `|d_L + d_U - 2 s|`, suppress otherwise. With
+    /// `d_L = 0`, `d_U = 4`, `s = 1`: centering measure is 2. Candidate
+    /// `delta = +1` (since d > s) gives s_new = 2, centering 0 ≤ 2,
+    /// accepted. With `s = 3`, candidate `delta = -2` gives s_new = 1,
+    /// centering 2 ≤ 2 (equal), accepted. With `s = 1`, d = -3:
+    /// candidate `delta = -4` gives s_new = -3, centering 10 > 2,
+    /// suppressed. Mirrors the `tmp` indicator logic in
+    /// `IpBacktrackingLineSearch.cpp:1054-1082`.
+    #[test]
+    fn test_magic_step_delta_double_bound_suppresses() {
+        let d_l = vec![0.0, 0.0, 0.0];
+        let d_u = vec![4.0, 4.0, 4.0];
+        // Component 0: candidate improves centering -> kept.
+        // Component 1: candidate keeps centering equal -> kept.
+        // Component 2: candidate worsens centering -> suppressed.
+        let s = vec![1.0, 3.0, 1.0];
+        let d = vec![2.5, 1.0, -3.0];
+        let mut delta = vec![0.0; 3];
+        let _ = compute_magic_step_delta(&s, &d, &d_l, &d_u, &mut delta);
+        assert!((delta[0] - 1.5).abs() < 1e-12, "kept: {}", delta[0]);
+        assert!((delta[1] - (-2.0)).abs() < 1e-12, "kept on tie: {}", delta[1]);
+        assert_eq!(delta[2], 0.0, "suppressed when centering worsens");
+    }
+
+    /// Free (no bounds) entries always produce zero delta.
+    #[test]
+    fn test_magic_step_delta_unbounded_no_step() {
+        let s = vec![1.0, -2.0, 100.0];
+        let d = vec![1e6, -1e6, 0.0];
+        let d_l = vec![f64::NEG_INFINITY; 3];
+        let d_u = vec![f64::INFINITY; 3];
+        let mut delta = vec![0.0; 3];
+        let nnz = compute_magic_step_delta(&s, &d, &d_l, &d_u, &mut delta);
+        assert_eq!(delta, vec![0.0, 0.0, 0.0]);
+        assert_eq!(nnz, 0);
+    }
+
+    /// `apply_magic_step` is a no-op in ripopt's implicit-slack
+    /// formulation: x, y, v_l, v_u, z_l, z_u must all be unchanged
+    /// regardless of the option flag. This test pins the architectural
+    /// invariant noted in the function's documentation; if a future
+    /// change adds explicit-slack behavior, the test should be updated
+    /// to reflect the new contract.
+    #[test]
+    fn test_apply_magic_step_is_noop_in_implicit_slack_mode() {
+        let mut state = minimal_state(2, 2);
+        // Populate with non-trivial values so any accidental mutation is
+        // visible. v_l and g_l are configured as Ipopt would expect for
+        // an inequality with finite lower bound.
+        state.x = vec![3.0, 4.0];
+        state.y = vec![1.5, -0.5];
+        state.z_l = vec![0.7, 0.2];
+        state.z_u = vec![0.0, 0.3];
+        state.v_l = vec![0.4, 0.0];
+        state.v_u = vec![0.0, 0.6];
+        state.g_l = vec![0.0, f64::NEG_INFINITY];
+        state.g_u = vec![f64::INFINITY, 5.0];
+        state.g = vec![1.0, 2.0];
+        state.mu = 0.1;
+        let snapshot = (
+            state.x.clone(),
+            state.y.clone(),
+            state.z_l.clone(),
+            state.z_u.clone(),
+            state.v_l.clone(),
+            state.v_u.clone(),
+            state.g.clone(),
+        );
+
+        let opts_on = SolverOptions { magic_step: true, ..SolverOptions::default() };
+        let n_on = apply_magic_step(&mut state, &opts_on);
+        assert_eq!(n_on, 0, "no explicit slack vector exists, so no updates possible");
+        assert_eq!(state.x, snapshot.0);
+        assert_eq!(state.y, snapshot.1);
+        assert_eq!(state.z_l, snapshot.2);
+        assert_eq!(state.z_u, snapshot.3);
+        assert_eq!(state.v_l, snapshot.4);
+        assert_eq!(state.v_u, snapshot.5);
+        assert_eq!(state.g, snapshot.6);
+
+        // With option off, identical (no-op) result.
+        let opts_off = SolverOptions { magic_step: false, ..SolverOptions::default() };
+        let n_off = apply_magic_step(&mut state, &opts_off);
+        assert_eq!(n_off, 0);
+        assert_eq!(state.x, snapshot.0);
+        assert_eq!(state.y, snapshot.1);
+    }
+
+    /// The option flag short-circuits the helper: when disabled the
+    /// function returns 0 without inspecting state. We verify by
+    /// passing a deliberately mis-shaped state (m == 0) and confirming
+    /// no panic.
+    #[test]
+    fn test_apply_magic_step_disabled_short_circuits() {
+        let mut state = minimal_state(0, 0);
+        let opts = SolverOptions { magic_step: false, ..SolverOptions::default() };
+        let n = apply_magic_step(&mut state, &opts);
+        assert_eq!(n, 0);
     }
 }

@@ -334,6 +334,23 @@ pub struct SolverOptions {
     /// Mirrors Ipopt 3.14's `slack_move` option. Default
     /// `f64::EPSILON.powf(0.75) ≈ 1.83e-12`.
     pub slack_move: f64,
+    /// Enable Ipopt 3.14's "magic step" — a closed-form per-component
+    /// adjustment of the inequality-constraint slack vector `s` after a
+    /// step is accepted (`IpBacktrackingLineSearch.cpp:1013-1111`). The
+    /// magic step pushes `s_i` toward `d(x)_i` only along the side(s)
+    /// allowed by the slack's bounds (`d_L`, `d_U`), holding `x` and all
+    /// multipliers fixed. For doubly-bounded slacks it suppresses the
+    /// step if it would not reduce centering against `d_L + d_U`.
+    ///
+    /// Architectural note (T2.24): ripopt uses an implicit-slack
+    /// formulation (see `.crucible/wiki/concepts/implicit-slack-formulation.org`),
+    /// so it has no explicit slack vector `s` distinct from `x`. With no
+    /// slack to adjust, the magic step has no degree of freedom to act
+    /// on in the standard solve path; `apply_magic_step` is therefore a
+    /// no-op there. The flag is exposed for spec compliance and for
+    /// future explicit-slack paths (see `slack_formulation.rs`).
+    /// Default: `true`, matching Ipopt 3.14's `magic_steps` default.
+    pub magic_step: bool,
     /// Method used to initialize the bound multipliers `z_l`, `z_u`.
     /// Default: `Constant` (Ipopt 3.14 default).
     pub bound_mult_init_method: BoundMultInitMethod,
@@ -428,6 +445,7 @@ impl Default for SolverOptions {
                 const EPS: f64 = f64::EPSILON;
                 EPS.powf(0.75)
             },
+            magic_step: true,
             use_ic_refinement: true,
             iterative_refinement_steps_required: 1,
             bound_mult_init_method: BoundMultInitMethod::Constant,
