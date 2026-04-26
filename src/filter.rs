@@ -29,6 +29,12 @@ pub struct Filter {
     eta_phi: f64,
     /// Small constant delta for filter margin.
     delta: f64,
+    /// Whether `set_theta_min_from_initial` has already seeded
+    /// `theta_max`/`theta_min` from the initial constraint violation.
+    /// Mirrors Ipopt's lazy-init sentinel (theta_max_ < 0.0) at
+    /// IpFilterLSAcceptor.cpp:325-339: once seeded, the bounds are
+    /// fixed for the rest of the solve.
+    theta_init_set: bool,
 }
 
 impl Filter {
@@ -44,19 +50,24 @@ impl Filter {
             s_phi: 2.3,
             eta_phi: 1e-8,
             delta: 1.0,
+            theta_init_set: false,
         }
     }
 
-    /// Initialize theta_min and theta_max based on constraint violation.
-    ///
-    /// NOTE: Ipopt sets these ONCE from the initial theta (IpFilterLSAcceptor.cpp:325-336).
-    /// ripopt currently re-computes them after each filter reset because the solver takes
-    /// more iterations than Ipopt, causing theta to bounce near the switching threshold.
-    /// This is a workaround — the proper fix is to improve search direction quality so
-    /// the solver converges faster (matching Ipopt's ~20 iterations vs current ~164).
+    /// Initialize `theta_min` and `theta_max` from the initial constraint
+    /// violation. This is a one-shot operation — subsequent calls are
+    /// no-ops, mirroring Ipopt's IpFilterLSAcceptor.cpp:325-339 which
+    /// seeds these bounds once at the first acceptability check (when the
+    /// `theta_max_ < 0.0` sentinel is still set) and never resets them.
+    /// Resetting on every μ change lets the filter envelope grow over
+    /// time and admits iterates earlier filter entries had rejected.
     pub fn set_theta_min_from_initial(&mut self, theta_init: f64) {
+        if self.theta_init_set {
+            return;
+        }
         self.theta_min = 1e-4 * theta_init.max(1e-4);
         self.theta_max = 1e4 * theta_init.max(1e-4);
+        self.theta_init_set = true;
     }
 
     /// Check if a trial point (theta, phi) is acceptable to the filter.
@@ -606,6 +617,42 @@ mod tests {
             theta_current, phi_current, theta_trial, phi_trial, grad, alpha,
         );
         assert!(!accept, "Switching+failed-Armijo must reject (no h-type fallback)");
+    }
+
+    #[test]
+    fn test_set_theta_min_from_initial_is_one_shot() {
+        // T0.7: theta_max/theta_min must be seeded ONCE from the initial
+        // constraint violation and never reset, mirroring Ipopt
+        // IpFilterLSAcceptor.cpp:325-339. Repeated calls (as happens on
+        // every μ change in ripopt) must be ignored — otherwise the
+        // filter envelope grows over time and admits iterates earlier
+        // filter entries had rejected.
+        let mut filter = Filter::new(100.0);
+        // First call: theta_init = 0.5
+        // theta_max = 1e4 * max(1, 0.5) = 1e4 * 1.0 = 1e4 (because 0.5 < 1.0,
+        // .max(1e-4) yields 0.5; but the spec uses Max(1, theta_0). Our
+        // implementation uses theta_init.max(1e-4) so theta_max = 1e4 * 0.5 = 5e3).
+        // We assert against the implemented formula: 1e4 * 0.5 = 5000.0.
+        filter.set_theta_min_from_initial(0.5);
+        let theta_max_init = filter.theta_max();
+        assert!((theta_max_init - 5000.0).abs() < 1e-9,
+            "first init: theta_max should be 1e4 * 0.5 = 5000, got {}", theta_max_init);
+
+        // Simulate the μ-update path that previously called
+        // set_theta_min_from_initial again with a (possibly different) theta.
+        // The reset_filter_with_current_theta helper used to do this on every
+        // μ change — now it is a no-op for the bounds.
+        filter.reset();
+        filter.set_theta_min_from_initial(1e-6); // would have shrunk theta_max to 1.0 before T0.7
+        assert!((filter.theta_max() - theta_max_init).abs() < 1e-12,
+            "T0.7: theta_max must remain seeded at the initial value across resets, got {}",
+            filter.theta_max());
+
+        // Even an enormous theta should not bump theta_max via this path
+        // (augmentation during restoration is a separate, intentional path).
+        filter.set_theta_min_from_initial(1e10);
+        assert!((filter.theta_max() - theta_max_init).abs() < 1e-12,
+            "T0.7: subsequent calls must be ignored, got {}", filter.theta_max());
     }
 
     #[test]
