@@ -2429,6 +2429,16 @@ fn run_initial_solve<P: NlpProblem>(problem: &P, options: &SolverOptions) -> Sol
 /// direction changes (TRO3X3, STRATEC, MGH10LS, ACOPR30). Only fires for
 /// `n ≤ 200` and a non-Optimal current result; consumes 70% of the
 /// remaining wall-time budget when one is set.
+///
+/// **ripopt-specific (no Ipopt analog).** T2.4 attempted to remove this
+/// per V0.8_IPOPT_ALIGNMENT_PLAN.md §3.1, but the HS regression suite
+/// showed it is load-bearing: HS TP106 (NumericalError, obj 6907 vs
+/// optimum 7049) and HS TP113 (NumericalError, obj 29.7 vs optimum
+/// 24.3) both depend on this retry to converge. Underlying issue is
+/// suspected to be in the Gondzio MCC / Mehrotra PC implementation —
+/// these problems fail with advanced corrections on but converge with
+/// them disabled. Keep until the Gondzio/Mehrotra correctness work
+/// lands as a separate item.
 fn try_conservative_ipm_retry<P: NlpProblem>(
     result: &mut SolveResult,
     problem: &P,
