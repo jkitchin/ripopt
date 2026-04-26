@@ -3560,8 +3560,17 @@ fn solve_with_quality_escalation(
     n: usize,
     m: usize,
 ) -> (Result<(Vec<f64>, Vec<f64>), crate::linear_solver::SolverError>, f64, f64) {
-    let mut dir_result = kkt::solve_for_direction(
-        kkt_system_opt.as_ref().unwrap(), lin_solver, ic_delta_w, ic_delta_c,
+    // T0.14: gate the pretend-singular trigger so it can fire at most
+    // once per outer iter. After this call, if the system was reported
+    // as pretend-singular, the standard escalation ladder runs below;
+    // any second pretend-singular within the same iter (e.g. from a
+    // re-solve after the ladder) will be suppressed by the wrapper.
+    let mut dir_result = kkt::solve_for_direction_iter_aware(
+        kkt_system_opt.as_ref().unwrap(),
+        lin_solver,
+        inertia_params,
+        ic_delta_w,
+        ic_delta_c,
     );
     if matches!(dir_result, Err(crate::linear_solver::SolverError::PretendSingular)) {
         if let Some(kkt_system) = kkt_system_opt.as_mut() {
@@ -7526,6 +7535,12 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
     // Main IPM loop
     for iteration in 0..options.max_iter {
         state.iter = iteration;
+
+        // T0.14 (Ipopt 3.14 alignment): clear the once-per-outer-iter
+        // pretend-singular flag at the top of each iteration so the
+        // PD perturbation handler allows the trick exactly once per
+        // iter (IpPDPerturbationHandler.cpp).
+        inertia_params.reset_pretend_singular_for_new_iter();
 
         // Early-stall timeout scaled by problem size: medium-scale problems
         // (n+m > 1000) can legitimately spend 30-60s on restoration or line
