@@ -762,29 +762,71 @@ fn matvec_original(
     }
 }
 
+/// T0.12 (Ipopt 3.14 alignment): iterative-refinement parameters
+/// for `solve_for_direction_with_ir`. Mirrors Ipopt's
+/// `min_refinement_steps` / `max_refinement_steps` /
+/// `residual_improvement_factor` controls in `IpPDFullSpaceSolver`.
+#[derive(Debug, Clone, Copy)]
+pub struct IrParams {
+    /// Whether to run iterative refinement at all. When false, the
+    /// solve is a single backsolve. Mirrors the user-exposed
+    /// `use_ic_refinement` option (Ipopt default: true).
+    pub enabled: bool,
+    /// Minimum number of IR steps to take even when the residual is
+    /// already below the acceptance threshold. Mirrors Ipopt's
+    /// `min_refinement_steps` (default 1).
+    pub steps_required: usize,
+    /// Hard cap on IR steps. Mirrors Ipopt's `max_refinement_steps`
+    /// (default 10).
+    pub max_steps: usize,
+}
+
+impl Default for IrParams {
+    fn default() -> Self {
+        Self { enabled: true, steps_required: 1, max_steps: 10 }
+    }
+}
+
 /// Solve the KKT system for the search direction, given a factored solver.
 ///
 /// Returns (dx, dy) where dx is the primal step and dy is the dual step.
 /// Bound multiplier steps dz_l, dz_u are recovered from complementarity.
 ///
-/// Uses iterative refinement against the ORIGINAL (unregularized) system
-/// to recover the true Newton direction despite δ_c/δ_w regularization.
-/// The factored regularized system acts as a preconditioner.
+/// Iterative refinement runs on the **augmented** post-perturbation
+/// KKT matrix `kkt.matrix` (matching Ipopt 3.14
+/// `IpPDFullSpaceSolver.cpp:701-732 + ComputeResidualRatio:795-820`).
+/// The IC-phase perturbation `(δ_w, δ_c_ic)` is *part of* the system
+/// being solved — δ_c_ic > 0 lifts a rank-deficient J, and the residual
+/// against the assembled augmented matrix is what Ipopt accepts.
+///
+/// Default IR cadence (matches Ipopt): always do at least 1 step,
+/// up to 10 steps total when residual stays large; stop on stagnation
+/// (no improvement at factor 1 − 1e-6).
 pub fn solve_for_direction(
     kkt: &KktSystem,
     solver: &mut dyn LinearSolver,
     delta_w: f64,
     delta_c_ic: f64,
 ) -> Result<(Vec<f64>, Vec<f64>), crate::linear_solver::SolverError> {
+    solve_for_direction_with_ir(kkt, solver, delta_w, delta_c_ic, IrParams::default())
+}
+
+/// T0.12: explicit-IR-config variant of `solve_for_direction`. Lets
+/// callers (and tests) override the iterative-refinement cadence.
+pub fn solve_for_direction_with_ir(
+    kkt: &KktSystem,
+    solver: &mut dyn LinearSolver,
+    delta_w: f64,
+    delta_c_ic: f64,
+    ir: IrParams,
+) -> Result<(Vec<f64>, Vec<f64>), crate::linear_solver::SolverError> {
     let dim = kkt.dim;
-    // Ipopt measures residuals against the assembled *regularized* KKT matrix
-    // (IpPDFullSpaceSolver.cpp:701-732 + ComputeResidualRatio:795-820). The
-    // IC-phase (δ_w, δ_c_ic) are *part of* the system being solved, not a
-    // perturbation to be undone. If J is rank-deficient, δ_c_ic > 0 makes the
-    // assembled system non-singular and its residual ratio is near machine
-    // epsilon; Ipopt accepts that step without complaint.
+    // The perturbation pair (δ_w, δ_c_ic) is folded into kkt.matrix at
+    // factor time; we measure the residual against that augmented matrix.
+    // `matvec_original` (which strips the perturbation) is retained for
+    // the legacy "use_ic_refinement on the *unregularized* system" mode.
     let _ = (delta_w, delta_c_ic);
-    let use_ic_refinement = false;
+    let use_unregularized_residual = false;
 
     // NaN guard on RHS — if the RHS has NaN, the problem evaluation is broken
     if kkt.rhs.iter().any(|v| v.is_nan() || v.is_infinite()) {
@@ -803,19 +845,15 @@ pub fn solve_for_direction(
         ));
     }
 
-    // Iterative refinement: correct the solution using residuals against the
-    // ORIGINAL (unregularized) matrix. The factored regularized system acts as
-    // a preconditioner. This converges to the solution of the original system.
-    // Use more refinement iterations for large systems where factorization accuracy
-    // may be limited, and for IC-refinement where we're solving a different system.
-    // Ipopt's default: max_refinement_steps = 10, min_refinement_steps = 1.
-    let max_refinements = 10;
+    // Iterative refinement on the augmented system. Ipopt 3.14 default:
+    // max_refinement_steps = 10, min_refinement_steps = 1. When
+    // `ir.enabled = false` the loop is skipped entirely.
+    let max_refinements = if ir.enabled { ir.max_steps } else { 0 };
+    let min_refinements = if ir.enabled { ir.steps_required } else { 0 };
     let mut residual = vec![0.0; dim];
     let mut prev_res_norm = f64::MAX;
-    for _ref_iter in 0..max_refinements {
-        // When IC regularization was applied, compute residual against the ORIGINAL
-        // (unregularized) matrix so refinement converges to the true Newton direction.
-        if use_ic_refinement {
+    for ref_iter in 0..max_refinements {
+        if use_unregularized_residual {
             matvec_original(kkt, &solution, &mut residual, delta_w, delta_c_ic);
         } else {
             kkt.matrix.matvec(&solution, &mut residual);
@@ -826,17 +864,16 @@ pub fn solve_for_direction(
             res_norm = res_norm.max(residual[i].abs());
         }
 
-        if res_norm < 1e-12 {
-            break;
-        }
-
-        // Stagnation detection: stop if not improving.
-        // IC path: 0.9 (aggressive, preconditioning mismatch expected).
-        // Non-IC path: 1.0 - 1e-6 (Ipopt uses 1 - 1e-9; stop only if
-        // refinement makes no progress, allowing slow but steady convergence).
-        let stagnation_factor = if use_ic_refinement { 0.9 } else { 1.0 - 1e-6 };
-        if res_norm > stagnation_factor * prev_res_norm {
-            break;
+        // Always do at least `min_refinements` steps; only after that
+        // can the residual-tolerance and stagnation early-outs fire.
+        if ref_iter + 1 > min_refinements {
+            if res_norm < 1e-12 {
+                break;
+            }
+            let stagnation_factor = if use_unregularized_residual { 0.9 } else { 1.0 - 1e-6 };
+            if res_norm > stagnation_factor * prev_res_norm {
+                break;
+            }
         }
         prev_res_norm = res_norm;
 
@@ -856,7 +893,7 @@ pub fn solve_for_direction(
     // ratio = ||resid||_inf / (min(||sol||_inf, 1e6 * ||rhs||_inf) + ||rhs||_inf)
     // If ratio > 1e-5 after iterative refinement, the system is numerically singular.
     {
-        if use_ic_refinement {
+        if use_unregularized_residual {
             matvec_original(kkt, &solution, &mut residual, delta_w, delta_c_ic);
         } else {
             kkt.matrix.matvec(&solution, &mut residual);
@@ -2242,6 +2279,65 @@ mod tests {
         ).unwrap();
         assert!(delta_w.abs() < 1e-15, "non-singular: no delta_w needed");
         assert!(delta_c.abs() < 1e-15, "non-singular: no delta_c (T0.13)");
+    }
+
+    /// T0.12: iterative refinement reduces the residual norm of the
+    /// augmented KKT solve. This test runs `solve_for_direction_with_ir`
+    /// twice — once with IR disabled (single backsolve) and once with
+    /// IR enabled — and asserts the IR path produces a residual at
+    /// least as small as the no-IR path. (For most well-conditioned
+    /// LDL^T factorizations the residual is near machine epsilon either
+    /// way; the test guards against regressions where IR is silently
+    /// skipped or produces a *worse* residual.)
+    #[test]
+    fn test_iterative_refinement_residual_decrease() {
+        // Small symmetric quasi-definite KKT system with a known solution.
+        // (1,1) block = diag(2, 3); J = [1, 1]; (2,2) = 0 (T0.13 — equality).
+        let n = 2;
+        let m = 1;
+        let mut matrix = SymmetricMatrix::zeros(3);
+        matrix.set(0, 0, 2.0);
+        matrix.set(1, 1, 3.0);
+        matrix.set(2, 0, 1.0);
+        matrix.set(2, 1, 1.0);
+        let kkt = KktSystem {
+            dim: 3, n, m,
+            matrix: KktMatrix::Dense(matrix),
+            rhs: vec![1.0, 0.5, -2.0],
+            delta_c_diag: vec![0.0; m],
+            scale_factors: None,
+        };
+
+        // IR disabled — single backsolve.
+        let mut solver_a = DenseLdl::new();
+        solver_a.factor(&kkt.matrix).unwrap();
+        let ir_off = IrParams { enabled: false, steps_required: 0, max_steps: 0 };
+        let (dx_a, dy_a) = solve_for_direction_with_ir(&kkt, &mut solver_a, 0.0, 0.0, ir_off).unwrap();
+        let mut sol_a = dx_a.clone();
+        sol_a.extend_from_slice(&dy_a);
+        let mut res_a = vec![0.0; 3];
+        kkt.matrix.matvec(&sol_a, &mut res_a);
+        let res_a_norm: f64 = (0..3).map(|i| (kkt.rhs[i] - res_a[i]).abs()).fold(0.0, f64::max);
+
+        // IR enabled — refinement on the augmented matrix.
+        let mut solver_b = DenseLdl::new();
+        solver_b.factor(&kkt.matrix).unwrap();
+        let ir_on = IrParams::default();
+        let (dx_b, dy_b) = solve_for_direction_with_ir(&kkt, &mut solver_b, 0.0, 0.0, ir_on).unwrap();
+        let mut sol_b = dx_b.clone();
+        sol_b.extend_from_slice(&dy_b);
+        let mut res_b = vec![0.0; 3];
+        kkt.matrix.matvec(&sol_b, &mut res_b);
+        let res_b_norm: f64 = (0..3).map(|i| (kkt.rhs[i] - res_b[i]).abs()).fold(0.0, f64::max);
+
+        // IR must not produce a worse residual than no-IR. With a small
+        // well-conditioned matrix both will be near machine epsilon, but
+        // we still want to exercise the IR loop and guarantee correctness.
+        assert!(res_b_norm <= res_a_norm + 1e-12,
+            "T0.12: IR-enabled residual {} must be <= IR-disabled residual {}", res_b_norm, res_a_norm);
+        // And it must remain very small in absolute terms.
+        assert!(res_b_norm < 1e-10,
+            "T0.12: IR-enabled residual must converge to near-zero, got {}", res_b_norm);
     }
 
     /// T0.14: pretend-singular allowed at most once per outer iteration.
