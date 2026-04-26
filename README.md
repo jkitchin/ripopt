@@ -26,7 +26,7 @@ It implements a primal-dual interior point method with a barrier formulation, si
 
 - Primal-dual interior point method with logarithmic barrier
 - Dense LDL^T factorization via Bunch-Kaufman pivoting with inertia detection
-- Sparse multifrontal LDL^T factorization (via `rmumps` with SuiteSparse AMD ordering) for larger problems (n+m >= 110)
+- Sparse multifrontal LDL^T factorization (via [`feral`](../feral) with Bunch-Kaufman 1×1/2×2 pivoting, MC64 scaling, AMD/METIS ordering, and certified inertia) for larger problems (n+m >= 110). The legacy `rmumps` backend is available behind the opt-in `rmumps` feature: `cargo build --no-default-features --features "rmumps faer"`
 - Banded LDL^T solver for problems with detected-banded structure (e.g., PDE discretizations)
 - Dense condensed KKT (Schur complement) for tall-narrow problems (m >> n, n <= 100)
 - Sparse condensed KKT for reducing system size when m > 0
@@ -855,10 +855,13 @@ src/
     mod.rs            LinearSolver trait, SymmetricMatrix, KktMatrix
     dense.rs          Dense LDL^T (Bunch-Kaufman) factorization
     banded.rs         Banded LDL^T for problems with small bandwidth
-    multifrontal.rs   Multifrontal sparse LDL^T via rmumps (default, SuiteSparse AMD ordering)
+    feral_direct.rs   Multifrontal sparse LDL^T via feral (default, Bunch-Kaufman, MC64, AMD/METIS)
+    feral_iterative.rs MINRES wrapper backed by feral (iterative-refinement variant)
+    feral_hybrid.rs   Hybrid direct/iterative wrapper for the feral backend
+    multifrontal.rs   Multifrontal sparse LDL^T via rmumps (opt-in `rmumps` feature)
     sparse.rs         Sparse LDL^T via faer (optional)
-    iterative.rs      MINRES iterative solver with incomplete LDL^T preconditioner
-    hybrid.rs         Hybrid direct/iterative solver with automatic switching
+    iterative.rs      MINRES with incomplete LDL^T preconditioner (rmumps feature)
+    hybrid.rs         Hybrid direct/iterative solver with automatic switching (rmumps feature)
 
 tests/
   correctness.rs      Integration tests (22 NLP problems)

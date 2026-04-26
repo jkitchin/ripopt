@@ -361,6 +361,58 @@ dependencies = [
 ]
 
 [[package]]
+name = "feral"
+version = "0.1.0"
+dependencies = [
+ "feral-amd",
+ "feral-kahip",
+ "feral-metis",
+ "feral-ordering-core",
+ "feral-scotch",
+ "pulp 0.22.2",
+ "rayon",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "feral-amd"
+version = "0.1.0"
+dependencies = [
+ "feral-ordering-core",
+]
+
+[[package]]
+name = "feral-kahip"
+version = "0.1.0"
+dependencies = [
+ "feral-amd",
+ "feral-metis",
+ "feral-ordering-core",
+]
+
+[[package]]
+name = "feral-metis"
+version = "0.1.0"
+dependencies = [
+ "feral-amd",
+ "feral-ordering-core",
+]
+
+[[package]]
+name = "feral-ordering-core"
+version = "0.1.0"
+
+[[package]]
+name = "feral-scotch"
+version = "0.1.0"
+dependencies = [
+ "feral-amd",
+ "feral-metis",
+ "feral-ordering-core",
+]
+
+[[package]]
 name = "gemm"
 version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1067,6 +1119,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulp"
+version = "0.22.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e205bb30d5b916c55e584c22201771bcf2bad9aabd5d4127f38387140c38632"
+dependencies = [
+ "bytemuck",
+ "cfg-if",
+ "libm",
+ "num-complex",
+ "paste",
+ "pulp-wasm-simd-flag",
+ "raw-cpuid",
+ "reborrow",
+ "version_check",
+]
+
+[[package]]
+name = "pulp-wasm-simd-flag"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40e24eee682d89fb193496edf918a7f407d30175b2e785fe057e4392dfd182e0"
+
+[[package]]
 name = "py_literal"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1248,11 +1323,12 @@ checksum = "a96887878f22d7bad8a3b6dc5b7440e0ada9a245242924394987b21cf2210a4c"
 
 [[package]]
 name = "ripopt"
-version = "0.7.1"
+version = "0.8.0-dev"
 dependencies = [
  "approx",
  "env_logger",
  "faer",
+ "feral",
  "libloading",
  "log",
  "nalgebra",

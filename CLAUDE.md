@@ -1,7 +1,17 @@
 # ripopt Development Guide
 
+## Linear solver backends
+- **Default (v0.8+)**: pure-Rust [`feral`](../feral) multifrontal LDLᵀ. The
+  `default-features = ["feral", "faer"]`. Modules: `src/linear_solver/feral_direct.rs`,
+  `feral_iterative.rs`, `feral_hybrid.rs`.
+- **Legacy**: `rmumps` is preserved behind the opt-in `rmumps` feature.
+  Build with `cargo build --no-default-features --features "rmumps faer"`.
+  Modules: `src/linear_solver/multifrontal.rs`, `iterative.rs`, `hybrid.rs`.
+- The `LinearSolver` trait surface is unchanged; the IPM, KKT, and
+  restoration paths are oblivious to the backend.
+
 ## Running Tests
-- `cargo test` — run all tests (230 tests, ~3 seconds)
+- `cargo test` — run all tests (~3 seconds)
 
 ## Benchmarks
 - `make benchmark` — full benchmark: HS + CUTEst + large-scale + report

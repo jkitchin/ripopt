@@ -6,6 +6,12 @@ pub mod multifrontal;
 pub mod iterative;
 #[cfg(feature = "rmumps")]
 pub mod hybrid;
+#[cfg(feature = "feral")]
+pub mod feral_direct;
+#[cfg(feature = "feral")]
+pub mod feral_iterative;
+#[cfg(feature = "feral")]
+pub mod feral_hybrid;
 #[cfg(feature = "faer")]
 pub mod sparse;
 

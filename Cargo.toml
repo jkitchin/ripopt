@@ -3,7 +3,7 @@ members = [".", "rmumps", "ripopt-py"]
 
 [package]
 name = "ripopt"
-version = "0.7.1"
+version = "0.8.0-dev"
 edition = "2021"
 license = "EPL-2.0"
 description = "A memory-safe interior point optimizer in Rust"
@@ -41,16 +41,18 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 faer = { version = "0.20", optional = true }
 rmumps = { version = "0.1.1", path = "rmumps", optional = true, features = ["faer"] }
+feral = { version = "0.1", path = "../feral", optional = true }
 num-dual = { version = "0.13", optional = true }
 nalgebra = { version = "0.34", optional = true }
 
 [features]
-default = ["rmumps", "faer"]
+default = ["feral", "faer"]
 ipopt-native = []
 cutest = []
 hs = []
 rmumps = ["dep:rmumps"]
 faer = ["dep:faer"]
+feral = ["dep:feral"]
 num-dual = ["dep:num-dual", "dep:nalgebra"]
 
 [[bin]]

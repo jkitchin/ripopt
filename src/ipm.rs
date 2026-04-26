@@ -6,13 +6,19 @@ use crate::filter::{self, Filter, FilterEntry};
 use crate::kkt::{self, InertiaCorrectionParams};
 use crate::linear_solver::banded::BandedLdl;
 use crate::linear_solver::dense::DenseLdl;
-#[cfg(all(feature = "faer", not(feature = "rmumps")))]
+#[cfg(all(feature = "faer", not(any(feature = "feral", feature = "rmumps"))))]
 use crate::linear_solver::sparse::SparseLdl;
-#[cfg(feature = "rmumps")]
+#[cfg(feature = "feral")]
+use crate::linear_solver::feral_direct::FeralLdl;
+#[cfg(feature = "feral")]
+use crate::linear_solver::feral_iterative::FeralIterativeMinres;
+#[cfg(feature = "feral")]
+use crate::linear_solver::feral_hybrid::FeralHybrid;
+#[cfg(all(feature = "rmumps", not(feature = "feral")))]
 use crate::linear_solver::multifrontal::MultifrontalLdl;
-#[cfg(feature = "rmumps")]
+#[cfg(all(feature = "rmumps", not(feature = "feral")))]
 use crate::linear_solver::iterative::IterativeMinres;
-#[cfg(feature = "rmumps")]
+#[cfg(all(feature = "rmumps", not(feature = "feral")))]
 use crate::linear_solver::hybrid::HybridSolver;
 use crate::linear_solver::{KktMatrix, LinearSolver, SymmetricMatrix};
 use crate::options::LinearSolverChoice;
@@ -25,7 +31,7 @@ use crate::options::LinearSolverChoice;
 const AVG_WINDOW: usize = 6;
 
 /// Create a new sparse linear solver using the best available backend.
-/// Prefers rmumps (multifrontal) when available, falls back to faer (SparseLdl).
+/// Prefers feral (multifrontal LDLᵀ, default), then rmumps, then faer (SparseLdl), then dense.
 fn new_sparse_solver() -> Box<dyn LinearSolver> {
     new_sparse_solver_with_choice(LinearSolverChoice::Direct)
 }
@@ -34,28 +40,34 @@ fn new_sparse_solver() -> Box<dyn LinearSolver> {
 fn new_sparse_solver_with_choice(choice: LinearSolverChoice) -> Box<dyn LinearSolver> {
     match choice {
         LinearSolverChoice::Direct => {
-            #[cfg(feature = "rmumps")]
+            #[cfg(feature = "feral")]
+            { return Box::new(FeralLdl::new()); }
+            #[cfg(all(not(feature = "feral"), feature = "rmumps"))]
             { return Box::new(MultifrontalLdl::new()); }
-            #[cfg(all(not(feature = "rmumps"), feature = "faer"))]
+            #[cfg(all(not(feature = "feral"), not(feature = "rmumps"), feature = "faer"))]
             { return Box::new(SparseLdl::new()); }
-            #[cfg(not(any(feature = "rmumps", feature = "faer")))]
+            #[cfg(not(any(feature = "feral", feature = "rmumps", feature = "faer")))]
             { return Box::new(DenseLdl::new()); }
         }
         LinearSolverChoice::Iterative => {
-            #[cfg(feature = "rmumps")]
+            #[cfg(feature = "feral")]
+            { return Box::new(FeralIterativeMinres::new()); }
+            #[cfg(all(not(feature = "feral"), feature = "rmumps"))]
             { return Box::new(IterativeMinres::new()); }
-            #[cfg(not(feature = "rmumps"))]
+            #[cfg(all(not(feature = "feral"), not(feature = "rmumps")))]
             {
-                log::warn!("Iterative solver requires rmumps feature; falling back to direct");
+                log::warn!("Iterative solver requires feral or rmumps feature; falling back to direct");
                 return new_sparse_solver_with_choice(LinearSolverChoice::Direct);
             }
         }
         LinearSolverChoice::Hybrid => {
-            #[cfg(feature = "rmumps")]
+            #[cfg(feature = "feral")]
+            { return Box::new(FeralHybrid::new()); }
+            #[cfg(all(not(feature = "feral"), feature = "rmumps"))]
             { return Box::new(HybridSolver::new()); }
-            #[cfg(not(feature = "rmumps"))]
+            #[cfg(all(not(feature = "feral"), not(feature = "rmumps")))]
             {
-                log::warn!("Hybrid solver requires rmumps feature; falling back to direct");
+                log::warn!("Hybrid solver requires feral or rmumps feature; falling back to direct");
                 return new_sparse_solver_with_choice(LinearSolverChoice::Direct);
             }
         }
