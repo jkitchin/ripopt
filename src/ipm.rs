@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
-use crate::convergence::{self, check_convergence, ConvergenceInfo, ConvergenceStatus};
+use crate::convergence::{self, ConvergenceInfo, ConvergenceStatus};
 use crate::filter::{self, Filter, FilterEntry};
 use crate::kkt::{self, InertiaCorrectionParams};
 use crate::linear_solver::banded::BandedLdl;
@@ -22,13 +22,6 @@ use crate::linear_solver::iterative::IterativeMinres;
 use crate::linear_solver::hybrid::HybridSolver;
 use crate::linear_solver::{KktMatrix, LinearSolver, SymmetricMatrix};
 use crate::options::LinearSolverChoice;
-
-/// Window size for the iterate-averaging oscillation-recovery
-/// strategy: dual-infeasibility and (x, y, z_l, z_u) histories are
-/// truncated to this many trailing entries, and oscillation is
-/// declared when at least `AVG_WINDOW / 2` consecutive sign changes
-/// appear in the differences of the dual-infeasibility history.
-const AVG_WINDOW: usize = 6;
 
 /// Create a new sparse linear solver using the best available backend.
 /// Prefers feral (multifrontal LDLᵀ, default), then rmumps, then faer (SparseLdl), then dense.
@@ -5773,223 +5766,9 @@ fn update_barrier_parameter_fixed_mode(
     }
 }
 
-/// Bounded ring of recent dual-infeasibility values + parallel ring of
-/// (x, y, z_l, z_u) snapshots, with a one-shot `tried` flag guarding the
-/// iterate-averaging promotion. Owned by solve_ipm; mutated each
-/// iteration via `record` and consumed by `try_iterate_averaging_promotion`.
-struct IterateAveragingState {
-    du_history: Vec<f64>,
-    iterate_history: Vec<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)>,
-    tried: bool,
-}
-
-impl IterateAveragingState {
-    fn new() -> Self {
-        Self {
-            du_history: Vec::with_capacity(AVG_WINDOW + 1),
-            iterate_history: Vec::new(),
-            tried: false,
-        }
-    }
-}
-
-/// State threaded through the convergence-check promotion attempts.
-///
-/// Groups the loop-spanning history + one-shot promotion flags so the
-/// `check_convergence_and_handle_promotions` helper doesn't need a 20-param
-/// signature. All fields live in `solve_ipm`'s stack frame; this struct is
-/// only a bundle of mutable references.
-struct ConvergenceWorkspace<'a> {
-    avg: &'a mut IterateAveragingState,
-}
-
-/// Check convergence status and, on Acceptable, try three promotion
-/// strategies in order: iterate averaging (oscillation smoothing), active-set
-/// reduced solve, and complementarity polishing via multiplier snap. Each
-/// promotion attempt is one-shot (guarded by its `tried_*` flag). Any
-/// successful promotion returns `Some(SolveResult { Optimal })`.
-///
-/// Returns:
-/// - `Some(SolveResult)` when the solver should terminate (Converged,
-///   Acceptable, promoted Optimal, or Diverging/Unbounded).
-/// - `None` when iteration should continue (NotConverged).
-///
-/// Ipopt parallel: `IpIpoptAlg::Optimize` → `IpConvCheck::CheckConvergence`
-/// plus the near-tolerance polishing heuristics (`RecalcIpoptData`,
-/// multiplier snap), which live inline in Ipopt as well.
-///
-/// Snapshot of (x, y, z_l, z_u) used by speculative promotion paths
-/// (iterate averaging, active-set solve) to roll back if the speculative
-/// step fails to converge.
-struct SavedIterate {
-    x: Vec<f64>,
-    y: Vec<f64>,
-    z_l: Vec<f64>,
-    z_u: Vec<f64>,
-}
-
-impl SavedIterate {
-    fn snapshot(state: &SolverState) -> Self {
-        Self {
-            x: state.x.clone(),
-            y: state.y.clone(),
-            z_l: state.z_l.clone(),
-            z_u: state.z_u.clone(),
-        }
-    }
-
-    /// Restore (x, y, z_l, z_u) into `state` and re-evaluate the problem
-    /// at the restored x. The eval result is discarded — callers expect
-    /// the saved point to have been valid.
-    fn restore_and_reeval<P: NlpProblem>(
-        &self,
-        state: &mut SolverState,
-        problem: &P,
-        linear_constraints: Option<&[bool]>,
-        lbfgs_mode: bool,
-    ) {
-        state.x.copy_from_slice(&self.x);
-        state.y.copy_from_slice(&self.y);
-        state.z_l.copy_from_slice(&self.z_l);
-        state.z_u.copy_from_slice(&self.z_u);
-        let _ = state.evaluate_with_linear(problem, 1.0, linear_constraints, lbfgs_mode);
-    }
-}
-
-/// Compute the arithmetic mean of the last `iterate_history.len()`
-/// iterates in `(x, y, z_l, z_u)`, then clamp `avg_x` strictly inside
-/// the variable bounds (push 1e-15 off each finite bound) and clamp
-/// `avg_zl, avg_zu` non-negative.
-fn compute_iterate_average(
-    iterate_history: &[(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)],
-    state: &SolverState,
-    n: usize,
-    m: usize,
-) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
-    let len = iterate_history.len() as f64;
-    let mut avg_x = vec![0.0; n];
-    let mut avg_y = vec![0.0; m];
-    let mut avg_zl = vec![0.0; n];
-    let mut avg_zu = vec![0.0; n];
-    for (hx, hy, hzl, hzu) in iterate_history.iter() {
-        for i in 0..n { avg_x[i] += hx[i] / len; }
-        for i in 0..m { avg_y[i] += hy[i] / len; }
-        for i in 0..n { avg_zl[i] += hzl[i] / len; }
-        for i in 0..n { avg_zu[i] += hzu[i] / len; }
-    }
-    for i in 0..n {
-        avg_x[i] = avg_x[i].clamp(
-            if state.x_l[i].is_finite() { state.x_l[i] + 1e-15 } else { f64::NEG_INFINITY },
-            if state.x_u[i].is_finite() { state.x_u[i] - 1e-15 } else { f64::INFINITY },
-        );
-        avg_zl[i] = avg_zl[i].max(0.0);
-        avg_zu[i] = avg_zu[i].max(0.0);
-    }
-    (avg_x, avg_y, avg_zl, avg_zu)
-}
-
-/// Count the number of sign changes in consecutive differences of
-/// `du_history` — i.e. interior indices `w` where
-/// `(h[w]-h[w-1])·(h[w+1]-h[w]) < 0`. Used by
-/// `try_iterate_averaging_promotion` to detect dual-infeasibility
-/// oscillation: ≥ `AVG_WINDOW/2` sign changes flag a stalled
-/// oscillating iterate that averaging may resolve.
-fn count_du_history_sign_changes(du_history: &[f64]) -> usize {
-    let mut sign_changes = 0;
-    for w in 1..du_history.len().saturating_sub(1) {
-        let d1 = du_history[w] - du_history[w - 1];
-        let d2 = du_history[w + 1] - du_history[w];
-        if d1 * d2 < 0.0 {
-            sign_changes += 1;
-        }
-    }
-    sign_changes
-}
-
-/// Strategy 1 (Acceptable promotion): if the dual-infeasibility history has
-/// `AVG_WINDOW` entries and shows oscillation (>= AVG_WINDOW/2 sign changes
-/// in consecutive differences), average the last `AVG_WINDOW` iterates and
-/// re-check convergence at the averaged point. On success returns
-/// `Some(Optimal)`; otherwise restores the original state and returns None.
-/// One-shot (guarded by `ws.tried_iterate_averaging`).
 #[allow(clippy::too_many_arguments)]
-fn try_iterate_averaging_promotion<P: NlpProblem>(
+fn check_convergence_and_handle_promotions(
     state: &mut SolverState,
-    problem: &P,
-    options: &SolverOptions,
-    ws: &mut ConvergenceWorkspace,
-    n: usize,
-    m: usize,
-    linear_constraints: Option<&[bool]>,
-    lbfgs_mode: bool,
-) -> Option<SolveResult> {
-    if ws.avg.tried || ws.avg.du_history.len() != AVG_WINDOW {
-        return None;
-    }
-    if count_du_history_sign_changes(&ws.avg.du_history) < AVG_WINDOW / 2 {
-        return None;
-    }
-    ws.avg.tried = true;
-    let (avg_x, avg_y, avg_zl, avg_zu) =
-        compute_iterate_average(&ws.avg.iterate_history, state, n, m);
-    let saved = SavedIterate::snapshot(state);
-    state.x.copy_from_slice(&avg_x);
-    state.y.copy_from_slice(&avg_y);
-    state.z_l.copy_from_slice(&avg_zl);
-    state.z_u.copy_from_slice(&avg_zu);
-    let _ = state.evaluate_with_linear(problem, 1.0, linear_constraints, lbfgs_mode);
-    let avg_conv = compute_convergence_info_from_state(state, state.mu, n, m);
-    if let ConvergenceStatus::Converged = check_convergence(&avg_conv, options, 0) {
-        if options.print_level >= 3 {
-            rip_log!("ripopt: Iterate averaging promoted near-tolerance -> Optimal (du={:.2e})", avg_conv.dual_inf);
-        }
-        return Some(make_result(state, SolveStatus::Optimal));
-    }
-    saved.restore_and_reeval(state, problem, linear_constraints, lbfgs_mode);
-    None
-}
-
-/// Handle the `ConvergenceStatus::Acceptable` branch: try the
-/// iterate-averaging promotion and, if it does not succeed, return
-/// `SolveStatus::Acceptable`.
-///
-/// Previously inlined in `check_convergence_and_handle_promotions`.
-#[allow(clippy::too_many_arguments)]
-fn handle_acceptable_status_with_promotions<P: NlpProblem>(
-    state: &mut SolverState,
-    problem: &P,
-    options: &SolverOptions,
-    ws: &mut ConvergenceWorkspace,
-    timings: &PhaseTimings,
-    iteration: usize,
-    ipm_start: Instant,
-    n: usize,
-    m: usize,
-    linear_constraints: Option<&[bool]>,
-    lbfgs_mode: bool,
-) -> SolveResult {
-    // Strategy 1: Try iterate averaging before declaring Acceptable
-    if let Some(result) = try_iterate_averaging_promotion(
-        state, problem, options, ws, n, m,
-        linear_constraints, lbfgs_mode,
-    ) {
-        return result;
-    }
-
-    if options.print_level >= 5 {
-        timings.print_summary(iteration + 1, ipm_start.elapsed());
-    }
-    // Promoted to SolveStatus::Acceptable (matches Ipopt's
-    // Solved_To_Acceptable_Level). Previously this fell through
-    // to NumericalError, which caused problems that met Ipopt's
-    // default acceptable-level tolerances to show as unsolved in
-    // benchmarks. Benchmark reporter counts Acceptable as solved.
-    make_result(state, SolveStatus::Acceptable)
-}
-
-fn check_convergence_and_handle_promotions<P: NlpProblem>(
-    state: &mut SolverState,
-    problem: &P,
     options: &SolverOptions,
     primal_inf_max: f64,
     dual_inf: f64,
@@ -5999,16 +5778,10 @@ fn check_convergence_and_handle_promotions<P: NlpProblem>(
     multiplier_count: usize,
     bound_multiplier_sum: f64,
     bound_multiplier_count: usize,
-    ws: &mut ConvergenceWorkspace,
     timings: &PhaseTimings,
     iteration: usize,
     ipm_start: Instant,
-    linear_constraints: Option<&[bool]>,
-    lbfgs_mode: bool,
 ) -> Option<SolveResult> {
-    let n = state.n;
-    let m = state.m;
-
     let conv_info = ConvergenceInfo {
         primal_inf: primal_inf_max,
         dual_inf,
@@ -6023,16 +5796,6 @@ fn check_convergence_and_handle_promotions<P: NlpProblem>(
         x_max_abs: linf_norm(&state.x),
     };
 
-    // Track iterate history for oscillation detection (Strategy 1)
-    ws.avg.du_history.push(dual_inf);
-    ws.avg.iterate_history.push((
-        state.x.clone(), state.y.clone(), state.z_l.clone(), state.z_u.clone(),
-    ));
-    if ws.avg.du_history.len() > AVG_WINDOW {
-        ws.avg.du_history.remove(0);
-        ws.avg.iterate_history.remove(0);
-    }
-
     match crate::convergence::check_convergence_with_last_obj(
         &conv_info, options, state.consecutive_acceptable, state.last_obj_for_acceptable,
     ) {
@@ -6042,11 +5805,13 @@ fn check_convergence_and_handle_promotions<P: NlpProblem>(
             }
             Some(make_result(state, SolveStatus::Optimal))
         }
-        ConvergenceStatus::Acceptable => Some(handle_acceptable_status_with_promotions(
-            state, problem, options, ws, timings,
-            iteration, ipm_start, n, m,
-            linear_constraints, lbfgs_mode,
-        )),
+        ConvergenceStatus::Acceptable => {
+            if options.print_level >= 5 {
+                timings.print_summary(iteration + 1, ipm_start.elapsed());
+            }
+            // Matches Ipopt's Solved_To_Acceptable_Level.
+            Some(make_result(state, SolveStatus::Acceptable))
+        }
         ConvergenceStatus::Diverging => {
             Some(make_result(state, SolveStatus::Unbounded))
         }
@@ -7752,10 +7517,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
     // best feasible point, restore it and restart with fresh parameters.
     let mut dual_stall = DualStallTracker::new();
 
-    // Strategy 1: Iterate averaging for oscillation recovery
-    let mut avg_state = IterateAveragingState::new();
-
-    // Strategy 2: Damped multiplier updates when oscillation detected
+    // Damped multiplier updates when oscillation detected
     let mut dy_tracker = DyOscillationTracker::new(m);
 
     // Initial evaluation with NaN/Inf recovery by bound-push perturbation.
@@ -7880,12 +7642,8 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         let bound_multiplier_sum = compute_bound_multiplier_sum(&state);
         let bound_multiplier_count = compute_bound_multiplier_count(&state);
 
-        let mut conv_ws = ConvergenceWorkspace {
-            avg: &mut avg_state,
-        };
         if let Some(result) = check_convergence_and_handle_promotions(
             &mut state,
-            problem,
             options,
             primal_inf_max,
             dual_inf,
@@ -7895,12 +7653,9 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             multiplier_count,
             bound_multiplier_sum,
             bound_multiplier_count,
-            &mut conv_ws,
             &timings,
             iteration,
             ipm_start,
-            linear_constraints.as_deref(),
-            lbfgs_mode,
         ) {
             return result;
         }
@@ -10355,9 +10110,10 @@ fn compute_multiplier_count(state: &SolverState) -> usize {
 /// Build a `ConvergenceInfo` from the current iterate by computing the
 /// max-norm primal infeasibility, dual infeasibility, complementarity
 /// error (at mu_target=0), and total multiplier sum from `state`. The
-/// caller supplies `mu` because some promotion paths (e.g. active-set)
-/// want to check convergence with mu=0 even though `state.mu` is
+/// caller supplies `mu` because some test paths want to check convergence
+/// at mu=0 even though `state.mu` is
 /// nonzero.
+#[cfg(test)]
 fn compute_convergence_info_from_state(
     state: &SolverState,
     mu: f64,
