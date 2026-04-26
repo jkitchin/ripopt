@@ -474,6 +474,12 @@ pub(crate) struct SolverState {
     /// primal slack found after an accepted step contributes one
     /// increment; surfaced for diagnostics only.
     pub adjusted_slacks_count: usize,
+    /// True when the problem is square in Ipopt's sense:
+    /// `m == n` or the equality-constraint count equals `n`.
+    /// Mirrors `IpoptCalculatedQuantities::IsSquareProblem`
+    /// (IpIpoptCalculatedQuantities.cpp:3732). Set once at setup
+    /// after bound preprocessing and read-only thereafter.
+    pub is_square: bool,
 }
 
 /// Barrier parameter mode (Ipopt's adaptive mu strategy).
@@ -855,6 +861,9 @@ impl SolverState {
             apply_warm_start_multipliers(problem, &mut y, &mut z_l, &mut z_u);
         }
 
+        let m_eq = (0..m).filter(|&i| g_l[i] == g_u[i]).count();
+        let is_square = m == n || m_eq == n;
+
         Self {
             x,
             y,
@@ -892,6 +901,7 @@ impl SolverState {
             diagnostics: SolverDiagnostics::default(),
             x_last_eval: vec![f64::NAN; n],
             adjusted_slacks_count: 0,
+            is_square,
         }
     }
 
@@ -2819,8 +2829,13 @@ fn run_line_search_loop<P: NlpProblem>(
         if force_restoration {
             break;
         }
-        // Intra-iteration early stall check (scaled by problem size)
-        if iteration < 3 && options.early_stall_timeout > 0.0
+        // Intra-iteration early stall check (scaled by problem size).
+        // Square problems can have legitimately slow first iterations
+        // (mirrors IpBacktrackingLineSearch.cpp:276-280), so we never
+        // declare infeasibility on time alone in that branch.
+        if !state.is_square
+            && iteration < 3
+            && options.early_stall_timeout > 0.0
             && start_time.elapsed().as_secs_f64() > early_timeout
         {
             return LineSearchOutcome::Return(make_result(state, SolveStatus::NumericalError));
@@ -4373,7 +4388,8 @@ fn try_nlp_restoration_phase<P: NlpProblem>(
     theta_current: f64,
 ) -> bool {
     let kkt_dim = n + m;
-    let skip_nlp_restoration = iteration < 3
+    let skip_nlp_restoration = !state.is_square
+        && iteration < 3
         && options.early_stall_timeout > 0.0
         && start_time.elapsed().as_secs_f64() > early_timeout * 0.5;
     if !((fail_count == 2 || fail_count == 4)
@@ -6087,8 +6103,10 @@ fn check_time_limits(
 
     // Early stall detection: bail out if stuck in early iterations.
     // `early_timeout` is pre-scaled by problem size in the caller (see
-    // scaling formula in solve_ipm).
-    if iteration < 5 && options.early_stall_timeout > 0.0 {
+    // scaling formula in solve_ipm). Square problems are exempt — they
+    // can have legitimately slow first iterations (mirrors Ipopt
+    // IpBacktrackingLineSearch.cpp:276-280).
+    if !state.is_square && iteration < 5 && options.early_stall_timeout > 0.0 {
         if start_time.elapsed().as_secs_f64() > early_timeout {
             if options.print_level >= 3 {
                 rip_log!(
@@ -7577,6 +7595,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
     let mut lin_solver = select_linear_solver(use_sparse, n, m, options);
     let mut inertia_params = InertiaCorrectionParams::default();
     let mut restoration = RestorationPhase::new(500);
+    restoration.set_square(state.is_square);
 
     let mut disable_sparse_condensed = estimate_schur_density_disable(problem, n, m, use_sparse, options);
     // Flag set by bandwidth detection: when the sparse condensed Schur complement
@@ -10620,6 +10639,7 @@ mod tests {
             diagnostics: SolverDiagnostics::default(),
             x_last_eval: vec![f64::NAN; n],
             adjusted_slacks_count: 0,
+            is_square: false,
         }
     }
 
