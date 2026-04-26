@@ -93,6 +93,84 @@ use crate::slack_formulation::SlackFormulation;
 use crate::warmstart::WarmStartInitializer;
 use crate::logging::rip_log;
 
+/// NLP problem wrapper that rejects non-finite (NaN/Inf) values from
+/// any evaluation. Mirrors Ipopt 3.14's `IpOrigIpoptNLP.cpp` per-call
+/// `Eval_Error` checks (lines 498, 535, 580, 629). When the inner
+/// implementation returns `true` but any output element is non-finite,
+/// the wrapper converts that to a `false` return, which the IPM line
+/// search treats as a trial-point rejection (and at the current
+/// iterate, as `EvaluationError → NumericalBreakdown`).
+///
+/// Wrapped as the outermost layer in `solve_ipm` so every eval that
+/// reaches the IPM core is guaranteed finite. The check covers
+/// objective, gradient, constraints, Jacobian values, and Hessian
+/// values; bounds / initial point / structure queries do not produce
+/// numerical output and are not checked.
+struct FiniteCheckedProblem<'a, P: NlpProblem> {
+    inner: &'a P,
+}
+
+impl<'a, P: NlpProblem> FiniteCheckedProblem<'a, P> {
+    fn new(inner: &'a P) -> Self {
+        Self { inner }
+    }
+}
+
+impl<P: NlpProblem> NlpProblem for FiniteCheckedProblem<'_, P> {
+    fn num_variables(&self) -> usize { self.inner.num_variables() }
+    fn num_constraints(&self) -> usize { self.inner.num_constraints() }
+    fn bounds(&self, x_l: &mut [f64], x_u: &mut [f64]) {
+        self.inner.bounds(x_l, x_u);
+    }
+    fn constraint_bounds(&self, g_l: &mut [f64], g_u: &mut [f64]) {
+        self.inner.constraint_bounds(g_l, g_u);
+    }
+    fn initial_point(&self, x0: &mut [f64]) { self.inner.initial_point(x0); }
+    fn initial_multipliers(
+        &self,
+        lam_g: &mut [f64],
+        z_l: &mut [f64],
+        z_u: &mut [f64],
+    ) -> bool {
+        self.inner.initial_multipliers(lam_g, z_l, z_u)
+    }
+    fn objective(&self, x: &[f64], new_x: bool, obj: &mut f64) -> bool {
+        if !self.inner.objective(x, new_x, obj) { return false; }
+        obj.is_finite()
+    }
+    fn gradient(&self, x: &[f64], new_x: bool, grad: &mut [f64]) -> bool {
+        if !self.inner.gradient(x, new_x, grad) { return false; }
+        grad.iter().all(|v| v.is_finite())
+    }
+    fn constraints(&self, x: &[f64], new_x: bool, g: &mut [f64]) -> bool {
+        if !self.inner.constraints(x, new_x, g) { return false; }
+        g.iter().all(|v| v.is_finite())
+    }
+    fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+        self.inner.jacobian_structure()
+    }
+    fn jacobian_values(&self, x: &[f64], new_x: bool, vals: &mut [f64]) -> bool {
+        if !self.inner.jacobian_values(x, new_x, vals) { return false; }
+        vals.iter().all(|v| v.is_finite())
+    }
+    fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+        self.inner.hessian_structure()
+    }
+    fn hessian_values(
+        &self,
+        x: &[f64],
+        new_x: bool,
+        obj_factor: f64,
+        lambda: &[f64],
+        vals: &mut [f64],
+    ) -> bool {
+        if !self.inner.hessian_values(x, new_x, obj_factor, lambda, vals) {
+            return false;
+        }
+        vals.iter().all(|v| v.is_finite())
+    }
+}
+
 /// NLP problem wrapper that applies gradient-based scaling.
 ///
 /// Scales objective by `obj_scaling` and each constraint `i` by `g_scaling[i]`
@@ -7712,7 +7790,14 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         g_scaling: g_scaling.clone(),
         jac_rows: jac_rows_sc,
     };
-    let problem = &scaled; // shadow: all subsequent code uses the scaled problem
+    // Mirrors Ipopt 3.14's IpOrigIpoptNLP per-call Eval_Error checks:
+    // wrap the scaled problem with a NaN/Inf guard so every eval
+    // reaching the IPM core is guaranteed finite. Non-finite outputs
+    // are converted to `false` returns, treated as trial-point
+    // rejections by the line search (and as EvaluationError →
+    // NumericalBreakdown at the current iterate).
+    let finite_checked = FiniteCheckedProblem::new(&scaled);
+    let problem = &finite_checked; // shadow: all subsequent code uses the wrapped problem
 
     let mut state = SolverState::new(problem, options);
     state.obj_scaling = obj_scaling;
@@ -11044,5 +11129,109 @@ mod tests {
         // 1/xi steers away from aggressive small-mu candidates).
         assert!(mu_on >= mu_off,
             "centrality should raise mu, off={mu_off:e} on={mu_on:e}");
+    }
+
+    /// Minimal `NlpProblem` whose evaluations return user-controlled
+    /// non-finite values so we can exercise `FiniteCheckedProblem`.
+    struct PoisonProblem {
+        bad_obj: bool,
+        bad_grad: bool,
+        bad_g: bool,
+        bad_jac: bool,
+        bad_hess: bool,
+    }
+
+    impl NlpProblem for PoisonProblem {
+        fn num_variables(&self) -> usize { 1 }
+        fn num_constraints(&self) -> usize { 1 }
+        fn bounds(&self, x_l: &mut [f64], x_u: &mut [f64]) {
+            x_l[0] = f64::NEG_INFINITY; x_u[0] = f64::INFINITY;
+        }
+        fn constraint_bounds(&self, g_l: &mut [f64], g_u: &mut [f64]) {
+            g_l[0] = 0.0; g_u[0] = 0.0;
+        }
+        fn initial_point(&self, x0: &mut [f64]) { x0[0] = 0.0; }
+        fn objective(&self, _x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+            *obj = if self.bad_obj { f64::NAN } else { 1.0 };
+            true
+        }
+        fn gradient(&self, _x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
+            grad[0] = if self.bad_grad { f64::INFINITY } else { 1.0 };
+            true
+        }
+        fn constraints(&self, _x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
+            g[0] = if self.bad_g { f64::NAN } else { 0.0 };
+            true
+        }
+        fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            (vec![0], vec![0])
+        }
+        fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
+            vals[0] = if self.bad_jac { f64::NEG_INFINITY } else { 1.0 };
+            true
+        }
+        fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            (vec![0], vec![0])
+        }
+        fn hessian_values(
+            &self, _x: &[f64], _new_x: bool, _of: f64, _l: &[f64], vals: &mut [f64],
+        ) -> bool {
+            vals[0] = if self.bad_hess { f64::NAN } else { 1.0 };
+            true
+        }
+    }
+
+    #[test]
+    fn finite_checked_passes_finite_values_through() {
+        let p = PoisonProblem {
+            bad_obj: false, bad_grad: false, bad_g: false,
+            bad_jac: false, bad_hess: false,
+        };
+        let w = FiniteCheckedProblem::new(&p);
+        let x = [0.0];
+        let mut obj = 0.0;
+        let mut grad = [0.0];
+        let mut g = [0.0];
+        let mut jac = [0.0];
+        let mut hess = [0.0];
+        assert!(w.objective(&x, true, &mut obj));
+        assert!(w.gradient(&x, true, &mut grad));
+        assert!(w.constraints(&x, true, &mut g));
+        assert!(w.jacobian_values(&x, true, &mut jac));
+        assert!(w.hessian_values(&x, true, 1.0, &[0.0], &mut hess));
+    }
+
+    #[test]
+    fn finite_checked_rejects_non_finite_values() {
+        let x = [0.0];
+        let mut buf1 = [0.0];
+        let mut buf_g = [0.0];
+
+        let p_obj = PoisonProblem {
+            bad_obj: true, bad_grad: false, bad_g: false, bad_jac: false, bad_hess: false,
+        };
+        let mut obj = 0.0;
+        assert!(!FiniteCheckedProblem::new(&p_obj).objective(&x, true, &mut obj));
+
+        let p_grad = PoisonProblem {
+            bad_obj: false, bad_grad: true, bad_g: false, bad_jac: false, bad_hess: false,
+        };
+        assert!(!FiniteCheckedProblem::new(&p_grad).gradient(&x, true, &mut buf1));
+
+        let p_g = PoisonProblem {
+            bad_obj: false, bad_grad: false, bad_g: true, bad_jac: false, bad_hess: false,
+        };
+        assert!(!FiniteCheckedProblem::new(&p_g).constraints(&x, true, &mut buf_g));
+
+        let p_jac = PoisonProblem {
+            bad_obj: false, bad_grad: false, bad_g: false, bad_jac: true, bad_hess: false,
+        };
+        assert!(!FiniteCheckedProblem::new(&p_jac).jacobian_values(&x, true, &mut buf1));
+
+        let p_hess = PoisonProblem {
+            bad_obj: false, bad_grad: false, bad_g: false, bad_jac: false, bad_hess: true,
+        };
+        assert!(!FiniteCheckedProblem::new(&p_hess)
+            .hessian_values(&x, true, 1.0, &[0.0], &mut buf1));
     }
 }
