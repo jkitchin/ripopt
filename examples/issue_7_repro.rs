@@ -162,8 +162,6 @@ fn main() {
         max_iter: 3000,
         // Disable fallback solvers to expose the raw IPM stall
         enable_lbfgs_fallback: false,
-        enable_al_fallback: false,
-        enable_sqp_fallback: false,
         enable_slack_fallback: false,
         enable_lbfgs_hessian_fallback: false,
         disable_nlp_restoration: true,

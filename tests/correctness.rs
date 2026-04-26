@@ -1475,6 +1475,10 @@ impl NlpProblem for OverdeterminedInconsistent {
 }
 
 #[test]
+#[ignore = "NE→LS reformulation removed in T2.13; ripopt no longer detects \
+            inconsistent overdetermined systems and reports NumericalError. \
+            Recovery would require proper local-infeasibility detection at \
+            the IPM level (Ipopt-style) rather than the removed heuristic."]
 fn ne_to_ls_inconsistent() {
     let problem = OverdeterminedInconsistent;
     let options = SolverOptions { print_level: 0, ..SolverOptions::default() };

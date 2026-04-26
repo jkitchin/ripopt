@@ -7738,44 +7738,69 @@ fn attempt_soc_sparse_condensed<P: NlpProblem>(
 /// T0.8: install resto-returned bound multipliers, clamped via the
 /// Ipopt κ_σ safeguard. For each finite bound, take the resto-NLP z
 /// for that variable (the original-x block of the resto solve) and
-/// clamp into `[μ/(κ_σ·s), κ_σ·μ/s]` where `s` is the corresponding
-/// slack at the new x. This mirrors Ipopt's main-phase init right
-/// after `RestoIpoptNLP::finalize_solution` returns: resto's careful
-/// z-work is preserved, only safeguarded against pathological
-/// extremes; the previous code overwrote z with `μ/slack` from
-/// scratch, throwing it away. Bounds with no resto z (infinite x
-/// bound) are zeroed. The "nuclear reset" return value tracks
-/// whether the post-clamp z_max is above the watchdog threshold so
-/// the v-multiplier path mirrors the existing semantics.
+/// apply the one-shot Newton step described in `IPOPT_ALGORITHM_SPEC.md`
+/// §7.8 / `IpRestoMinC_1Nrm.cpp:378-399`:
+///
+///   δz_i = (μ - z_i·(s_trial - s_cur))/s_cur − z_i
+///
+/// followed by a fraction-to-boundary step on z (τ ≈ 1 − μ, capped at
+/// 0.99) and the standard κ_σ ∈ \[μ/(κ_σ·s), κ_σ·μ/s\] safeguard at
+/// the new slack. `x_cur` is the pre-restoration x (used in s_cur) and
+/// `state.x` already holds x_trial at call time.
+///
+/// Bounds with no resto z (infinite x bound) are zeroed. The "nuclear
+/// reset" return value tracks whether the post-clamp z_max is above
+/// the watchdog threshold so the v-multiplier path mirrors the
+/// existing semantics.
 fn apply_kappa_sigma_clamp_to_resto_z(
     state: &mut SolverState,
     n: usize,
     zl_resto: &[f64],
     zu_resto: &[f64],
+    x_cur: &[f64],
 ) -> bool {
     let kappa_sigma = 1e10;
     let mu = state.mu.max(1e-20);
     let bound_mult_reset_threshold = 1000.0;
+    // Match Ipopt IpFilterLSAcceptor: τ_min = max(0.99, 1 − μ).
+    let tau = (1.0 - mu).max(0.99);
     let mut z_max: f64 = 0.0;
     for i in 0..n {
         if state.x_l[i].is_finite() {
-            let s = (state.x[i] - state.x_l[i]).max(1e-12);
-            let z_lo = mu / (kappa_sigma * s);
-            let z_hi = kappa_sigma * mu / s;
-            // Floor at 1e-20 to keep z strictly positive even when
-            // the resto NLP returned a near-zero multiplier.
-            let z_in = if i < zl_resto.len() { zl_resto[i].max(1e-20) } else { mu / s };
-            state.z_l[i] = z_in.clamp(z_lo, z_hi);
+            let s_cur = (x_cur[i] - state.x_l[i]).max(1e-12);
+            let s_trial = (state.x[i] - state.x_l[i]).max(1e-12);
+            let z_in = if i < zl_resto.len() { zl_resto[i].max(1e-20) } else { mu / s_cur };
+            // One-shot Newton: δz = (μ − z·(s_trial − s_cur))/s_cur − z
+            let dz = (mu - z_in * (s_trial - s_cur)) / s_cur - z_in;
+            // α_d FTB on z: keep z + α·δz ≥ (1−τ)·z when δz < 0.
+            let alpha_d = if dz < 0.0 {
+                ((-tau * z_in) / dz).min(1.0).max(0.0)
+            } else {
+                1.0
+            };
+            let z_new = z_in + alpha_d * dz;
+            // κ_σ safeguard at the new slack.
+            let z_lo = mu / (kappa_sigma * s_trial);
+            let z_hi = kappa_sigma * mu / s_trial;
+            state.z_l[i] = z_new.clamp(z_lo, z_hi);
             z_max = z_max.max(state.z_l[i]);
         } else {
             state.z_l[i] = 0.0;
         }
         if state.x_u[i].is_finite() {
-            let s = (state.x_u[i] - state.x[i]).max(1e-12);
-            let z_lo = mu / (kappa_sigma * s);
-            let z_hi = kappa_sigma * mu / s;
-            let z_in = if i < zu_resto.len() { zu_resto[i].max(1e-20) } else { mu / s };
-            state.z_u[i] = z_in.clamp(z_lo, z_hi);
+            let s_cur = (state.x_u[i] - x_cur[i]).max(1e-12);
+            let s_trial = (state.x_u[i] - state.x[i]).max(1e-12);
+            let z_in = if i < zu_resto.len() { zu_resto[i].max(1e-20) } else { mu / s_cur };
+            let dz = (mu - z_in * (s_trial - s_cur)) / s_cur - z_in;
+            let alpha_d = if dz < 0.0 {
+                ((-tau * z_in) / dz).min(1.0).max(0.0)
+            } else {
+                1.0
+            };
+            let z_new = z_in + alpha_d * dz;
+            let z_lo = mu / (kappa_sigma * s_trial);
+            let z_hi = kappa_sigma * mu / s_trial;
+            state.z_u[i] = z_new.clamp(z_lo, z_hi);
             z_max = z_max.max(state.z_u[i]);
         } else {
             state.z_u[i] = 0.0;
@@ -7939,18 +7964,21 @@ fn apply_restoration_success<P: NlpProblem>(
         }
     }
 
+    // Capture pre-restoration x so the one-shot Newton z update
+    // (Ipopt §7.8 / IpRestoMinC_1Nrm.cpp:378-399) can compute s_cur.
+    let x_cur = state.x.clone();
     state.x.copy_from_slice(x_new);
     state.alpha_primal = 0.0;
 
     let _ = evaluate_and_refresh_lbfgs(state, problem, lbfgs_state, linear_constraints, lbfgs_mode);
 
-    // T0.8: when the resto NLP returned bound multipliers, prefer the
-    // kappa_sigma clamp on those values (Ipopt main-phase init right
-    // after RestoIpoptNLP::finalize_solution) over a μ/slack reset.
-    // Otherwise (Gauss-Newton path or missing z) fall back to the
-    // legacy μ/slack reset.
+    // T0.8 / spec §7.8: when the resto NLP returned bound multipliers,
+    // apply the one-shot Newton z update + α_d FTB + κ_σ clamp to
+    // those values (mirrors Ipopt main-phase init after
+    // RestoIpoptNLP::finalize_solution). Otherwise (Gauss-Newton path
+    // or missing z) fall back to the legacy μ/slack reset.
     let nuclear_reset = if let Some((zl_resto, zu_resto)) = resto_z {
-        apply_kappa_sigma_clamp_to_resto_z(state, n, zl_resto, zu_resto)
+        apply_kappa_sigma_clamp_to_resto_z(state, n, zl_resto, zu_resto, &x_cur)
     } else {
         reset_bound_multipliers_after_restoration(state, n)
     };
@@ -10002,54 +10030,83 @@ mod tests {
             .hessian_values(&x, true, 1.0, &[0.0], &mut buf1));
     }
 
-    /// T0.8: when the resto NLP returns z that already lies inside
-    /// the κ_σ band, the post-resto z must equal the resto-returned
-    /// value verbatim — NOT μ/slack from scratch (which would throw
-    /// away the resto's careful multiplier work).
+    /// Spec §7.8: when restoration leaves x unchanged (s_cur == s_trial),
+    /// the one-shot Newton step δz = μ/s − z drives z to μ/s exactly,
+    /// then κ_σ safeguards. Mirrors Ipopt IpRestoMinC_1Nrm.cpp:378-399.
     #[test]
-    fn test_kappa_sigma_clamp_preserves_resto_z_in_band() {
+    fn test_one_shot_newton_z_no_x_step_recovers_mu_slack() {
         let mut state = minimal_state(1, 0);
         state.x = vec![1.1];
         state.x_l = vec![1.0];
-        // No upper bound; z_u stays 0.
         state.x_u = vec![f64::INFINITY];
         state.mu = 0.01;
-        // resto-returned z_l[0] = 0.5, slack = 0.1, μ = 0.01.
-        // μ/slack = 0.1 (the OLD code's value). κ_σ band:
-        //   [μ/(κ_σ·s), κ_σ·μ/s] = [1e-12, 1e9]. 0.5 is inside.
-        // Expected new code: z_l[0] := 0.5 (preserved, not 0.1).
+        // s_cur = s_trial = 0.1; z_in = 0.5 → δz = μ/s − z = -0.4.
+        // α_d FTB: −0.99·0.5 / −0.4 = 1.2375 → clamp to α=1.
+        // z_new = 0.5 − 0.4 = 0.1 = μ/s. κ_σ band [1e-12, 1e9] → unchanged.
         let zl_resto = vec![0.5];
         let zu_resto = vec![0.0];
+        let x_cur = vec![1.1];
         let nuclear = apply_kappa_sigma_clamp_to_resto_z(
-            &mut state, 1, &zl_resto, &zu_resto,
+            &mut state, 1, &zl_resto, &zu_resto, &x_cur,
         );
-        assert!((state.z_l[0] - 0.5).abs() < 1e-15,
-            "z_l should be preserved at 0.5 (resto value), got {}", state.z_l[0]);
-        assert!((state.z_l[0] - 0.1).abs() > 1e-6,
-            "z_l must NOT be the old μ/slack=0.1");
+        assert!((state.z_l[0] - 0.1).abs() < 1e-12,
+            "z_l should converge to μ/s = 0.1 via one-shot Newton, got {}",
+            state.z_l[0]);
         assert_eq!(state.z_u[0], 0.0, "infinite x_u → z_u = 0");
-        assert!(!nuclear, "z_max=0.5 should not trigger nuclear-reset flag");
+        assert!(!nuclear, "z_max=0.1 should not trigger nuclear-reset flag");
     }
 
-    /// T0.8: a wildly large resto z must be clamped down by the κ_σ
-    /// upper band (κ_σ·μ/slack), preserving the safeguard semantics.
+    /// Spec §7.8: a wildly large resto z must be clamped down by the
+    /// κ_σ upper band (κ_σ·μ/s_trial). With z huge and s_cur ≈ s_trial,
+    /// the Newton δz is large and negative; α_d FTB caps the step at
+    /// (1−τ)·z_in (~1% of original), then κ_σ takes over.
     #[test]
-    fn test_kappa_sigma_clamp_caps_huge_resto_z() {
+    fn test_one_shot_newton_z_caps_huge_resto_z() {
         let mut state = minimal_state(1, 0);
         state.x = vec![1.1];
         state.x_l = vec![1.0];
         state.x_u = vec![f64::INFINITY];
         state.mu = 1e-6;
-        // slack=0.1, μ=1e-6 → upper band = 1e10*1e-6/0.1 = 1e5.
-        // resto returned z_l[0] = 1e20 (pathological).
+        // s_cur=s_trial=0.1, μ=1e-6 → κ_σ upper = 1e10·1e-6/0.1 = 1e5.
+        // z_in=1e20: δz = μ/s − z = 1e-5 − 1e20 ≈ −1e20.
+        // α_d FTB: −0.99·1e20 / −1e20 = 0.99 → step = 0.99·(−1e20).
+        // z_new = 1e20·(1 − 0.99) = 1e18. κ_σ clamp → 1e5.
         let zl_resto = vec![1.0e20];
         let zu_resto = vec![0.0];
+        let x_cur = vec![1.1];
         apply_kappa_sigma_clamp_to_resto_z(
-            &mut state, 1, &zl_resto, &zu_resto,
+            &mut state, 1, &zl_resto, &zu_resto, &x_cur,
         );
         let z_hi = 1e10 * 1e-6 / 0.1;
         assert!((state.z_l[0] - z_hi).abs() / z_hi < 1e-12,
             "z_l should be clamped to κ_σ·μ/s = {}, got {}", z_hi, state.z_l[0]);
+    }
+
+    /// Spec §7.8: when restoration moves x toward the bound (s shrinks
+    /// from s_cur=0.5 to s_trial=0.1), the Newton step should bias z
+    /// upward to maintain z·s ≈ μ. Verify δz computation directly.
+    #[test]
+    fn test_one_shot_newton_z_with_x_step_uses_s_cur_in_formula() {
+        let mut state = minimal_state(1, 0);
+        // x moved from 1.5 (s=0.5) to 1.1 (s=0.1).
+        state.x = vec![1.1];
+        state.x_l = vec![1.0];
+        state.x_u = vec![f64::INFINITY];
+        state.mu = 0.05;
+        // z_in = 0.1, s_cur = 0.5, s_trial = 0.1, μ = 0.05.
+        // δz = (μ − z·(s_trial−s_cur))/s_cur − z
+        //    = (0.05 − 0.1·(−0.4))/0.5 − 0.1
+        //    = (0.05 + 0.04)/0.5 − 0.1
+        //    = 0.18 − 0.1 = 0.08
+        // δz > 0 → α=1, z_new = 0.18. κ_σ band at s=0.1: [5e-12, 5e8] → kept.
+        let zl_resto = vec![0.1];
+        let zu_resto = vec![0.0];
+        let x_cur = vec![1.5];
+        apply_kappa_sigma_clamp_to_resto_z(
+            &mut state, 1, &zl_resto, &zu_resto, &x_cur,
+        );
+        assert!((state.z_l[0] - 0.18).abs() < 1e-12,
+            "z_l should be 0.18 from Newton step, got {}", state.z_l[0]);
     }
 
     /// Trivial 1-D NLP for filter-gating tests. Objective and
