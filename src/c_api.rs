@@ -583,6 +583,13 @@ pub unsafe extern "C" fn ripopt_add_str_option(
         "quality_function_centrality" => {
             p.options.quality_function_centrality = value == "yes";
         }
+        "quality_function_max_section_steps" => {
+            if let Ok(v) = value.parse::<usize>() {
+                p.options.quality_function_max_section_steps = v;
+            } else {
+                return 0;
+            }
+        }
         _ => return 0,
     }
     1

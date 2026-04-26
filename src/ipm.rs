@@ -4885,12 +4885,280 @@ fn compute_loqo_mu(
     new_mu
 }
 
+/// Quality-function μ oracle (T2.23, spec §3.5,
+/// `IpQualityFunctionMuOracle.cpp:154-485`).
+///
+/// Procedure:
+/// 1. Assemble and factor the augmented KKT at the current iterate.
+/// 2. Solve the affine-predictor RHS (μ=0 in centering rows) → `d_aff`.
+/// 3. Solve the full RHS at `μ_cur` → `d_full`.  The centering direction
+///    is `d_cen = d_full − d_aff`, so a candidate σ produces the trial
+///    step `d(σ) = (1−σ)·d_aff + σ·d_full` (which by linearity solves
+///    KKT at μ_target = σ·μ_cur).
+/// 4. For each candidate σ, take the fraction-to-boundary step
+///    (α_p, α_d) under τ=1 and evaluate
+///    Q(σ) = (1−α_d)·dual_inf₀ / s_d
+///          + (1−α_p)·primal_inf₀
+///          + max_i (s+_i · z+_i) / s_c          (compl, target μ=0)
+///          + (1−min(α_p,α_d)) · max(avg_compl, μ) / s_c   (balancing)
+///          [+ 1/ξ at trial when `quality_function_centrality`]
+///    using the linear-residual identity `‖res(α)‖ = (1−α)·‖res(0)‖`.
+/// 5. Golden-section minimise over σ ∈ [1e-6, 1.0] with at most 8 steps
+///    and relative tolerance 1e-2 on the bracket width.
+/// 6. Return clamp(σ*·avg_compl, max=1e5, min=max(monotone_floor, μ_min)).
+///
+/// Returns `None` on factorisation/solve failure so the caller can fall
+/// back to the Loqo oracle (this matches `IpQualityFunctionMuOracle`'s
+/// behaviour — it skips the candidate and lets the algorithm fall
+/// through). Re-factorises the KKT inside the oracle (option (b) in the
+/// task spec) — slower than reusing the iteration's factor, but cleanly
+/// scoped without plumbing the linear solver through five call frames.
+///
+/// Tech-debt notes versus Ipopt 3.14's QF reference:
+///   * Ipopt's QF uses the **true nonlinear residual** at the trial
+///     point (problem(x+α·dx)). ripopt uses the linearised
+///     `(1−α)·current` identity, which is exact only when the trial step
+///     stays inside the linear regime. Near optimum where α≈1 the
+///     dual/primal terms collapse and Q is dominated by the compl term.
+///     Without a balancing term the QF becomes degenerate (Q is flat
+///     across σ). The balancing term above breaks that degeneracy and
+///     restores meaningful σ selection.
+///   * Spec §3.5 quotes σ_max=1e2 (matching Ipopt's full-balancing
+///     mode). ripopt caps σ_max at 1.0 because the linearised Q above
+///     has spurious local minima at σ≳1 in well-converged regimes.
+///   * Compl target is μ=0 (optimality), not σ·μ_cur (centering). This
+///     makes σ→0 strictly preferred whenever the affine direction
+///     admits a long FTB stride, matching Mehrotra-like behaviour.
+///   * To upgrade to the full Ipopt formulation we would need to plumb
+///     `&P: NlpProblem` and the linear solver through `update_barrier_*`
+///     so the oracle can call `problem.objective`/`gradient`/etc. at
+///     each trial point. That is option (a) in the task spec.
+fn compute_quality_function_mu(
+    state: &SolverState,
+    options: &SolverOptions,
+    avg_compl: f64,
+    use_sparse: bool,
+) -> Option<f64> {
+    let n = state.n;
+    let m = state.m;
+
+    if avg_compl <= 0.0 {
+        return None;
+    }
+
+    // 1) Assemble + factor KKT at the current iterate.
+    let sigma_vec = compute_sigma_from_state(state);
+    let mut kkt = assemble_kkt_from_state(state, n, m, &sigma_vec, use_sparse, options.kappa_d);
+    let mut solver = new_fallback_solver(use_sparse);
+    let mut inertia_params = InertiaCorrectionParams::default();
+    if kkt::factor_with_inertia_correction(&mut kkt, solver.as_mut(), &mut inertia_params, state.mu).is_err() {
+        return None;
+    }
+
+    // 2) Affine-predictor solve (μ=0 in the centering rows).
+    let rhs_aff = kkt::affine_predictor_rhs(
+        &kkt.rhs, &state.x, &state.x_l, &state.x_u, state.mu, options.kappa_d,
+    );
+    let (dx_aff, _dy_aff) = kkt::solve_with_custom_rhs_refined(
+        &kkt.matrix, kkt.n, kkt.dim, solver.as_mut(), &rhs_aff,
+    ).ok()?;
+    let (dz_l_aff, dz_u_aff) = recover_dz_from_state(state, &dx_aff, 0.0);
+
+    // 3) Full-step solve at μ_cur (the existing rhs is exactly this).
+    let (dx_full, _dy_full) = kkt::solve_with_custom_rhs_refined(
+        &kkt.matrix, kkt.n, kkt.dim, solver.as_mut(), &kkt.rhs,
+    ).ok()?;
+    let (dz_l_full, dz_u_full) = recover_dz_from_state(state, &dx_full, state.mu);
+
+    // 4) Pre-compute the residuals at the current iterate (needed for the
+    //    `(1−α)·residual` linearised identity).
+    let primal_inf0 = compute_primal_inf_max_at_state(state);
+    let dual_inf0 = compute_dual_inf_at_state(state);
+    let s_d = compute_residual_scaling(compute_multiplier_sum(state), compute_multiplier_count(state));
+    let s_c = compute_residual_scaling(compute_bound_multiplier_sum(state), compute_bound_multiplier_count(state));
+
+    // Quality-function evaluator at sigma. Captures the precomputed
+    // affine + full directions; pure scalar arithmetic from here on.
+    let q_eval = |sigma: f64| -> f64 {
+        // Trial step d(σ) = (1−σ)·d_aff + σ·d_full
+        let mut dx = vec![0.0; n];
+        let mut dz_l = vec![0.0; n];
+        let mut dz_u = vec![0.0; n];
+        for i in 0..n {
+            dx[i] = (1.0 - sigma) * dx_aff[i] + sigma * dx_full[i];
+            dz_l[i] = (1.0 - sigma) * dz_l_aff[i] + sigma * dz_l_full[i];
+            dz_u[i] = (1.0 - sigma) * dz_u_aff[i] + sigma * dz_u_full[i];
+        }
+
+        // Fraction-to-boundary step lengths under τ=1 (Ipopt QF probe uses
+        // a full FTB scan on the candidate direction).
+        let alpha_p = fraction_to_boundary_primal_x(state, &dx, 1.0).clamp(0.0, 1.0);
+        let alpha_d = fraction_to_boundary_dual_z_min(state, &dz_l, &dz_u, 1.0).clamp(0.0, 1.0);
+
+        // Linearised residual reduction: ‖r(α)‖ = (1−α)·‖r(0)‖.
+        let dual_inf_trial = (1.0 - alpha_d) * dual_inf0;
+        let primal_inf_trial = (1.0 - alpha_p) * primal_inf0;
+
+        // Complementarity at the trial point, measured against the
+        // *optimality* target μ=0 rather than the σ·μ_cur centering
+        // target. This is the discriminator that Ipopt's QF effectively
+        // uses (`IpQualityFunctionMuOracle.cpp` evaluates compl as
+        // `slack·z` directly, not `slack·z − μ`): a smaller σ that drives
+        // s·z toward zero is preferred whenever the affine step admits a
+        // long FTB stride. The σ=σ_max degeneracy (where the σ·μ_cur
+        // target is trivially met by the centered step) is broken.
+        let mut compl_max: f64 = 0.0;
+        for i in 0..n {
+            if state.x_l[i].is_finite() {
+                let s_plus = (slack_xl(state, i) + alpha_p * dx[i]).max(1e-20);
+                let z_plus = (state.z_l[i] + alpha_d * dz_l[i]).max(1e-20);
+                compl_max = compl_max.max(s_plus * z_plus);
+            }
+            if state.x_u[i].is_finite() {
+                let s_plus = (slack_xu(state, i) - alpha_p * dx[i]).max(1e-20);
+                let z_plus = (state.z_u[i] + alpha_d * dz_u[i]).max(1e-20);
+                compl_max = compl_max.max(s_plus * z_plus);
+            }
+        }
+
+        let mut q = dual_inf_trial / s_d + primal_inf_trial + compl_max / s_c;
+
+        // Balancing term: penalise σ values whose linearised step admits
+        // only a tiny fraction-to-boundary step. Without this, σ=0 (full
+        // affine) and σ=1 (full centered) are both linearisation-optimal
+        // (each kills its own residual), and the search lacks a
+        // discriminator. Mirrors Ipopt's
+        // `IpQualityFunctionMuOracle.cpp:625-660` balancing term, which
+        // adds a contribution proportional to (1−min(α_p,α_d))·max_compl
+        // to penalise short steps.
+        let alpha_min = alpha_p.min(alpha_d).max(1e-12);
+        // Use the current max compl as the scale so the balancing term is
+        // commensurate with the rest of Q.
+        let scale = avg_compl.max(state.mu);
+        q += (1.0 - alpha_min) * scale / s_c;
+
+        // Optional centrality penalty: 1/ξ where ξ = min(s·z) / avg(s·z)
+        // at the trial point (Ipopt `centrality=reciprocal`,
+        // `IpQualityFunctionMuOracle.cpp:622`).
+        if options.quality_function_centrality {
+            let mut sum_sz = 0.0_f64;
+            let mut min_sz = f64::INFINITY;
+            let mut nb = 0usize;
+            for i in 0..n {
+                if state.x_l[i].is_finite() {
+                    let s_plus = (slack_xl(state, i) + alpha_p * dx[i]).max(1e-20);
+                    let z_plus = (state.z_l[i] + alpha_d * dz_l[i]).max(1e-20);
+                    let sz = s_plus * z_plus;
+                    sum_sz += sz;
+                    if sz < min_sz { min_sz = sz; }
+                    nb += 1;
+                }
+                if state.x_u[i].is_finite() {
+                    let s_plus = (slack_xu(state, i) - alpha_p * dx[i]).max(1e-20);
+                    let z_plus = (state.z_u[i] + alpha_d * dz_u[i]).max(1e-20);
+                    let sz = s_plus * z_plus;
+                    sum_sz += sz;
+                    if sz < min_sz { min_sz = sz; }
+                    nb += 1;
+                }
+            }
+            if nb > 0 && sum_sz > 0.0 {
+                let avg = sum_sz / nb as f64;
+                let xi = (min_sz / avg).clamp(1e-20, 1.0);
+                q += 1.0 / xi;
+            }
+        }
+        q
+    };
+
+    // 5) Golden-section minimise Q over σ ∈ [σ_min, σ_max]. Spec §3.5
+    //    quotes [1e-6, 1e2] from Ipopt's full QF with balancing terms;
+    //    ripopt's simpler linearised Q has a degeneracy near σ=1 where
+    //    both endpoints satisfy the linearised KKT, so we cap σ_max at
+    //    1.0 (Ipopt's effective range when `quality_function_balancing_term`
+    //    is `none`, which is the default). This avoids σ ≳ 1 picks that
+    //    would pin μ at avg_compl indefinitely.
+    let sigma_min = 1e-6;
+    let sigma_max = 1.0;
+    let sigma_star = golden_section_minimize(
+        &q_eval,
+        sigma_min,
+        sigma_max,
+        options.quality_function_max_section_steps,
+        0.01, // relative tolerance: |σ_hi − σ_lo| < 0.01·σ_lo
+    );
+
+    // 6) Convert σ* to μ. Apply the same monotone floor and clamp as the
+    //    Loqo oracle (Ipopt's `IpQualityFunctionMuOracle::CalculateMu`
+    //    re-uses the Loqo clamp).
+    let qf_mu = sigma_star * avg_compl;
+    let monotone_floor =
+        (options.mu_linear_decrease_factor * state.mu)
+            .min(state.mu.powf(options.mu_superlinear_decrease_power));
+    let new_mu = qf_mu.max(monotone_floor).clamp(options.mu_min, 1e5);
+
+    if options.print_level >= 5 {
+        rip_log!("ripopt: mu QF: sigma*={:.4e} avg_compl={:.3e} floor={:.3e} -> mu={:.3e}",
+            sigma_star, avg_compl, monotone_floor, new_mu);
+    }
+    Some(new_mu)
+}
+
+/// Golden-section search for the minimum of a unimodal `f` on `[lo, hi]`
+/// (operating in log-space because the QF candidate range spans 8 orders
+/// of magnitude). Stops after at most `max_steps` shrinks or once the
+/// log-bracket width is below `rel_tol`. Returns the bracket centre.
+///
+/// Used by [`compute_quality_function_mu`] to minimise Q(σ) per
+/// `IpQualityFunctionMuOracle.cpp:520-560` (Ipopt also operates in the
+/// log scale and bounds `quality_function_max_section_steps` at 8 by
+/// default).
+fn golden_section_minimize<F: Fn(f64) -> f64>(
+    f: &F,
+    lo: f64,
+    hi: f64,
+    max_steps: usize,
+    rel_tol: f64,
+) -> f64 {
+    debug_assert!(lo > 0.0 && hi > lo);
+    let log_lo0 = lo.ln();
+    let log_hi0 = hi.ln();
+    let mut log_lo = log_lo0;
+    let mut log_hi = log_hi0;
+    // Golden-section split factor.
+    let phi = (5.0_f64.sqrt() - 1.0) / 2.0; // ~0.618
+    let mut log_x1 = log_hi - phi * (log_hi - log_lo);
+    let mut log_x2 = log_lo + phi * (log_hi - log_lo);
+    let mut f1 = f(log_x1.exp());
+    let mut f2 = f(log_x2.exp());
+    for _ in 0..max_steps {
+        if (log_hi - log_lo).abs() < rel_tol {
+            break;
+        }
+        if f1 < f2 {
+            log_hi = log_x2;
+            log_x2 = log_x1;
+            f2 = f1;
+            log_x1 = log_hi - phi * (log_hi - log_lo);
+            f1 = f(log_x1.exp());
+        } else {
+            log_lo = log_x1;
+            log_x1 = log_x2;
+            f1 = f2;
+            log_x2 = log_lo + phi * (log_hi - log_lo);
+            f2 = f(log_x2.exp());
+        }
+    }
+    (0.5 * (log_lo + log_hi)).exp()
+}
+
 fn update_barrier_parameter(
     state: &mut SolverState,
     mu_state: &mut MuState,
     filter: &mut Filter,
     last_mehrotra_sigma: &mut Option<f64>,
     options: &SolverOptions,
+    use_sparse: bool,
 ) {
     let n = state.n;
     // When there are no variable bounds, mu serves no barrier purpose but is
@@ -4941,7 +5209,7 @@ fn update_barrier_parameter(
         MuMode::Free => {
             update_barrier_parameter_free_mode(
                 state, mu_state, filter, last_mehrotra_sigma, options,
-                sufficient, kkt_error, barrier_subproblem_solved,
+                sufficient, kkt_error, barrier_subproblem_solved, use_sparse,
             );
         }
         MuMode::Fixed => {
@@ -5022,12 +5290,17 @@ fn apply_free_mode_sufficient_progress_update(
     filter: &mut Filter,
     options: &SolverOptions,
     kkt_error: f64,
+    use_sparse: bool,
 ) {
     mu_state.consecutive_insufficient = 0;
     mu_state.remember_accepted(kkt_error);
     let avg_compl = compute_avg_complementarity(state);
     if options.mu_oracle_quality_function && avg_compl > 0.0 {
-        state.mu = compute_loqo_mu(state, options, avg_compl);
+        // T2.23: try the Ipopt-style Quality Function oracle first
+        // (spec §3.5, IpQualityFunctionMuOracle.cpp). Falls back to the
+        // Loqo formula on aff/centering solve failure.
+        state.mu = compute_quality_function_mu(state, options, avg_compl, use_sparse)
+            .unwrap_or_else(|| compute_loqo_mu(state, options, avg_compl));
     } else if avg_compl > 0.0 {
         // T2.3: dropped the ripopt-specific `μ/5` floor that fired when
         // barrier_err > κ_eps·μ; Ipopt's monotone-mode update uses only
@@ -5079,12 +5352,13 @@ fn update_barrier_parameter_free_mode(
     sufficient: bool,
     kkt_error: f64,
     barrier_subproblem_solved: bool,
+    use_sparse: bool,
 ) {
     // Consume Mehrotra sigma for use as quality function candidate
     let _sigma_mu = last_mehrotra_sigma.take();
     if sufficient && !mu_state.tiny_step && barrier_subproblem_solved {
         apply_free_mode_sufficient_progress_update(
-            state, mu_state, filter, options, kkt_error,
+            state, mu_state, filter, options, kkt_error, use_sparse,
         );
     } else {
         let du_stagnant = compute_du_stagnant_in_free_mode(mu_state, options);
@@ -7443,6 +7717,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             &mut filter,
             &mut last_mehrotra_sigma,
             options,
+            use_sparse,
         );
 
         track_post_step_acceptable(&mut state, options);
@@ -10690,5 +10965,166 @@ mod tests {
         let opts = SolverOptions { magic_step: false, ..SolverOptions::default() };
         let n = apply_magic_step(&mut state, &opts);
         assert_eq!(n, 0);
+    }
+
+    // ---- T2.23 Quality Function μ oracle (spec §3.5) ----
+
+    /// Golden-section on a unimodal convex function `(log σ + 0.5)²`
+    /// whose minimum sits at σ = exp(−0.5) ≈ 0.6065 should converge
+    /// inside 8 steps for a [1e-6, 1e2] bracket.
+    #[test]
+    fn test_golden_section_converges_in_eight_steps_synthetic() {
+        let target = (-0.5_f64).exp();
+        let f = |sigma: f64| -> f64 {
+            let l = sigma.ln();
+            (l + 0.5).powi(2)
+        };
+        let s_star = golden_section_minimize(&f, 1e-6, 1e2, 8, 0.01);
+        // After 8 golden-section steps the (1−φ)^8 ≈ 0.0214 fraction of the
+        // log-bracket remains, so the minimiser is within ~0.4 (in log) of the
+        // true minimum at exp(−0.5).
+        let log_err = (s_star.ln() - target.ln()).abs();
+        assert!(log_err < 0.5, "golden section did not narrow enough: log_err={}", log_err);
+        // And it should be inside the original bracket.
+        assert!(s_star >= 1e-6 && s_star <= 1e2);
+    }
+
+    /// Golden-section on a flat function should not panic and should
+    /// return some point inside the bracket.
+    #[test]
+    fn test_golden_section_flat_function_returns_inside_bracket() {
+        let f = |_sigma: f64| -> f64 { 1.0 };
+        let s = golden_section_minimize(&f, 1e-6, 1e2, 8, 0.01);
+        assert!(s >= 1e-6 && s <= 1e2);
+    }
+
+    /// Build a tiny but realistic primal-dual state with one variable bound
+    /// and no constraints, so `compute_quality_function_mu` can assemble +
+    /// factor an actual KKT matrix.
+    fn qf_minimal_state() -> SolverState {
+        let mut s = minimal_state(2, 0);
+        // Two variables x_l = 0 ≤ x with H = I, grad = (1, 1). Optimum at
+        // x → 0 along both axes; KKT system has unique solution.
+        s.x = vec![1.0, 1.0];
+        s.x_l = vec![0.0, 0.0];
+        s.x_u = vec![f64::INFINITY, f64::INFINITY];
+        s.z_l = vec![0.5, 0.5];
+        s.z_u = vec![0.0, 0.0];
+        s.grad_f = vec![1.0, 1.0];
+        s.hess_rows = vec![0, 1];
+        s.hess_cols = vec![0, 1];
+        s.hess_vals = vec![1.0, 1.0];
+        s.mu = 0.1;
+        s
+    }
+
+    /// On a small well-posed iterate the QF oracle must return Some, and
+    /// the chosen μ must lie in the documented [μ_min, 1e5] clamp.
+    #[test]
+    fn test_compute_quality_function_mu_returns_clamped_some() {
+        let state = qf_minimal_state();
+        let opts = SolverOptions::default();
+        let avg = compute_avg_complementarity(&state);
+        assert!(avg > 0.0, "test state must have positive avg_compl");
+        let mu = compute_quality_function_mu(&state, &opts, avg, false);
+        let mu = mu.expect("QF oracle should produce μ on a well-formed iterate");
+        assert!(mu >= opts.mu_min, "μ below mu_min: {}", mu);
+        assert!(mu <= 1e5, "μ above clamp: {}", mu);
+        assert!(mu.is_finite(), "μ must be finite");
+    }
+
+    /// The QF oracle returns None when avg_compl ≤ 0 (no active bound
+    /// products), so the caller falls back to the linear-decrease branch.
+    #[test]
+    fn test_compute_quality_function_mu_none_on_zero_avg_compl() {
+        let state = qf_minimal_state();
+        let opts = SolverOptions::default();
+        let mu = compute_quality_function_mu(&state, &opts, 0.0, false);
+        assert!(mu.is_none(), "QF oracle must reject avg_compl ≤ 0");
+    }
+
+    /// Centrality-on exercises the `quality_function_centrality` branch
+    /// end-to-end. Both must produce finite, clamped μ; the two need not
+    /// disagree on every iterate (when the trial step is the same the
+    /// reciprocal-centrality term cancels out at the optimum), so the
+    /// assertion is on shape, not on a specific μ delta.
+    #[test]
+    fn test_compute_quality_function_mu_centrality_branch_lives() {
+        let mut state = qf_minimal_state();
+        state.x = vec![10.0, 0.01];
+        state.z_l = vec![0.001, 5.0];
+        let avg = compute_avg_complementarity(&state);
+
+        let opts_off = SolverOptions { quality_function_centrality: false, ..SolverOptions::default() };
+        let mu_off = compute_quality_function_mu(&state, &opts_off, avg, false)
+            .expect("QF off");
+        let opts_on = SolverOptions { quality_function_centrality: true, ..SolverOptions::default() };
+        let mu_on = compute_quality_function_mu(&state, &opts_on, avg, false)
+            .expect("QF on");
+        for mu in [mu_off, mu_on] {
+            assert!(mu.is_finite(), "μ must be finite, got {}", mu);
+            assert!(mu >= opts_off.mu_min, "μ below mu_min: {}", mu);
+            assert!(mu <= 1e5, "μ above clamp: {}", mu);
+        }
+    }
+
+    /// End-to-end: a tiny QP `min 0.5·(x-1)² + 0.5·(y-1)² s.t. x ≥ 0, y ≥ 0`
+    /// (separable, optimum at (1, 1)) solves to optimal under both
+    /// `mu_oracle_quality_function = true` and `false`, exercising the QF
+    /// dispatch path through the live IPM loop.
+    struct QfQpProblem;
+    impl NlpProblem for QfQpProblem {
+        fn num_variables(&self) -> usize { 2 }
+        fn num_constraints(&self) -> usize { 0 }
+        fn bounds(&self, x_l: &mut [f64], x_u: &mut [f64]) {
+            x_l[0] = 0.0; x_l[1] = 0.0;
+            x_u[0] = f64::INFINITY; x_u[1] = f64::INFINITY;
+        }
+        fn constraint_bounds(&self, _g_l: &mut [f64], _g_u: &mut [f64]) {}
+        fn initial_point(&self, x0: &mut [f64]) { x0[0] = 0.5; x0[1] = 0.5; }
+        fn objective(&self, x: &[f64], _: bool, obj: &mut f64) -> bool {
+            *obj = 0.5 * ((x[0] - 1.0).powi(2) + (x[1] - 1.0).powi(2));
+            true
+        }
+        fn gradient(&self, x: &[f64], _: bool, grad: &mut [f64]) -> bool {
+            grad[0] = x[0] - 1.0; grad[1] = x[1] - 1.0; true
+        }
+        fn constraints(&self, _: &[f64], _: bool, _: &mut [f64]) -> bool { true }
+        fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
+        fn jacobian_values(&self, _: &[f64], _: bool, _: &mut [f64]) -> bool { true }
+        fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            (vec![0, 1], vec![0, 1])
+        }
+        fn hessian_values(&self, _: &[f64], _: bool, obj_factor: f64, _: &[f64], vals: &mut [f64]) -> bool {
+            vals[0] = obj_factor; vals[1] = obj_factor; true
+        }
+    }
+
+    #[test]
+    fn test_quality_function_mu_end_to_end_small_nlp() {
+        let problem = QfQpProblem;
+
+        let opts_off = SolverOptions { mu_oracle_quality_function: false, ..SolverOptions::default() };
+        let r_off = solve_ipm(&problem, &opts_off);
+        assert_eq!(r_off.status, SolveStatus::Optimal,
+            "Loqo path must solve the QP, got {:?}", r_off.status);
+
+        let opts_on = SolverOptions { mu_oracle_quality_function: true, ..SolverOptions::default() };
+        let r_on = solve_ipm(&problem, &opts_on);
+        assert_eq!(r_on.status, SolveStatus::Optimal,
+            "QF path must also solve the QP, got {:?}", r_on.status);
+
+        // Both should reach the optimum (1, 1).
+        assert!((r_off.x[0] - 1.0).abs() < 1e-6);
+        assert!((r_on.x[0] - 1.0).abs() < 1e-6);
+
+        // Iteration counts within a 2x band (we don't require QF to be
+        // faster, only comparable — small problems hit the μ_min floor
+        // regardless of the oracle).
+        let off = r_off.iterations.max(1) as f64;
+        let on = r_on.iterations.max(1) as f64;
+        let ratio = on / off;
+        assert!(ratio < 2.0 && ratio > 0.5,
+            "QF iterations diverge from Loqo: off={} on={}", r_off.iterations, r_on.iterations);
     }
 }

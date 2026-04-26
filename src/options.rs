@@ -277,6 +277,14 @@ pub struct SolverOptions {
     /// function picks aggressive small-mu candidates.
     /// Default: false.
     pub quality_function_centrality: bool,
+    /// Maximum number of golden-section steps used by the Quality Function
+    /// μ oracle (`IpQualityFunctionMuOracle.cpp:548`,
+    /// `quality_function_max_section_steps`). Each step adds one extra
+    /// linearised Q(σ) evaluation; Ipopt's default is 8 and that's plenty
+    /// for the [1e-6, 1e2] log-bracket because each shrink eliminates
+    /// ~38% of the bracket width.
+    /// Default: 8.
+    pub quality_function_max_section_steps: usize,
     /// User-provided objective scaling factor. When `Some`, bypasses automatic
     /// gradient-based scaling and uses this value directly.
     pub user_obj_scaling: Option<f64>,
@@ -432,6 +440,7 @@ impl Default for SolverOptions {
             recalc_y_feas_tol: 1e-6,
             mu_oracle_quality_function: true,
             quality_function_centrality: false,
+            quality_function_max_section_steps: 8,
             user_obj_scaling: None,
             user_g_scaling: None,
             user_x_scaling: None,

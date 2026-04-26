@@ -433,6 +433,11 @@ fn apply_option(opts: &mut SolverOptions, key: &str, value: &str) {
         "quality_function_centrality" => {
             opts.quality_function_centrality = value == "yes" || value == "true" || value == "1";
         }
+        "quality_function_max_section_steps" => {
+            if let Ok(v) = value.parse() {
+                opts.quality_function_max_section_steps = v;
+            }
+        }
         "warm_start_target_mu" => {
             if let Ok(v) = value.parse() {
                 opts.warm_start_target_mu = Some(v);
