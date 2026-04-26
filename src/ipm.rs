@@ -4226,14 +4226,14 @@ fn try_nlp_restoration_phase<P: NlpProblem>(
     }
 
     state.diagnostics.nlp_restoration_count += 1;
-    let (x_nlp, outcome) = attempt_nlp_restoration(
+    let (x_nlp, resto_z, outcome) = attempt_nlp_restoration(
         problem, state, filter, options, theta_current, start_time,
     );
     match outcome {
         RestorationOutcome::Success => {
             apply_restoration_success(
                 state, filter, mu_state, options, n, m,
-                problem, &x_nlp,
+                problem, &x_nlp, resto_z.as_ref(),
                 linear_constraints, lbfgs_mode, lbfgs_state,
             );
             true
@@ -4286,8 +4286,12 @@ fn try_gn_restoration<P: NlpProblem>(
 
     if gn_success {
         state.diagnostics.restoration_count += 1;
+        // Gauss-Newton restoration is primal-only; no z is returned.
+        // Pass None so apply_restoration_success falls back to the
+        // μ/slack reset (T0.8 only applies when the resto NLP path
+        // produced fresh bound multipliers).
         apply_restoration_success(
-            state, filter, mu_state, options, n, m, problem, &x_rest,
+            state, filter, mu_state, options, n, m, problem, &x_rest, None,
             linear_constraints, lbfgs_mode, lbfgs_state,
         );
         true
@@ -8410,6 +8414,55 @@ fn attempt_soc_sparse_condensed<P: NlpProblem>(
 /// when slack is tight — the least-squares y computed after can't absorb
 /// that. Returns whether the nuclear reset was triggered (for downstream
 /// v_L/v_U handling).
+/// T0.8: install resto-returned bound multipliers, clamped via the
+/// Ipopt κ_σ safeguard. For each finite bound, take the resto-NLP z
+/// for that variable (the original-x block of the resto solve) and
+/// clamp into `[μ/(κ_σ·s), κ_σ·μ/s]` where `s` is the corresponding
+/// slack at the new x. This mirrors Ipopt's main-phase init right
+/// after `RestoIpoptNLP::finalize_solution` returns: resto's careful
+/// z-work is preserved, only safeguarded against pathological
+/// extremes; the previous code overwrote z with `μ/slack` from
+/// scratch, throwing it away. Bounds with no resto z (infinite x
+/// bound) are zeroed. The "nuclear reset" return value tracks
+/// whether the post-clamp z_max is above the watchdog threshold so
+/// the v-multiplier path mirrors the existing semantics.
+fn apply_kappa_sigma_clamp_to_resto_z(
+    state: &mut SolverState,
+    n: usize,
+    zl_resto: &[f64],
+    zu_resto: &[f64],
+) -> bool {
+    let kappa_sigma = 1e10;
+    let mu = state.mu.max(1e-20);
+    let bound_mult_reset_threshold = 1000.0;
+    let mut z_max: f64 = 0.0;
+    for i in 0..n {
+        if state.x_l[i].is_finite() {
+            let s = (state.x[i] - state.x_l[i]).max(1e-12);
+            let z_lo = mu / (kappa_sigma * s);
+            let z_hi = kappa_sigma * mu / s;
+            // Floor at 1e-20 to keep z strictly positive even when
+            // the resto NLP returned a near-zero multiplier.
+            let z_in = if i < zl_resto.len() { zl_resto[i].max(1e-20) } else { mu / s };
+            state.z_l[i] = z_in.clamp(z_lo, z_hi);
+            z_max = z_max.max(state.z_l[i]);
+        } else {
+            state.z_l[i] = 0.0;
+        }
+        if state.x_u[i].is_finite() {
+            let s = (state.x_u[i] - state.x[i]).max(1e-12);
+            let z_lo = mu / (kappa_sigma * s);
+            let z_hi = kappa_sigma * mu / s;
+            let z_in = if i < zu_resto.len() { zu_resto[i].max(1e-20) } else { mu / s };
+            state.z_u[i] = z_in.clamp(z_lo, z_hi);
+            z_max = z_max.max(state.z_u[i]);
+        } else {
+            state.z_u[i] = 0.0;
+        }
+    }
+    z_max > bound_mult_reset_threshold
+}
+
 fn reset_bound_multipliers_after_restoration(state: &mut SolverState, n: usize) -> bool {
     let bound_mult_reset_threshold = 1000.0;
     let mu_for_reset = state.mu;
@@ -8528,6 +8581,7 @@ fn apply_restoration_success<P: NlpProblem>(
     m: usize,
     problem: &P,
     x_new: &[f64],
+    resto_z: Option<&(Vec<f64>, Vec<f64>)>,
     linear_constraints: Option<&[bool]>,
     lbfgs_mode: bool,
     lbfgs_state: &mut Option<LbfgsIpmState>,
@@ -8537,7 +8591,16 @@ fn apply_restoration_success<P: NlpProblem>(
 
     let _ = evaluate_and_refresh_lbfgs(state, problem, lbfgs_state, linear_constraints, lbfgs_mode);
 
-    let nuclear_reset = reset_bound_multipliers_after_restoration(state, n);
+    // T0.8: when the resto NLP returned bound multipliers, prefer the
+    // kappa_sigma clamp on those values (Ipopt main-phase init right
+    // after RestoIpoptNLP::finalize_solution) over a μ/slack reset.
+    // Otherwise (Gauss-Newton path or missing z) fall back to the
+    // legacy μ/slack reset.
+    let nuclear_reset = if let Some((zl_resto, zu_resto)) = resto_z {
+        apply_kappa_sigma_clamp_to_resto_z(state, n, zl_resto, zu_resto)
+    } else {
+        reset_bound_multipliers_after_restoration(state, n)
+    };
     recompute_y_after_restoration(state, options, n, m);
 
     reset_constraint_slack_multipliers_after_restoration(state, m, nuclear_reset);
@@ -8625,7 +8688,7 @@ fn attempt_nlp_restoration<P: NlpProblem>(
     options: &SolverOptions,
     theta_current: f64,
     start_time: Instant,
-) -> (Vec<f64>, RestorationOutcome) {
+) -> (Vec<f64>, Option<(Vec<f64>, Vec<f64>)>, RestorationOutcome) {
     let n = state.n;
     let m = state.m;
 
@@ -8656,7 +8719,7 @@ fn attempt_nlp_restoration<P: NlpProblem>(
         options, resto_mu, resto_nlp.num_variables() + resto_nlp.num_constraints(), start_time,
     ) {
         Some(opts) => opts,
-        None => return (state.x[..n].to_vec(), RestorationOutcome::Failed),
+        None => return (state.x[..n].to_vec(), None, RestorationOutcome::Failed),
     };
 
     // Solve the restoration NLP
@@ -8664,20 +8727,34 @@ fn attempt_nlp_restoration<P: NlpProblem>(
 
     // Extract x_orig from the restoration solution
     let x_nlp: Vec<f64> = result.x[..n].to_vec();
+    // Extract the bound multipliers for the original-x block (T0.8). The
+    // resto NLP variable layout is [x(n), p(m), n(m)]; the p/n slack
+    // multipliers are not relevant to the parent problem. Validate that
+    // the inner solve returned an n-block (it always should), else None.
+    let resto_z: Option<(Vec<f64>, Vec<f64>)> = if result.bound_multipliers_lower.len() >= n
+        && result.bound_multipliers_upper.len() >= n
+    {
+        let zl_x: Vec<f64> = result.bound_multipliers_lower[..n].to_vec();
+        let zu_x: Vec<f64> = result.bound_multipliers_upper[..n].to_vec();
+        let finite = zl_x.iter().chain(zu_x.iter()).all(|v| v.is_finite());
+        if finite { Some((zl_x, zu_x)) } else { None }
+    } else {
+        None
+    };
 
     // Evaluate original constraints at the restored point
     let mut g_new = vec![0.0; m];
     if !problem.constraints(&x_nlp, true, &mut g_new)
         || g_new.iter().any(|v| !v.is_finite())
     {
-        return (x_nlp, RestorationOutcome::Failed);
+        return (x_nlp, resto_z, RestorationOutcome::Failed);
     }
     let theta_new = theta_for_g(state, &g_new);
 
     // Evaluate original objective at the restored point
     let mut phi_new = f64::INFINITY;
     if !problem.objective(&x_nlp, false, &mut phi_new) || !phi_new.is_finite() {
-        return (x_nlp, RestorationOutcome::Failed);
+        return (x_nlp, resto_z, RestorationOutcome::Failed);
     }
 
     if options.print_level >= 5 {
@@ -8694,7 +8771,7 @@ fn attempt_nlp_restoration<P: NlpProblem>(
     let outcome = classify_restoration_outcome(
         filter, options, theta_current, theta_new, phi_new, inner_converged,
     );
-    (x_nlp, outcome)
+    (x_nlp, resto_z, outcome)
 }
 
 /// Check whether the restored `(theta_new, phi_new)` is acceptable
@@ -10554,5 +10631,55 @@ mod tests {
         // 1/xi steers away from aggressive small-mu candidates).
         assert!(mu_on >= mu_off,
             "centrality should raise mu, off={mu_off:e} on={mu_on:e}");
+    }
+
+    /// T0.8: when the resto NLP returns z that already lies inside
+    /// the κ_σ band, the post-resto z must equal the resto-returned
+    /// value verbatim — NOT μ/slack from scratch (which would throw
+    /// away the resto's careful multiplier work).
+    #[test]
+    fn test_kappa_sigma_clamp_preserves_resto_z_in_band() {
+        let mut state = minimal_state(1, 0);
+        state.x = vec![1.1];
+        state.x_l = vec![1.0];
+        // No upper bound; z_u stays 0.
+        state.x_u = vec![f64::INFINITY];
+        state.mu = 0.01;
+        // resto-returned z_l[0] = 0.5, slack = 0.1, μ = 0.01.
+        // μ/slack = 0.1 (the OLD code's value). κ_σ band:
+        //   [μ/(κ_σ·s), κ_σ·μ/s] = [1e-12, 1e9]. 0.5 is inside.
+        // Expected new code: z_l[0] := 0.5 (preserved, not 0.1).
+        let zl_resto = vec![0.5];
+        let zu_resto = vec![0.0];
+        let nuclear = apply_kappa_sigma_clamp_to_resto_z(
+            &mut state, 1, &zl_resto, &zu_resto,
+        );
+        assert!((state.z_l[0] - 0.5).abs() < 1e-15,
+            "z_l should be preserved at 0.5 (resto value), got {}", state.z_l[0]);
+        assert!((state.z_l[0] - 0.1).abs() > 1e-6,
+            "z_l must NOT be the old μ/slack=0.1");
+        assert_eq!(state.z_u[0], 0.0, "infinite x_u → z_u = 0");
+        assert!(!nuclear, "z_max=0.5 should not trigger nuclear-reset flag");
+    }
+
+    /// T0.8: a wildly large resto z must be clamped down by the κ_σ
+    /// upper band (κ_σ·μ/slack), preserving the safeguard semantics.
+    #[test]
+    fn test_kappa_sigma_clamp_caps_huge_resto_z() {
+        let mut state = minimal_state(1, 0);
+        state.x = vec![1.1];
+        state.x_l = vec![1.0];
+        state.x_u = vec![f64::INFINITY];
+        state.mu = 1e-6;
+        // slack=0.1, μ=1e-6 → upper band = 1e10*1e-6/0.1 = 1e5.
+        // resto returned z_l[0] = 1e20 (pathological).
+        let zl_resto = vec![1.0e20];
+        let zu_resto = vec![0.0];
+        apply_kappa_sigma_clamp_to_resto_z(
+            &mut state, 1, &zl_resto, &zu_resto,
+        );
+        let z_hi = 1e10 * 1e-6 / 0.1;
+        assert!((state.z_l[0] - z_hi).abs() / z_hi < 1e-12,
+            "z_l should be clamped to κ_σ·μ/s = {}, got {}", z_hi, state.z_l[0]);
     }
 }
