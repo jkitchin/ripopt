@@ -1,0 +1,4792 @@
+[
+  {
+    "number": 1,
+    "status": "Optimal",
+    "objective": -3.1086244689504383e-15,
+    "x": [
+      0.9999999999892266,
+      0.9999999999794565
+    ],
+    "constraint_multipliers": [],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [],
+    "iterations": 25,
+    "solve_time": 0.000136208,
+    "known_fopt": 0.0,
+    "n": 2,
+    "m": 0,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 0.0,
+    "final_compl": 0.0,
+    "final_mu": 0.0,
+    "final_s_d": 0.0
+  },
+  {
+    "number": 2,
+    "status": "Optimal",
+    "objective": 4.94122943395852,
+    "x": [
+      -1.2210262683808488,
+      1.5000000637550366
+    ],
+    "constraint_multipliers": [],
+    "bound_multipliers_lower": [
+      0.0,
+      1.8189831993660588
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [],
+    "iterations": 12,
+    "solve_time": 0.000357083,
+    "known_fopt": null,
+    "n": 2,
+    "m": 0,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 6.469924549931383e-9,
+    "final_compl": 5.954035255396703e-9,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 3,
+    "status": "Optimal",
+    "objective": -7.494096406374967e-9,
+    "x": [
+      -7.494096406374967e-9,
+      -7.494096406374967e-9
+    ],
+    "constraint_multipliers": [],
+    "bound_multipliers_lower": [
+      0.0,
+      1.000000000000025
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [],
+    "iterations": 6,
+    "solve_time": 0.000119083,
+    "known_fopt": 0.0,
+    "n": 2,
+    "m": 0,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 2.5091040356528538e-14,
+    "final_compl": 2.505903593625096e-9,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 4,
+    "status": "Optimal",
+    "objective": 2.666666621679326,
+    "x": [
+      0.9999999906266891,
+      -7.494096406374755e-9
+    ],
+    "constraint_multipliers": [],
+    "bound_multipliers_lower": [
+      3.9999999625065685,
+      1.000000000000025
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [],
+    "iterations": 6,
+    "solve_time": 0.004628709,
+    "known_fopt": 2.6666666666666665,
+    "n": 2,
+    "m": 0,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 1.8784973576657649e-13,
+    "final_compl": 2.5067565565928597e-9,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 5,
+    "status": "Optimal",
+    "objective": -1.9132229549810367,
+    "x": [
+      -0.5471975511977568,
+      -1.547197551196405
+    ],
+    "constraint_multipliers": [],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [],
+    "iterations": 7,
+    "solve_time": 0.000029709,
+    "known_fopt": null,
+    "n": 2,
+    "m": 0,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 0.0,
+    "final_compl": 0.0,
+    "final_mu": 0.0,
+    "final_s_d": 0.0
+  },
+  {
+    "number": 6,
+    "status": "Optimal",
+    "objective": 0.0,
+    "x": [
+      1.0,
+      1.0
+    ],
+    "constraint_multipliers": [
+      3.0814879110195774e-33
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      0.0
+    ],
+    "iterations": 5,
+    "solve_time": 0.000118792,
+    "known_fopt": 0.0,
+    "n": 2,
+    "m": 1,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 6.162975822039155e-32,
+    "final_compl": 0.0,
+    "final_mu": 2.548296747979348e-8,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 7,
+    "status": "Optimal",
+    "objective": -1.7320508075688796,
+    "x": [
+      1.4443935410083533e-10,
+      1.7320508075688796
+    ],
+    "constraint_multipliers": [
+      0.28867513459491895
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      7.993605777301127e-15
+    ],
+    "iterations": 32,
+    "solve_time": 0.000145625,
+    "known_fopt": null,
+    "n": 2,
+    "m": 1,
+    "final_primal_inf": 7.993605777301127e-15,
+    "final_dual_inf": 4.556629081451179e-10,
+    "final_compl": 0.0,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 9,
+    "status": "Optimal",
+    "objective": -0.499999999999929,
+    "x": [
+      -471.0000000001806,
+      -628.0000000002408
+    ],
+    "constraint_multipliers": [
+      -0.03272492347489365
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      0.0
+    ],
+    "iterations": 3,
+    "solve_time": 0.000067291,
+    "known_fopt": -0.5,
+    "n": 2,
+    "m": 1,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 1.234518043347066e-11,
+    "final_compl": 0.0,
+    "final_mu": 0.00042169650342858235,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 10,
+    "status": "Optimal",
+    "objective": -1.000000005000984,
+    "x": [
+      -1.1477576064165064e-12,
+      1.0000000049998363
+    ],
+    "constraint_multipliers": [
+      -0.49999999749908763
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      -1.0001968142603346e-8
+    ],
+    "iterations": 19,
+    "solve_time": 0.000137875,
+    "known_fopt": -1.0,
+    "n": 2,
+    "m": 1,
+    "final_primal_inf": 1.968142603345559e-12,
+    "final_dual_inf": 1.4548362514688051e-12,
+    "final_compl": 0.0,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 11,
+    "status": "Optimal",
+    "objective": -8.49846425364796,
+    "x": [
+      1.2347728274868308,
+      1.5246639254998215
+    ],
+    "constraint_multipliers": [
+      -3.049327850999643
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      -1.000000127149292e-8
+    ],
+    "iterations": 6,
+    "solve_time": 0.000067,
+    "known_fopt": null,
+    "n": 2,
+    "m": 1,
+    "final_primal_inf": 1.2714929196317407e-15,
+    "final_dual_inf": 2.6645352591003757e-15,
+    "final_compl": 0.0,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 12,
+    "status": "Optimal",
+    "objective": -30.000000005000004,
+    "x": [
+      2.000000000473684,
+      3.0000000004035092
+    ],
+    "constraint_multipliers": [
+      -0.49999999987719274
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      -1.000000082740371e-8
+    ],
+    "iterations": 10,
+    "solve_time": 0.00012125,
+    "known_fopt": -30.0,
+    "n": 2,
+    "m": 1,
+    "final_primal_inf": 8.274037097816781e-16,
+    "final_dual_inf": 4.440892098500626e-15,
+    "final_compl": 0.0,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 13,
+    "status": "Acceptable",
+    "objective": 0.9937560041290162,
+    "x": [
+      1.003126886645539,
+      -9.99980078802703e-9
+    ],
+    "constraint_multipliers": [
+      -67971.0022381399
+    ],
+    "bound_multipliers_lower": [
+      1.3503346571567339e-8,
+      67971.00223811991
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      -2.0573083459041186e-8
+    ],
+    "iterations": 92,
+    "solve_time": 0.0004085,
+    "known_fopt": 1.0,
+    "n": 2,
+    "m": 1,
+    "final_primal_inf": 1.0573083459041186e-8,
+    "final_dual_inf": 3.110903798694934e-6,
+    "final_compl": 1.3545570140665522e-8,
+    "final_mu": 1.3545562533570585e-8,
+    "final_s_d": 339.8550111906833
+  },
+  {
+    "number": 14,
+    "status": "Optimal",
+    "objective": 1.3934649622219717,
+    "x": [
+      0.8228756630921644,
+      0.9114378315460823
+    ],
+    "constraint_multipliers": [
+      -1.8465914147206233,
+      1.5944911063610325
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      -1.0000767103335306e-8,
+      0.0
+    ],
+    "iterations": 5,
+    "solve_time": 0.000103333,
+    "known_fopt": null,
+    "n": 2,
+    "m": 2,
+    "final_primal_inf": 7.671033353060647e-13,
+    "final_dual_inf": 6.074607483697037e-11,
+    "final_compl": 0.0,
+    "final_mu": 2.548296747979348e-8,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 15,
+    "status": "Optimal",
+    "objective": 3.0649997555441377,
+    "x": [
+      0.5000000099632225,
+      1.9999999401471555
+    ],
+    "constraint_multipliers": [
+      -6.999999580105535,
+      -1.4312200018740194e-10
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      17.509998671294014,
+      0.0
+    ],
+    "constraint_values": [
+      -9.9999778457871e-9,
+      4.499999770551848
+    ],
+    "iterations": 14,
+    "solve_time": 0.000108167,
+    "known_fopt": 3.065,
+    "n": 2,
+    "m": 2,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 1.4459544672718039e-12,
+    "final_compl": 6.439753941044201e-10,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 16,
+    "status": "Optimal",
+    "objective": 0.24999999619889587,
+    "x": [
+      0.5000000038011045,
+      0.2500000037368648
+    ],
+    "constraint_multipliers": [
+      -9.433185839932004e-9,
+      -1.0397073500151522e-8
+    ],
+    "bound_multipliers_lower": [
+      5.441004955196695e-9,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      1.0000000171085277,
+      7.506277875891462e-9
+    ],
+    "constraint_values": [
+      0.562500005669537,
+      0.5000000075379694
+    ],
+    "iterations": 20,
+    "solve_time": 0.00010375,
+    "known_fopt": 0.25,
+    "n": 2,
+    "m": 2,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 8.501799664250053e-10,
+    "final_compl": 2.576432092297534e-10,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 17,
+    "status": "Optimal",
+    "objective": 1.000037302462772,
+    "x": [
+      9.867562677851475e-9,
+      -0.0006109189626885068
+    ],
+    "constraint_multipliers": [
+      -1.9999999786024651,
+      -0.11974011443085196
+    ],
+    "bound_multipliers_lower": [
+      1.2026699584402412e-10,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      4.81772471440961e-10,
+      6.988925968303183e-10
+    ],
+    "constraint_values": [
+      3.6335441629454974e-7,
+      0.0006109189626886042
+    ],
+    "iterations": 17,
+    "solve_time": 0.000087583,
+    "known_fopt": 1.0,
+    "n": 2,
+    "m": 2,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 6.580908434555306e-11,
+    "final_compl": 2.9065651311701187e-11,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 18,
+    "status": "Optimal",
+    "objective": 4.999999998033077,
+    "x": [
+      15.811388297781374,
+      1.5811388297682465
+    ],
+    "constraint_multipliers": [
+      -0.19999999999743956,
+      -1.4543440159642812e-13
+    ],
+    "bound_multipliers_lower": [
+      2.395425030636807e-12,
+      2.0922789506299926e-11
+    ],
+    "bound_multipliers_upper": [
+      9.675978028890838e-13,
+      6.83241554880763e-13
+    ],
+    "constraint_values": [
+      -9.83461134751451e-9,
+      227.49999990221866
+    ],
+    "iterations": 14,
+    "solve_time": 0.000078875,
+    "known_fopt": 5.0,
+    "n": 2,
+    "m": 2,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 3.0988742746139116e-15,
+    "final_compl": 3.3084145284258283e-11,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 19,
+    "status": "Optimal",
+    "objective": -6961.813899500819,
+    "x": [
+      14.094999989734033,
+      0.8429607679577759
+    ],
+    "constraint_multipliers": [
+      -1097.1189321950365,
+      -1229.5420818160433
+    ],
+    "bound_multipliers_lower": [
+      2.9339818529764577e-9,
+      3.809648605545535e-9
+    ],
+    "bound_multipliers_upper": [
+      3.7408633476307686e-11,
+      3.2409159052516444e-11
+    ],
+    "constraint_values": [
+      -9.99972671333893e-9,
+      -1.0532218652770098e-8
+    ],
+    "iterations": 21,
+    "solve_time": 0.000108167,
+    "known_fopt": null,
+    "n": 2,
+    "m": 2,
+    "final_primal_inf": 5.322186527700976e-10,
+    "final_dual_inf": 1.3316553132756988e-12,
+    "final_compl": 5.342488003754888e-10,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 20,
+    "status": "Optimal",
+    "objective": 38.19872704531397,
+    "x": [
+      0.5000000099778237,
+      0.8660253913972245
+    ],
+    "constraint_multipliers": [
+      -3.4653993517517835e-9,
+      -3.881386312176004e-9,
+      -71.13248496952767
+    ],
+    "bound_multipliers_lower": [
+      4.3316867376189605e-9,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      195.3375651226287,
+      0.0
+    ],
+    "constraint_values": [
+      1.2499999885225395,
+      1.1160254013750484,
+      -1.147746042651221e-8
+    ],
+    "iterations": 13,
+    "solve_time": 0.000101792,
+    "known_fopt": null,
+    "n": 2,
+    "m": 3,
+    "final_primal_inf": 1.4774604265122091e-9,
+    "final_dual_inf": 3.2008529160520993e-10,
+    "final_compl": 2.1878174143581415e-9,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 21,
+    "status": "Optimal",
+    "objective": -99.96000000079002,
+    "x": [
+      1.999999980249653,
+      -5.007307301600747e-13
+    ],
+    "constraint_multipliers": [
+      -1.0014614036830928e-12
+    ],
+    "bound_multipliers_lower": [
+      0.03999999959518678,
+      1.9999996968280622e-13
+    ],
+    "bound_multipliers_upper": [
+      2.0833198369558363e-13,
+      2.000000263180533e-13
+    ],
+    "constraint_values": [
+      9.999999802497033
+    ],
+    "iterations": 9,
+    "solve_time": 0.000077834,
+    "known_fopt": -99.96,
+    "n": 2,
+    "m": 1,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 1.3668753269962866e-18,
+    "final_compl": 1.0000001415902779e-11,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 22,
+    "status": "Optimal",
+    "objective": 1.000000012379063,
+    "x": [
+      0.9999999938104689,
+      0.9999999775996257
+    ],
+    "constraint_multipliers": [
+      -0.6666667034143335,
+      -0.6666666586135849
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      2.858990555409946e-8,
+      -1.0021312113472902e-8
+    ],
+    "iterations": 6,
+    "solve_time": 0.000054125,
+    "known_fopt": 1.0,
+    "n": 2,
+    "m": 2,
+    "final_primal_inf": 2.1312113472901974e-11,
+    "final_dual_inf": 9.733103212283822e-12,
+    "final_compl": 0.0,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 23,
+    "status": "Optimal",
+    "objective": 1.9999999588748925,
+    "x": [
+      0.9999999897187231,
+      0.9999999897187231
+    ],
+    "constraint_multipliers": [
+      -5.627840538118639e-10,
+      -5.627840653833611e-10,
+      -5.627841579366244e-10,
+      -2.000000011746053,
+      -2.0000000147475685
+    ],
+    "bound_multipliers_lower": [
+      1.1034981224777455e-11,
+      1.1034981224777455e-11
+    ],
+    "bound_multipliers_upper": [
+      1.1485388612385885e-11,
+      1.1485388612385885e-11
+    ],
+    "constraint_values": [
+      0.9999999794374461,
+      0.9999999588748925,
+      0.9999997943744626,
+      -1.0281276829893216e-8,
+      -1.0281276829893216e-8
+    ],
+    "iterations": 12,
+    "solve_time": 0.000084333,
+    "known_fopt": 2.0,
+    "n": 2,
+    "m": 5,
+    "final_primal_inf": 2.8127682989321535e-10,
+    "final_dual_inf": 5.45018030317107e-16,
+    "final_compl": 5.627840478676871e-10,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 24,
+    "status": "Optimal",
+    "objective": -1.0000000115567358,
+    "x": [
+      2.9999999963396813,
+      1.7320508142411613
+    ],
+    "constraint_multipliers": [
+      -0.8660254080460404,
+      -1.7545501007357361e-10,
+      -0.5000000037804538
+    ],
+    "bound_multipliers_lower": [
+      3.510278545871507e-10,
+      6.075904914315186e-10
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      -8.785569383107372e-9,
+      6.000000007896421,
+      -7.89642129461754e-9
+    ],
+    "iterations": 14,
+    "solve_time": 0.000103667,
+    "known_fopt": -1.0,
+    "n": 2,
+    "m": 3,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 3.446519361195409e-9,
+    "final_compl": 1.0530835659868568e-9,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 26,
+    "status": "Optimal",
+    "objective": 2.220446049250313e-16,
+    "x": [
+      0.9999552717056305,
+      0.9999552717056305,
+      1.0000447249182554
+    ],
+    "constraint_multipliers": [
+      -2.775798719575121e-17
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      4.4995827064298055e-9
+    ],
+    "iterations": 24,
+    "solve_time": 0.000141209,
+    "known_fopt": 0.0,
+    "n": 3,
+    "m": 1,
+    "final_primal_inf": 4.4995827064298055e-9,
+    "final_dual_inf": 2.860878200862336e-12,
+    "final_compl": 0.0,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 27,
+    "status": "Optimal",
+    "objective": 3.9999999999979963,
+    "x": [
+      -0.9999999999994954,
+      0.9999999999959391,
+      -4.689281122716555e-10
+    ],
+    "constraint_multipliers": [
+      4.000000000187006
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      5.045965845857081e-13
+    ],
+    "iterations": 13,
+    "solve_time": 0.000075208,
+    "known_fopt": 4.0,
+    "n": 3,
+    "m": 1,
+    "final_primal_inf": 5.045965845857081e-13,
+    "final_dual_inf": 2.341713419693276e-10,
+    "final_compl": 0.0,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 28,
+    "status": "Optimal",
+    "objective": 0.0,
+    "x": [
+      0.5,
+      -0.5,
+      0.5
+    ],
+    "constraint_multipliers": [
+      1.6653345369377348e-16
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      0.0
+    ],
+    "iterations": 1,
+    "solve_time": 0.000042958,
+    "known_fopt": 0.0,
+    "n": 3,
+    "m": 1,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 4.996003610813204e-16,
+    "final_compl": 0.0,
+    "final_mu": 0.0316227766016838,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 29,
+    "status": "Optimal",
+    "objective": -22.62741700510465,
+    "x": [
+      4.000000000413609,
+      2.8284271250466047,
+      2.0000000002114326
+    ],
+    "constraint_multipliers": [
+      -0.7071067812602811
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      -1.0090595026213123e-8
+    ],
+    "iterations": 14,
+    "solve_time": 0.00008025,
+    "known_fopt": null,
+    "n": 3,
+    "m": 1,
+    "final_primal_inf": 9.059502621312256e-11,
+    "final_dual_inf": 2.405098342705969e-11,
+    "final_compl": 0.0,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 30,
+    "status": "Optimal",
+    "objective": 0.9999999874171861,
+    "x": [
+      0.999999993708593,
+      7.139733983733299e-11,
+      1.429972184235852e-25
+    ],
+    "constraint_multipliers": [
+      -0.24006998595350137
+    ],
+    "bound_multipliers_lower": [
+      1.5198600156825464,
+      2.5059154204922405e-10,
+      2.505903534620993e-10
+    ],
+    "bound_multipliers_upper": [
+      2.783915058560301e-10,
+      2.5058916517728586e-10,
+      2.505903534620993e-10
+    ],
+    "constraint_values": [
+      -1.258281390192396e-8
+    ],
+    "iterations": 6,
+    "solve_time": 0.000069292,
+    "known_fopt": 1.0,
+    "n": 3,
+    "m": 1,
+    "final_primal_inf": 2.58281390192396e-9,
+    "final_dual_inf": 3.12678458281564e-9,
+    "final_compl": 5.636542366036541e-9,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 31,
+    "status": "Optimal",
+    "objective": 5.999999940003461,
+    "x": [
+      0.5773502660917212,
+      1.7320507995430816,
+      -2.0327366931762922e-10
+    ],
+    "constraint_multipliers": [
+      -5.999999995636558
+    ],
+    "bound_multipliers_lower": [
+      3.843087257378996e-10,
+      5.548397315404896e-9,
+      4.0650776415063766e-10
+    ],
+    "bound_multipliers_upper": [
+      4.3143590512630693e-10,
+      4.917072057619562e-10,
+      4.065433811867911e-9
+    ],
+    "constraint_values": [
+      -9.9994232893863e-9
+    ],
+    "iterations": 10,
+    "solve_time": 0.000083292,
+    "known_fopt": 6.0,
+    "n": 3,
+    "m": 1,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 2.676537317857484e-12,
+    "final_compl": 4.065433853348644e-9,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 32,
+    "status": "Optimal",
+    "objective": 0.9999999621990725,
+    "x": [
+      0.000022153246563576918,
+      -9.941438937451853e-9,
+      0.9999778566948755
+    ],
+    "constraint_multipliers": [
+      -2.3425462034101327e-10,
+      1.999999959062989
+    ],
+    "bound_multipliers_lower": [
+      0.00017730667527749436,
+      3.999822614730199,
+      2.3423904727470434e-10
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      0.9999113671308573,
+      -2.220446049250313e-16
+    ],
+    "iterations": 14,
+    "solve_time": 0.000087334,
+    "known_fopt": 1.0,
+    "n": 3,
+    "m": 2,
+    "final_primal_inf": 2.220446049250313e-16,
+    "final_dual_inf": 2.6645352591003757e-15,
+    "final_compl": 3.929691561543176e-9,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 33,
+    "status": "Optimal",
+    "objective": -4.585786550824245,
+    "x": [
+      -9.989748223457146e-9,
+      1.4142135623730192,
+      1.4142135590629867
+    ],
+    "constraint_multipliers": [
+      -0.17677669571592364,
+      -0.17677669568773047
+    ],
+    "bound_multipliers_lower": [
+      11.000000119876976,
+      7.974372916392414e-11,
+      7.9798463399172e-11
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      3.144214396356998e-11
+    ],
+    "constraint_values": [
+      -9.362185693362335e-9,
+      -9.36261468353905e-9
+    ],
+    "iterations": 11,
+    "solve_time": 0.000074,
+    "known_fopt": null,
+    "n": 3,
+    "m": 2,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 1.419415271573074e-13,
+    "final_compl": 1.1285206972948514e-10,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 34,
+    "status": "Optimal",
+    "objective": -0.8340324537160538,
+    "x": [
+      0.8340324537160538,
+      2.3025851024918262,
+      10.000000084960638
+    ],
+    "constraint_multipliers": [
+      -0.4342944785595796,
+      -0.04342944747068406
+    ],
+    "bound_multipliers_lower": [
+      7.765573856342373e-10,
+      2.8133019898466926e-10,
+      6.470089364896006e-11
+    ],
+    "bound_multipliers_upper": [
+      6.5384178137428775e-12,
+      6.636784531618014e-12,
+      0.043429447535384955
+    ],
+    "constraint_values": [
+      -1.0000735795046012e-8,
+      -1.0017167539899674e-8
+    ],
+    "iterations": 11,
+    "solve_time": 0.000097791,
+    "known_fopt": null,
+    "n": 3,
+    "m": 2,
+    "final_primal_inf": 1.7167539899673802e-11,
+    "final_dual_inf": 2.598845354893255e-12,
+    "final_compl": 6.531511723458356e-10,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 35,
+    "status": "Optimal",
+    "objective": 0.11111111143658833,
+    "x": [
+      1.3333333332947082,
+      0.7777777777212139,
+      0.44444444375971237
+    ],
+    "constraint_multipliers": [
+      -0.22222222574175873
+    ],
+    "bound_multipliers_lower": [
+      1.8824695687103853e-9,
+      3.2160557768026214e-9,
+      5.592384031548488e-9
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      1.4646532875417506e-9
+    ],
+    "iterations": 6,
+    "solve_time": 0.000071875,
+    "known_fopt": 0.1111111111111111,
+    "n": 3,
+    "m": 1,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 2.5510836661451347e-14,
+    "final_compl": 2.5099594436991652e-9,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 36,
+    "status": "Optimal",
+    "objective": -3300.0000208938704,
+    "x": [
+      20.000000199944285,
+      11.000000109961695,
+      14.999999795066161
+    ],
+    "constraint_multipliers": [
+      -110.0000022000856
+    ],
+    "bound_multipliers_lower": [
+      1.5319395409167825e-10,
+      2.7853437018182887e-10,
+      2.042690899436918e-10
+    ],
+    "bound_multipliers_upper": [
+      54.99999719516951,
+      79.99999450055957,
+      1.134739995888793e-10
+    ],
+    "constraint_values": [
+      -9.999993721976352e-9
+    ],
+    "iterations": 15,
+    "solve_time": 0.000063125,
+    "known_fopt": -3300.0,
+    "n": 3,
+    "m": 1,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 1.4593533636888525e-9,
+    "final_compl": 3.0644285001281206e-9,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 37,
+    "status": "Optimal",
+    "objective": -3456.0000014543893,
+    "x": [
+      24.000000003366782,
+      12.000000001683286,
+      12.000000001683286
+    ],
+    "constraint_multipliers": [
+      -144.00000004040035,
+      -1.3888888831271403e-13
+    ],
+    "bound_multipliers_lower": [
+      4.1666671340725537e-13,
+      8.333332807120807e-13,
+      8.333332807120807e-13
+    ],
+    "bound_multipliers_upper": [
+      5.555554591981457e-13,
+      3.3333333697447784e-13,
+      3.3333333697447784e-13
+    ],
+    "constraint_values": [
+      -1.0099938663188368e-8,
+      72.00000001009994
+    ],
+    "iterations": 13,
+    "solve_time": 0.000084583,
+    "known_fopt": -3456.0,
+    "n": 3,
+    "m": 2,
+    "final_primal_inf": 9.993866318836787e-11,
+    "final_dual_inf": 1.4779287478591847e-12,
+    "final_compl": 1.0000001127343623e-11,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 38,
+    "status": "Optimal",
+    "objective": -7.061018436615996e-14,
+    "x": [
+      1.0000000000044509,
+      1.000000000009553,
+      0.9999999999995213,
+      0.999999999995888
+    ],
+    "constraint_multipliers": [],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [],
+    "iterations": 25,
+    "solve_time": 0.000022542,
+    "known_fopt": 0.0,
+    "n": 4,
+    "m": 0,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 0.0,
+    "final_compl": 0.0,
+    "final_mu": 0.0,
+    "final_s_d": 0.0
+  },
+  {
+    "number": 39,
+    "status": "Optimal",
+    "objective": -1.0000000000031393,
+    "x": [
+      1.0000000000031393,
+      1.000000000007955,
+      3.1010493756937493e-12,
+      -6.660020792348184e-12
+    ],
+    "constraint_multipliers": [
+      -0.999999999977506,
+      -0.999999999977506
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      -1.4628298572557228e-12,
+      -1.6764367672283423e-12
+    ],
+    "iterations": 13,
+    "solve_time": 0.000088042,
+    "known_fopt": -1.0,
+    "n": 4,
+    "m": 2,
+    "final_primal_inf": 1.6764367672283423e-12,
+    "final_dual_inf": 1.3320041584396747e-11,
+    "final_compl": 0.0,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 40,
+    "status": "Optimal",
+    "objective": -0.2500000000822896,
+    "x": [
+      0.7937005263438075,
+      0.7071067807917079,
+      0.5297315474878389,
+      0.8408964151297287
+    ],
+    "constraint_multipliers": [
+      0.4999999991402019,
+      -0.4719371560541486,
+      0.3535533892004619
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      1.214174871755347e-10,
+      9.38548128104344e-11,
+      1.8632118070627257e-10
+    ],
+    "iterations": 3,
+    "solve_time": 0.00007475,
+    "known_fopt": -0.25,
+    "n": 4,
+    "m": 3,
+    "final_primal_inf": 1.8632118070627257e-10,
+    "final_dual_inf": 2.6606551406516132e-9,
+    "final_compl": 0.0,
+    "final_mu": 0.00042169650342858235,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 41,
+    "status": "Optimal",
+    "objective": 1.9259259238222812,
+    "x": [
+      0.6666666718540073,
+      0.3333333367696989,
+      0.3333333367696989,
+      2.000000018932803
+    ],
+    "constraint_multipliers": [
+      0.1111111132116578
+    ],
+    "bound_multipliers_lower": [
+      1.7661597745383472e-10,
+      3.577502706364254e-10,
+      3.577502706365313e-10,
+      5.93509833647131e-11
+    ],
+    "bound_multipliers_upper": [
+      3.668137812586444e-10,
+      1.7820589084402495e-10,
+      1.78205890843972e-10,
+      0.11111111327100878
+    ],
+    "constraint_values": [
+      0.0
+    ],
+    "iterations": 12,
+    "solve_time": 0.000079834,
+    "known_fopt": 1.9259259259259258,
+    "n": 4,
+    "m": 1,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 1.5250574293364936e-12,
+    "final_compl": 1.222712621848979e-10,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 42,
+    "status": "Optimal",
+    "objective": 13.857864376269049,
+    "x": [
+      2.0,
+      2.0,
+      0.848528137423857,
+      1.131370849898476
+    ],
+    "constraint_multipliers": [
+      -2.0,
+      2.5355339059327378
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      0.0,
+      0.0
+    ],
+    "iterations": 4,
+    "solve_time": 0.000051208,
+    "known_fopt": null,
+    "n": 4,
+    "m": 2,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 0.0,
+    "final_compl": 0.0,
+    "final_mu": 8.659643233600657e-6,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 43,
+    "status": "NumericalError",
+    "objective": -43.99917390511524,
+    "x": [
+      -0.0010606078902997325,
+      1.01382203097462,
+      1.9967501951445352,
+      -1.0010945617443774
+    ],
+    "constraint_multipliers": [
+      -1.0692086524518967,
+      0.03340205692008327,
+      -1.9550008164352624
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      -1.6766499300047144e-8,
+      0.9507814995791453,
+      -1.7066595248138583e-8
+    ],
+    "iterations": 82,
+    "solve_time": 0.003533083,
+    "known_fopt": -44.0,
+    "n": 4,
+    "m": 3,
+    "final_primal_inf": 7.066595248138583e-9,
+    "final_dual_inf": 1.3322676295501878e-15,
+    "final_compl": 0.031758058101525315,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 44,
+    "status": "Optimal",
+    "objective": -15.00000013284571,
+    "x": [
+      -9.01993916487957e-9,
+      3.000000009264954,
+      -7.54892640468032e-9,
+      4.000000008774464
+    ],
+    "constraint_multipliers": [
+      -4.287780058415033e-9,
+      -9.527910485198255e-10,
+      -1.2500000022955593,
+      -2.1433333792563667e-9,
+      -1.5000000050152573,
+      -8.570524968444557e-9
+    ],
+    "bound_multipliers_lower": [
+      8.75000002979473,
+      2.8585767038543987e-9,
+      3.5000000323584985,
+      2.1440102657531254e-9
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      1.9999999904900312,
+      9.000000026814803,
+      -9.99999905104687e-9,
+      4.000000006323389,
+      -1.000000082740371e-8,
+      0.999999998774463
+    ],
+    "iterations": 19,
+    "solve_time": 0.0001395,
+    "known_fopt": -15.0,
+    "n": 4,
+    "m": 6,
+    "final_primal_inf": 8.274037097816781e-16,
+    "final_dual_inf": 3.79884390611096e-9,
+    "final_compl": 8.578757662931941e-9,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 45,
+    "status": "Optimal",
+    "objective": 0.9999999501202965,
+    "x": [
+      1.0000000099759405,
+      2.000000019951881,
+      3.000000029927822,
+      4.000000039903762,
+      5.000000049879703
+    ],
+    "constraint_multipliers": [],
+    "bound_multipliers_lower": [
+      2.407293141383729e-11,
+      1.2036465764629382e-11,
+      8.024310520518401e-12,
+      6.018232896959097e-12,
+      4.814586355413768e-12
+    ],
+    "bound_multipliers_upper": [
+      1.0000000399277948,
+      0.5000000199638974,
+      0.3333333466425983,
+      0.2500000099819487,
+      0.200000007985559
+    ],
+    "constraint_values": [],
+    "iterations": 8,
+    "solve_time": 0.000222625,
+    "known_fopt": 1.0,
+    "n": 5,
+    "m": 0,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 4.063416270128073e-14,
+    "final_compl": 2.4072932065364843e-11,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 46,
+    "status": "Optimal",
+    "objective": 0.021088928627757964,
+    "x": [
+      -0.5805137399801127,
+      -0.5687318149662218,
+      1.1091456490582212,
+      1.302813417178279,
+      0.7072722657977814
+    ],
+    "constraint_multipliers": [
+      -0.01557835265615362,
+      -0.02356384988654213
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      1.1224354778960333e-11,
+      4.7122306057190144e-12
+    ],
+    "iterations": 20,
+    "solve_time": 0.000112166,
+    "known_fopt": 0.0,
+    "n": 5,
+    "m": 2,
+    "final_primal_inf": 1.1224354778960333e-11,
+    "final_dual_inf": 4.477597372737341e-10,
+    "final_compl": 0.0,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 47,
+    "status": "Optimal",
+    "objective": 0.0,
+    "x": [
+      1.0000000000000002,
+      1.0000000000000002,
+      0.9999999999999999,
+      0.9999999999999996,
+      0.9999999999999997
+    ],
+    "constraint_multipliers": [
+      -1.9698543792861703e-16,
+      -4.440891921610748e-16,
+      3.8426908951955886e-16
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      3.3306690738754696e-16,
+      0.0,
+      -1.1102230246251565e-16
+    ],
+    "iterations": 16,
+    "solve_time": 0.000103083,
+    "known_fopt": 0.0,
+    "n": 5,
+    "m": 3,
+    "final_primal_inf": 3.3306690738754696e-16,
+    "final_dual_inf": 2.9722207053629865e-16,
+    "final_compl": 0.0,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 48,
+    "status": "Optimal",
+    "objective": 0.0,
+    "x": [
+      1.0,
+      1.0000000000000004,
+      1.0,
+      1.0,
+      1.0
+    ],
+    "constraint_multipliers": [
+      6.661338147750939e-16,
+      4.440892098500626e-16
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      0.0,
+      0.0
+    ],
+    "iterations": 1,
+    "solve_time": 0.000046,
+    "known_fopt": 0.0,
+    "n": 5,
+    "m": 2,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 1.5543122344752192e-15,
+    "final_compl": 0.0,
+    "final_mu": 0.0316227766016838,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 49,
+    "status": "Optimal",
+    "objective": 1.0599521260701295e-11,
+    "x": [
+      1.0036087439631984,
+      1.0036087439631984,
+      1.0,
+      0.9981956280184008,
+      1.0
+    ],
+    "constraint_multipliers": [
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      0.0,
+      0.0
+    ],
+    "iterations": 19,
+    "solve_time": 0.000084416,
+    "known_fopt": 0.0,
+    "n": 5,
+    "m": 2,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 9.179061156994184e-9,
+    "final_compl": 0.0,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 50,
+    "status": "Optimal",
+    "objective": 0.0,
+    "x": [
+      1.0000000000028315,
+      1.000000000001279,
+      0.9999999999982034,
+      1.0000000000007714,
+      1.0000000000000846
+    ],
+    "constraint_multipliers": [
+      -3.1048786690291135e-12,
+      3.163551048863478e-12,
+      -5.863538143522848e-14
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "iterations": 8,
+    "solve_time": 0.00006325,
+    "known_fopt": 0.0,
+    "n": 5,
+    "m": 3,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 2.3426794621152193e-13,
+    "final_compl": 0.0,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 51,
+    "status": "Optimal",
+    "objective": 0.0,
+    "x": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ],
+    "constraint_multipliers": [
+      0.0,
+      3.469446951953614e-17,
+      -1.1102230246251565e-16
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "iterations": 1,
+    "solve_time": 0.000044833,
+    "known_fopt": 0.0,
+    "n": 5,
+    "m": 3,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 1.1102230246251565e-16,
+    "final_compl": 0.0,
+    "final_mu": 0.0316227766016838,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 52,
+    "status": "Optimal",
+    "objective": 5.326647564469916,
+    "x": [
+      -0.09455587392550147,
+      0.03151862464183375,
+      0.5157593123209168,
+      -0.45272206303724927,
+      0.03151862464183375
+    ],
+    "constraint_multipliers": [
+      3.277936962750715,
+      2.9054441260744994,
+      -7.747851002865332
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      -2.220446049250313e-16,
+      0.0,
+      0.0
+    ],
+    "iterations": 1,
+    "solve_time": 0.00004475,
+    "known_fopt": 5.326647564469914,
+    "n": 5,
+    "m": 3,
+    "final_primal_inf": 2.220446049250313e-16,
+    "final_dual_inf": 6.217248937900877e-15,
+    "final_compl": 0.0,
+    "final_mu": 0.0316227766016838,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 53,
+    "status": "Optimal",
+    "objective": 4.093023255813954,
+    "x": [
+      -0.7674418604547358,
+      0.2558139534849119,
+      0.6279069767331001,
+      -0.1162790697632763,
+      0.2558139534849119
+    ],
+    "constraint_multipliers": [
+      2.0465116279179867,
+      2.2325581395323812,
+      -5.953488372082109
+    ],
+    "bound_multipliers_lower": [
+      2.7142044683087464e-10,
+      2.443397559250752e-10,
+      2.357851012930609e-10,
+      2.5353853300653497e-10,
+      2.443397559250752e-10
+    ],
+    "bound_multipliers_upper": [
+      2.3272958079751758e-10,
+      2.5716914712409525e-10,
+      2.6737945613005787e-10,
+      2.4770994945714385e-10,
+      2.5716914712409525e-10
+    ],
+    "constraint_values": [
+      -1.1102230246251565e-16,
+      0.0,
+      0.0
+    ],
+    "iterations": 7,
+    "solve_time": 0.000061875,
+    "known_fopt": 4.093023255813954,
+    "n": 5,
+    "m": 3,
+    "final_primal_inf": 1.1102230246251565e-16,
+    "final_dual_inf": 5.421048714212353e-16,
+    "final_compl": 2.5059051620993588e-9,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 56,
+    "status": "Optimal",
+    "objective": -1.1857066146610575e-44,
+    "x": [
+      2.1082716641472348e-9,
+      2.3715113618176363e-18,
+      2.3715127354716203e-18,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_multipliers": [
+      2.2553099943145583e-9,
+      4.510947929624438e-9,
+      4.5109478968492275e-9,
+      -2.2554739742552954e-9
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      2.1082716641472348e-9,
+      2.3715113618176363e-18,
+      2.3715127354716203e-18,
+      2.108271673633283e-9
+    ],
+    "iterations": 2,
+    "solve_time": 0.000073333,
+    "known_fopt": -3.456,
+    "n": 7,
+    "m": 4,
+    "final_primal_inf": 2.108271673633283e-9,
+    "final_dual_inf": 1.6397994073713562e-13,
+    "final_compl": 0.0,
+    "final_mu": 0.005623413251903492,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 58,
+    "status": "Optimal",
+    "objective": 3.1903367227180044,
+    "x": [
+      -0.7861513717258112,
+      0.6180339885244894
+    ],
+    "constraint_multipliers": [
+      -2.0594284666612239e-10,
+      -1.2559397265201369,
+      -1.0160780809050802
+    ],
+    "bound_multipliers_lower": [
+      1.981250111245743e-10,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      1.8714768318375048e-10,
+      0.0
+    ],
+    "constraint_values": [
+      1.1681173826973,
+      -9.258114830323905e-9,
+      -9.762136654600795e-9
+    ],
+    "iterations": 16,
+    "solve_time": 0.000078166,
+    "known_fopt": 3.19033354957,
+    "n": 2,
+    "m": 3,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 6.615737629135518e-12,
+    "final_compl": 1.0004166721262055e-11,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 60,
+    "status": "Optimal",
+    "objective": 0.032568200255062685,
+    "x": [
+      1.104859019713565,
+      1.1966741822673745,
+      1.5352622603324602
+    ],
+    "constraint_multipliers": [
+      -0.010726727896307839
+    ],
+    "bound_multipliers_lower": [
+      2.256580765734146e-10,
+      2.2380762079550665e-10,
+      2.1723861318599467e-10
+    ],
+    "bound_multipliers_upper": [
+      2.817163377119609e-10,
+      2.846545496712789e-10,
+      2.960401686247029e-10
+    ],
+    "constraint_values": [
+      1.7763568394002505e-15
+    ],
+    "iterations": 7,
+    "solve_time": 0.000062708,
+    "known_fopt": 0.0325682002513,
+    "n": 3,
+    "m": 1,
+    "final_primal_inf": 1.7763568394002505e-15,
+    "final_dual_inf": 7.792497762189413e-15,
+    "final_compl": 2.5059067747216784e-9,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 61,
+    "status": "Optimal",
+    "objective": -143.6461421978006,
+    "x": [
+      5.326770135566919,
+      -2.1189986322206305,
+      3.2104642253538347
+    ],
+    "constraint_multipliers": [
+      -0.8876840877195166,
+      -1.7377772053442009
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      -5.048406137575512e-12,
+      -9.121592370320286e-12
+    ],
+    "iterations": 9,
+    "solve_time": 0.000059542,
+    "known_fopt": -143.646142201,
+    "n": 3,
+    "m": 2,
+    "final_primal_inf": 9.121592370320286e-12,
+    "final_dual_inf": 2.3078339239646084e-10,
+    "final_compl": 0.0,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 63,
+    "status": "Optimal",
+    "objective": 961.7151721300522,
+    "x": [
+      3.51212134187234,
+      0.2169879415154125,
+      3.5521711548293586
+    ],
+    "constraint_multipliers": [
+      0.2749371020722212,
+      1.2234635604782191
+    ],
+    "bound_multipliers_lower": [
+      5.664101235255923e-12,
+      9.16798824989566e-11,
+      5.600341776015842e-12
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      0.0,
+      0.0
+    ],
+    "iterations": 9,
+    "solve_time": 0.00007225,
+    "known_fopt": 961.715172127,
+    "n": 3,
+    "m": 2,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 4.253439270276444e-15,
+    "final_compl": 1.989342989862231e-11,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 64,
+    "status": "Optimal",
+    "objective": 6299.8424005720635,
+    "x": [
+      108.73470459268479,
+      85.12621190523114,
+      204.3245938357327
+    ],
+    "constraint_multipliers": [
+      -2279.0449699397786
+    ],
+    "bound_multipliers_lower": [
+      3.087165370319995e-9,
+      3.952169513436524e-9,
+      1.646544188580512e-9
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      -1.2000402005440947e-8
+    ],
+    "iterations": 17,
+    "solve_time": 0.000065125,
+    "known_fopt": 6299.84242821,
+    "n": 3,
+    "m": 1,
+    "final_primal_inf": 3.350045341219538e-13,
+    "final_dual_inf": 1.6638968303822126e-12,
+    "final_compl": 3.364331800040184e-9,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 65,
+    "status": "Optimal",
+    "objective": 0.9535288559893509,
+    "x": [
+      3.650461725776581,
+      3.650461725776581,
+      4.620417555503576
+    ],
+    "constraint_multipliers": [
+      -0.08215327725202455
+    ],
+    "bound_multipliers_lower": [
+      3.7821049825369045e-12,
+      3.7821049825369045e-12,
+      3.204133186107961e-12
+    ],
+    "bound_multipliers_upper": [
+      3.628119988703171e-11,
+      3.628119988703171e-11,
+      8.123998162614437e-11
+    ],
+    "constraint_values": [
+      -9.925109623054595e-9
+    ],
+    "iterations": 11,
+    "solve_time": 0.000056125,
+    "known_fopt": 0.953528856757,
+    "n": 3,
+    "m": 1,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 2.0467974178835687e-15,
+    "final_compl": 3.083727487849549e-11,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 66,
+    "status": "Optimal",
+    "objective": 0.5181632655157828,
+    "x": [
+      0.1841264950039125,
+      1.2021678717019442,
+      3.3273223075945637
+    ],
+    "constraint_multipliers": [
+      -0.6654644626938931,
+      -0.19999999990537326
+    ],
+    "bound_multipliers_lower": [
+      3.4633042770991263e-9,
+      5.181631445321574e-10,
+      1.8736176287531336e-10
+    ],
+    "bound_multipliers_upper": [
+      6.213780016377357e-12,
+      6.277757470829984e-12,
+      9.273502656890013e-11
+    ],
+    "constraint_values": [
+      -1.0007727535565891e-8,
+      -1.002985650089272e-8
+    ],
+    "iterations": 11,
+    "solve_time": 0.000076458,
+    "known_fopt": 0.518163274159,
+    "n": 3,
+    "m": 2,
+    "final_primal_inf": 2.985650089271964e-11,
+    "final_dual_inf": 1.2691853246604552e-11,
+    "final_compl": 6.376861123073638e-10,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 71,
+    "status": "Optimal",
+    "objective": 17.01401709387984,
+    "x": [
+      0.9999999900904214,
+      4.742999646150193,
+      3.8211499775342483,
+      1.3794082882267116
+    ],
+    "constraint_multipliers": [
+      -13.80734148065223,
+      6.458742528808947
+    ],
+    "bound_multipliers_lower": [
+      1.0878712119227671,
+      2.6201149962389883e-11,
+      3.477201360315732e-11,
+      2.5802733965631424e-10
+    ],
+    "bound_multipliers_upper": [
+      2.4516930649438946e-11,
+      3.820865033139163e-10,
+      8.316204730037797e-11,
+      2.7094626676585896e-11
+    ],
+    "constraint_values": [
+      -1.3362172368580616e-8,
+      5.773159728050814e-15
+    ],
+    "iterations": 11,
+    "solve_time": 0.000062375,
+    "known_fopt": 17.0140172895,
+    "n": 4,
+    "m": 2,
+    "final_primal_inf": 3.3621723685806158e-9,
+    "final_dual_inf": 3.5717212807783667e-13,
+    "final_compl": 9.836689033573556e-11,
+    "final_mu": 9.807882636588955e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 72,
+    "status": "Optimal",
+    "objective": 727.6788654911959,
+    "x": [
+      193.40746066242002,
+      179.54699745104318,
+      185.01785908203078,
+      168.70654829570188
+    ],
+    "constraint_multipliers": [
+      -7692.945014842931,
+      -41466.66112004319
+    ],
+    "bound_multipliers_lower": [
+      1.0273291854283522e-12,
+      1.0678510301016804e-12,
+      9.951414598138854e-13,
+      1.0686464570244063e-12
+    ],
+    "bound_multipliers_upper": [
+      4.920428198580187e-16,
+      6.561457187964004e-16,
+      9.845837595620568e-16,
+      1.97083181039196e-15
+    ],
+    "constraint_values": [
+      -1.0014453689921599e-8,
+      -1.0014241519362699e-8
+    ],
+    "iterations": 19,
+    "solve_time": 0.000115292,
+    "known_fopt": 727.67936,
+    "n": 4,
+    "m": 2,
+    "final_primal_inf": 1.4453689921598358e-11,
+    "final_dual_inf": 2.363906097547055e-9,
+    "final_compl": 1.9869210169917788e-10,
+    "final_mu": 1e-11,
+    "final_s_d": 40.96633844573844
+  },
+  {
+    "number": 76,
+    "status": "Optimal",
+    "objective": -4.681818201365214,
+    "x": [
+      0.27272726953559945,
+      2.090909094428276,
+      -9.344438043820305e-9,
+      0.5454545584468935
+    ],
+    "constraint_multipliers": [
+      -0.45454545367111754,
+      -6.93041961303735e-10,
+      -1.9215125964899574e-9
+    ],
+    "bound_multipliers_lower": [
+      4.165891636294473e-9,
+      5.42051883228894e-10,
+      1.72727271759358,
+      2.0805422958900855e-9
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      -7.494607601188363e-9,
+      1.636363674100695,
+      0.5909090570505242
+    ],
+    "iterations": 8,
+    "solve_time": 0.00008225,
+    "known_fopt": -4.68181818182,
+    "n": 4,
+    "m": 3,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 1.1316468383776464e-14,
+    "final_compl": 1.1361522928066984e-9,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 77,
+    "status": "Optimal",
+    "objective": 0.24150512877037397,
+    "x": [
+      1.1661721891435408,
+      1.1821113882425216,
+      1.3802570432701455,
+      1.5060362734004458,
+      0.6109201925177496
+    ],
+    "constraint_multipliers": [
+      -0.08553959678266168,
+      -0.031878398197961795
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      -2.2437607327674414e-10,
+      -1.908873059619509e-11
+    ],
+    "iterations": 11,
+    "solve_time": 0.000067958,
+    "known_fopt": 0.241505128786,
+    "n": 5,
+    "m": 2,
+    "final_primal_inf": 2.2437607327674414e-10,
+    "final_dual_inf": 2.8068405238945715e-9,
+    "final_compl": 0.0,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 78,
+    "status": "Optimal",
+    "objective": -2.9197004089696605,
+    "x": [
+      -1.7171435703946267,
+      1.5957096901839956,
+      1.827245752926689,
+      -0.7636430781848583,
+      -0.7636430781848583
+    ],
+    "constraint_multipliers": [
+      0.7444459309759935,
+      -0.7035751900192181,
+      0.09680552489545184
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      2.62323496258432e-12,
+      -5.559552818112934e-12,
+      1.2070344723724702e-12
+    ],
+    "iterations": 4,
+    "solve_time": 0.000056292,
+    "known_fopt": -2.91970040911,
+    "n": 5,
+    "m": 3,
+    "final_primal_inf": 5.559552818112934e-12,
+    "final_dual_inf": 7.962963621821473e-12,
+    "final_compl": 0.0,
+    "final_mu": 8.659643233600657e-6,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 79,
+    "status": "Optimal",
+    "objective": 0.07877682096342209,
+    "x": [
+      1.1911274570588861,
+      1.3626031659097617,
+      1.4728179314004104,
+      1.6350166174346743,
+      1.679081431848396
+    ],
+    "constraint_multipliers": [
+      -0.03882104881895126,
+      -0.01672651807746942,
+      -0.0002873262578310869
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      2.604628956959232e-9,
+      -4.563379674138446e-10,
+      -3.887626665033395e-9
+    ],
+    "iterations": 4,
+    "solve_time": 0.000052167,
+    "known_fopt": 0.0787768208538,
+    "n": 5,
+    "m": 3,
+    "final_primal_inf": 3.887626665033395e-9,
+    "final_dual_inf": 3.4126631236089215e-9,
+    "final_compl": 0.0,
+    "final_mu": 8.659643233600657e-6,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 80,
+    "status": "Optimal",
+    "objective": 0.05394984777027169,
+    "x": [
+      -1.7171435703755795,
+      1.5957096901617813,
+      1.8272457529621322,
+      -0.7636430781862213,
+      -0.7636430781862213
+    ],
+    "constraint_multipliers": [
+      0.0401627446465814,
+      -0.03795777439675523,
+      0.005222643331839406
+    ],
+    "bound_multipliers_lower": [
+      1.715840105948961e-11,
+      2.5668874740422068e-12,
+      1.9891985020074094e-12,
+      4.104479044360841e-12,
+      4.104479044360014e-12
+    ],
+    "bound_multipliers_upper": [
+      2.489299358654862e-12,
+      1.4199892330459303e-11,
+      7.284122989765483e-12,
+      2.522935199467628e-12,
+      2.522935199467628e-12
+    ],
+    "constraint_values": [
+      5.995204332975845e-15,
+      -1.7763568394002505e-15,
+      2.6645352591003757e-15
+    ],
+    "iterations": 10,
+    "solve_time": 0.00006425,
+    "known_fopt": 0.0539498477624,
+    "n": 5,
+    "m": 3,
+    "final_primal_inf": 5.995204332975845e-15,
+    "final_dual_inf": 7.21378507556401e-16,
+    "final_compl": 1.0000884774241212e-11,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 81,
+    "status": "Optimal",
+    "objective": 0.05394984777027523,
+    "x": [
+      -1.717143570375579,
+      1.5957096901617807,
+      1.8272457529621333,
+      -0.7636430781862215,
+      -0.7636430781862215
+    ],
+    "constraint_multipliers": [
+      0.04016274464658134,
+      -0.03795777439675522,
+      0.005222643331839323
+    ],
+    "bound_multipliers_lower": [
+      1.7158399096798467e-11,
+      2.5668875242404894e-12,
+      1.9891984484999907e-12,
+      4.104479063186645e-12,
+      4.104479063186645e-12
+    ],
+    "bound_multipliers_upper": [
+      2.489299400999065e-12,
+      1.4199890775187698e-11,
+      7.28412365844671e-12,
+      2.522935192464717e-12,
+      2.522935192464717e-12
+    ],
+    "constraint_values": [
+      6.661338147750939e-15,
+      -2.6645352591003757e-15,
+      8.881784197001252e-16
+    ],
+    "iterations": 10,
+    "solve_time": 0.000079875,
+    "known_fopt": 0.0539498477749,
+    "n": 5,
+    "m": 3,
+    "final_primal_inf": 6.661338147750939e-15,
+    "final_dual_inf": 8.087618093984238e-15,
+    "final_compl": 1.0000883630274021e-11,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 106,
+    "status": "Optimal",
+    "objective": 7049.247844195983,
+    "x": [
+      579.3067003955256,
+      1359.9706590164492,
+      5109.970484784008,
+      182.01770362846304,
+      295.60117775949243,
+      217.98230298767731,
+      286.41653144315956,
+      395.6011791533103
+    ],
+    "constraint_multipliers": [
+      -1964.0460839390646,
+      -5210.674056291129,
+      -5109.970413559905,
+      -0.00847584743363292,
+      -0.009578651608660579,
+      -0.009999999860616665
+    ],
+    "bound_multipliers_lower": [
+      8.211459860069418e-12,
+      1.0933690097361797e-11,
+      9.576243293887602e-13,
+      2.2880248101126672e-11,
+      1.3780782588334525e-11,
+      1.8923762650163937e-11,
+      1.4238684340241029e-11,
+      1.020693906246447e-11
+    ],
+    "bound_multipliers_upper": [
+      4.1778323230861555e-13,
+      4.55531750899574e-13,
+      8.048637837871156e-13,
+      4.811604980228106e-12,
+      5.587470562029073e-12,
+      5.0328882629920705e-12,
+      5.5155533407718844e-12,
+      6.5119380418926585e-12
+    ],
+    "constraint_values": [
+      -1.6540350866733888e-8,
+      -1.393547233163872e-8,
+      -1.3938178611283547e-8,
+      -4.637549864128232e-7,
+      -8.91159288585186e-8,
+      -5.00120222568512e-7
+    ],
+    "iterations": 67,
+    "solve_time": 0.000985708,
+    "known_fopt": 7049.248,
+    "n": 8,
+    "m": 6,
+    "final_primal_inf": 6.540350866733888e-9,
+    "final_dual_inf": 1.141242402789843e-14,
+    "final_compl": 3.935807739171636e-9,
+    "final_mu": 1e-11,
+    "final_s_d": 4.3878904566912045
+  },
+  {
+    "number": 108,
+    "status": "Optimal",
+    "objective": -0.8660254119208323,
+    "x": [
+      0.9666779563927435,
+      0.2559955791820605,
+      0.2616403122653852,
+      0.9651654554493596,
+      0.966677959407016,
+      0.2559955706487627,
+      0.2616403009008463,
+      0.9651654556810465,
+      -2.849050655672629e-9
+    ],
+    "constraint_multipliers": [
+      -0.14433756413926643,
+      -8.731007531690639e-11,
+      -0.14433756866964445,
+      -0.1443375640704557,
+      -8.731007531690635e-11,
+      -0.1443375668483286,
+      -0.1443375668393634,
+      -8.731007531690639e-11,
+      -0.14433756868969283,
+      -1.0081699047224718e-10,
+      -0.009414819940418305,
+      -0.010090791332652616,
+      -1.008169895042387e-10
+    ],
+    "bound_multipliers_lower": [
+      9.031971269196392e-11,
+      3.4106086150411675e-10,
+      3.337026779041213e-10,
+      9.046125179126679e-11,
+      9.03197124098477e-11,
+      3.410608728987012e-10,
+      3.3370269242374723e-10,
+      9.046125176906822e-11,
+      0.007291243409524306
+    ],
+    "bound_multipliers_upper": [
+      2.6201889421002476e-9,
+      1.1735155406769022e-10,
+      1.1824870243810816e-10,
+      2.50642149734727e-9,
+      2.620189167316987e-9,
+      1.1735155272278476e-10,
+      1.182487006191838e-10,
+      2.5064215037348956e-9,
+      8.731007506815555e-11
+    ],
+    "constraint_values": [
+      -9.395098032882743e-9,
+      1.0,
+      -9.395098032882743e-9,
+      -9.395098254927348e-9,
+      0.9999999999999996,
+      -9.395098476971953e-9,
+      -9.395098699016557e-9,
+      0.9999999999999998,
+      -9.395098032882743e-9,
+      0.8660254067789059,
+      -7.454265032100871e-10,
+      2.7541144740728375e-9,
+      0.8660254150540706
+    ],
+    "iterations": 37,
+    "solve_time": 0.000419333,
+    "known_fopt": -0.866025403841,
+    "n": 9,
+    "m": 13,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 4.527366807486041e-9,
+    "final_compl": 8.731007638980511e-11,
+    "final_mu": 8.731007619000713e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 113,
+    "status": "Optimal",
+    "objective": 24.30620902201973,
+    "x": [
+      2.1719963716127157,
+      2.363682974658414,
+      8.773925738876963,
+      5.095984487879631,
+      0.9906547658084192,
+      1.430573978754634,
+      1.3216442073445158,
+      9.828725808113097,
+      8.280091671810624,
+      8.375926662551985
+    ],
+    "constraint_multipliers": [
+      -1.716533153212195,
+      -0.4745201537534454,
+      -1.3759266625512003,
+      -0.020545555130769444,
+      -0.3120285085608341,
+      -1.821581482838232e-12,
+      -0.2870493191694525,
+      -2.2389273512639032e-13
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      -1.072724842288153e-8,
+      -1.0229271651951422e-8,
+      -1.0364249902750089e-8,
+      -9.999979511121637e-9,
+      -1.7806154772870286e-8,
+      6.148503422604691,
+      -9.999997274690031e-9,
+      50.023961769339394
+    ],
+    "iterations": 528,
+    "solve_time": 0.00434775,
+    "known_fopt": 24.3062090641,
+    "n": 10,
+    "m": 8,
+    "final_primal_inf": 7.806154772870286e-9,
+    "final_dual_inf": 1.1435297153639112e-14,
+    "final_compl": 0.0,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 114,
+    "status": "Optimal",
+    "objective": -1768.80715235568,
+    "x": [
+      1698.0947895587135,
+      15818.61601086281,
+      54.102680572037556,
+      3031.2252537364825,
+      2000.0000199997953,
+      90.11542459804222,
+      95.00000094999896,
+      10.49329880783225,
+      1.5616357773278662,
+      153.5353564243376
+    ],
+    "constraint_multipliers": [
+      -5.488468734052115e-10,
+      -69.91966233774144,
+      -311.8038996145353,
+      -5.862934791807455e-11,
+      -0.6778213946419783,
+      -229.6064340932925,
+      -2.9696500565661666e-12,
+      -9.475450246535963e-11,
+      4.209403567321336,
+      -74.62209108026192,
+      -59.43331763623383
+    ],
+    "bound_multipliers_lower": [
+      1.0655613510673287e-13,
+      1.1438310791193702e-14,
+      3.3445217337390313e-12,
+      5.969289237189297e-14,
+      9.047137940664149e-14,
+      3.5373263973251273e-11,
+      3.618851984850903e-11,
+      2.4146604006816772e-11,
+      5.003500095401951e-10,
+      2.1199171997651035e-11
+    ],
+    "bound_multipliers_upper": [
+      5.99344641147466e-13,
+      1.0000998335107477e-12,
+      2.74577115490494e-12,
+      9.190651438530695e-14,
+      0.8844035673224144,
+      6.272375864633993e-11,
+      173.41580824621917,
+      1.2010910647215288e-10,
+      7.420655164731717e-11,
+      2.1376345566040677e-11
+    ],
+    "constraint_values": [
+      0.32967867420197194,
+      -1.0097323865920771e-8,
+      -1.009942707241862e-8,
+      3.0862157604450715,
+      -9.99943949864246e-9,
+      -1.021268758449878e-8,
+      60.93068945379264,
+      1.9095959889045702,
+      -2.2737367544323206e-13,
+      0.0,
+      1.1102230246251565e-15
+    ],
+    "iterations": 23,
+    "solve_time": 0.000224667,
+    "known_fopt": -1768.80696344,
+    "n": 10,
+    "m": 11,
+    "final_primal_inf": 2.1268758449878057e-10,
+    "final_dual_inf": 9.053530106163972e-14,
+    "final_compl": 9.446850255572302e-11,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 116,
+    "status": "NumericalError",
+    "objective": 0.0100020294,
+    "x": [
+      0.5,
+      0.8,
+      0.9,
+      0.0990010098,
+      0.14,
+      0.5,
+      0.0010000098000000001,
+      0.0010000098000000001,
+      4.9999999599,
+      450.0,
+      0.0100000098,
+      1.0098e-6,
+      1.0098e-6
+    ],
+    "constraint_multipliers": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_lower": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ],
+    "bound_multipliers_upper": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ],
+    "constraint_values": [
+      0.09999999999999998,
+      0.30000000000000004,
+      1.0,
+      -49.9899979706,
+      249.9899979706,
+      -69.60280399020002,
+      0.00923999999999997,
+      0.03787250000000003,
+      -0.000360003528,
+      0.35700072003111594,
+      -193.50000001202997,
+      -0.010000000000000009,
+      0.035800517522500006,
+      0.0093529069584543,
+      -1.3888929790610707
+    ],
+    "iterations": 82,
+    "solve_time": 1.007109334,
+    "known_fopt": 97.5884089805,
+    "n": 13,
+    "m": 15,
+    "final_primal_inf": 49.9899979606,
+    "final_dual_inf": 1.0,
+    "final_compl": 494.99999498734934,
+    "final_mu": 11.44768205174317,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 201,
+    "status": "Optimal",
+    "objective": 0.0,
+    "x": [
+      5.0,
+      6.0
+    ],
+    "constraint_multipliers": [],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [],
+    "iterations": 3,
+    "solve_time": 0.000037333,
+    "known_fopt": 0.0,
+    "n": 2,
+    "m": 0,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 0.0,
+    "final_compl": 0.0,
+    "final_mu": 0.0,
+    "final_s_d": 0.0
+  },
+  {
+    "number": 206,
+    "status": "Optimal",
+    "objective": -4.6629367034256575e-15,
+    "x": [
+      0.9999999999999994,
+      0.9999999999999988
+    ],
+    "constraint_multipliers": [],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [],
+    "iterations": 4,
+    "solve_time": 0.0000805,
+    "known_fopt": 0.0,
+    "n": 2,
+    "m": 0,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 2.5714488121022737e-14,
+    "final_compl": 0.0,
+    "final_mu": 8.659643233600657e-6,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 211,
+    "status": "Optimal",
+    "objective": -4.929390229335695e-14,
+    "x": [
+      1.0000000000015528,
+      1.0000000000046598
+    ],
+    "constraint_multipliers": [],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [],
+    "iterations": 34,
+    "solve_time": 0.000021334,
+    "known_fopt": 0.0,
+    "n": 2,
+    "m": 0,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 0.0,
+    "final_compl": 0.0,
+    "final_mu": 0.0,
+    "final_s_d": 0.0
+  },
+  {
+    "number": 212,
+    "status": "Optimal",
+    "objective": 2.85479547991739e-25,
+    "x": [
+      6.245908078912973e-14,
+      -1.7946470975078972e-13
+    ],
+    "constraint_multipliers": [],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [],
+    "iterations": 13,
+    "solve_time": 0.000026167,
+    "known_fopt": 0.0,
+    "n": 2,
+    "m": 0,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 0.0,
+    "final_compl": 0.0,
+    "final_mu": 0.0,
+    "final_s_d": 0.0
+  },
+  {
+    "number": 213,
+    "status": "Optimal",
+    "objective": 8.149072527885438e-10,
+    "x": [
+      1.0230744045170745,
+      1.000208083705107
+    ],
+    "constraint_multipliers": [],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [],
+    "iterations": 29,
+    "solve_time": 0.000097,
+    "known_fopt": 0.0,
+    "n": 2,
+    "m": 0,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 3.860332071781159e-9,
+    "final_compl": 0.0,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 214,
+    "status": "NumericalError",
+    "objective": 0.0,
+    "x": [
+      1.0000000300645224,
+      1.0000000313889503
+    ],
+    "constraint_multipliers": [],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [],
+    "iterations": 59,
+    "solve_time": 0.000258292,
+    "known_fopt": 0.0,
+    "n": 2,
+    "m": 0,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 0.0,
+    "final_compl": 0.0,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 215,
+    "status": "Optimal",
+    "objective": -8.727507280168438e-9,
+    "x": [
+      0.00003780457613824313,
+      -8.727507280168438e-9
+    ],
+    "constraint_multipliers": [
+      -1.0
+    ],
+    "bound_multipliers_lower": [
+      0.00007560915227683256,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      -1.015669325716066e-8
+    ],
+    "iterations": 16,
+    "solve_time": 0.000077334,
+    "known_fopt": 0.0,
+    "n": 2,
+    "m": 1,
+    "final_primal_inf": 1.5669325716065938e-10,
+    "final_dual_inf": 3.462941738918701e-16,
+    "final_compl": 2.8591280455203037e-9,
+    "final_mu": 3.462452922119704e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 216,
+    "status": "Optimal",
+    "objective": 0.9993752928767612,
+    "x": [
+      1.999375244110127,
+      4.00000019515996
+    ],
+    "constraint_multipliers": [
+      0.24988283997651362
+    ],
+    "bound_multipliers_lower": [
+      3.9244635774225466e-10,
+      2.802837907149005e-10
+    ],
+    "bound_multipliers_upper": [
+      2.4522916915495695e-10,
+      3.2699777154139405e-10
+    ],
+    "constraint_values": [
+      1.3322676295501878e-15
+    ],
+    "iterations": 11,
+    "solve_time": 0.000068875,
+    "known_fopt": 1.0,
+    "n": 2,
+    "m": 1,
+    "final_primal_inf": 1.3322676295501878e-15,
+    "final_dual_inf": 5.054968573297605e-14,
+    "final_compl": 9.100123456916536e-10,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 217,
+    "status": "Optimal",
+    "objective": -0.800000000081826,
+    "x": [
+      0.5999999999002892,
+      0.800000000081826
+    ],
+    "constraint_multipliers": [
+      -0.29999999800698474,
+      0.250000002462354
+    ],
+    "bound_multipliers_lower": [
+      4.890749503454311e-9,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      -2.6336288705408606e-10,
+      1.1268652677642876e-11
+    ],
+    "iterations": 10,
+    "solve_time": 0.000057542,
+    "known_fopt": -0.8,
+    "n": 2,
+    "m": 2,
+    "final_primal_inf": 1.1268652677642876e-11,
+    "final_dual_inf": 7.2351255388458874e-12,
+    "final_compl": 2.9344497504924213e-9,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 218,
+    "status": "Optimal",
+    "objective": -9.98999999493107e-9,
+    "x": [
+      -0.00008141955063470428,
+      -9.98999999493107e-9
+    ],
+    "constraint_multipliers": [
+      -5.063010607981119e-7
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.9999994936989394
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      -1.6619143220488245e-8
+    ],
+    "iterations": 19,
+    "solve_time": 0.00008,
+    "known_fopt": 0.0,
+    "n": 2,
+    "m": 1,
+    "final_primal_inf": 6.619143220488245e-9,
+    "final_dual_inf": 8.244560971211272e-11,
+    "final_compl": 1.0000000005916292e-11,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 219,
+    "status": "Optimal",
+    "objective": -1.0000000000202072,
+    "x": [
+      1.0000000000202072,
+      1.0000000000540512,
+      6.729142224787847e-23,
+      -4.820508679404071e-11
+    ],
+    "constraint_multipliers": [
+      -0.9999999998540187,
+      -0.9999999998540187
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      -6.570299859731676e-12,
+      -1.3636869413794527e-11
+    ],
+    "iterations": 53,
+    "solve_time": 0.0001615,
+    "known_fopt": -1.0,
+    "n": 4,
+    "m": 2,
+    "final_primal_inf": 1.3636869413794527e-11,
+    "final_dual_inf": 9.641017357400733e-11,
+    "final_compl": 0.0,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 220,
+    "status": "Optimal",
+    "objective": 0.9999999900779021,
+    "x": [
+      0.9999999900779021,
+      1.275314062150709e-8
+    ],
+    "constraint_multipliers": [
+      -0.006814752398258683
+    ],
+    "bound_multipliers_lower": [
+      1.0000000000005458,
+      0.006814752398258683
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      -1.2753140654631068e-8
+    ],
+    "iterations": 12,
+    "solve_time": 0.000072291,
+    "known_fopt": 1.0,
+    "n": 2,
+    "m": 1,
+    "final_primal_inf": 2.7531406546310675e-9,
+    "final_dual_inf": 5.45785638905727e-13,
+    "final_compl": 1.550570196183325e-10,
+    "final_mu": 7.79021933703967e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 221,
+    "status": "Optimal",
+    "objective": -1.0000000027091718,
+    "x": [
+      1.0000000027091718,
+      -2.7091718639707172e-9
+    ],
+    "constraint_multipliers": [
+      -0.9999999998272222
+    ],
+    "bound_multipliers_lower": [
+      7.290828094329047e-9,
+      1.00000000711805
+    ],
+    "bound_multipliers_upper": [
+      1.000000007290827,
+      7.290828094329046e-9
+    ],
+    "constraint_values": [
+      2.7091716647831277e-9
+    ],
+    "iterations": 18,
+    "solve_time": 0.000081208,
+    "known_fopt": -1.0,
+    "n": 2,
+    "m": 1,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 1.5543122344752192e-15,
+    "final_compl": 7.290828216576027e-9,
+    "final_mu": 7.290828186989434e-9,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 223,
+    "status": "NumericalError",
+    "objective": -0.0,
+    "x": [
+      0.0,
+      3.3
+    ],
+    "constraint_multipliers": [
+      0.36787944117144233,
+      0.0
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      2.718281828459045,
+      0.5817181715409547
+    ],
+    "iterations": 81,
+    "solve_time": 0.010683584,
+    "known_fopt": -0.834032445247956,
+    "n": 2,
+    "m": 2,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 0.0,
+    "final_compl": 1.0000000036787944,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 224,
+    "status": "Optimal",
+    "objective": -304.0000003950478,
+    "x": [
+      4.000000004468129,
+      4.000000007877115
+    ],
+    "constraint_multipliers": [
+      -1.5130612287670665e-10,
+      -1.2104489975451107e-9,
+      -3.0261224562598384e-10,
+      -31.999999980766777
+    ],
+    "bound_multipliers_lower": [
+      6.052244907089827e-10,
+      6.05224490237535e-10
+    ],
+    "bound_multipliers_upper": [
+      1.2104489519206499e-9,
+      1.210448954338674e-9
+    ],
+    "constraint_values": [
+      16.00000002809947,
+      1.9999999719005288,
+      8.000000012345243,
+      -1.2345243050049248e-8
+    ],
+    "iterations": 14,
+    "solve_time": 0.000071459,
+    "known_fopt": -304.0,
+    "n": 2,
+    "m": 4,
+    "final_primal_inf": 2.345243050049248e-9,
+    "final_dual_inf": 1.0464231706470716e-12,
+    "final_compl": 2.4208979717698076e-9,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 225,
+    "status": "Optimal",
+    "objective": 1.9999999596298288,
+    "x": [
+      0.9999999899082757,
+      0.9999999899066386
+    ],
+    "constraint_multipliers": [
+      -1.0000000101850848e-11,
+      -1.00000003037015e-11,
+      -1.0000001918387014e-11,
+      -2.0000000200278736,
+      -2.000000020082299
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      0.9999999798149144,
+      0.9999999596298288,
+      0.99999979816224,
+      -1.009008721020166e-8,
+      -1.0094998281751089e-8
+    ],
+    "iterations": 9,
+    "solve_time": 0.00006575,
+    "known_fopt": 2.0,
+    "n": 2,
+    "m": 5,
+    "final_primal_inf": 9.499828175108839e-11,
+    "final_dual_inf": 8.881784197001252e-16,
+    "final_compl": 0.0,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 226,
+    "status": "Optimal",
+    "objective": -0.5000000049876685,
+    "x": [
+      0.7071067847133617,
+      0.7071067847133617
+    ],
+    "constraint_multipliers": [
+      -1.2323355454591136e-11,
+      -0.5000000000246465
+    ],
+    "bound_multipliers_lower": [
+      1.742986831929602e-11,
+      1.742986831929602e-11
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      1.000000009975337,
+      -9.975337000867057e-9
+    ],
+    "iterations": 10,
+    "solve_time": 0.000059625,
+    "known_fopt": null,
+    "n": 2,
+    "m": 2,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 2.253412545087671e-15,
+    "final_compl": 1.2324778319533379e-11,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 227,
+    "status": "Optimal",
+    "objective": 0.9999999799163382,
+    "x": [
+      1.000000010041831,
+      1.0000000100475512
+    ],
+    "constraint_multipliers": [
+      -1.3333332881834636,
+      -0.6666666256706699
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      -1.0036110609235038e-8,
+      -1.0053271548571274e-8
+    ],
+    "iterations": 10,
+    "solve_time": 0.000067042,
+    "known_fopt": 1.0,
+    "n": 2,
+    "m": 2,
+    "final_primal_inf": 5.327154857127404e-11,
+    "final_dual_inf": 3.350287158809806e-9,
+    "final_compl": 0.0,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 228,
+    "status": "Optimal",
+    "objective": -3.0000000016667685,
+    "x": [
+      -2.729471182921065e-9,
+      -3.0000000016667685
+    ],
+    "constraint_multipliers": [
+      -6.371296157709607e-9,
+      -0.16666666763578863
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      4.00000000439624,
+      -1.0000611894156464e-8
+    ],
+    "iterations": 6,
+    "solve_time": 0.00006475,
+    "known_fopt": -3.0,
+    "n": 2,
+    "m": 2,
+    "final_primal_inf": 6.118941564634678e-13,
+    "final_dual_inf": 2.5300589367406438e-12,
+    "final_compl": 0.0,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 229,
+    "status": "Optimal",
+    "objective": -1.354472090042691e-14,
+    "x": [
+      0.99999999999924,
+      0.9999999999984474
+    ],
+    "constraint_multipliers": [],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [],
+    "iterations": 41,
+    "solve_time": 0.000022458,
+    "known_fopt": 0.0,
+    "n": 2,
+    "m": 0,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 0.0,
+    "final_compl": 0.0,
+    "final_mu": 0.0,
+    "final_s_d": 0.0
+  },
+  {
+    "number": 230,
+    "status": "Optimal",
+    "objective": 0.37499999,
+    "x": [
+      0.5,
+      0.37499999
+    ],
+    "constraint_multipliers": [
+      -0.5000000001813012,
+      -0.4999999998186987
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      -9.999999994736442e-9,
+      -9.99999993922529e-9
+    ],
+    "iterations": 2,
+    "solve_time": 0.000041,
+    "known_fopt": null,
+    "n": 2,
+    "m": 2,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 4.532531017176211e-10,
+    "final_compl": 0.0,
+    "final_mu": 0.005623413251903492,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 232,
+    "status": "Optimal",
+    "objective": -1.000000013534931,
+    "x": [
+      2.9999999963397186,
+      1.7320508153832728
+    ],
+    "constraint_multipliers": [
+      -0.8660254107966088,
+      -1.0447202576682535e-11,
+      -0.5000000048927448
+    ],
+    "bound_multipliers_lower": [
+      2.089714708314291e-11,
+      3.6185438565109654e-11
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      -9.92765936125295e-9,
+      6.000000009874654,
+      -9.87465398338827e-9
+    ],
+    "iterations": 13,
+    "solve_time": 0.000089958,
+    "known_fopt": -1.0,
+    "n": 2,
+    "m": 3,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 1.9642281748623387e-10,
+    "final_compl": 6.269144138191077e-11,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 234,
+    "status": "Optimal",
+    "objective": -0.5323737279300318,
+    "x": [
+      0.36647967455710256,
+      0.9304260626968587
+    ],
+    "constraint_multipliers": [
+      0.38553302536933104
+    ],
+    "bound_multipliers_lower": [
+      1.5411638990908233e-8,
+      3.4273557839548922e-9
+    ],
+    "bound_multipliers_upper": [
+      1.5321305787445639e-9,
+      2.344518616956654e-9
+    ],
+    "constraint_values": [
+      -1.0009058692972417e-8
+    ],
+    "iterations": 6,
+    "solve_time": 0.0000505,
+    "known_fopt": -0.8,
+    "n": 2,
+    "m": 1,
+    "final_primal_inf": 9.058692972416584e-12,
+    "final_dual_inf": 8.180277304510578e-11,
+    "final_compl": 2.565724797714345e-9,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 235,
+    "status": "Optimal",
+    "objective": 0.0399999999999312,
+    "x": [
+      -0.9999999999982794,
+      0.9999999999866361,
+      4.484748266960078e-13
+    ],
+    "constraint_multipliers": [
+      0.04000000002695978
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      1.7206236435642687e-12
+    ],
+    "iterations": 18,
+    "solve_time": 0.00007175,
+    "known_fopt": 0.04,
+    "n": 3,
+    "m": 1,
+    "final_primal_inf": 1.7206236435642687e-12,
+    "final_dual_inf": 1.9845236565174673e-11,
+    "final_compl": 0.0,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 240,
+    "status": "Optimal",
+    "objective": 1.2672261581470334e-26,
+    "x": [
+      1.4210854715202004e-14,
+      -2.842170943040401e-14,
+      4.973799150320701e-14
+    ],
+    "constraint_multipliers": [],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [],
+    "iterations": 3,
+    "solve_time": 0.000018167,
+    "known_fopt": 0.0,
+    "n": 3,
+    "m": 0,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 0.0,
+    "final_compl": 0.0,
+    "final_mu": 0.0,
+    "final_s_d": 0.0
+  },
+  {
+    "number": 248,
+    "status": "Optimal",
+    "objective": -0.8000000030984337,
+    "x": [
+      0.5999999958687557,
+      0.8000000030984337,
+      2.1238071008168667e-11
+    ],
+    "constraint_multipliers": [
+      -0.299999998708963,
+      0.25000000064555256
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      -1.032811169920933e-8,
+      7.771565682932698e-16
+    ],
+    "iterations": 12,
+    "solve_time": 0.000073625,
+    "known_fopt": -0.8,
+    "n": 3,
+    "m": 2,
+    "final_primal_inf": 3.2811169920933005e-10,
+    "final_dual_inf": 1.0619035531504915e-11,
+    "final_compl": 0.0,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 249,
+    "status": "Optimal",
+    "objective": 0.9999999873593135,
+    "x": [
+      0.9999999936796568,
+      3.108562704054703e-11,
+      0.0
+    ],
+    "constraint_multipliers": [
+      -0.23432365916347747
+    ],
+    "bound_multipliers_lower": [
+      1.531352668868914,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      -1.2640686497532727e-8
+    ],
+    "iterations": 6,
+    "solve_time": 0.00004825,
+    "known_fopt": 1.0,
+    "n": 3,
+    "m": 1,
+    "final_primal_inf": 2.6406864975327266e-9,
+    "final_dual_inf": 3.1254563381821754e-9,
+    "final_compl": 5.6348522634691926e-9,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 250,
+    "status": "Optimal",
+    "objective": -3300.000020893869,
+    "x": [
+      20.00000019994427,
+      11.000000109961684,
+      14.99999979506618
+    ],
+    "constraint_multipliers": [
+      -4.256513535203621e-11,
+      -110.00000220012811
+    ],
+    "bound_multipliers_lower": [
+      1.5323122519964942e-10,
+      2.786021358029239e-10,
+      2.0431878815341912e-10
+    ],
+    "bound_multipliers_upper": [
+      54.99999719516968,
+      79.99999450055991,
+      1.1350160684326869e-10
+    ],
+    "constraint_values": [
+      72.00000001000001,
+      -1.0000007932831068e-8
+    ],
+    "iterations": 15,
+    "solve_time": 0.000076791,
+    "known_fopt": -3300.0,
+    "n": 3,
+    "m": 2,
+    "final_primal_inf": 7.93283106738268e-15,
+    "final_dual_inf": 1.4595870681183882e-9,
+    "final_compl": 3.065281151352432e-9,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 251,
+    "status": "Optimal",
+    "objective": -3456.000001454391,
+    "x": [
+      24.000000003366786,
+      12.000000001683288,
+      12.000000001683288
+    ],
+    "constraint_multipliers": [
+      -144.00000004040024
+    ],
+    "bound_multipliers_lower": [
+      4.1666671344571927e-13,
+      8.333332806711353e-13,
+      8.333332806711353e-13
+    ],
+    "bound_multipliers_upper": [
+      5.555554591294897e-13,
+      3.333333369809919e-13,
+      3.333333369809919e-13
+    ],
+    "constraint_values": [
+      -1.0099938663188368e-8
+    ],
+    "iterations": 13,
+    "solve_time": 0.000064042,
+    "known_fopt": -3456.0,
+    "n": 3,
+    "m": 1,
+    "final_primal_inf": 9.993866318836787e-11,
+    "final_dual_inf": 1.4462873794823548e-12,
+    "final_compl": 1.0000001128266758e-11,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 252,
+    "status": "Optimal",
+    "objective": 0.040000005056095356,
+    "x": [
+      -1.0000001264023786,
+      1.0000002528047731,
+      0.00036419635923119504
+    ],
+    "constraint_multipliers": [
+      -1.5190341076188446e-13
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.04000000252825403,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      6.236609513163254e-9
+    ],
+    "iterations": 21,
+    "solve_time": 0.000074958,
+    "known_fopt": 0.04,
+    "n": 3,
+    "m": 1,
+    "final_primal_inf": 6.236609513163254e-9,
+    "final_dual_inf": 5.455358387251863e-14,
+    "final_compl": 5.4560954894335444e-9,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 254,
+    "status": "Optimal",
+    "objective": -1.7320508162508306,
+    "x": [
+      2.9582773987219208e-6,
+      1.7320508125237075,
+      0.9999999914179821
+    ],
+    "constraint_multipliers": [
+      0.28867513376900783,
+      -4.989206319632615e-6
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      1.011639759007255
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      -1.1102230246251565e-16,
+      -8.590769318139735e-9
+    ],
+    "iterations": 15,
+    "solve_time": 0.000075208,
+    "known_fopt": null,
+    "n": 3,
+    "m": 2,
+    "final_primal_inf": 8.590769318139735e-9,
+    "final_dual_inf": 2.951891258585948e-11,
+    "final_compl": 1.4344871469284085e-9,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 255,
+    "status": "Optimal",
+    "objective": -18850.17859372854,
+    "x": [
+      -10.00000009999997,
+      -10.000000099980712,
+      -10.000000099999966,
+      7.326732771267294
+    ],
+    "constraint_multipliers": [],
+    "bound_multipliers_lower": [
+      1978.0000197999973,
+      3.0693068514850133,
+      1778.0000177999968,
+      3.416650748495915e-12
+    ],
+    "bound_multipliers_upper": [
+      2.959999930832065e-12,
+      2.9599744791353434e-12,
+      2.9599999263783263e-12,
+      2.2146656356749593e-11
+    ],
+    "constraint_values": [],
+    "iterations": 13,
+    "solve_time": 0.00022525,
+    "known_fopt": 0.0,
+    "n": 4,
+    "m": 0,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 6.843420029185293e-14,
+    "final_compl": 1.0136636376584971e-11,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 256,
+    "status": "Optimal",
+    "objective": 6.609742922479067e-15,
+    "x": [
+      0.000017223938090302887,
+      -1.7223949372069695e-6,
+      0.00013146848748657756,
+      0.00013146848828611045
+    ],
+    "constraint_multipliers": [],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [],
+    "iterations": 54,
+    "solve_time": 0.000018375,
+    "known_fopt": 0.0,
+    "n": 4,
+    "m": 0,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 0.0,
+    "final_compl": 0.0,
+    "final_mu": 0.0,
+    "final_s_d": 0.0
+  },
+  {
+    "number": 257,
+    "status": "Optimal",
+    "objective": -6.750155989720952e-14,
+    "x": [
+      1.0000000000034799,
+      1.0000000000069664,
+      1.0000000000036628,
+      1.0000000000069518
+    ],
+    "constraint_multipliers": [],
+    "bound_multipliers_lower": [
+      1.4201557613108574e-10,
+      1.4201557613059062e-10,
+      1.4201557613105976e-10,
+      1.420155761305927e-10
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [],
+    "iterations": 15,
+    "solve_time": 0.000085209,
+    "known_fopt": 0.0,
+    "n": 4,
+    "m": 0,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 1.8058793233333958e-13,
+    "final_compl": 1.4201557755173571e-10,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 258,
+    "status": "Optimal",
+    "objective": -6.59472476627343e-14,
+    "x": [
+      0.9999999999864678,
+      0.9999999999745987,
+      1.0000000000132576,
+      1.0000000000256315
+    ],
+    "constraint_multipliers": [],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [],
+    "iterations": 31,
+    "solve_time": 0.0000225,
+    "known_fopt": 0.0,
+    "n": 4,
+    "m": 0,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 0.0,
+    "final_compl": 0.0,
+    "final_mu": 0.0,
+    "final_s_d": 0.0
+  },
+  {
+    "number": 259,
+    "status": "Optimal",
+    "objective": -2.3092638912203256e-14,
+    "x": [
+      1.0000000000004894,
+      1.0000000000052567,
+      0.9999999999985608,
+      1.0
+    ],
+    "constraint_multipliers": [],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [],
+    "iterations": 35,
+    "solve_time": 0.00003175,
+    "known_fopt": -8.544621,
+    "n": 4,
+    "m": 0,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 0.0,
+    "final_compl": 0.0,
+    "final_mu": 0.0,
+    "final_s_d": 0.0
+  },
+  {
+    "number": 262,
+    "status": "Optimal",
+    "objective": -10.000000012479308,
+    "x": [
+      -4.975121666786684e-9,
+      8.666666681630053,
+      -4.990649358136348e-9,
+      1.3333333358321404
+    ],
+    "constraint_multipliers": [
+      -0.9999999982612034,
+      -8.355339297424274e-10,
+      -2.3483482696243587e-9,
+      -7.384126649849754e-10
+    ],
+    "bound_multipliers_lower": [
+      0.5000000023866192,
+      2.8893123964287707e-10,
+      0.499999999532524,
+      1.8787913433888205e-9
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      -7.496421261521391e-9,
+      2.999999993506367,
+      1.0666666636490874,
+      0.0
+    ],
+    "iterations": 8,
+    "solve_time": 0.000081625,
+    "known_fopt": -10.0,
+    "n": 4,
+    "m": 4,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 2.5221319529530406e-14,
+    "final_compl": 2.5124391785991292e-9,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 263,
+    "status": "Acceptable",
+    "objective": -1.0000000442195522,
+    "x": [
+      1.0000000442195522,
+      1.00000009945648,
+      0.0005709236540127286,
+      -0.000037318919879610415
+    ],
+    "constraint_multipliers": [
+      -0.9999983745819054,
+      -0.9999996569150348,
+      -1.4485399114303002e-6,
+      -1.662067821034255e-7
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      -3.320218278091147e-8,
+      -1.101737345798881e-8,
+      -3.591560014921573e-7,
+      -1.2410075238969591e-8
+    ],
+    "iterations": 23,
+    "solve_time": 0.000154958,
+    "known_fopt": -1.0,
+    "n": 4,
+    "m": 4,
+    "final_primal_inf": 1.1971866716405244e-7,
+    "final_dual_inf": 1.6540113984341225e-9,
+    "final_compl": 0.0,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 264,
+    "status": "Optimal",
+    "objective": -44.000000030510385,
+    "x": [
+      1.0133251660104356e-9,
+      1.0000000015348585,
+      2.0000000017492123,
+      -0.9999999996198827
+    ],
+    "constraint_multipliers": [
+      -1.0000000083881764,
+      2.247327651026137e-9,
+      -1.9999999874528414
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      -1.0153893725828311e-8,
+      -1.0222372281987191e-8,
+      -1.0178240472669131e-8
+    ],
+    "iterations": 9,
+    "solve_time": 0.000058125,
+    "known_fopt": -44.0,
+    "n": 4,
+    "m": 3,
+    "final_primal_inf": 2.2237228198719074e-10,
+    "final_dual_inf": 2.298911283560301e-9,
+    "final_compl": 4.997433781315952e-19,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 270,
+    "status": "Optimal",
+    "objective": -2.440856405883096e-10,
+    "x": [
+      1.39313761971714,
+      2.166707684925434,
+      3.096875759151339,
+      3.9999999615539927,
+      -1.007972114713719e-23
+    ],
+    "constraint_multipliers": [
+      -5.65809196794553e-12
+    ],
+    "bound_multipliers_lower": [
+      2.5420791119963367e-11,
+      5.977897631168228e-11,
+      1.0217096799420639e-10,
+      0.006349145579023926,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      1.7739062205628002
+    ],
+    "iterations": 14,
+    "solve_time": 0.000105167,
+    "known_fopt": -1.0,
+    "n": 5,
+    "m": 1,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 2.5868421436884783e-9,
+    "final_compl": 9.993869566436918e-12,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 325,
+    "status": "Optimal",
+    "objective": 3.79134143260653,
+    "x": [
+      -2.3722813205866218,
+      -1.8363772313976763
+    ],
+    "constraint_multipliers": [
+      -1.9198801151961832e-12,
+      -1.050800525161915,
+      -0.7785253131563689
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      5.208658551984298,
+      -1.5409173048652747e-8,
+      8.881784197001252e-16
+    ],
+    "iterations": 19,
+    "solve_time": 0.000081625,
+    "known_fopt": 3.7913414,
+    "n": 2,
+    "m": 3,
+    "final_primal_inf": 5.4091730486527465e-9,
+    "final_dual_inf": 4.440892098500626e-16,
+    "final_compl": 0.0,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 335,
+    "status": "Optimal",
+    "objective": -0.004472136971394368,
+    "x": [
+      2.0327886088797454e-6,
+      0.00447213493860576,
+      0.0020000032231381757
+    ],
+    "constraint_multipliers": [
+      0.22360684856966243,
+      0.22360684856966243
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      1.1874182193061245e-15,
+      4.666406150377611e-16
+    ],
+    "iterations": 23,
+    "solve_time": 0.000076542,
+    "known_fopt": null,
+    "n": 3,
+    "m": 2,
+    "final_primal_inf": 5.937091096530623e-17,
+    "final_dual_inf": 2.0779760561990407e-13,
+    "final_compl": 0.0,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 338,
+    "status": "Optimal",
+    "objective": -7.205698449400351,
+    "x": [
+      0.36689438172220223,
+      2.2437201815624577,
+      -1.427167372423559
+    ],
+    "constraint_multipliers": [
+      -1.4403878680293756,
+      1.9814730958584121
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      0.0,
+      6.888933867799096e-13
+    ],
+    "iterations": 33,
+    "solve_time": 0.000112667,
+    "known_fopt": -10.992806,
+    "n": 3,
+    "m": 2,
+    "final_primal_inf": 6.888933867799096e-13,
+    "final_dual_inf": 4.650791973759283e-9,
+    "final_compl": 0.0,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 339,
+    "status": "Optimal",
+    "objective": 3.361679688379566,
+    "x": [
+      2.3797627196094604,
+      0.3162277671481213,
+      1.942935923279671
+    ],
+    "constraint_multipliers": [
+      -0.18176246508944466
+    ],
+    "bound_multipliers_lower": [
+      3.9906444880350045e-10,
+      3.1021871648156844e-9,
+      4.894184198961286e-10
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      -4.786334883988275e-9
+    ],
+    "iterations": 12,
+    "solve_time": 0.00008375,
+    "known_fopt": 3.3616797,
+    "n": 3,
+    "m": 1,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 1.4930603308694175e-11,
+    "final_compl": 9.499758797789396e-10,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 344,
+    "status": "Optimal",
+    "objective": 0.03256820025513374,
+    "x": [
+      1.1048590197310117,
+      1.1966741822841296,
+      1.5352622603268773
+    ],
+    "constraint_multipliers": [
+      -0.010726727888086983
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      5.928590951498336e-12
+    ],
+    "iterations": 7,
+    "solve_time": 0.000060084,
+    "known_fopt": null,
+    "n": 3,
+    "m": 1,
+    "final_primal_inf": 5.928590951498336e-12,
+    "final_dual_inf": 1.1152773149447626e-11,
+    "final_compl": 0.0,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 354,
+    "status": "Optimal",
+    "objective": 0.11378384788660977,
+    "x": [
+      0.5033179323359902,
+      -0.04556116723971491,
+      0.2358189837187236,
+      0.30642424842795324
+    ],
+    "constraint_multipliers": [
+      -0.4007325836081544
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      1.237856012836574e-10,
+      1.205035365227919e-10,
+      1.221754546995094e-10,
+      1.2259242748527114e-10
+    ],
+    "constraint_values": [
+      -2.7570479232963407e-9
+    ],
+    "iterations": 10,
+    "solve_time": 0.000072542,
+    "known_fopt": 0.11378385,
+    "n": 4,
+    "m": 1,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 5.576753965256527e-10,
+    "final_compl": 7.792132375280765e-10,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 374,
+    "status": "NumericalError",
+    "objective": -7971609999.900003,
+    "x": [
+      0.1,
+      0.1,
+      0.1,
+      0.1,
+      0.1,
+      0.1,
+      0.1,
+      0.1,
+      0.1,
+      -7971609999.900003
+    ],
+    "constraint_multipliers": [
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001,
+      -0.001
+    ],
+    "bound_multipliers_lower": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bound_multipliers_upper": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "constraint_values": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "iterations": 81,
+    "solve_time": 0.109508792,
+    "known_fopt": 0.233264,
+    "n": 10,
+    "m": 35,
+    "final_primal_inf": 0.0,
+    "final_dual_inf": 1.0,
+    "final_compl": 0.0,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  },
+  {
+    "number": 376,
+    "status": "Optimal",
+    "objective": -1614.9593596910627,
+    "x": [
+      0.20916468719635262,
+      0.0006141816079033542,
+      0.008100009999989999,
+      442.67736310381883,
+      0.0016734286578573081,
+      0.001272119453132552,
+      0.0025054842481577397,
+      0.001405031371700877,
+      0.1524298952967108,
+      0.10257010470328921
+    ],
+    "constraint_multipliers": [
+      -18607.53784586606,
+      -2.945261436951593e-7,
+      -2.2557319157303379e-7,
+      -6.54961528984817e-8,
+      -1.2206767906402662e-7,
+      -1.635192487264831e-10,
+      -1.68728578711722e-10,
+      -1.638445355259307e-10,
+      -1.3381672529696773e-9,
+      -1.7485761429638174e-10,
+      -2.387583468045132e-10,
+      -151.96527411588812,
+      -1.654270400703252e-10,
+      -1.133698809747887e-10,
+      -3.9219242853405077e-7
+    ],
+    "bound_multipliers_lower": [
+      4.780921948824807e-9,
+      1.628157089006393e-6,
+      1.2422329096609487e-7,
+      2.3111910257818486e-12,
+      1.4849497939662067e-6,
+      3.674950294145277e-6,
+      6.64233663431112e-7,
+      2.4688833986958125e-6,
+      6.603696237983793e-9,
+      9.845458308337357e-9
+    ],
+    "bound_multipliers_upper": [
+      1.02136330137075e-10,
+      1.0061796672437952e-8,
+      201647.91862602555,
+      1.794292723220211e-12,
+      0.0000375987961501043,
+      0.00003583264011904443,
+      5.140709147207056e-6,
+      1.6807327322933423e-6,
+      1.1798440052354308e-9,
+      1.114292608331143e-9
+    ],
+    "constraint_values": [
+      -1.3776373902762984e-8,
+      0.0033977302636597484,
+      0.004434763221887433,
+      0.015268068698228499,
+      0.008192167572938391,
+      6.1154894766006365,
+      5.926674314884023,
+      6.103348248758864,
+      0.7472916138974623,
+      5.718940391090243,
+      4.188336681095044,
+      -1.2048349669058211e-6,
+      6.044962544464286,
+      8.820656807104132,
+      0.0
+    ],
+    "iterations": 65,
+    "solve_time": 0.00085825,
+    "known_fopt": -4430.0879,
+    "n": 10,
+    "m": 15,
+    "final_primal_inf": 2.051571890137054e-9,
+    "final_dual_inf": 8.447159416391514e-9,
+    "final_compl": 2.016616476028794e-11,
+    "final_mu": 1e-11,
+    "final_s_d": 1.0
+  }
+]
