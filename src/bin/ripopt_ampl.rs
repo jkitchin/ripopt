@@ -451,6 +451,12 @@ fn apply_option(opts: &mut SolverOptions, key: &str, value: &str) {
                 opts.user_obj_scaling = Some(v);
             }
         }
+        "kkt_dump_dir" => {
+            opts.kkt_dump_dir = Some(std::path::PathBuf::from(value));
+        }
+        "kkt_dump_name" => {
+            opts.kkt_dump_name = value.to_string();
+        }
         _ => {
             eprintln!("Warning: unknown option '{}'", key);
         }
