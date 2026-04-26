@@ -5801,7 +5801,6 @@ impl IterateAveragingState {
 /// only a bundle of mutable references.
 struct ConvergenceWorkspace<'a> {
     avg: &'a mut IterateAveragingState,
-    tried_active_set: &'a mut bool,
 }
 
 /// Check convergence status and, on Acceptable, try three promotion
@@ -5951,8 +5950,8 @@ fn try_iterate_averaging_promotion<P: NlpProblem>(
 }
 
 /// Handle the `ConvergenceStatus::Acceptable` branch: try the
-/// promotion strategies (iterate averaging, active set) and, if none
-/// succeed, return `SolveStatus::Acceptable`.
+/// iterate-averaging promotion and, if it does not succeed, return
+/// `SolveStatus::Acceptable`.
 ///
 /// Previously inlined in `check_convergence_and_handle_promotions`.
 #[allow(clippy::too_many_arguments)]
@@ -5975,17 +5974,6 @@ fn handle_acceptable_status_with_promotions<P: NlpProblem>(
         linear_constraints, lbfgs_mode,
     ) {
         return result;
-    }
-
-    // Strategy 3: Try active set identification + reduced solve
-    if !*ws.tried_active_set {
-        *ws.tried_active_set = true;
-        if let Some(result) = try_active_set_solve(state, problem, options, linear_constraints, lbfgs_mode) {
-            if options.print_level >= 3 {
-                rip_log!("ripopt: Active set solve promoted Acceptable -> Optimal");
-            }
-            return result;
-        }
     }
 
     if options.print_level >= 5 {
@@ -7770,9 +7758,6 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
     // Strategy 2: Damped multiplier updates when oscillation detected
     let mut dy_tracker = DyOscillationTracker::new(m);
 
-    // Strategy 3: Active set reduced KKT solve
-    let mut tried_active_set: bool = false;
-
     // Initial evaluation with NaN/Inf recovery by bound-push perturbation.
     if let Err(result) = initial_evaluate_with_recovery(
         &mut state, problem, &mut lbfgs_state, linear_constraints.as_deref(), lbfgs_mode, n, options,
@@ -7897,7 +7882,6 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
 
         let mut conv_ws = ConvergenceWorkspace {
             avg: &mut avg_state,
-            tried_active_set: &mut tried_active_set,
         };
         if let Some(result) = check_convergence_and_handle_promotions(
             &mut state,
@@ -10501,320 +10485,6 @@ fn compute_barrier_error(state: &SolverState) -> f64 {
     dual_err.max(compl_err).max(primal_err).max(du_floor)
 }
 
-/// Strategy 3: Try active set identification + reduced KKT solve.
-///
-/// At near-optimal points, identify variables at their bounds (active set),
-/// fix them, solve the reduced KKT system for free variables, and check
-/// if the result meets strict convergence tolerances.
-/// Identification of the working active set for `try_active_set_solve`.
-struct ActiveSet {
-    active_lower: Vec<bool>,
-    active_upper: Vec<bool>,
-    /// `free_idx[k]` is the original variable index of the k-th free variable.
-    free_idx: Vec<usize>,
-    /// `orig_to_free[i]` is the reduced-system index of variable `i`, or
-    /// `usize::MAX` when `i` is fixed at a bound.
-    orig_to_free: Vec<usize>,
-    n_free: usize,
-    /// Reduced KKT dimension: `n_free + m`.
-    dim: usize,
-}
-
-/// Identify the working active set: a variable is "active at lower bound"
-/// if x_i is close to x_l_i (relative tol 1e-6) and z_l_i > 1e-8. Returns
-/// `None` when the reduced system is too large for dense solve (dim > 500),
-/// when no bounds are active (dim == n + m), or when dim == 0.
-fn identify_active_bounds(state: &SolverState, n: usize, m: usize) -> Option<ActiveSet> {
-    let tol_bound = 1e-6;
-    let mut is_free = vec![true; n];
-    let mut active_lower = vec![false; n];
-    let mut active_upper = vec![false; n];
-    let mut n_free = 0usize;
-
-    for i in 0..n {
-        let at_lower = state.x_l[i].is_finite()
-            && (state.x[i] - state.x_l[i]).abs() < tol_bound * (1.0 + state.x_l[i].abs());
-        let at_upper = state.x_u[i].is_finite()
-            && (state.x_u[i] - state.x[i]).abs() < tol_bound * (1.0 + state.x_u[i].abs());
-
-        if at_lower && state.z_l[i] > 1e-8 {
-            is_free[i] = false;
-            active_lower[i] = true;
-        } else if at_upper && state.z_u[i] > 1e-8 {
-            is_free[i] = false;
-            active_upper[i] = true;
-        } else {
-            n_free += 1;
-        }
-    }
-
-    if n_free == n {
-        return None;
-    }
-    let dim = n_free + m;
-    if dim > 500 || dim == 0 {
-        return None;
-    }
-
-    let mut free_idx = Vec::with_capacity(n_free);
-    let mut orig_to_free = vec![usize::MAX; n];
-    for i in 0..n {
-        if is_free[i] {
-            orig_to_free[i] = free_idx.len();
-            free_idx.push(i);
-        }
-    }
-    Some(ActiveSet { active_lower, active_upper, free_idx, orig_to_free, n_free, dim })
-}
-
-/// Build the reduced dense KKT system for the working active set:
-///   [ H_ff   J_f^T ] [ dx_f ]   [ -grad_f_f       ]
-///   [ J_f    0     ] [ dy   ] = [ g_target - g(x) ]
-/// where H_ff is the Hessian restricted to free-free pairs, J_f is the
-/// Jacobian columns for free variables, and the constraint target picks
-/// either g_l or g_u depending on which side is active (or 0 for inactive
-/// inequalities). Returns the dense `dim*dim` KKT (row-major) and the
-/// length-`dim` RHS.
-fn build_reduced_kkt_dense(
-    state: &SolverState,
-    orig_to_free: &[usize],
-    free_idx: &[usize],
-    n_free: usize,
-    m: usize,
-    dim: usize,
-) -> (Vec<f64>, Vec<f64>) {
-    let mut kkt = vec![0.0; dim * dim];
-    let mut rhs = vec![0.0; dim];
-
-    // H_ff (top-left n_free x n_free)
-    for (idx, (&row, &col)) in state.hess_rows.iter().zip(state.hess_cols.iter()).enumerate() {
-        let fr = orig_to_free[row];
-        let fc = orig_to_free[col];
-        if fr != usize::MAX && fc != usize::MAX {
-            kkt[fr * dim + fc] += state.hess_vals[idx];
-            if fr != fc {
-                kkt[fc * dim + fr] += state.hess_vals[idx];
-            }
-        }
-    }
-
-    // J_f (bottom-left m x n_free) and J_f^T (top-right n_free x m)
-    for (idx, (&row, &col)) in state.jac_rows.iter().zip(state.jac_cols.iter()).enumerate() {
-        let fc = orig_to_free[col];
-        if fc != usize::MAX {
-            let r = n_free + row;
-            kkt[r * dim + fc] += state.jac_vals[idx];
-            kkt[fc * dim + r] += state.jac_vals[idx];
-        }
-    }
-
-    // RHS top: -grad_f for free variables
-    for k in 0..n_free {
-        rhs[k] = -state.grad_f[free_idx[k]];
-    }
-
-    // RHS bottom: g_target - g, picking the active side per constraint
-    for i in 0..m {
-        if (state.g_l[i] - state.g_u[i]).abs() < 1e-20 {
-            rhs[n_free + i] = state.g_l[i] - state.g[i];
-        } else if state.g[i] <= state.g_l[i] + 1e-10 {
-            rhs[n_free + i] = state.g_l[i] - state.g[i];
-        } else if state.g[i] >= state.g_u[i] - 1e-10 {
-            rhs[n_free + i] = state.g_u[i] - state.g[i];
-        } else {
-            rhs[n_free + i] = 0.0;
-        }
-    }
-
-    (kkt, rhs)
-}
-
-/// Recover bound multipliers `z_L`, `z_U` from primal stationarity at
-/// a candidate iterate where `(x, y)` have already been set. Computes
-/// `g = ∇f + J^T·y`; for each variable `i`, when its lower bound is
-/// finite and `g[i] > 0` set `z_L[i] = g[i]`; when its upper bound is
-/// finite and `g[i] < 0` set `z_U[i] = -g[i]`; both `z` components
-/// are zero otherwise. Used by the active-set promotion path where
-/// `z` is not produced by the reduced KKT solve.
-fn recover_z_from_stationarity(state: &mut SolverState, n: usize) {
-    let mut grad_jty = state.grad_f.clone();
-    accumulate_jt_y(state, &mut grad_jty);
-    for i in 0..n {
-        state.z_l[i] = 0.0;
-        state.z_u[i] = 0.0;
-        if state.x_l[i].is_finite() && grad_jty[i] > 0.0 {
-            state.z_l[i] = grad_jty[i];
-        } else if state.x_u[i].is_finite() && grad_jty[i] < 0.0 {
-            state.z_u[i] = -grad_jty[i];
-        }
-    }
-}
-
-/// Snap variables flagged active to their bound: `state.x[i] = x_l[i]`
-/// when `active_lower[i]`, `state.x[i] = x_u[i]` when `active_upper[i]`.
-/// Used by the active-set promotion path after `identify_active_bounds`
-/// has classified each variable.
-fn snap_active_variables_to_bounds(
-    state: &mut SolverState,
-    active_lower: &[bool],
-    active_upper: &[bool],
-    n: usize,
-) {
-    for i in 0..n {
-        if active_lower[i] {
-            state.x[i] = state.x_l[i];
-        } else if active_upper[i] {
-            state.x[i] = state.x_u[i];
-        }
-    }
-}
-
-/// Apply the full Newton step from the reduced active-set KKT solve
-/// to the free variables, clamping each result back to its finite
-/// bounds. Mutates `state.x[free_idx[k]]` in place.
-fn apply_active_set_step_with_clamping(
-    state: &mut SolverState,
-    free_idx: &[usize],
-    sol: &[f64],
-    n_free: usize,
-) {
-    for k in 0..n_free {
-        let i = free_idx[k];
-        state.x[i] += sol[k];
-        if state.x_l[i].is_finite() {
-            state.x[i] = state.x[i].max(state.x_l[i]);
-        }
-        if state.x_u[i].is_finite() {
-            state.x[i] = state.x[i].min(state.x_u[i]);
-        }
-    }
-}
-
-fn try_active_set_solve<P: NlpProblem>(
-    state: &mut SolverState,
-    problem: &P,
-    options: &SolverOptions,
-    linear_constraints: Option<&[bool]>,
-    lbfgs_mode: bool,
-) -> Option<SolveResult> {
-    let n = state.n;
-    let m = state.m;
-
-    let active_set = match identify_active_bounds(state, n, m) {
-        Some(set) => set,
-        None => return None,
-    };
-    let ActiveSet { active_lower, active_upper, free_idx, orig_to_free, n_free, dim } = active_set;
-
-    // Fix active variables at their bounds (save full state for restoration)
-    let saved = SavedIterate::snapshot(state);
-    snap_active_variables_to_bounds(state, &active_lower, &active_upper, n);
-
-    // Re-evaluate at the snapped point
-    let _ = state.evaluate_with_linear(problem, 1.0, linear_constraints, lbfgs_mode);
-
-    let (mut kkt, mut rhs) = build_reduced_kkt_dense(
-        state, &orig_to_free, &free_idx, n_free, m, dim,
-    );
-    let solution = dense_symmetric_solve(dim, &mut kkt, &mut rhs);
-    if solution.is_none() {
-        // Singular system, restore and bail
-        saved.restore_and_reeval(state, problem, linear_constraints, lbfgs_mode);
-        return None;
-    }
-    let sol = solution.unwrap();
-
-    apply_active_set_step_with_clamping(state, &free_idx, &sol, n_free);
-
-    // Update y from the solve
-    state.y.copy_from_slice(&sol[n_free..n_free + m]);
-
-    // Re-evaluate at the new point
-    let _ = state.evaluate_with_linear(problem, 1.0, linear_constraints, lbfgs_mode);
-
-    recover_z_from_stationarity(state, n);
-
-    // Check strict convergence (use max-norm for primal infeasibility,
-    // mu=0 at the solution).
-    let conv_info = compute_convergence_info_from_state(state, 0.0, n, m);
-
-    if let ConvergenceStatus::Converged = check_convergence(&conv_info, options, 0) {
-        return Some(make_result(state, SolveStatus::Optimal));
-    }
-
-    // Didn't converge; restore original state and re-evaluate
-    saved.restore_and_reeval(state, problem, linear_constraints, lbfgs_mode);
-
-    None
-}
-
-/// Dense symmetric indefinite solve using diagonal pivoting (LDL^T).
-/// Solves A*x = b in-place. Returns Some(x) on success, None if singular.
-/// `a` is row-major dim x dim, `b` is length dim.
-fn dense_symmetric_solve(dim: usize, a: &mut [f64], b: &mut [f64]) -> Option<Vec<f64>> {
-    // Gaussian elimination with partial pivoting for symmetric indefinite systems.
-    // Simple but sufficient for small systems (dim < 500).
-    let mut piv = vec![0usize; dim];
-    for i in 0..dim {
-        piv[i] = i;
-    }
-
-    for k in 0..dim {
-        // Find pivot: largest diagonal element in remaining submatrix
-        let mut max_val = a[k * dim + k].abs();
-        let mut max_idx = k;
-        for i in (k + 1)..dim {
-            if a[i * dim + i].abs() > max_val {
-                max_val = a[i * dim + i].abs();
-                max_idx = i;
-            }
-        }
-
-        if max_val < 1e-15 {
-            return None; // Singular
-        }
-
-        // Swap rows/cols k and max_idx
-        if max_idx != k {
-            piv.swap(k, max_idx);
-            // Swap rows
-            for j in 0..dim {
-                let tmp = a[k * dim + j];
-                a[k * dim + j] = a[max_idx * dim + j];
-                a[max_idx * dim + j] = tmp;
-            }
-            // Swap cols
-            for i in 0..dim {
-                let tmp = a[i * dim + k];
-                a[i * dim + k] = a[i * dim + max_idx];
-                a[i * dim + max_idx] = tmp;
-            }
-            b.swap(k, max_idx);
-        }
-
-        let pivot = a[k * dim + k];
-        // Eliminate below
-        for i in (k + 1)..dim {
-            let factor = a[i * dim + k] / pivot;
-            a[i * dim + k] = factor;
-            for j in (k + 1)..dim {
-                a[i * dim + j] -= factor * a[k * dim + j];
-            }
-            b[i] -= factor * b[k];
-        }
-    }
-
-    // Back substitution
-    let mut x = b.to_vec();
-    for k in (0..dim).rev() {
-        for j in (k + 1)..dim {
-            x[k] -= a[k * dim + j] * x[j];
-        }
-        x[k] /= a[k * dim + k];
-    }
-
-    Some(x)
-}
 
 /// Compute a steepest-descent fallback direction when KKT solve fails.
 ///
