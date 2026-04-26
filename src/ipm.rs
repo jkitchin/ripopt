@@ -9517,12 +9517,18 @@ fn compl_err_with_z(state: &SolverState, z_l: &[f64], z_u: &[f64]) -> f64 {
     )
 }
 
-/// `convergence::complementarity_error` at the current iterate using
-/// `state.{x, x_l, x_u, z_l, z_u}` with `μ = 0` (i.e. the
-/// optimality complementarity rather than the centered-path one).
+/// Full complementarity error at the current iterate including both
+/// variable-bound blocks `(x − x_L)·z_L`, `(x_U − x)·z_U` and the
+/// constraint-slack blocks `(g − g_L)·max(y, 0)`, `(g_U − g)·max(−y, 0)`,
+/// each compared against `μ = 0`. Mirrors Ipopt's `curr_complementarity`,
+/// which sums Asum() over all four projection blocks z_L / z_U / v_L / v_U
+/// (`IpIpoptCalculatedQuantities.cpp:2467-2497`). Without the v_L / v_U
+/// terms the convergence test cannot detect a stalled inequality
+/// constraint where `y` and slack are both nonzero.
 fn compute_compl_err_at_state(state: &SolverState) -> f64 {
-    convergence::complementarity_error(
-        &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u, 0.0,
+    convergence::complementarity_error_full(
+        &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u,
+        &state.g, &state.g_l, &state.g_u, &state.y, 0.0,
     )
 }
 
@@ -10546,6 +10552,40 @@ mod tests {
         state.g_u[1] = 5.0;
         let count = compute_bound_multiplier_count(&state);
         assert_eq!(count, 3, "expected 3 finite bounds, got {}", count);
+    }
+
+    #[test]
+    fn test_compl_err_includes_constraint_slack() {
+        // T0.3: inequality constraint with slack > 0 and y > 0 must contribute
+        // to compl error. No variable bounds.
+        // g = 3.0, g_l = 1.0, g_u = +inf, y = 0.5; slack = 2.0.
+        // Variable-bound block: 0.0.
+        // Constraint-slack block: |2.0 * max(0.5, 0) - 0.0| = 1.0.
+        let mut state = minimal_state(1, 1);
+        state.x = vec![0.0];
+        state.g = vec![3.0];
+        state.g_l = vec![1.0];
+        state.g_u = vec![f64::INFINITY];
+        state.y = vec![0.5];
+        let err = compute_compl_err_at_state(&state);
+        assert!((err - 1.0).abs() < 1e-12,
+            "expected slack*max(y,0) = 1.0, got {}", err);
+    }
+
+    #[test]
+    fn test_compl_err_constraint_upper_block() {
+        // T0.3: upper-bound side: y < 0, slack from g_u.
+        // g = 1.0, g_l = -inf, g_u = 4.0, y = -0.25; slack = 3.0.
+        // Constraint-slack block: |3.0 * max(0.25, 0) - 0.0| = 0.75.
+        let mut state = minimal_state(1, 1);
+        state.x = vec![0.0];
+        state.g = vec![1.0];
+        state.g_l = vec![f64::NEG_INFINITY];
+        state.g_u = vec![4.0];
+        state.y = vec![-0.25];
+        let err = compute_compl_err_at_state(&state);
+        assert!((err - 0.75).abs() < 1e-12,
+            "expected slack*max(-y,0) = 0.75, got {}", err);
     }
 
     #[test]
