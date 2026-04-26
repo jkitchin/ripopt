@@ -46,6 +46,11 @@ pub struct ConvergenceInfo {
     pub bound_multiplier_sum: f64,
     /// Total number of bound-multiplier components (2n) — denominator for s_c.
     pub bound_multiplier_count: usize,
+    /// `‖x‖_∞` of the current iterate, used by the divergence gate
+    /// against `options.diverging_iterates_tol` (Ipopt
+    /// `IpOptErrorConvCheck.cpp:255`). Default `0.0` when an upstream
+    /// caller cannot supply x; that value never triggers divergence.
+    pub x_max_abs: f64,
 }
 
 /// Test whether the iterate meets Ipopt's acceptable-level thresholds,
@@ -152,9 +157,10 @@ pub fn check_convergence_with_last_obj(
         return ConvergenceStatus::Acceptable;
     }
 
-    // Check divergence (use 1e50 — constrained problems can have large feasible objectives,
-    // and transient excursions to large |obj| can occur during interior point iterations)
-    if info.objective.abs() > 1e50 {
+    // Divergence gate: ‖x‖_∞ > diverging_iterates_tol (Ipopt 3.14
+    // IpOptErrorConvCheck.cpp:255). Earlier ripopt tested |f| > 1e50,
+    // which fired on legitimate large-objective constrained problems.
+    if info.x_max_abs > options.diverging_iterates_tol {
         return ConvergenceStatus::Diverging;
     }
 
@@ -382,6 +388,7 @@ mod tests {
             multiplier_count: 0,
             bound_multiplier_sum: 0.0,
             bound_multiplier_count: 0,
+            x_max_abs: 0.0,
         };
         let opts = SolverOptions::default();
         assert_eq!(
@@ -403,6 +410,7 @@ mod tests {
             multiplier_count: 0,
             bound_multiplier_sum: 0.0,
             bound_multiplier_count: 0,
+            x_max_abs: 0.0,
         };
         let opts = SolverOptions::default();
         assert_eq!(
@@ -413,23 +421,40 @@ mod tests {
 
     #[test]
     fn test_convergence_diverging() {
+        // T0.6: divergence is gated by ‖x‖_∞ > diverging_iterates_tol,
+        // not |f| (Ipopt IpOptErrorConvCheck.cpp:255).
         let info = ConvergenceInfo {
             primal_inf: 1e-3,
             dual_inf: 1e-3,
             dual_inf_unscaled: 1e-3,
             compl_inf: 1e-3,
             mu: 1e-11,
-            objective: 1e51,
+            objective: 1.0,
             multiplier_sum: 0.0,
             multiplier_count: 0,
             bound_multiplier_sum: 0.0,
             bound_multiplier_count: 0,
+            x_max_abs: 1e25,
         };
         let opts = SolverOptions::default();
         assert_eq!(
             check_convergence(&info, &opts, 0),
             ConvergenceStatus::Diverging
         );
+    }
+
+    #[test]
+    fn test_convergence_diverging_uses_x_not_obj() {
+        // T0.6: |f| huge but ‖x‖_∞ small ⇒ NOT diverging.
+        let info = ConvergenceInfo {
+            primal_inf: 1e-3, dual_inf: 1e-3, dual_inf_unscaled: 1e-3,
+            compl_inf: 1e-3, mu: 1e-11, objective: 1e60,
+            multiplier_sum: 0.0, multiplier_count: 0,
+            bound_multiplier_sum: 0.0, bound_multiplier_count: 0,
+            x_max_abs: 1e15,
+        };
+        let opts = SolverOptions::default();
+        assert_ne!(check_convergence(&info, &opts, 0), ConvergenceStatus::Diverging);
     }
 
     #[test]
@@ -441,6 +466,7 @@ mod tests {
             compl_inf: 1e-7, mu: 0.0, objective: 10.001,
             multiplier_sum: 0.0, multiplier_count: 0,
             bound_multiplier_sum: 0.0, bound_multiplier_count: 0,
+            x_max_abs: 0.0,
         };
         let mut opts = SolverOptions::default();
         opts.acceptable_obj_change_tol = 1e-2;
@@ -457,6 +483,7 @@ mod tests {
             compl_inf: 1e-7, mu: 0.0, objective: 11.0,
             multiplier_sum: 0.0, multiplier_count: 0,
             bound_multiplier_sum: 0.0, bound_multiplier_count: 0,
+            x_max_abs: 0.0,
         };
         let mut opts = SolverOptions::default();
         opts.acceptable_obj_change_tol = 1e-2;
@@ -472,6 +499,7 @@ mod tests {
             compl_inf: 1e-7, mu: 0.0, objective: 11.0,
             multiplier_sum: 0.0, multiplier_count: 0,
             bound_multiplier_sum: 0.0, bound_multiplier_count: 0,
+            x_max_abs: 0.0,
         };
         let mut opts = SolverOptions::default();
         opts.acceptable_obj_change_tol = 1e-12; // would block any change
@@ -492,6 +520,7 @@ mod tests {
             multiplier_count: 0,
             bound_multiplier_sum: 0.0,
             bound_multiplier_count: 0,
+            x_max_abs: 0.0,
         };
         let opts = SolverOptions::default();
         // Need enough consecutive near-tolerance iterations (hardcoded NEAR_TOL_ITERS=15).
@@ -514,6 +543,7 @@ mod tests {
             multiplier_count: 0,
             bound_multiplier_sum: 0.0,
             bound_multiplier_count: 0,
+            x_max_abs: 0.0,
         };
         let opts = SolverOptions::default();
         // Not enough consecutive iterations (14 < 15)
@@ -540,6 +570,7 @@ mod tests {
             // arithmetic check below valid.
             bound_multiplier_sum: 1e6,
             bound_multiplier_count: 10,
+            x_max_abs: 0.0,
         };
         let opts = SolverOptions::default();
         // s_d = max(100, 1e6/10)/100 = 1e5/100 = 1000
@@ -576,6 +607,7 @@ mod tests {
             multiplier_count: 0,
             bound_multiplier_sum: 0.0,
             bound_multiplier_count: 0,
+            x_max_abs: 0.0,
         };
         let opts = SolverOptions::default();
         assert_eq!(

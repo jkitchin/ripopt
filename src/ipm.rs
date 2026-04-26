@@ -5866,6 +5866,7 @@ fn check_convergence_and_handle_promotions<P: NlpProblem>(
         multiplier_count,
         bound_multiplier_sum,
         bound_multiplier_count,
+        x_max_abs: linf_norm(&state.x),
     };
 
     // Track iterate history for oscillation detection (Strategy 1)
@@ -9954,6 +9955,7 @@ fn compute_convergence_info_from_state(
         multiplier_count: compute_multiplier_count(state),
         bound_multiplier_sum: compute_bound_multiplier_sum(state),
         bound_multiplier_count: compute_bound_multiplier_count(state),
+        x_max_abs: linf_norm(&state.x),
     }
 }
 
