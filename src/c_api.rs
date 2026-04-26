@@ -561,9 +561,6 @@ pub unsafe extern "C" fn ripopt_add_str_option(
         "detect_linear_constraints" => {
             p.options.detect_linear_constraints = value == "yes";
         }
-        "enable_sqp_fallback" => {
-            p.options.enable_sqp_fallback = value == "yes";
-        }
         "hessian_approximation" => {
             match value {
                 "limited-memory" => p.options.hessian_approximation_lbfgs = true,

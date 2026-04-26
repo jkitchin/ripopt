@@ -1730,7 +1730,6 @@ fn intermediate_callback_early_stop() {
         print_level: 0,
         enable_preprocessing: false,
         enable_lbfgs_fallback: false,
-        enable_sqp_fallback: false,
         enable_slack_fallback: false,
         enable_lbfgs_hessian_fallback: false,
         ..SolverOptions::default()

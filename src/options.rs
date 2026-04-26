@@ -191,9 +191,6 @@ pub struct SolverOptions {
     /// Detect linear constraints and skip their Hessian contribution.
     /// Default: true.
     pub detect_linear_constraints: bool,
-    /// Enable SQP fallback for constrained problems when IPM/AL/slack fail.
-    /// Default: true.
-    pub enable_sqp_fallback: bool,
     /// Use L-BFGS Hessian approximation inside the IPM instead of exact Hessian.
     /// When enabled, `hessian_structure()` and `hessian_values()` are never called.
     /// Equivalent to Ipopt's `hessian_approximation = "limited-memory"`.
@@ -387,7 +384,6 @@ impl Default for SolverOptions {
             enable_lbfgs_fallback: true,
             enable_preprocessing: true,
             detect_linear_constraints: true,
-            enable_sqp_fallback: true,
             hessian_approximation_lbfgs: false,
             enable_lbfgs_hessian_fallback: true,
             mehrotra_pc: false,
