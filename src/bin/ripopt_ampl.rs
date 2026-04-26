@@ -158,8 +158,8 @@ fn print_help() {
     println!("    slack_bound_push=<float>             Slack variable bound push [1e-2]");
     println!("    slack_bound_frac=<float>             Slack variable bound fraction [1e-2]");
     println!("    tau_min=<float>                      Fraction-to-boundary minimum [0.99]");
-    println!("    nlp_lower_bound_inf=<float>          Treat bounds below this as -inf [-1e20]");
-    println!("    nlp_upper_bound_inf=<float>          Treat bounds above this as +inf [1e20]");
+    println!("    nlp_lower_bound_inf=<float>          Treat bounds below this as -inf [-1e19]");
+    println!("    nlp_upper_bound_inf=<float>          Treat bounds above this as +inf [1e19]");
     println!();
     println!("  Warm Start");
     println!("    warm_start_init_point=<bool>         Enable warm-start initialization [no]");
@@ -175,7 +175,7 @@ fn print_help() {
     println!("  Step Control & Line Search");
     println!("    max_soc=<int>                        Max second-order correction steps [4]");
     println!("    watchdog_shortened_iter_trigger=<int> Shortened steps before watchdog [10]");
-    println!("    watchdog_trial_iter_max=<int>        Max watchdog trial iterations [3]");
+    println!("    watchdog_trial_iter_max=<int>        Max watchdog trial iterations [5]");
     println!();
     println!("  Constraint Handling");
     println!("    constraint_slack_barrier=<bool>      Slack log-barriers in filter merit [yes]");
@@ -187,7 +187,7 @@ fn print_help() {
     println!("    hessian_approximation=<str>          exact or limited-memory (L-BFGS) [exact]");
     println!("    linear_solver=<str>                  direct, iterative (MINRES), or hybrid [direct]");
     println!("    sparse_threshold=<int>               Sparse solver if n+m >= threshold [110]");
-    println!("    mehrotra_pc=<bool>                   Mehrotra predictor-corrector [yes]");
+    println!("    mehrotra_pc=<bool>                   Mehrotra predictor-corrector [no]");
     println!("    gondzio_mcc_max=<int>                Max Gondzio centrality corrections [3]");
     println!();
     println!("  Fallback Strategies");

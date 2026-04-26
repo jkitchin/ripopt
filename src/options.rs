@@ -1,3 +1,50 @@
+/// Treatment of variables with `x_L[i] == x_U[i]` (fixed variables).
+///
+/// Mirrors Ipopt 3.14's `fixed_variable_treatment` (`TNLPAdapter`).
+/// Ipopt's default is `MakeParameter`: fixed variables are removed from
+/// the optimization. ripopt currently defaults to `RelaxBounds` (the
+/// pre-v0.8 behavior); `MakeParameter` is a TODO — the option exists
+/// so callers can configure it once it lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixedVariableTreatment {
+    /// Widen `[x_L, x_U]` by ±1e-8·max(|c|, 1) around the fixed value
+    /// `c = x_L = x_U` so the IPM has a non-empty interior. Adds one
+    /// degree of freedom per fixed variable.
+    RelaxBounds,
+    /// (TODO, not implemented) Remove fixed variables from the working
+    /// problem. Picking this currently falls back to `RelaxBounds` —
+    /// chosen so callers can opt in without breaking once support
+    /// lands. Tracked under T0.X-fixed-var in the v0.8 alignment plan.
+    MakeParameter,
+}
+
+impl Default for FixedVariableTreatment {
+    fn default() -> Self {
+        Self::RelaxBounds
+    }
+}
+
+/// Bound multiplier initialization method.
+///
+/// Mirrors Ipopt 3.14's `bound_mult_init_method`
+/// (`IpDefaultIterateInitializer.cpp:254-288`). Ipopt's default is
+/// `Constant` with `bound_mult_init_val = 1.0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundMultInitMethod {
+    /// `z_l = z_u = bound_mult_init_val` for every finite bound.
+    /// Ipopt default.
+    Constant,
+    /// `z_l = μ_init / (x − x_l)`, `z_u = μ_init / (x_u − x)`.
+    /// Mirrors Ipopt's `mu-based`. Pre-v0.8 ripopt default.
+    MuBased,
+}
+
+impl Default for BoundMultInitMethod {
+    fn default() -> Self {
+        Self::Constant
+    }
+}
+
 /// Choice of linear solver for the KKT system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinearSolverChoice {
@@ -170,7 +217,7 @@ pub struct SolverOptions {
     ///
     /// Expected effect: 20–40% fewer iterations on convex-like problems.
     /// Applies to the full sparse/dense KKT path.
-    /// Default: true.
+    /// Default: false (matches Ipopt 3.14's `mehrotra_algorithm = no`).
     pub mehrotra_pc: bool,
     /// Maximum number of Gondzio multiple centrality corrections per iteration.
     ///
@@ -275,6 +322,16 @@ pub struct SolverOptions {
     /// Mirrors Ipopt 3.14's `slack_move` option. Default
     /// `f64::EPSILON.powf(0.75) ≈ 1.83e-12`.
     pub slack_move: f64,
+    /// Method used to initialize the bound multipliers `z_l`, `z_u`.
+    /// Default: `Constant` (Ipopt 3.14 default).
+    pub bound_mult_init_method: BoundMultInitMethod,
+    /// Initial value used when `bound_mult_init_method = Constant`.
+    /// Default: 1.0 (Ipopt 3.14 default).
+    pub bound_mult_init_val: f64,
+    /// Treatment of fixed variables (`x_L[i] == x_U[i]`).
+    /// Default: `RelaxBounds`. `MakeParameter` is a TODO (currently
+    /// falls back to `RelaxBounds`).
+    pub fixed_variable_treatment: FixedVariableTreatment,
 }
 
 impl Default for SolverOptions {
@@ -304,8 +361,8 @@ impl Default for SolverOptions {
             warm_start_bound_frac: 1e-3,
             warm_start_mult_bound_push: 1e-3,
             warm_start_target_mu: None,
-            nlp_lower_bound_inf: -1e20,
-            nlp_upper_bound_inf: 1e20,
+            nlp_lower_bound_inf: -1e19,
+            nlp_upper_bound_inf: 1e19,
             kappa: 10.0,
             mu_allow_increase: true,
             least_squares_mult_init: true,
@@ -313,7 +370,7 @@ impl Default for SolverOptions {
             constraint_slack_barrier: true,
             max_wall_time: 0.0,
             watchdog_shortened_iter_trigger: 10,
-            watchdog_trial_iter_max: 3,
+            watchdog_trial_iter_max: 5,
             sparse_threshold: 110,
             barrier_tol_factor: 10.0,
             mu_allow_fast_monotone_decrease: true,
@@ -328,7 +385,7 @@ impl Default for SolverOptions {
             enable_sqp_fallback: true,
             hessian_approximation_lbfgs: false,
             enable_lbfgs_hessian_fallback: true,
-            mehrotra_pc: true,
+            mehrotra_pc: false,
             gondzio_mcc_max: 3,
             proactive_infeasibility_detection: false,
             linear_solver: LinearSolverChoice::default(),
@@ -351,6 +408,9 @@ impl Default for SolverOptions {
             },
             use_ic_refinement: true,
             iterative_refinement_steps_required: 1,
+            bound_mult_init_method: BoundMultInitMethod::Constant,
+            bound_mult_init_val: 1.0,
+            fixed_variable_treatment: FixedVariableTreatment::RelaxBounds,
         }
     }
 }

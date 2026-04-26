@@ -83,6 +83,8 @@ fn new_fallback_solver(use_sparse: bool) -> Box<dyn LinearSolver> {
         Box::new(DenseLdl::new())
     }
 }
+use crate::options::BoundMultInitMethod;
+use crate::options::FixedVariableTreatment;
 use crate::options::SolverOptions;
 use crate::problem::NlpProblem;
 use crate::restoration::RestorationPhase;
@@ -974,7 +976,7 @@ impl SolverState {
         let mut x = vec![0.0; n];
         problem.initial_point(&mut x);
 
-        relax_fixed_variable_bounds(&mut x_l, &mut x_u);
+        relax_fixed_variable_bounds(&mut x_l, &mut x_u, options);
 
         push_initial_point_from_bounds(&mut x, &x_l, &x_u, options);
 
@@ -986,7 +988,7 @@ impl SolverState {
             (true, Some(mu)) if mu > 0.0 => mu,
             _ => options.mu_init,
         };
-        let (mut z_l, mut z_u) = init_bound_multipliers(&x, &x_l, &x_u, initial_mu);
+        let (mut z_l, mut z_u) = init_bound_multipliers(&x, &x_l, &x_u, initial_mu, options);
 
         let (jac_rows, jac_cols) = problem.jacobian_structure();
         let jac_nnz = jac_rows.len();
@@ -9508,28 +9510,48 @@ fn apply_warm_start_multipliers<P: NlpProblem>(
     }
 }
 
-/// Initialize bound multipliers from complementarity at mu_init:
-/// z_l[i] = mu / (x[i] - x_l[i]), z_u[i] = mu / (x_u[i] - x[i]).
-/// Multipliers stay at 0 for inactive (infinite) bounds. Slack is
-/// floored at 1e-20 to avoid division by zero in pathological cases
-/// where the bound-push didn't move x off the bound.
+/// Initialize bound multipliers `z_l`, `z_u`. The method is selected
+/// by `options.bound_mult_init_method` (Ipopt 3.14
+/// `IpDefaultIterateInitializer.cpp:254-288`):
+///
+/// - `Constant` (Ipopt default): every finite-bounded entry is set to
+///   `options.bound_mult_init_val` (Ipopt default 1.0). Inactive
+///   (infinite) bounds stay at 0.
+/// - `MuBased`: `z_l = mu_init / (x − x_l)`, `z_u = mu_init / (x_u − x)`.
+///   Slack is floored at 1e-20 to avoid division by zero.
 fn init_bound_multipliers(
     x: &[f64],
     x_l: &[f64],
     x_u: &[f64],
     mu_init: f64,
+    options: &SolverOptions,
 ) -> (Vec<f64>, Vec<f64>) {
     let n = x.len();
     let mut z_l = vec![0.0; n];
     let mut z_u = vec![0.0; n];
-    for i in 0..n {
-        if x_l[i].is_finite() {
-            let slack = (x[i] - x_l[i]).max(1e-20);
-            z_l[i] = mu_init / slack;
+    match options.bound_mult_init_method {
+        BoundMultInitMethod::Constant => {
+            let v = options.bound_mult_init_val;
+            for i in 0..n {
+                if x_l[i].is_finite() {
+                    z_l[i] = v;
+                }
+                if x_u[i].is_finite() {
+                    z_u[i] = v;
+                }
+            }
         }
-        if x_u[i].is_finite() {
-            let slack = (x_u[i] - x[i]).max(1e-20);
-            z_u[i] = mu_init / slack;
+        BoundMultInitMethod::MuBased => {
+            for i in 0..n {
+                if x_l[i].is_finite() {
+                    let slack = (x[i] - x_l[i]).max(1e-20);
+                    z_l[i] = mu_init / slack;
+                }
+                if x_u[i].is_finite() {
+                    let slack = (x_u[i] - x[i]).max(1e-20);
+                    z_u[i] = mu_init / slack;
+                }
+            }
         }
     }
     (z_l, z_u)
@@ -9574,39 +9596,66 @@ fn apply_bound_relax_factor(
     }
 }
 
-/// Relax fixed variables (x_l == x_u) by widening bounds to a tiny
-/// interval centered on the fixed value. Interior-point methods require
-/// strictly interior starting points; without this fixed variables would
-/// have zero feasible interior. Mirrors Ipopt's relax_bounds approach.
-fn relax_fixed_variable_bounds(x_l: &mut [f64], x_u: &mut [f64]) {
-    for i in 0..x_l.len() {
-        if x_l[i].is_finite() && x_u[i].is_finite() && (x_u[i] - x_l[i]).abs() < 1e-10 {
-            let center = (x_l[i] + x_u[i]) / 2.0;
-            let relax = 1e-8 * center.abs().max(1.0);
-            x_l[i] = center - relax;
-            x_u[i] = center + relax;
+/// Apply the configured `fixed_variable_treatment` to entries with
+/// `x_l[i] == x_u[i]`.
+///
+/// `RelaxBounds` (current default): widen the bounds by ±1e-8·max(|c|, 1)
+/// around the fixed value `c`. Mirrors Ipopt 3.14's `relax_bounds`.
+///
+/// `MakeParameter` (Ipopt default; not yet implemented): would substitute
+/// out fixed variables. Falls back to `RelaxBounds` here so the option
+/// is a no-op for callers — see TODO in `FixedVariableTreatment` doc.
+fn relax_fixed_variable_bounds(
+    x_l: &mut [f64],
+    x_u: &mut [f64],
+    options: &SolverOptions,
+) {
+    match options.fixed_variable_treatment {
+        FixedVariableTreatment::RelaxBounds | FixedVariableTreatment::MakeParameter => {
+            for i in 0..x_l.len() {
+                if x_l[i].is_finite() && x_u[i].is_finite() && (x_u[i] - x_l[i]).abs() < 1e-10 {
+                    let center = (x_l[i] + x_u[i]) / 2.0;
+                    let relax = 1e-8 * center.abs().max(1.0);
+                    x_l[i] = center - relax;
+                    x_u[i] = center + relax;
+                }
+            }
         }
     }
 }
 
-/// Push the initial point strictly inside finite variable bounds. For
-/// two-sided bounds, the push is min(bound_push, bound_frac * range);
-/// for one-sided bounds it is bound_push.
+/// Push the initial point strictly inside finite variable bounds.
+///
+/// Ipopt 3.14 (`IpDefaultIterateInitializer.cpp:526-599`):
+///   pL = min(κ1·max(|x_L|, 1), κ2·(x_U − x_L))   [two-sided]
+///   pL = κ1·max(|x_L|, 1)                         [one-sided lower]
+///   pU = κ1·max(|x_U|, 1)                         [one-sided upper]
+/// where κ1 = `bound_push` and κ2 = `bound_frac`. The `max(|x|, 1)`
+/// scaling matters for one-sided bounds at large magnitude: without it,
+/// `x ≥ 1e3` gets pushed by only 0.01 absolute and the slack-driven
+/// initial multipliers `z = μ/slack` blow up the KKT factorization.
 fn push_initial_point_from_bounds(
     x: &mut [f64],
     x_l: &[f64],
     x_u: &[f64],
     options: &SolverOptions,
 ) {
+    let kappa1 = options.bound_push;
+    let kappa2 = options.bound_frac;
     for i in 0..x.len() {
-        if x_l[i].is_finite() && x_u[i].is_finite() {
+        let lower_finite = x_l[i].is_finite();
+        let upper_finite = x_u[i].is_finite();
+        if lower_finite && upper_finite {
             let range = x_u[i] - x_l[i];
-            let push = options.bound_push.min(options.bound_frac * range);
-            x[i] = x[i].max(x_l[i] + push).min(x_u[i] - push);
-        } else if x_l[i].is_finite() {
-            x[i] = x[i].max(x_l[i] + options.bound_push);
-        } else if x_u[i].is_finite() {
-            x[i] = x[i].min(x_u[i] - options.bound_push);
+            let p_l = (kappa1 * x_l[i].abs().max(1.0)).min(kappa2 * range);
+            let p_u = (kappa1 * x_u[i].abs().max(1.0)).min(kappa2 * range);
+            x[i] = x[i].max(x_l[i] + p_l).min(x_u[i] - p_u);
+        } else if lower_finite {
+            let p_l = kappa1 * x_l[i].abs().max(1.0);
+            x[i] = x[i].max(x_l[i] + p_l);
+        } else if upper_finite {
+            let p_u = kappa1 * x_u[i].abs().max(1.0);
+            x[i] = x[i].min(x_u[i] - p_u);
         }
     }
 }
@@ -11630,5 +11679,113 @@ mod tests {
         assert_eq!(filter.entries().len(), entries_before_len,
             "filter must retain entries on resto success (T0.9)");
         assert!((filter.entries()[0].theta - 1.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn test_push_initial_point_one_sided_lower_large_magnitude() {
+        // Variable with x_L = 1e3 and no upper bound, starting at x = 1e3.
+        // Ipopt pushes by κ1 · max(|x_L|, 1) = 0.01 · 1e3 = 10, so x ≥ 1010.
+        // The pre-fix formula pushed by only `bound_push = 0.01` absolute.
+        let opts = SolverOptions::default();
+        let mut x = vec![1e3];
+        let x_l = vec![1e3];
+        let x_u = vec![f64::INFINITY];
+        push_initial_point_from_bounds(&mut x, &x_l, &x_u, &opts);
+        assert!(
+            x[0] >= 1e3 + 0.01 * 1e3 - 1e-12,
+            "expected x >= 1010 after magnitude-scaled push, got x = {}",
+            x[0]
+        );
+    }
+
+    #[test]
+    fn test_push_initial_point_one_sided_lower_unit_magnitude() {
+        // |x_L| < 1 falls back to max(|x_L|, 1) = 1, so push is bound_push.
+        let opts = SolverOptions::default();
+        let mut x = vec![0.0];
+        let x_l = vec![0.0];
+        let x_u = vec![f64::INFINITY];
+        push_initial_point_from_bounds(&mut x, &x_l, &x_u, &opts);
+        assert!(
+            (x[0] - opts.bound_push).abs() < 1e-12,
+            "expected x = bound_push = {}, got x = {}",
+            opts.bound_push,
+            x[0]
+        );
+    }
+
+    #[test]
+    fn test_relax_fixed_variable_bounds_default_widens() {
+        // Default option: RelaxBounds. x_l = x_u = 5.0 should be widened
+        // to [5 - 5e-8, 5 + 5e-8].
+        let opts = SolverOptions::default();
+        let mut x_l = vec![5.0];
+        let mut x_u = vec![5.0];
+        relax_fixed_variable_bounds(&mut x_l, &mut x_u, &opts);
+        let expected_relax = 1e-8 * 5.0;
+        assert!((x_l[0] - (5.0 - expected_relax)).abs() < 1e-15);
+        assert!((x_u[0] - (5.0 + expected_relax)).abs() < 1e-15);
+    }
+
+    #[test]
+    fn test_relax_fixed_variable_bounds_make_parameter_falls_back() {
+        // MakeParameter is not implemented yet: it should behave the same
+        // as RelaxBounds (the documented fallback).
+        let mut opts = SolverOptions::default();
+        opts.fixed_variable_treatment = FixedVariableTreatment::MakeParameter;
+        let mut x_l = vec![5.0];
+        let mut x_u = vec![5.0];
+        relax_fixed_variable_bounds(&mut x_l, &mut x_u, &opts);
+        assert!(x_l[0] < 5.0 && x_u[0] > 5.0);
+    }
+
+    #[test]
+    fn test_relax_fixed_variable_bounds_skips_non_fixed() {
+        let opts = SolverOptions::default();
+        let mut x_l = vec![1.0, f64::NEG_INFINITY];
+        let mut x_u = vec![3.0, f64::INFINITY];
+        relax_fixed_variable_bounds(&mut x_l, &mut x_u, &opts);
+        assert_eq!(x_l[0], 1.0);
+        assert_eq!(x_u[0], 3.0);
+        assert_eq!(x_l[1], f64::NEG_INFINITY);
+        assert_eq!(x_u[1], f64::INFINITY);
+    }
+
+    #[test]
+    fn test_init_bound_multipliers_default_is_constant_one() {
+        // Default options: bound_mult_init_method = Constant, val = 1.0.
+        // mu_init = 0.1 should NOT appear in z_l[0]; the constant 1.0 should.
+        let opts = SolverOptions::default();
+        let x = vec![1.5];
+        let x_l = vec![0.0];
+        let x_u = vec![f64::INFINITY];
+        let (z_l, z_u) = init_bound_multipliers(&x, &x_l, &x_u, 0.1, &opts);
+        assert_eq!(z_l[0], 1.0, "constant default should give z_l = 1.0");
+        assert_eq!(z_u[0], 0.0, "no upper bound -> z_u stays at 0");
+    }
+
+    #[test]
+    fn test_init_bound_multipliers_mu_based_uses_mu_over_slack() {
+        let mut opts = SolverOptions::default();
+        opts.bound_mult_init_method = BoundMultInitMethod::MuBased;
+        let x = vec![1.5];
+        let x_l = vec![0.5];
+        let x_u = vec![f64::INFINITY];
+        let (z_l, _z_u) = init_bound_multipliers(&x, &x_l, &x_u, 0.1, &opts);
+        // slack = 1.5 - 0.5 = 1.0 -> z_l = 0.1 / 1.0 = 0.1
+        assert!((z_l[0] - 0.1).abs() < 1e-12, "got z_l = {}", z_l[0]);
+    }
+
+    #[test]
+    fn test_push_initial_point_two_sided_uses_min_of_kappa1_kappa2() {
+        // Two-sided narrow range: [0, 0.01]. κ2·range = 0.01·0.01 = 1e-4
+        // vs κ1·max(|x_L|, 1) = 0.01·1 = 0.01. The min picks 1e-4.
+        let opts = SolverOptions::default();
+        let mut x = vec![0.0];
+        let x_l = vec![0.0];
+        let x_u = vec![0.01];
+        push_initial_point_from_bounds(&mut x, &x_l, &x_u, &opts);
+        // p_l = min(0.01, 1e-4) = 1e-4
+        assert!((x[0] - 1e-4).abs() < 1e-12, "got x = {}", x[0]);
     }
 }
