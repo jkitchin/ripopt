@@ -67,6 +67,31 @@ impl Default for LinearSolverChoice {
     }
 }
 
+/// Step length used to update the equality multipliers `y` after a
+/// Newton step. Mirrors Ipopt 3.14 `alpha_for_y` option
+/// (`IpBacktrackingLineSearch.cpp:84-104`). T3.32 ports the simple
+/// modes; min/max-dual-infeas variants are deferred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AlphaForY {
+    /// `alpha_y = alpha_primal` (Ipopt default).
+    #[default]
+    Primal,
+    /// `alpha_y = alpha_dual_max` (the bound-multiplier step length).
+    BoundMult,
+    /// `alpha_y = min(alpha_primal, alpha_dual_max)`.
+    Min,
+    /// `alpha_y = max(alpha_primal, alpha_dual_max)`.
+    Max,
+    /// `alpha_y = 1.0` (full step, ignoring fraction-to-boundary).
+    Full,
+    /// Use full step when alpha_primal exceeds the alpha_for_y_tol gate;
+    /// fall back to alpha_primal otherwise.
+    PrimalAndFull,
+    /// Use full step when alpha_dual_max exceeds the gate; else
+    /// alpha_dual_max.
+    DualAndFull,
+}
+
 /// Solver options matching Ipopt defaults.
 #[derive(Debug, Clone)]
 pub struct SolverOptions {
@@ -298,6 +323,15 @@ pub struct SolverOptions {
     /// the Newton direction).
     /// Default: 1e-6.
     pub recalc_y_feas_tol: f64,
+    /// Step length policy for the equality multipliers `y` after a Newton
+    /// step. Mirrors Ipopt 3.14 `alpha_for_y` (`IpBacktrackingLineSearch.cpp:84-104`).
+    /// Default: `Primal` (the Ipopt default).
+    pub alpha_for_y: AlphaForY,
+    /// Threshold for `PrimalAndFull` / `DualAndFull` modes: take the full
+    /// step on `y` when the gating step length exceeds this tolerance,
+    /// else fall back to that step length. Mirrors Ipopt
+    /// `alpha_for_y_tol` (default 10.0).
+    pub alpha_for_y_tol: f64,
     /// Tolerance on the relative dual-step `‖Δy‖_∞ / (1 + ‖y‖_∞)` below
     /// which a tiny x-step is allowed to *latch* the tiny-step flag.
     /// Mirrors Ipopt 3.14 `tiny_step_y_tol` (`IpBacktrackingLineSearch.cpp:421-424`).
@@ -488,6 +522,8 @@ impl Default for SolverOptions {
             early_stall_timeout: 120.0,
             recalc_y: false,
             recalc_y_feas_tol: 1e-6,
+            alpha_for_y: AlphaForY::default(),
+            alpha_for_y_tol: 10.0,
             tiny_step_y_tol: 1e-2,
             mu_oracle_quality_function: true,
             quality_function_centrality: false,

@@ -21,6 +21,7 @@ use crate::linear_solver::iterative::IterativeMinres;
 #[cfg(all(feature = "rmumps", not(feature = "feral")))]
 use crate::linear_solver::hybrid::HybridSolver;
 use crate::linear_solver::{KktMatrix, LinearSolver, SymmetricMatrix};
+use crate::options::AlphaForY;
 use crate::options::LinearSolverChoice;
 
 /// Create a new sparse linear solver using the best available backend.
@@ -2505,8 +2506,23 @@ fn update_dual_variables(
     tracker: &mut DyOscillationTracker,
     options: &SolverOptions,
 ) -> f64 {
-    let alpha_y = state.alpha_primal;
+    // T3.32 simple modes: pick alpha_y per `alpha_for_y` option,
+    // matching Ipopt IpBacktrackingLineSearch.cpp:84-104.
+    let alpha_p = state.alpha_primal;
     let alpha_d = alpha_dual_max;
+    let alpha_y = match options.alpha_for_y {
+        AlphaForY::Primal => alpha_p,
+        AlphaForY::BoundMult => alpha_d,
+        AlphaForY::Min => alpha_p.min(alpha_d),
+        AlphaForY::Max => alpha_p.max(alpha_d),
+        AlphaForY::Full => 1.0,
+        AlphaForY::PrimalAndFull => {
+            if alpha_p >= options.alpha_for_y_tol { 1.0 } else { alpha_p }
+        }
+        AlphaForY::DualAndFull => {
+            if alpha_d >= options.alpha_for_y_tol { 1.0 } else { alpha_d }
+        }
+    };
 
     apply_damped_y_update(state, alpha_y, tracker);
 
