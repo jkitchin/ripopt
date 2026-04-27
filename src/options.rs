@@ -272,6 +272,11 @@ pub struct SolverOptions {
     /// the Newton direction).
     /// Default: 1e-6.
     pub recalc_y_feas_tol: f64,
+    /// Tolerance on the relative dual-step `‖Δy‖_∞ / (1 + ‖y‖_∞)` below
+    /// which a tiny x-step is allowed to *latch* the tiny-step flag.
+    /// Mirrors Ipopt 3.14 `tiny_step_y_tol` (`IpBacktrackingLineSearch.cpp:421-424`).
+    /// Default: 1e-2.
+    pub tiny_step_y_tol: f64,
     /// Use quality function for barrier parameter selection in adaptive mode.
     /// Evaluates Q(mu) = barrier KKT error for several candidate mu values and
     /// picks the minimizer. Allows more aggressive mu decreases than the Loqo
@@ -385,6 +390,11 @@ pub struct SolverOptions {
     /// acceptable_obj_change_tol`. Default 1e20 disables the gate
     /// (matches Ipopt 3.14 `IpOptErrorConvCheck.cpp:115`).
     pub acceptable_obj_change_tol: f64,
+    /// Number of consecutive iterations meeting the acceptable
+    /// thresholds required to terminate with `Acceptable`. Setting to
+    /// `0` disables the acceptable termination entirely
+    /// (`IpOptErrorConvCheck.cpp:241`). Default `15` matches Ipopt 3.14.
+    pub acceptable_iter: usize,
     /// Threshold on `‖x‖_∞` above which the iterate is declared
     /// diverging. Default 1e20 matches Ipopt
     /// `IpOptErrorConvCheck.cpp:123`.
@@ -449,6 +459,7 @@ impl Default for SolverOptions {
             early_stall_timeout: 120.0,
             recalc_y: false,
             recalc_y_feas_tol: 1e-6,
+            tiny_step_y_tol: 1e-2,
             mu_oracle_quality_function: true,
             quality_function_centrality: false,
             quality_function_max_section_steps: 8,
@@ -472,6 +483,7 @@ impl Default for SolverOptions {
             bound_mult_init_val: 1.0,
             fixed_variable_treatment: FixedVariableTreatment::RelaxBounds,
             acceptable_obj_change_tol: 1e20,
+            acceptable_iter: 15,
             diverging_iterates_tol: 1e20,
         }
     }

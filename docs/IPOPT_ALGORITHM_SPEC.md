@@ -1462,6 +1462,73 @@ representations where needed. Mathematically equivalent at solutions;
 diverges only in intermediate sign conventions on raw multiplier
 arrays, and is documented at the source.
 
+### 14.4  SOC primal-only direction capture
+
+When a second-order correction step is accepted
+(`run_soc_loop`, `attempt_soc{,_condensed,_sparse_condensed}`), ripopt
+captures only the primal correction `dx_soc` from the SOC solve and
+uses the *predictor* `state.dy`/`state.dz_l`/`state.dz_u` (computed
+before SOC) for the post-line-search dual update.
+`IpFilterLSAcceptor::TrySecondOrderCorrection`
+(`IpFilterLSAcceptor.cpp:646-649`) instead replaces the entire
+`actual_delta` with `delta_soc`, so Ipopt's dual update uses the
+SOC-corrected `dy/dz/dv` directions. Empirically this affects only
+iterates where SOC is accepted (rare on most problems) and the
+predictor duals remain a reasonable Newton-direction estimate at
+the corrected primal. Lifting this deviation requires extending the
+condensed and sparse-condensed Schur recovery to also produce
+`dy_soc` (and recomputing `dz_l/dz_u` from `dx_soc` via the existing
+`recover_dz_from_state` Fiacco-step helper) — left as future work.
+
+### 14.5  More aggressive δ_c application during inertia correction
+
+Ipopt's `PDPerturbationHandler::ConsiderNewSystem`
+(`IpPDPerturbationHandler.cpp:144-243`) initialises the constraint
+regularisation as `delta_c = 0` on every new factorisation attempt,
+and only escalates to `delta_c = delta_cd() = delta_cd_val * mu^delta_cd_exp`
+once the Jacobian is *detected* as degenerate (sticky flag
+`jac_degenerate_ == DEGENERATE`) or `perturb_always_cd_` is set. ripopt's
+`factor_with_inertia_correction` (`src/kkt.rs:497`) instead computes
+`delta_c_active = delta_c_base * mu^0.25` *every* call and applies it on
+both the PerturbForSingularity branch (`src/kkt.rs:614`) and the
+wrong-inertia loop (`src/kkt.rs:671`). This is strictly more conservative
+— ripopt always perturbs the (2,2) block when it perturbs at all, while
+Ipopt only does so once the Jacobian is known to be rank-deficient. On
+non-degenerate problems the deviation costs at most a single extra
+attempt before factorisation; on degenerate ones it converges to Ipopt's
+behaviour because the mu-scaled formula is the same. Considered
+acceptable for v0.8.
+
+### 14.6  Filter-reset escalation
+
+Ipopt's `IpFilterLSAcceptor::CheckAcceptabilityOfTrialPoint`
+(`IpFilterLSAcceptor.cpp:407-419`) tracks consecutive line-search
+rejections and, after `filter_reset_trigger` (default 5) reset-eligible
+iterations, clears the filter up to `max_filter_resets` (default 5)
+times before falling through to restoration. ripopt's `Filter`
+(`src/filter.rs`) exposes only the manual `reset()` and
+`augment_for_restoration` paths and never auto-clears entries on
+repeated rejection — failed line searches go straight to restoration via
+the standard alpha-min check. This makes ripopt slightly more eager to
+trigger restoration on hard problems where Ipopt would have escaped
+through a filter clear. Lifting this deviation requires threading a
+rejection counter through `run_line_search_loop` and adding
+`max_filter_resets`/`filter_reset_trigger` options. Deferred.
+
+### 14.7  No predictor-corrector line-search step (`TryCorrector`)
+
+Ipopt's `IpFilterLSAcceptor::TryCorrector`
+(`IpFilterLSAcceptor.cpp:660-877`) is an opt-in
+(`corrector_type ∈ {affine, primal-dual}`, default `none`) extra Newton
+iteration applied during the line search before SOC: it solves a corrector
+system around the current trial point to refine the search direction. ripopt
+has no equivalent path. Because Ipopt's default disables `TryCorrector`,
+this deviation is invisible at default settings; users who set
+`corrector_type` in Ipopt will see different ripopt behaviour. Implementing
+it requires a separate corrector-solve dispatch, the
+`skip_corr_if_neg_curv` / `skip_corr_in_monotone_mode` gates, and
+plumbing for the affine vs. primal-dual variant. Deferred.
+
 ---
 
 ## End

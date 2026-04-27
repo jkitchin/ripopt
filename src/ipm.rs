@@ -2198,8 +2198,10 @@ fn run_line_search_loop<P: NlpProblem>(
             break;
         }
 
-        // SOC on the first trial only, if full step increased theta
-        if theta_trial > theta_current && options.max_soc > 0 && *ls_steps == 0 {
+        // SOC on the first trial only, if full step did not strictly decrease theta.
+        // Mirrors `IpFilterLSAcceptor::TrySecondOrderCorrection` entry condition
+        // (`IpFilterLSAcceptor.cpp` SOC dispatch): `theta_trial >= theta_current`.
+        if theta_trial >= theta_current && options.max_soc > 0 && *ls_steps == 0 {
             let soc_accepted = dispatch_soc_attempt(
                 state, problem, &x_trial, &g_trial, condensed_system,
                 cond_solver_for_soc, sparse_condensed_system, kkt_system_opt,
@@ -4144,21 +4146,32 @@ fn reevaluate_after_step<P: NlpProblem>(
 }
 
 /// Reset the slack-constraint multipliers `v_l`, `v_u` from the
-/// barrier equilibrium `v = mu_ks / slack` after the post-step
+/// barrier equilibrium `v = mu / slack` after the post-step
 /// re-evaluation.
 ///
 /// A simple reset rather than a Newton update — the dv direction is
 /// approximate (we carry no explicit slacks) and applying FTB on `v`
 /// can restrict `alpha_d` too much. Only active slacks (`v > 0`) are
 /// touched.
-fn reset_slack_multipliers(state: &mut SolverState, mu_ks: f64) {
+///
+/// Uses the **current barrier parameter** `state.mu` rather than the
+/// kappa_sigma reference `mu_ks` so that `v · slack` shrinks with each
+/// barrier update; on problems with no variable bounds, `avg_compl`
+/// falls back to `Σ v_l·slack` which would make `mu_ks` self-referential
+/// (= previous `v_l·slack`) and freeze the complementarity residual at
+/// the initial value, blocking convergence (see the
+/// `mixed_equality_inequality` regression). Mirrors Ipopt's
+/// `correct_bound_multiplier`, which clamps against current barrier mu
+/// (`IpIpoptAlg.cpp:1055-1134`).
+fn reset_slack_multipliers(state: &mut SolverState, _mu_ks: f64) {
     let m = state.m;
+    let mu = state.mu;
     for i in 0..m {
         if state.v_l[i] > 0.0 && state.g_l[i].is_finite() {
-            state.v_l[i] = mu_ks / slack_gl(state, i);
+            state.v_l[i] = mu / slack_gl(state, i);
         }
         if state.v_u[i] > 0.0 && state.g_u[i].is_finite() {
-            state.v_u[i] = mu_ks / slack_gu(state, i);
+            state.v_u[i] = mu / slack_gu(state, i);
         }
     }
 }
@@ -4461,31 +4474,66 @@ fn compute_alpha_max(
 }
 
 /// Ipopt-style tiny-step detection: set the `tiny_step` flag when the
-/// relative step is below `10*eps` and primal infeasibility is small.
+/// raw search direction is at machine-precision noise and the dual step
+/// is also small.
 ///
-/// Mirrors `IpBacktrackingLineSearch.cpp::DetectTinyStep` from Ipopt
-/// 3.14: the flag is sticky across consecutive tiny iterations
-/// (`consecutive_tiny_steps`), and the main loop is responsible for
-/// terminating the solve with `STOP_AT_TINY_STEP` once the flag is set
-/// for the second consecutive iteration. We do **not** force a μ
-/// decrease or reset the filter here — those side-effects were a
-/// ripopt-specific heuristic that contradicts the Ipopt reference.
+/// Mirrors `IpBacktrackingLineSearch.cpp::DetectTinyStep` (Ipopt 3.14,
+/// lines 1219-1278) and the latch logic at lines 407-434:
+/// - Threshold is `max_i |Δx_i| / (1 + |x_i|) < 10·eps ≈ 2.22e-15` on
+///   the raw direction (NOT scaled by `α_primal_max` — that is a
+///   ripopt-specific bug that mis-flagged normal short steps near a
+///   bound as "tiny").
+/// - The latch (`tiny_step_flag`) requires the dual step to also be
+///   small: `‖Δy‖_∞ < tiny_step_y_tol` (default 1e-2), unscaled
+///   (Ipopt's `Max(delta_y_c->Amax(), delta_y_d->Amax())`,
+///   `IpBacktrackingLineSearch.cpp:421`). Without this, iterates still
+///   making dual progress get latched.
+/// - `consecutive_tiny_steps` is the two-iteration counter that mirrors
+///   Ipopt's `tiny_step_last_iteration_` latch reset at line 434.
+///   Crucially, `mu_state.tiny_step` only goes true when the counter
+///   reaches 2 — Ipopt's `Set_tiny_step_flag(true)` at line 410 fires
+///   only when the prior iter was also tiny. Latching on iter 1 would
+///   force a μ decrease one iteration earlier than Ipopt does.
+///
+/// The actual `STOP_AT_TINY_STEP` exit is *not* triggered here — it
+/// fires from `update_barrier_parameter` when `tiny_step && new_μ == μ`
+/// (`IpMonotoneMuUpdate.cpp:158-160`, `IpAdaptiveMuUpdate.cpp:329,377`).
+/// The main loop consumes the resulting `pending_tiny_step_exit` flag
+/// at the *top* of the next iteration, AFTER `check_convergence` has
+/// run, so KKT-clean tiny-step iterates exit Optimal first.
 fn detect_tiny_step(
     state: &mut SolverState,
-    _options: &SolverOptions,
+    options: &SolverOptions,
     mu_state: &mut MuState,
     _filter: &mut Filter,
     consecutive_tiny_steps: &mut usize,
-    alpha_primal_max: f64,
     primal_inf: f64,
 ) {
     let n = state.n;
-    let max_rel_step: f64 = (0..n)
-        .map(|i| (alpha_primal_max * state.dx[i]).abs() / (state.x[i].abs() + 1.0))
+    let m = state.m;
+    let tiny_tol = 10.0 * f64::EPSILON;
+
+    let max_rel_dx: f64 = (0..n)
+        .map(|i| state.dx[i].abs() / (state.x[i].abs() + 1.0))
         .fold(0.0f64, f64::max);
-    if max_rel_step < 1e-14 && primal_inf < 1e-4 {
+    // Ipopt uses raw `Amax(delta_y)` (unscaled L∞ norm) compared
+    // directly against `tiny_step_y_tol_`
+    // (`IpBacktrackingLineSearch.cpp:421`). Do NOT divide by `1+|y|`.
+    let dy_amax: f64 = if m == 0 {
+        0.0
+    } else {
+        state.dy.iter().map(|v| v.abs()).fold(0.0f64, f64::max)
+    };
+
+    let x_tiny = max_rel_dx < tiny_tol;
+    let y_tiny = dy_amax < options.tiny_step_y_tol;
+
+    if x_tiny && y_tiny && primal_inf < 1e-4 {
         *consecutive_tiny_steps += 1;
-        mu_state.tiny_step = true;
+        // Ipopt's `Set_tiny_step_flag(true)` (line 410) fires only when
+        // the previous iter also latched — i.e. on iter 2+ of a run of
+        // consecutive tiny steps. Mirror that with the >= 2 gate.
+        mu_state.tiny_step = *consecutive_tiny_steps >= 2;
     } else {
         *consecutive_tiny_steps = 0;
         mu_state.tiny_step = false;
@@ -7143,6 +7191,13 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
     // Tiny step counter (Ipopt: accept full step when relative step < 10*eps for 2 consecutive)
     let mut consecutive_tiny_steps: usize = 0;
 
+    // STOP_AT_TINY_STEP exit flag: set by `update_barrier_parameter` when
+    // `tiny_step && new_μ == μ` (no-op mu update — Ipopt's
+    // `IpMonotoneMuUpdate.cpp:158-160`, `IpAdaptiveMuUpdate.cpp:329,377`),
+    // consumed at the top of the *next* iteration after `check_convergence`
+    // so KKT-clean tiny-step iterates exit Optimal first.
+    let mut pending_tiny_step_exit: bool = false;
+
     // Overall progress stall detection: if neither primal nor dual infeasibility
     // improves by at least 1% over many consecutive iterations, terminate early.
     let mut stall = ProgressStallTracker::new();
@@ -7312,6 +7367,21 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             ipm_start,
         ) {
             return result;
+        }
+
+        // Tiny-step termination — consumed AFTER `check_convergence_and_handle_promotions`
+        // so a KKT-clean tiny-step iterate exits Optimal first. The flag
+        // itself was set by the previous iteration's `update_barrier_parameter`
+        // when `tiny_step && new_μ == μ` (Ipopt's `IpMonotoneMuUpdate.cpp:158-160`,
+        // `IpAdaptiveMuUpdate.cpp:329,377`). Mirrors `IpIpoptAlg.cpp:347-466`
+        // ordering: AcceptTrialPoint → CheckConvergence (end of iter k) →
+        // UpdateBarrierParameter throws (top of iter k+1).
+        if pending_tiny_step_exit {
+            log::debug!(
+                "STOP_AT_TINY_STEP: tiny_step latched and mu update found nothing to change at mu={:.2e}",
+                state.mu
+            );
+            return make_result(&state, SolveStatus::StopAtTinyStep);
         }
 
         let s_d_for_acc = track_consecutive_acceptable(
@@ -7524,30 +7594,23 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         trace_meta.alpha_primal_max = Some(alpha_primal_max);
         trace_meta.tau_used = Some(tau);
 
+        // Ipopt-style tiny-step detection (T2.21, spec §4): set the
+        // `tiny_step` flag when the raw search direction is at machine-
+        // precision noise AND the dual step is also small. The actual
+        // STOP_AT_TINY_STEP exit fires from `update_barrier_parameter`
+        // when `tiny_step && new_μ == μ` and is consumed at the top of
+        // the next iteration (after `check_convergence`).
+        // See `IpBacktrackingLineSearch.cpp:1219-1278,407-424`,
+        // `IpMonotoneMuUpdate.cpp:158-160`,
+        // `IpAdaptiveMuUpdate.cpp:329,377`.
         detect_tiny_step(
             &mut state,
             options,
             &mut mu_state,
             &mut filter,
             &mut consecutive_tiny_steps,
-            alpha_primal_max,
             primal_inf,
         );
-
-        // Ipopt-style tiny-step exit (T2.21, spec §4): after two
-        // consecutive iterations with relative step < 10·eps,
-        // `IpBacktrackingLineSearch` returns STOP_AT_TINY_STEP. We mirror
-        // that here instead of forcing a μ decrease. Downstream
-        // promotion logic (`check_convergence_and_handle_promotions`)
-        // will upgrade to Optimal/Acceptable on its next iteration if the
-        // KKT gates are met; this exit fires only when they are not.
-        if consecutive_tiny_steps >= 2 {
-            log::debug!(
-                "Tiny step detected for {} consecutive iterations; returning StopAtTinyStep",
-                consecutive_tiny_steps
-            );
-            return make_result(&state, SolveStatus::StopAtTinyStep);
-        }
 
         // Line search
         let t_ls = Instant::now();
@@ -7720,6 +7783,9 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         track_best_feasible(&state, options, &mut best_feasible);
 
         // --- Barrier parameter update (free/fixed mode) ---
+        // Save mu before so we can detect "mu update found nothing to
+        // change" (Ipopt `!mu_changed`, IpMonotoneMuUpdate.cpp:158-160).
+        let mu_before_update = state.mu;
         update_barrier_parameter(
             &mut state,
             &mut mu_state,
@@ -7728,6 +7794,17 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             options,
             use_sparse,
         );
+        // Set the STOP_AT_TINY_STEP latch when the tiny-step flag is
+        // active, the two-iter counter has tripped, and the mu update
+        // could not advance — this is exactly the Ipopt throw condition.
+        // Consumed at the top of the next iteration AFTER check_convergence,
+        // so a KKT-clean iterate still exits Optimal.
+        if mu_state.tiny_step
+            && consecutive_tiny_steps >= 2
+            && state.mu == mu_before_update
+        {
+            pending_tiny_step_exit = true;
+        }
 
         track_post_step_acceptable(&mut state, options);
     }
@@ -8880,6 +8957,14 @@ fn compute_initial_y_with_ls<P: NlpProblem>(
     if !(options.least_squares_mult_init && m > 0) {
         return vec![0.0; m];
     }
+    // Square-problem branch: when m == n, Ipopt's
+    // `IpDefaultIterateInitializer::least_square_mults` skips the LS solve and
+    // initializes y = 0 directly (`IpDefaultIterateInitializer.cpp:685-690`).
+    // The LS estimate is unreliable when J is square (equivalently expects
+    // grad_f ∈ range(J^T) which is too restrictive at a poor initial point).
+    if m == n {
+        return vec![0.0; m];
+    }
     let mut grad_f_init = vec![0.0; n];
     let grad_ok = problem.gradient(x, true, &mut grad_f_init);
     let mut jac_vals_init = vec![0.0; jac_nnz];
@@ -9478,7 +9563,7 @@ fn compl_err_with_z(state: &SolverState, z_l: &[f64], z_u: &[f64]) -> f64 {
 fn compute_compl_err_at_state(state: &SolverState) -> f64 {
     convergence::complementarity_error_full(
         &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u,
-        &state.g, &state.g_l, &state.g_u, &state.y, 0.0,
+        &state.g, &state.g_l, &state.g_u, &state.v_l, &state.v_u, 0.0,
     )
 }
 
@@ -10318,36 +10403,38 @@ mod tests {
 
     #[test]
     fn test_compl_err_includes_constraint_slack() {
-        // T0.3: inequality constraint with slack > 0 and y > 0 must contribute
+        // T0.3: inequality constraint with slack > 0 and v_l > 0 must contribute
         // to compl error. No variable bounds.
-        // g = 3.0, g_l = 1.0, g_u = +inf, y = 0.5; slack = 2.0.
+        // g = 3.0, g_l = 1.0, g_u = +inf, v_l = 0.5; slack = 2.0.
         // Variable-bound block: 0.0.
-        // Constraint-slack block: |2.0 * max(0.5, 0) - 0.0| = 1.0.
+        // Constraint-slack block: |2.0 * 0.5 - 0.0| = 1.0.
+        // Mirrors Ipopt's curr_complementarity which uses the dedicated v_L
+        // multipliers, not max(y,0) (IpIpoptCalculatedQuantities.cpp:2467-2497).
         let mut state = minimal_state(1, 1);
         state.x = vec![0.0];
         state.g = vec![3.0];
         state.g_l = vec![1.0];
         state.g_u = vec![f64::INFINITY];
-        state.y = vec![0.5];
+        state.v_l = vec![0.5];
         let err = compute_compl_err_at_state(&state);
         assert!((err - 1.0).abs() < 1e-12,
-            "expected slack*max(y,0) = 1.0, got {}", err);
+            "expected slack*v_l = 1.0, got {}", err);
     }
 
     #[test]
     fn test_compl_err_constraint_upper_block() {
-        // T0.3: upper-bound side: y < 0, slack from g_u.
-        // g = 1.0, g_l = -inf, g_u = 4.0, y = -0.25; slack = 3.0.
-        // Constraint-slack block: |3.0 * max(0.25, 0) - 0.0| = 0.75.
+        // T0.3: upper-bound side uses v_u directly.
+        // g = 1.0, g_l = -inf, g_u = 4.0, v_u = 0.25; slack = 3.0.
+        // Constraint-slack block: |3.0 * 0.25 - 0.0| = 0.75.
         let mut state = minimal_state(1, 1);
         state.x = vec![0.0];
         state.g = vec![1.0];
         state.g_l = vec![f64::NEG_INFINITY];
         state.g_u = vec![4.0];
-        state.y = vec![-0.25];
+        state.v_u = vec![0.25];
         let err = compute_compl_err_at_state(&state);
         assert!((err - 0.75).abs() < 1e-12,
-            "expected slack*max(-y,0) = 0.75, got {}", err);
+            "expected slack*v_u = 0.75, got {}", err);
     }
 
     #[test]
@@ -11204,7 +11291,7 @@ mod tests {
 
         detect_tiny_step(
             &mut state, &opts, &mut mu_state, &mut filter,
-            &mut consecutive, 1.0, 0.0,
+            &mut consecutive, 0.0,
         );
 
         assert!(mu_state.tiny_step, "tiny_step flag must be set");
@@ -11215,7 +11302,7 @@ mod tests {
             "detect_tiny_step must not reset/augment the filter");
     }
 
-    /// When the relative step exceeds 1e-14, the flag must clear and
+    /// When the relative step exceeds `10·eps`, the flag must clear and
     /// the consecutive counter must reset.
     #[test]
     fn test_detect_tiny_step_clears_when_step_grows() {
@@ -11231,11 +11318,37 @@ mod tests {
 
         detect_tiny_step(
             &mut state, &opts, &mut mu_state, &mut filter,
-            &mut consecutive, 1.0, 0.0,
+            &mut consecutive, 0.0,
         );
 
         assert!(!mu_state.tiny_step, "tiny_step must clear on a real step");
         assert_eq!(consecutive, 0, "consecutive counter must reset");
+    }
+
+    /// A tiny x-step combined with a *large* dual step must NOT latch
+    /// the tiny-step flag (Ipopt's `tiny_step_y_tol` gate at
+    /// `IpBacktrackingLineSearch.cpp:421-424`).
+    #[test]
+    fn test_detect_tiny_step_blocked_by_large_dy() {
+        let mut state = minimal_state(1, 1);
+        state.x = vec![1.0];
+        state.dx = vec![1e-20];
+        state.y = vec![0.0];
+        state.dy = vec![1.0]; // |dy|/(1+|y|) = 1.0, well above default 1e-2
+
+        let opts = SolverOptions::default();
+        let mut mu_state = MuState::new();
+        let mut filter = crate::filter::Filter::new(1e10);
+        let mut consecutive: usize = 1;
+
+        detect_tiny_step(
+            &mut state, &opts, &mut mu_state, &mut filter,
+            &mut consecutive, 0.0,
+        );
+
+        assert!(!mu_state.tiny_step,
+            "tiny x-step must not latch tiny_step when dual step is still large");
+        assert_eq!(consecutive, 0, "counter must reset when dy gate fails");
     }
 
     /// Watchdog fidelity (spec §4): on a watchdog accept the filter is

@@ -154,8 +154,11 @@ pub fn check_convergence_with_last_obj(
         return ConvergenceStatus::Converged;
     }
 
-    if meets_acceptable_thresholds(info, options, s_d, s_c, last_obj)
-        && consecutive_acceptable >= NEAR_TOL_ITERS
+    // `acceptable_iter == 0` disables the acceptable exit entirely
+    // (Ipopt 3.14 `IpOptErrorConvCheck.cpp:241`).
+    if options.acceptable_iter > 0
+        && meets_acceptable_thresholds(info, options, s_d, s_c, last_obj)
+        && consecutive_acceptable >= options.acceptable_iter
     {
         return ConvergenceStatus::Acceptable;
     }
@@ -317,10 +320,19 @@ pub fn complementarity_error(
 /// Compute full complementarity error including constraint slack complementarity.
 ///
 /// In addition to variable bound complementarity (x-x_l)*z_l and (x_u-x)*z_u,
-/// this also checks constraint slack complementarity for inequality constraints:
-/// - Lower-bounded: (g(x) - g_l) * max(y\[i\], 0)
-/// - Upper-bounded: (g_u - g(x)) * max(-y\[i\], 0)
+/// this also checks constraint slack complementarity for inequality constraints
+/// using the dedicated slack-bound multipliers `v_l`, `v_u` (Ipopt's `v_L`,
+/// `v_U`):
+/// - Lower-bounded: (g(x) - g_l) * v_l\[i\]
+/// - Upper-bounded: (g_u - g(x)) * v_u\[i\]
 /// - Equality constraints are skipped.
+///
+/// Mirrors Ipopt's `IpIpoptCalculatedQuantities::curr_complementarity` which
+/// sums Asum() over four projection blocks: z_L, z_U, v_L, v_U
+/// (`IpIpoptCalculatedQuantities.cpp:2467-2497`). The earlier `max(y,0)` /
+/// `max(-y,0)` substitute (T0.3) was an approximation that broke when `y`
+/// drifted away from the central path even though `v_l*slack = mu` was
+/// preserved by `reset_slack_multipliers` — see the HS32 stuck-compl regression.
 #[allow(clippy::too_many_arguments)]
 pub fn complementarity_error_full(
     x: &[f64],
@@ -331,27 +343,33 @@ pub fn complementarity_error_full(
     g: &[f64],
     g_l: &[f64],
     g_u: &[f64],
-    y: &[f64],
+    v_l: &[f64],
+    v_u: &[f64],
     mu: f64,
 ) -> f64 {
     // Start with variable bound complementarity
     let mut max_err = complementarity_error(x, x_l, x_u, z_l, z_u, mu);
 
-    // Add constraint slack complementarity for inequality constraints
+    // Add constraint slack complementarity for inequality constraints.
+    // Ipopt iterates an explicit slack s ≥ 0 (kept interior by the line
+    // search) so v·s − μ is a meaningful central-path residual. ripopt's
+    // implicit-slack formulation lets g(x) drift infeasible during the
+    // line search, where s := g − g_l can go negative; v_l (set to
+    // μ_ks/max(s,1e-20)) is then huge and the unclamped product is
+    // nonsense. Clamp the effective slack at 0 to mirror Ipopt's interior
+    // s (any constraint infeasibility is already counted by primal_inf).
     let m = g.len();
     for i in 0..m {
         if is_equality_constraint(g_l[i], g_u[i]) {
             continue;
         }
         if g_l[i].is_finite() {
-            let slack = g[i] - g_l[i];
-            let mult = y[i].max(0.0);
-            max_err = max_err.max((slack * mult - mu).abs());
+            let slack = (g[i] - g_l[i]).max(0.0);
+            max_err = max_err.max((slack * v_l[i] - mu).abs());
         }
         if g_u[i].is_finite() {
-            let slack = g_u[i] - g[i];
-            let mult = (-y[i]).max(0.0);
-            max_err = max_err.max((slack * mult - mu).abs());
+            let slack = (g_u[i] - g[i]).max(0.0);
+            max_err = max_err.max((slack * v_u[i] - mu).abs());
         }
     }
     max_err
