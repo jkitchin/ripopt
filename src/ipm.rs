@@ -660,6 +660,11 @@ struct MuState {
     consecutive_soft_restoration: usize,
     /// Sliding window of dual infeasibility values for stagnation detection.
     dual_inf_window: Vec<f64>,
+    /// Snapshot of `avg_compl` at the *first* Free-mode μ-oracle call.
+    /// Used to derive Ipopt's `mu_max = mu_max_fact * initial_avg_compl`
+    /// upper bound on adaptive μ (`IpAdaptiveMuUpdate.cpp:267-273`).
+    /// `None` until the first oracle call captures it.
+    initial_avg_compl: Option<f64>,
 }
 
 impl MuState {
@@ -675,6 +680,21 @@ impl MuState {
             consecutive_insufficient: 0,
             consecutive_soft_restoration: 0,
             dual_inf_window: Vec::with_capacity(4),
+            initial_avg_compl: None,
+        }
+    }
+
+    /// Compute the Ipopt `mu_max = mu_max_fact * initial_avg_compl` cap,
+    /// capturing `initial_avg_compl` lazily on the first Free-mode oracle
+    /// call. Mirrors `IpAdaptiveMuUpdate.cpp:267-273`. Falls back to
+    /// `1e10` until first capture (matches Ipopt before the first call).
+    fn mu_max_cap(&mut self, options: &SolverOptions, avg_compl: f64) -> f64 {
+        if self.initial_avg_compl.is_none() && avg_compl.is_finite() && avg_compl > 0.0 {
+            self.initial_avg_compl = Some(avg_compl);
+        }
+        match self.initial_avg_compl {
+            Some(init) => options.mu_max_fact * init,
+            None => 1e10,
         }
     }
 
@@ -4902,17 +4922,16 @@ fn compute_centrality_xi(state: &SolverState, avg_compl: f64) -> f64 {
 fn compute_loqo_mu(
     state: &SolverState,
     options: &SolverOptions,
+    mu_state: &mut MuState,
     avg_compl: f64,
 ) -> f64 {
-    // T2.28: faithful mirror of Ipopt 3.14
+    // T2.28 + T3.2: faithful mirror of Ipopt 3.14
     // `LoqoMuOracle::CalculateMu` (`IpLoqoMuOracle.cpp:34-66`).
     // No `monotone_floor`, no `mu^super` clamp — Ipopt's CalculateMu
-    // is just `Max(Min(mu_max, sigma*avg_compl), mu_min)`. The upper
-    // bound `mu_max` in Ipopt is `mu_max_fact * initial_avg_compl`
-    // (default `mu_max_fact = 1000`), computed lazily and threaded
-    // through `IpAdaptiveMuUpdate`. ripopt approximates this as
-    // 1e5 (matching the historical hard cap) until §3.3's mu_max
-    // plumbing is wired through. spec §3.4.
+    // is `Max(Min(mu_max, sigma*avg_compl), mu_min)`, where
+    // `mu_max = mu_max_fact * initial_avg_compl` is captured lazily
+    // by the adaptive μ-update on its first call
+    // (`IpAdaptiveMuUpdate.cpp:267-273`).
     let xi = compute_centrality_xi(state, avg_compl);
 
     let ratio = if xi > 1e-20 {
@@ -4922,11 +4941,12 @@ fn compute_loqo_mu(
     };
     let sigma = 0.1 * ratio.powi(3);
     let loqo_mu = sigma * avg_compl;
-    let new_mu = loqo_mu.clamp(options.mu_min, 1e5);
+    let mu_cap = mu_state.mu_max_cap(options, avg_compl);
+    let new_mu = loqo_mu.clamp(options.mu_min, mu_cap);
 
     if options.print_level >= 5 {
-        rip_log!("ripopt: mu loqo: xi={:.4} sigma={:.4} avg_compl={:.3e} -> mu={:.3e}",
-            xi, sigma, avg_compl, new_mu);
+        rip_log!("ripopt: mu loqo: xi={:.4} sigma={:.4} avg_compl={:.3e} mu_cap={:.3e} -> mu={:.3e}",
+            xi, sigma, avg_compl, mu_cap, new_mu);
     }
     new_mu
 }
@@ -4982,6 +5002,7 @@ fn compute_loqo_mu(
 fn compute_quality_function_mu(
     state: &SolverState,
     options: &SolverOptions,
+    mu_state: &mut MuState,
     avg_compl: f64,
     use_sparse: bool,
 ) -> Option<f64> {
@@ -5141,7 +5162,8 @@ fn compute_quality_function_mu(
     let monotone_floor =
         (options.mu_linear_decrease_factor * state.mu)
             .min(state.mu.powf(options.mu_superlinear_decrease_power));
-    let new_mu = qf_mu.max(monotone_floor).clamp(options.mu_min, 1e5);
+    let mu_cap = mu_state.mu_max_cap(options, avg_compl);
+    let new_mu = qf_mu.max(monotone_floor).clamp(options.mu_min, mu_cap);
 
     if options.print_level >= 5 {
         rip_log!("ripopt: mu QF: sigma*={:.4e} avg_compl={:.3e} floor={:.3e} -> mu={:.3e}",
@@ -5345,13 +5367,14 @@ fn apply_free_mode_sufficient_progress_update(
         // T2.23: try the Ipopt-style Quality Function oracle first
         // (spec §3.5, IpQualityFunctionMuOracle.cpp). Falls back to the
         // Loqo formula on aff/centering solve failure.
-        state.mu = compute_quality_function_mu(state, options, avg_compl, use_sparse)
-            .unwrap_or_else(|| compute_loqo_mu(state, options, avg_compl));
+        state.mu = compute_quality_function_mu(state, options, mu_state, avg_compl, use_sparse)
+            .unwrap_or_else(|| compute_loqo_mu(state, options, mu_state, avg_compl));
     } else if avg_compl > 0.0 {
         // T2.3: dropped the ripopt-specific `μ/5` floor that fired when
         // barrier_err > κ_eps·μ; Ipopt's monotone-mode update uses only
         // `mu_min` as the lower clamp.
-        state.mu = (avg_compl / options.kappa).clamp(options.mu_min, 1e5);
+        let mu_cap = mu_state.mu_max_cap(options, avg_compl);
+        state.mu = (avg_compl / options.kappa).clamp(options.mu_min, mu_cap);
     } else {
         state.mu = (options.mu_linear_decrease_factor * state.mu)
             .max(options.mu_min);
@@ -11053,17 +11076,20 @@ mod tests {
     }
 
     /// On a small well-posed iterate the QF oracle must return Some, and
-    /// the chosen μ must lie in the documented [μ_min, 1e5] clamp.
+    /// the chosen μ must lie in `[μ_min, mu_max_fact * initial_avg_compl]`
+    /// (T3.2 — replaced the historical 1e5 hard cap with the lazy mu_max).
     #[test]
     fn test_compute_quality_function_mu_returns_clamped_some() {
         let state = qf_minimal_state();
         let opts = SolverOptions::default();
+        let mut mu_state = MuState::new();
         let avg = compute_avg_complementarity(&state);
         assert!(avg > 0.0, "test state must have positive avg_compl");
-        let mu = compute_quality_function_mu(&state, &opts, avg, false);
+        let mu = compute_quality_function_mu(&state, &opts, &mut mu_state, avg, false);
         let mu = mu.expect("QF oracle should produce μ on a well-formed iterate");
+        let cap = opts.mu_max_fact * avg;
         assert!(mu >= opts.mu_min, "μ below mu_min: {}", mu);
-        assert!(mu <= 1e5, "μ above clamp: {}", mu);
+        assert!(mu <= cap, "μ above mu_max_fact*avg cap: {}", mu);
         assert!(mu.is_finite(), "μ must be finite");
     }
 
@@ -11073,7 +11099,8 @@ mod tests {
     fn test_compute_quality_function_mu_none_on_zero_avg_compl() {
         let state = qf_minimal_state();
         let opts = SolverOptions::default();
-        let mu = compute_quality_function_mu(&state, &opts, 0.0, false);
+        let mut mu_state = MuState::new();
+        let mu = compute_quality_function_mu(&state, &opts, &mut mu_state, 0.0, false);
         assert!(mu.is_none(), "QF oracle must reject avg_compl ≤ 0");
     }
 
@@ -11090,15 +11117,18 @@ mod tests {
         let avg = compute_avg_complementarity(&state);
 
         let opts_off = SolverOptions { quality_function_centrality: false, ..SolverOptions::default() };
-        let mu_off = compute_quality_function_mu(&state, &opts_off, avg, false)
+        let mut mus_off = MuState::new();
+        let mu_off = compute_quality_function_mu(&state, &opts_off, &mut mus_off, avg, false)
             .expect("QF off");
         let opts_on = SolverOptions { quality_function_centrality: true, ..SolverOptions::default() };
-        let mu_on = compute_quality_function_mu(&state, &opts_on, avg, false)
+        let mut mus_on = MuState::new();
+        let mu_on = compute_quality_function_mu(&state, &opts_on, &mut mus_on, avg, false)
             .expect("QF on");
+        let cap = opts_off.mu_max_fact * avg;
         for mu in [mu_off, mu_on] {
             assert!(mu.is_finite(), "μ must be finite, got {}", mu);
             assert!(mu >= opts_off.mu_min, "μ below mu_min: {}", mu);
-            assert!(mu <= 1e5, "μ above clamp: {}", mu);
+            assert!(mu <= cap, "μ above mu_max_fact*avg cap: {}", mu);
         }
     }
 

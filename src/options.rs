@@ -78,6 +78,14 @@ pub struct SolverOptions {
     pub mu_init: f64,
     /// Minimum barrier parameter.
     pub mu_min: f64,
+    /// Multiplier on the initial average complementarity used as the
+    /// upper bound on adaptive μ (`μ_max = mu_max_fact * initial_avg_compl`).
+    /// Mirrors Ipopt 3.14 `mu_max_fact` (default `1000`,
+    /// `IpAdaptiveMuUpdate.cpp:267-273`). The cap is applied to both
+    /// the LOQO and quality-function oracles. ripopt computes
+    /// `initial_avg_compl` lazily on the first Free-mode call. When
+    /// adaptive mode is off this option has no effect.
+    pub mu_max_fact: f64,
     /// Fraction-to-boundary parameter minimum.
     pub tau_min: f64,
     /// Barrier parameter reduction factor (monotone mode).
@@ -409,6 +417,7 @@ impl Default for SolverOptions {
             max_iter: 3000,
             mu_init: 0.1,
             mu_min: 1e-11,
+            mu_max_fact: 1000.0,
             tau_min: 0.99,
             mu_linear_decrease_factor: 0.2,
             mu_superlinear_decrease_power: 1.5,
