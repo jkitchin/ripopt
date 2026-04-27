@@ -581,6 +581,33 @@ impl KktMatrix {
     }
 }
 
+/// Diagnostic snapshot from the most recent factorization. T3.38: lets
+/// the IPM log/inspect implementation-defined factorization quality
+/// signals (delayed pivots, 2x2 blocks, fill, scaling info, resolved
+/// algorithm), without baking those into the trait surface.
+///
+/// All fields are `Option`-typed so backends that cannot report a
+/// given quantity simply return `None` for it.
+#[derive(Debug, Clone, Default)]
+pub struct FactorDiagnostics {
+    /// Number of delayed pivots (Bunch-Kaufman pivots that could not
+    /// be eliminated in their natural supernode and were pushed to a
+    /// parent / column-swap path).
+    pub n_delayed: Option<usize>,
+    /// Number of 2x2 pivot blocks selected during BK factorization.
+    pub n_2x2: Option<usize>,
+    /// Non-zeros in the factor L (post-fill).
+    pub factor_nnz: Option<usize>,
+    /// Smallest diagonal entry (in absolute value) of D.
+    pub min_diagonal: Option<f64>,
+    /// One-line, human-readable description of the scaling that was
+    /// applied (e.g. `"Identity"`, `"InfNorm"`, `"MC64"`).
+    pub scaling_info: Option<String>,
+    /// Backend-specific name of the algorithm that was actually
+    /// resolved (e.g. `"multifrontal"`, `"supernodal-ldlt"`).
+    pub resolved_method: Option<String>,
+}
+
 /// Trait for linear solvers used within the IPM.
 pub trait LinearSolver {
     /// Factor the symmetric matrix. Returns inertia if the solver can compute it.
@@ -604,6 +631,13 @@ pub trait LinearSolver {
     /// Matches Ipopt's IncreaseQuality() / MUMPS pivtol escalation.
     fn increase_quality(&mut self) -> bool {
         false
+    }
+
+    /// Diagnostic snapshot from the most recent factorization. Default
+    /// returns an empty struct; backends fill in the fields they can
+    /// surface.
+    fn last_factor_diagnostics(&self) -> FactorDiagnostics {
+        FactorDiagnostics::default()
     }
 }
 

@@ -18,7 +18,7 @@
 //! delegates everything to `FeralLdl`.
 
 use super::feral_direct::FeralLdl;
-use super::{Inertia, KktMatrix, LinearSolver, SolverError};
+use super::{FactorDiagnostics, Inertia, KktMatrix, LinearSolver, SolverError};
 
 pub struct FeralIterativeMinres {
     inner: FeralLdl,
@@ -65,5 +65,9 @@ impl LinearSolver for FeralIterativeMinres {
 
     fn increase_quality(&mut self) -> bool {
         self.inner.increase_quality()
+    }
+
+    fn last_factor_diagnostics(&self) -> FactorDiagnostics {
+        self.inner.last_factor_diagnostics()
     }
 }

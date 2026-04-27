@@ -16,7 +16,7 @@
 //!   `increase_quality()` using the same MA27-style rule as feral's
 //!   `Solver::increase_quality`.
 
-use super::{Inertia, KktMatrix, LinearSolver, SolverError};
+use super::{FactorDiagnostics, Inertia, KktMatrix, LinearSolver, SolverError};
 use feral::numeric::factorize::{
     factorize_multifrontal_with_workspace, FactorWorkspace, NumericParams, SparseFactors,
 };
@@ -341,6 +341,36 @@ impl LinearSolver for FeralLdl {
 
     fn min_diagonal(&self) -> Option<f64> {
         self.factors.as_ref().and_then(|f| f.min_diagonal())
+    }
+
+    fn last_factor_diagnostics(&self) -> FactorDiagnostics {
+        let Some(factors) = self.factors.as_ref() else {
+            return FactorDiagnostics::default();
+        };
+        let mut n_2x2 = 0usize;
+        let mut n_delayed = 0usize;
+        for nf in &factors.node_factors {
+            let ff = &nf.frontal_factors;
+            n_delayed += ff.n_delayed;
+            let nelim = ff.nelim;
+            let mut k = 0;
+            while k < nelim {
+                if k + 1 < nelim && ff.d_subdiag[k] != 0.0 {
+                    n_2x2 += 1;
+                    k += 2;
+                } else {
+                    k += 1;
+                }
+            }
+        }
+        FactorDiagnostics {
+            n_delayed: Some(n_delayed),
+            n_2x2: Some(n_2x2),
+            factor_nnz: Some(factors.factor_nnz()),
+            min_diagonal: factors.min_diagonal(),
+            scaling_info: Some(format!("{:?}", factors.scaling_info)),
+            resolved_method: Some(format!("{:?}", factors.resolved_method)),
+        }
     }
 
     fn increase_quality(&mut self) -> bool {

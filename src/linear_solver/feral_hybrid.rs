@@ -10,7 +10,7 @@
 
 use super::feral_direct::FeralLdl;
 use super::feral_iterative::FeralIterativeMinres;
-use super::{Inertia, KktMatrix, LinearSolver, SolverError};
+use super::{FactorDiagnostics, Inertia, KktMatrix, LinearSolver, SolverError};
 
 pub struct FeralHybrid {
     direct: FeralLdl,
@@ -156,6 +156,13 @@ impl LinearSolver for FeralHybrid {
         match self.mode {
             HybridMode::Direct => self.direct.increase_quality(),
             HybridMode::Iterative => self.iterative.increase_quality(),
+        }
+    }
+
+    fn last_factor_diagnostics(&self) -> FactorDiagnostics {
+        match self.mode {
+            HybridMode::Direct => self.direct.last_factor_diagnostics(),
+            HybridMode::Iterative => self.iterative.last_factor_diagnostics(),
         }
     }
 }
