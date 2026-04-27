@@ -400,7 +400,11 @@ impl RestorationPhase {
         // Ipopt RestoFilterConvCheck (IpRestoFilterConvCheck.cpp:53-80)
         // requires three gates to declare restoration success:
         //   (1) primal-infeasibility decrease:
-        //         theta_final <= max(0.9 * theta_initial, min(tol, constr_viol_tol))
+        //         theta_final <= max(kappa_resto * theta_initial, min(tol, constr_viol_tol))
+        //       where kappa_resto is `options.kappa_resto` (Ipopt's
+        //       `required_infeasibility_reduction`, default 0.9; spec §7.7).
+        //       Square-problem branch (T2.2) overrides this to 0 to require
+        //       true feasibility recovery before exiting GN restoration.
         //   (2) parent filter accepts (theta_final, phi_rest)
         //   (3) parent current iterate accepts the trial point with
         //       resto-relaxation; this is implicit here because the
@@ -417,7 +421,7 @@ impl RestorationPhase {
         // recover when theta_initial is small.
         let feasible = theta_final < options.constr_viol_tol;
         let small_threshold = options.tol.min(options.constr_viol_tol);
-        let kappa_resto = if self.is_square { 0.0 } else { 0.9 };
+        let kappa_resto = if self.is_square { 0.0 } else { options.kappa_resto };
         let ipopt_kappa_resto_met =
             theta_final <= (kappa_resto * theta_initial).max(small_threshold);
         let large_reduction = theta_final < 0.5 * theta_initial;

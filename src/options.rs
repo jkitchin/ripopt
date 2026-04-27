@@ -180,6 +180,16 @@ pub struct SolverOptions {
     pub restoration_max_iter: usize,
     /// Disable NLP restoration (prevents recursion in inner solve). Default: false.
     pub disable_nlp_restoration: bool,
+    /// Required infeasibility reduction for restoration to be declared a
+    /// success. Mirrors Ipopt's `required_infeasibility_reduction` option
+    /// (a.k.a. `kappa_resto`) used by `IpRestoFilterConvCheck::CheckProgress`
+    /// (`IpRestoConvCheck.cpp:71-248`, spec §7.7). Restoration accepts a
+    /// trial point when
+    ///   `theta_trial <= max(kappa_resto * theta_entry, min(tol, constr_viol_tol))`
+    /// Default: 0.9. Set to 0.0 to require true feasibility (Ipopt's
+    /// square-problem convention; ripopt's `RestorationPhase` enforces
+    /// this automatically when `is_square`).
+    pub kappa_resto: f64,
     /// Enable slack variable fallback for inequality problems. When the initial
     /// solve fails, retry with explicit slack variables (g(x)-s=0, bounds on s).
     /// Default: true.
@@ -424,6 +434,7 @@ impl Default for SolverOptions {
             adaptive_mu_monotone_init_factor: 0.8,
             restoration_max_iter: 200,
             disable_nlp_restoration: false,
+            kappa_resto: 0.9,
             enable_slack_fallback: true,
             enable_lbfgs_fallback: true,
             enable_preprocessing: true,

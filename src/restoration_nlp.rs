@@ -588,4 +588,105 @@ mod tests {
             vals[1]
         );
     }
+
+    /// Spec §7.4 (T2.22): Hessian of the restoration objective uses D_R^2,
+    /// not D_R, and the slack rows/cols are zero. The original Hessian must
+    /// be evaluated with `obj_factor=0` (P22, `IpRestoIpoptNLP.cpp:691`).
+    #[test]
+    fn test_hessian_uses_d_r_squared_and_zeroes_slacks() {
+        let prob = SimpleConstrained;
+        let x_r = vec![2.0_f64, 4.0];
+        let mu: f64 = 0.25;
+        let eta = 1.0 * mu.sqrt();
+        let resto = RestorationNlp::new(&prob, &x_r, mu, 1000.0, 1.0);
+        let (hrows, hcols) = resto.hessian_structure();
+        let nnz = hrows.len();
+        let mut vals = vec![0.0; nnz];
+        let x = vec![3.0, 5.0, 0.1, 0.1];
+        let lambda = vec![0.0];
+        resto.hessian_values(&x, true, 1.0, &lambda, &mut vals);
+
+        let mut diag_x = vec![0.0; 2];
+        let mut max_off_x_or_slack = 0.0_f64;
+        for k in 0..nnz {
+            let r = hrows[k];
+            let c = hcols[k];
+            if r == c && r < 2 {
+                diag_x[r] = vals[k];
+            } else if vals[k].abs() > max_off_x_or_slack {
+                max_off_x_or_slack = vals[k].abs();
+            }
+        }
+        assert!(
+            (diag_x[0] - eta * 0.25).abs() < 1e-12,
+            "diag_x[0] should be eta*D_R^2[0] = {} but was {}",
+            eta * 0.25, diag_x[0]
+        );
+        assert!(
+            (diag_x[1] - eta * 0.0625).abs() < 1e-12,
+            "diag_x[1] should be eta*D_R^2[1] = {} but was {}",
+            eta * 0.0625, diag_x[1]
+        );
+        assert!((diag_x[0] - eta * 0.5).abs() > 1e-3, "regression: D_R not D_R^2");
+        assert!(
+            max_off_x_or_slack < 1e-12,
+            "slack rows/cols and x off-diag must be zero, max abs = {}",
+            max_off_x_or_slack
+        );
+    }
+
+    /// Spec §7.2 / T2.22 item A1: residual is c(x) − p + n.
+    #[test]
+    fn test_eval_g_signs_match_spec() {
+        let prob = SimpleConstrained;
+        let x_r = vec![0.0, 0.0];
+        let resto = RestorationNlp::new(&prob, &x_r, 0.1, 1000.0, 1.0);
+        let mut g = vec![0.0; 1];
+        let x = vec![1.0, 3.0, 1.0, 0.0];
+        resto.constraints(&x, true, &mut g);
+        assert!((g[0] - 3.0).abs() < 1e-12, "expected 3 (= 4-1+0), got {}", g[0]);
+        let x2 = vec![1.0, 3.0, 0.0, 1.0];
+        resto.constraints(&x2, true, &mut g);
+        assert!((g[0] - 5.0).abs() < 1e-12, "expected 5 (= 4-0+1), got {}", g[0]);
+    }
+
+    /// Spec §7.2 / T2.22 item A2: Jacobian slack columns [−I_p, +I_n].
+    #[test]
+    fn test_eval_jac_g_slack_signs_match_spec() {
+        let prob = SimpleConstrained;
+        let x_r = vec![0.0, 0.0];
+        let resto = RestorationNlp::new(&prob, &x_r, 0.1, 1000.0, 1.0);
+        let (rows, cols) = resto.jacobian_structure();
+        let mut vals = vec![0.0; rows.len()];
+        resto.jacobian_values(&[0.5, 0.5, 0.1, 0.1], true, &mut vals);
+        for (k, (&r, &c)) in rows.iter().zip(cols.iter()).enumerate() {
+            assert_eq!(r, 0);
+            match c {
+                0 | 1 => assert!((vals[k] - 1.0).abs() < 1e-12, "J_x[{}]=1, got {}", c, vals[k]),
+                2 => assert!((vals[k] - (-1.0)).abs() < 1e-12, "p-col should be -1, got {}", vals[k]),
+                3 => assert!((vals[k] - 1.0).abs() < 1e-12, "n-col should be +1, got {}", vals[k]),
+                _ => panic!("unexpected col {}", c),
+            }
+        }
+    }
+
+    /// Spec §7.2 / T2.22 item A3: gradient `[η·D_R²·(x−x_R), ρ·1, ρ·1]`.
+    #[test]
+    fn test_eval_grad_f_uses_d_r_squared() {
+        let prob = SimpleConstrained;
+        let x_r = vec![2.0_f64, 4.0];
+        let mu: f64 = 0.25;
+        let eta = mu.sqrt();
+        let rho = 1000.0;
+        let resto = RestorationNlp::new(&prob, &x_r, mu, rho, 1.0);
+        let nv = resto.num_variables();
+        let mut grad = vec![0.0; nv];
+        let x = vec![3.0, 5.0, 0.7, 0.3];
+        resto.gradient(&x, true, &mut grad);
+        assert!((grad[0] - eta * 0.25).abs() < 1e-12, "grad[0] = {}", grad[0]);
+        assert!((grad[1] - eta * 0.0625).abs() < 1e-12, "grad[1] = {}", grad[1]);
+        assert!((grad[2] - rho).abs() < 1e-12);
+        assert!((grad[3] - rho).abs() < 1e-12);
+        assert!((grad[0] - eta * 0.5).abs() > 1e-3, "regression: grad uses D_R, not D_R^2");
+    }
 }

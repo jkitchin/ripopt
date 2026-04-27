@@ -8607,12 +8607,16 @@ fn filter_accepts_restored_iterate(
     true
 }
 
-/// Classify the outcome of a completed restoration solve. Decision tree:
-/// 1. theta_new < constr_viol_tol → Success (achieved feasibility).
-/// 2. theta_new ≤ 0.5*theta_current → Success (50% reduction, stricter than
-///    Gauss-Newton's 10% to avoid marginal "success" that prevents recovery
-///    mechanisms from engaging).
-/// 3. theta_new < 0.9*theta_current AND filter-acceptable → Success.
+/// Classify the outcome of a completed restoration solve. Mirrors Ipopt's
+/// `IpRestoFilterConvCheck::CheckProgress` (`IpRestoConvCheck.cpp:71-248`,
+/// spec §7.7). Decision tree:
+/// 1. theta_new < min(tol, constr_viol_tol) → Success (achieved feasibility,
+///    matches Ipopt's "small_threshold" gate).
+/// 2. theta_new ≤ 0.5*theta_current → Success (50% reduction, ripopt-specific
+///    lenient path that helps NLP restoration recover when θ_current is small;
+///    subsumed by gate 3 when `kappa_resto >= 0.5`).
+/// 3. theta_new ≤ kappa_resto * theta_current AND filter-acceptable → Success
+///    (Ipopt's primary `required_infeasibility_reduction` gate, default 0.9).
 /// 4. inner_converged but no feasibility improvement → LocalInfeasibility
 ///    (the restoration NLP itself reached a stationary point of the
 ///    L1-feasibility objective with positive residual).
@@ -8625,13 +8629,14 @@ fn classify_restoration_outcome(
     phi_new: f64,
     inner_converged: bool,
 ) -> RestorationOutcome {
-    if theta_new < options.constr_viol_tol {
+    let small_threshold = options.tol.min(options.constr_viol_tol);
+    if theta_new < small_threshold {
         return RestorationOutcome::Success;
     }
     if theta_new <= 0.5 * theta_current {
         return RestorationOutcome::Success;
     }
-    if theta_new < 0.9 * theta_current
+    if theta_new <= options.kappa_resto * theta_current
         && filter_accepts_restored_iterate(filter, theta_new, phi_new)
     {
         return RestorationOutcome::Success;
@@ -11126,5 +11131,46 @@ mod tests {
         let ratio = on / off;
         assert!(ratio < 2.0 && ratio > 0.5,
             "QF iterations diverge from Loqo: off={} on={}", r_off.iterations, r_on.iterations);
+    }
+
+    // ---- T2.22 kappa_resto / restoration acceptance (spec §7.7) ----
+
+    /// Spec §7.7 / T2.22 item B: when restoration ends with theta_new just
+    /// inside `kappa_resto * theta_current` (and is filter-acceptable),
+    /// the outcome must be `Success`. Tightening kappa_resto must reject.
+    #[test]
+    fn test_classify_restoration_kappa_resto_gates_success() {
+        let filter = crate::filter::Filter::new(1e8);
+        let mut opts = SolverOptions::default();
+        opts.kappa_resto = 0.9;
+        opts.constr_viol_tol = 1e-4;
+        opts.tol = 1e-8;
+        let outcome = classify_restoration_outcome(&filter, &opts, 1.0, 0.85, 0.0, true);
+        assert!(matches!(outcome, RestorationOutcome::Success),
+            "expected Success at kappa=0.9, got {:?}",
+            std::mem::discriminant(&outcome));
+
+        opts.kappa_resto = 0.5;
+        let outcome2 = classify_restoration_outcome(&filter, &opts, 1.0, 0.85, 0.0, true);
+        assert!(matches!(outcome2, RestorationOutcome::LocalInfeasibility),
+            "expected LocalInfeasibility at kappa=0.5 (inner_converged=true), got {:?}",
+            std::mem::discriminant(&outcome2));
+
+        let outcome3 = classify_restoration_outcome(&filter, &opts, 1.0, 0.85, 0.0, false);
+        assert!(matches!(outcome3, RestorationOutcome::Failed),
+            "expected Failed when inner did not converge, got {:?}",
+            std::mem::discriminant(&outcome3));
+    }
+
+    /// Spec §7.7: small_threshold = min(tol, constr_viol_tol).
+    #[test]
+    fn test_classify_restoration_feasibility_threshold() {
+        let filter = crate::filter::Filter::new(1e8);
+        let mut opts = SolverOptions::default();
+        opts.tol = 1e-8;
+        opts.constr_viol_tol = 1e-6;
+        opts.kappa_resto = 0.9;
+        let outcome = classify_restoration_outcome(&filter, &opts, 6e-9, 5e-9, 0.0, true);
+        assert!(matches!(outcome, RestorationOutcome::Success));
     }
 }
