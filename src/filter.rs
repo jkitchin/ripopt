@@ -37,6 +37,11 @@ pub struct Filter {
     /// `basval = max(1.0, log10(|reference_phi|))`. Exact mirror of
     /// `IpFilterLSAcceptor.cpp:478-493`.
     obj_max_inc: f64,
+    /// T3.5: line-search minimum step multiplier. Ipopt's
+    /// `alpha_min_frac` (default `0.05`, `IpFilterLSAcceptor.cpp:113,
+    /// 222, 468`). Multiplies the final `min` of the gamma_theta /
+    /// gamma_phi / switching-condition terms in `compute_alpha_min`.
+    alpha_min_frac: f64,
     /// Whether `set_theta_min_from_initial` has already seeded
     /// `theta_max`/`theta_min` from the initial constraint violation.
     /// Mirrors Ipopt's lazy-init sentinel (theta_max_ < 0.0) at
@@ -59,6 +64,7 @@ impl Filter {
             eta_phi: 1e-8,
             delta: 1.0,
             obj_max_inc: 5.0,
+            alpha_min_frac: 0.05,
             theta_init_set: false,
         }
     }
@@ -246,23 +252,34 @@ impl Filter {
     /// - When gradBarrTDelta >= 0 (no descent): alpha_min = alpha_min_frac * gamma_theta
     /// - When gradBarrTDelta < 0: alpha_min from filter parameters
     pub fn compute_alpha_min(&self, theta_current: f64, grad_phi_step: f64) -> f64 {
-        let alpha_min_frac = 0.05; // Ipopt default
+        // Ipopt formula (`IpFilterLSAcceptor.cpp:450-469`):
+        //   alpha_min = gamma_theta
+        //   if gBD < 0:
+        //     alpha_min = min(alpha_min, gamma_phi*theta/(-gBD))
+        //     if theta <= theta_min:
+        //       alpha_min = min(alpha_min, delta*theta^s_theta/(-gBD)^s_phi)
+        //   return alpha_min_frac * alpha_min
+        // No further floor — Ipopt does not apply a `Max(epsilon, ...)` clamp.
         if grad_phi_step >= 0.0 {
             // No barrier descent direction (common for feasibility problems with obj=0).
-            // Ipopt uses gamma_theta here, not epsilon — this triggers restoration after
-            // ~12 backtracking steps instead of ~50.
-            return alpha_min_frac * self.gamma_theta;
+            // Falls back to gamma_theta; restoration triggers after ~13 halvings at the
+            // default alpha_min_frac=0.05.
+            return self.alpha_min_frac * self.gamma_theta;
         }
         let neg_gphi = -grad_phi_step;
-        let term1 = self.gamma_theta;
-        let term2 = self.gamma_phi * theta_current / neg_gphi;
-        let mut alpha_min = alpha_min_frac * term1.min(term2);
+        let mut inner = self.gamma_theta.min(self.gamma_phi * theta_current / neg_gphi);
         if theta_current <= self.theta_min {
-            let term3 =
-                self.delta * theta_current.powf(self.s_theta) / neg_gphi.powf(self.s_phi);
-            alpha_min = alpha_min.min(alpha_min_frac * term3);
+            inner = inner.min(
+                self.delta * theta_current.powf(self.s_theta) / neg_gphi.powf(self.s_phi),
+            );
         }
-        alpha_min.max(1e-15)
+        self.alpha_min_frac * inner
+    }
+
+    /// Set the `alpha_min_frac` line-search step multiplier. Mirrors Ipopt
+    /// 3.14 `alpha_min_frac` (default `0.05`, `IpFilterLSAcceptor.cpp:113`).
+    pub fn set_alpha_min_frac(&mut self, value: f64) {
+        self.alpha_min_frac = value;
     }
 
     /// Augment the filter at restoration entry (Ipopt's PrepareRestoPhaseStart,
@@ -570,16 +587,19 @@ mod tests {
         filter.set_theta_min_from_initial(10.0); // theta_min = 1e-3
         let theta_current = 1e-4; // <= theta_min
         let grad = -1.0;
-        // alpha_min without term3 = 0.05 * min(1e-5, 1e-8 * 1e-4 / 1) = 0.05 * 1e-12 = 5e-14
-        // term3 = delta * theta^s_theta / |grad|^s_phi = 1.0 * (1e-4)^1.1 / 1.0^2.3 ≈ 5.01e-5
-        // alpha_min with term3 = min(5e-14, 0.05*5.01e-5=2.51e-6) -> 5e-14
-        // The small theta/grad case is dominated by term2; confirm we don't violate the floor.
+        // alpha_min = 0.05 * min(gamma_theta=1e-5, gamma_phi*theta/|grad|=1e-12, term3≈5.01e-5)
+        //           = 0.05 * 1e-12 = 5e-14
+        // T3.5: no `.max(1e-15)` floor — Ipopt does not clamp.
         let alpha_min = filter.compute_alpha_min(theta_current, grad);
-        assert!(alpha_min >= 1e-15, "alpha_min floor not enforced, got {}", alpha_min);
-        // Now use a much steeper descent so term2 grows and term3 becomes the binding term.
+        let expected = 0.05 * 1e-12;
+        assert!((alpha_min - expected).abs() < 1e-25,
+            "alpha_min should be 0.05*term2 = 5e-14, got {}", alpha_min);
+        // Now use a much steeper descent so term2 grows and term1 becomes the binding term.
         let alpha_min_steep = filter.compute_alpha_min(theta_current, -1e-10);
-        // With very small |grad|, term2 = 1e-8 * 1e-4 / 1e-10 = 1e-2; term3 bounded by term1 first
-        assert!(alpha_min_steep >= 1e-15);
+        // term1=1e-5, term2=1e-8*1e-4/1e-10=1e-2, term3 huge → inner = term1 = 1e-5
+        let expected_steep = 0.05 * 1e-5;
+        assert!((alpha_min_steep - expected_steep).abs() < 1e-15,
+            "steep-grad alpha_min should be 0.05*gamma_theta = 5e-7, got {}", alpha_min_steep);
     }
 
     #[test]
@@ -759,6 +779,38 @@ mod tests {
         filter.set_theta_min_from_initial(1e10);
         assert!((filter.theta_max() - theta_max_init).abs() < 1e-12,
             "T0.7: subsequent calls must be ignored, got {}", filter.theta_max());
+    }
+
+    #[test]
+    fn test_alpha_min_frac_is_configurable() {
+        // T3.5: alpha_min_frac is plumbed from SolverOptions, not hard-coded.
+        let mut filter = Filter::new(100.0);
+        // Default
+        let baseline = filter.compute_alpha_min(1.0, -2.0);
+        // term1=1e-5, term2=1e-8*1.0/2=5e-9 → inner=5e-9 → 0.05 * 5e-9 = 2.5e-10
+        assert!((baseline - 2.5e-10).abs() < 1e-20);
+        // Half the multiplier → half the result
+        filter.set_alpha_min_frac(0.025);
+        let halved = filter.compute_alpha_min(1.0, -2.0);
+        assert!((halved - 1.25e-10).abs() < 1e-20,
+            "alpha_min should scale linearly with alpha_min_frac, got {}", halved);
+    }
+
+    #[test]
+    fn test_alpha_min_no_floor_clamp() {
+        // T3.5: Ipopt has no `Max(epsilon, ...)` clamp on the returned
+        // alpha_min. Confirm tiny but positive values pass through.
+        let mut filter = Filter::new(100.0);
+        // theta=1e-12, grad=-1.0 → term2 = 1e-8 * 1e-12 / 1 = 1e-20
+        // → inner = min(1e-5, 1e-20) = 1e-20 (theta below theta_min default 1e-4*1.0=1e-4
+        //   but term3 = 1*(1e-12)^1.1/1^2.3 = 7.94e-14 > 1e-20)
+        // Result: 0.05 * 1e-20 = 5e-22, well below the old 1e-15 clamp.
+        filter.set_theta_min_from_initial(1.0);
+        let alpha_min = filter.compute_alpha_min(1e-12, -1.0);
+        assert!(alpha_min < 1e-15,
+            "expected sub-1e-15 alpha_min, old code would have clamped to 1e-15, got {}",
+            alpha_min);
+        assert!(alpha_min > 0.0, "alpha_min must remain positive, got {}", alpha_min);
     }
 
     #[test]

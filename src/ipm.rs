@@ -7110,6 +7110,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
     // Initialize filter
     let mut filter = Filter::new(1e4);
     filter.set_obj_max_inc(options.obj_max_inc);
+    filter.set_alpha_min_frac(options.alpha_min_frac);
 
     // Mehrotra centering parameter from the last iteration's predictor step.
     // Used in the Free-mode mu update: when sigma is available, mu = sigma * mu_current

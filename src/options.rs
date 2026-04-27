@@ -95,6 +95,14 @@ pub struct SolverOptions {
     /// blow-up trials that the filter alone may admit on degenerate
     /// problems.
     pub obj_max_inc: f64,
+    /// Multiplier on the line-search minimum step size. Mirrors Ipopt 3.14
+    /// `alpha_min_frac` (default `0.05`, `IpFilterLSAcceptor.cpp:113, 222,
+    /// 468`). Ipopt computes
+    /// `alpha_min_frac * min(gamma_theta, gamma_phi*theta/(-gBD), [δ*θ^sθ/(-gBD)^sφ])`
+    /// and rejects line searches that backtrack below it (entry to
+    /// restoration). Smaller values let backtracking continue further; the
+    /// Ipopt default 0.05 means restoration triggers after ~13 halvings.
+    pub alpha_min_frac: f64,
     /// Fraction-to-boundary parameter minimum.
     pub tau_min: f64,
     /// Barrier parameter reduction factor (monotone mode).
@@ -428,6 +436,7 @@ impl Default for SolverOptions {
             mu_min: 1e-11,
             mu_max_fact: 1000.0,
             obj_max_inc: 5.0,
+            alpha_min_frac: 0.05,
             tau_min: 0.99,
             mu_linear_decrease_factor: 0.2,
             mu_superlinear_decrease_power: 1.5,
