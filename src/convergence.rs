@@ -265,28 +265,23 @@ pub fn dual_infeasibility_scaled(
     z_u: &[f64],
     n: usize,
 ) -> f64 {
+    // T3.1: dropped the ripopt-specific per-component `(1 + |grad_f_i|)`
+    // divisor. Ipopt's `IpIpoptCalculatedQuantities::curr_dual_infeasibility`
+    // computes the raw max-norm of `grad_f + J^T y - z_L + z_U` and only
+    // applies the global `s_d` scaling at the convergence-test boundary
+    // (`IpOptErrorConvCheck.cpp:208`). The per-component normalisation
+    // could declare false-Optimal on problems with one large gradient
+    // component shadowing uniformly small residuals.
     let mut residual = vec![0.0; n];
-
-    // Start with gradient of objective
     residual[..n].copy_from_slice(&grad_f[..n]);
-
-    // Add J^T * lambda (Ipopt convention: L = f + y^T g)
     for (idx, (&row, &col)) in jac_rows.iter().zip(jac_cols.iter()).enumerate() {
         residual[col] += jac_vals[idx] * lambda[row];
     }
-
-    // Subtract z_l and add z_u (bound multipliers)
     for i in 0..n {
         residual[i] -= z_l[i];
         residual[i] += z_u[i];
     }
-
-    // Component-wise scaling: divide by (1 + |grad_f_i|)
-    residual
-        .iter()
-        .enumerate()
-        .map(|(i, r)| r.abs() / (1.0 + grad_f[i].abs()))
-        .fold(0.0f64, f64::max)
+    residual.iter().map(|r| r.abs()).fold(0.0f64, f64::max)
 }
 
 /// Compute complementarity error for bound constraints.
@@ -705,27 +700,14 @@ mod tests {
         assert!(di2 > 0.1, "Non-stationary should give positive dual_inf");
     }
 
-    #[test]
-    fn test_dual_infeasibility_scaled_insensitive_to_gradient_magnitude() {
-        let n = 2;
-        // Large gradient magnitudes
-        let grad_f = vec![1e6, 1e6];
-        let jac_rows = vec![];
-        let jac_cols = vec![];
-        let jac_vals: Vec<f64> = vec![];
-        let lambda: Vec<f64> = vec![];
-        // Residual = grad_f - z_l + z_u = [1e6 - 0, 1e6 - 0] = [1e6, 1e6]
-        let z_l = vec![0.0, 0.0];
-        let z_u = vec![0.0, 0.0];
-
-        // Unscaled: max |r_i| = 1e6
-        let di = dual_infeasibility(&grad_f, &jac_rows, &jac_cols, &jac_vals, &lambda, &z_l, &z_u, n);
-        assert!(di > 1e5, "Unscaled should be large: {}", di);
-
-        // Scaled: max |r_i| / (1 + |grad_f_i|) ≈ 1e6 / (1 + 1e6) ≈ 1.0
-        let di_s = dual_infeasibility_scaled(&grad_f, &jac_rows, &jac_cols, &jac_vals, &lambda, &z_l, &z_u, n);
-        assert!(di_s < 1.1, "Scaled should be ~1.0: {}", di_s);
-    }
+    // T3.1 (2026-04-27): removed
+    // `test_dual_infeasibility_scaled_insensitive_to_gradient_magnitude`.
+    // Its premise — that the dual-residual max-norm should be divided
+    // component-wise by `1 + |grad_f_i|` — was a ripopt-specific
+    // heuristic with no Ipopt analog. `dual_infeasibility_scaled` now
+    // matches `IpIpoptCalculatedQuantities::curr_dual_infeasibility`'s
+    // raw L_inf formula; the global `s_d` scaling is applied at the
+    // convergence-test boundary instead.
 
     #[test]
     fn test_dual_infeasibility_scaled_stationarity() {
