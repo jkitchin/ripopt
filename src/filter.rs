@@ -70,12 +70,20 @@ impl Filter {
     /// `theta_max_ < 0.0` sentinel is still set) and never resets them.
     /// Resetting on every μ change lets the filter envelope grow over
     /// time and admits iterates earlier filter entries had rejected.
+    ///
+    /// T3.3: floor is `1.0`, matching Ipopt
+    /// `IpFilterLSAcceptor.cpp:325-335`'s `Max(Number(1.0), reference_theta_)`.
+    /// The previous `1e-4` floor produced 10⁴× tighter theta_max on
+    /// near-feasible starts (`theta_init = 1e-6` → `theta_max = 1.0`
+    /// instead of Ipopt's `1e4`), rejecting trial points Ipopt would
+    /// accept.
     pub fn set_theta_min_from_initial(&mut self, theta_init: f64) {
         if self.theta_init_set {
             return;
         }
-        self.theta_min = 1e-4 * theta_init.max(1e-4);
-        self.theta_max = 1e4 * theta_init.max(1e-4);
+        let floor = theta_init.max(1.0);
+        self.theta_min = 1e-4 * floor;
+        self.theta_max = 1e4 * floor;
         self.theta_init_set = true;
     }
 
@@ -729,15 +737,12 @@ mod tests {
         // filter envelope grows over time and admits iterates earlier
         // filter entries had rejected.
         let mut filter = Filter::new(100.0);
-        // First call: theta_init = 0.5
-        // theta_max = 1e4 * max(1, 0.5) = 1e4 * 1.0 = 1e4 (because 0.5 < 1.0,
-        // .max(1e-4) yields 0.5; but the spec uses Max(1, theta_0). Our
-        // implementation uses theta_init.max(1e-4) so theta_max = 1e4 * 0.5 = 5e3).
-        // We assert against the implemented formula: 1e4 * 0.5 = 5000.0.
+        // First call: theta_init = 0.5. T3.3 floor is `Max(1.0, theta_init)`
+        // (IpFilterLSAcceptor.cpp:325-335), so theta_max = 1e4 * 1.0 = 1e4.
         filter.set_theta_min_from_initial(0.5);
         let theta_max_init = filter.theta_max();
-        assert!((theta_max_init - 5000.0).abs() < 1e-9,
-            "first init: theta_max should be 1e4 * 0.5 = 5000, got {}", theta_max_init);
+        assert!((theta_max_init - 1e4).abs() < 1e-9,
+            "first init: theta_max should be 1e4 * max(1.0, 0.5) = 1e4, got {}", theta_max_init);
 
         // Simulate the μ-update path that previously called
         // set_theta_min_from_initial again with a (possibly different) theta.
@@ -754,6 +759,27 @@ mod tests {
         filter.set_theta_min_from_initial(1e10);
         assert!((filter.theta_max() - theta_max_init).abs() < 1e-12,
             "T0.7: subsequent calls must be ignored, got {}", filter.theta_max());
+    }
+
+    #[test]
+    fn test_set_theta_min_from_initial_floor_is_one() {
+        // T3.3: floor must be Max(1.0, theta_init), matching Ipopt
+        // IpFilterLSAcceptor.cpp:325-335. On a near-feasible start with
+        // theta_init = 1e-6 the previous 1e-4 floor produced
+        // theta_max = 1e4 * 1e-4 = 1.0, which was 10⁴× tighter than
+        // Ipopt's 1e4. The new floor of 1.0 yields theta_max = 1e4.
+        let mut filter = Filter::new(100.0);
+        filter.set_theta_min_from_initial(1e-6);
+        assert!((filter.theta_max() - 1e4).abs() < 1e-9,
+            "near-feasible start: theta_max should be 1e4, got {}", filter.theta_max());
+        assert!((filter.theta_min - 1e-4).abs() < 1e-12,
+            "near-feasible start: theta_min should be 1e-4, got {}", filter.theta_min);
+
+        // For theta_init >= 1.0 the floor passes through unchanged.
+        let mut filter2 = Filter::new(100.0);
+        filter2.set_theta_min_from_initial(7.5);
+        assert!((filter2.theta_max() - 7.5e4).abs() < 1e-6,
+            "theta_init=7.5: theta_max should be 7.5e4, got {}", filter2.theta_max());
     }
 
     #[test]
