@@ -40,10 +40,21 @@ impl fmt::Display for Inertia {
 }
 
 /// Error from a linear solver.
+///
+/// T3.34: `WrongInertia` is distinct from `SingularMatrix` to match Ipopt's
+/// `ESymSolverStatus` (SUCCESS / SINGULAR / WRONG_INERTIA). The IPM's
+/// perturbation handler escalates `delta_w`/`delta_c` differently for the
+/// two cases — singular triggers a fresh factor with bumped delta_c; wrong
+/// inertia triggers a delta_w escalation. Collapsing them into one variant
+/// loses that signal.
 #[derive(Debug, Clone)]
 pub enum SolverError {
     /// Matrix is structurally singular (e.g., zero row).
     SingularMatrix,
+    /// Factorization succeeded but inertia does not match the expected
+    /// (n positive, m negative, 0 zero) signature for an augmented KKT
+    /// system. Carries the actual inertia so callers can log/diagnose.
+    WrongInertia { actual: Inertia },
     /// Numerical failure during factorization.
     NumericalFailure(String),
     /// Dimension mismatch.
@@ -57,6 +68,7 @@ impl fmt::Display for SolverError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SolverError::SingularMatrix => write!(f, "singular matrix"),
+            SolverError::WrongInertia { actual } => write!(f, "wrong inertia: {}", actual),
             SolverError::NumericalFailure(msg) => write!(f, "numerical failure: {}", msg),
             SolverError::DimensionMismatch { expected, got } => {
                 write!(f, "dimension mismatch: expected {}, got {}", expected, got)
