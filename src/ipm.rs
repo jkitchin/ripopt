@@ -4904,6 +4904,15 @@ fn compute_loqo_mu(
     options: &SolverOptions,
     avg_compl: f64,
 ) -> f64 {
+    // T2.28: faithful mirror of Ipopt 3.14
+    // `LoqoMuOracle::CalculateMu` (`IpLoqoMuOracle.cpp:34-66`).
+    // No `monotone_floor`, no `mu^super` clamp — Ipopt's CalculateMu
+    // is just `Max(Min(mu_max, sigma*avg_compl), mu_min)`. The upper
+    // bound `mu_max` in Ipopt is `mu_max_fact * initial_avg_compl`
+    // (default `mu_max_fact = 1000`), computed lazily and threaded
+    // through `IpAdaptiveMuUpdate`. ripopt approximates this as
+    // 1e5 (matching the historical hard cap) until §3.3's mu_max
+    // plumbing is wired through. spec §3.4.
     let xi = compute_centrality_xi(state, avg_compl);
 
     let ratio = if xi > 1e-20 {
@@ -4913,16 +4922,11 @@ fn compute_loqo_mu(
     };
     let sigma = 0.1 * ratio.powi(3);
     let loqo_mu = sigma * avg_compl;
-    let monotone_floor =
-        (options.mu_linear_decrease_factor * state.mu)
-            .min(state.mu.powf(options.mu_superlinear_decrease_power));
-    let new_mu = loqo_mu
-        .max(monotone_floor)
-        .clamp(options.mu_min, 1e5);
+    let new_mu = loqo_mu.clamp(options.mu_min, 1e5);
 
     if options.print_level >= 5 {
-        rip_log!("ripopt: mu loqo: xi={:.4} sigma={:.4} avg_compl={:.3e} floor={:.3e} -> mu={:.3e}",
-            xi, sigma, avg_compl, monotone_floor, new_mu);
+        rip_log!("ripopt: mu loqo: xi={:.4} sigma={:.4} avg_compl={:.3e} -> mu={:.3e}",
+            xi, sigma, avg_compl, new_mu);
     }
     new_mu
 }
