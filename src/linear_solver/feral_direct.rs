@@ -20,7 +20,8 @@ use super::{FactorDiagnostics, Inertia, KktMatrix, LinearSolver, SolverError};
 use feral::numeric::factorize::{
     factorize_multifrontal_with_workspace, FactorWorkspace, NumericParams, SparseFactors,
 };
-use feral::numeric::solve::solve_sparse;
+use feral::numeric::condition::estimate_condition_1norm;
+use feral::numeric::solve::{solve_sparse, solve_sparse_many};
 use feral::scaling::ScalingStrategy;
 use feral::symbolic::supernode::SupernodeParams;
 use feral::symbolic::{symbolic_factorize, SymbolicFactorization};
@@ -335,6 +336,49 @@ impl LinearSolver for FeralLdl {
         Ok(())
     }
 
+    fn solve_many(
+        &mut self,
+        rhs: &[f64],
+        nrhs: usize,
+        solution: &mut [f64],
+    ) -> Result<(), SolverError> {
+        if !self.factored {
+            return Err(SolverError::NumericalFailure(
+                "matrix not factored".to_string(),
+            ));
+        }
+        if nrhs == 0 {
+            return Ok(());
+        }
+        let expected = self.n * nrhs;
+        if rhs.len() != expected || solution.len() != expected {
+            return Err(SolverError::DimensionMismatch {
+                expected,
+                got: rhs.len().min(solution.len()),
+            });
+        }
+        if self.n == 0 {
+            return Ok(());
+        }
+        let factors = match self.factors.as_ref() {
+            Some(f) => f,
+            None => {
+                return Err(SolverError::NumericalFailure(
+                    "FeralLdl: factor cache lost".into(),
+                ))
+            }
+        };
+        let out = solve_sparse_many(factors, rhs, nrhs).map_err(Self::map_error)?;
+        if out.len() != solution.len() {
+            return Err(SolverError::DimensionMismatch {
+                expected: solution.len(),
+                got: out.len(),
+            });
+        }
+        solution.copy_from_slice(&out);
+        Ok(())
+    }
+
     fn provides_inertia(&self) -> bool {
         true
     }
@@ -370,6 +414,15 @@ impl LinearSolver for FeralLdl {
             min_diagonal: factors.min_diagonal(),
             scaling_info: Some(format!("{:?}", factors.scaling_info)),
             resolved_method: Some(format!("{:?}", factors.resolved_method)),
+        }
+    }
+
+    fn estimate_condition_1norm(&mut self) -> Option<f64> {
+        let factors = self.factors.as_ref()?;
+        let csc = self.csc.as_ref()?;
+        match estimate_condition_1norm(csc, factors) {
+            Ok(k) if k.is_finite() => Some(k),
+            _ => None,
         }
     }
 

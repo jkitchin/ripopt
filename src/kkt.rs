@@ -1244,6 +1244,62 @@ pub fn solve_with_custom_rhs(
     solve_with_custom_rhs_impl(n, dim, solver, rhs, None)
 }
 
+/// Batched multi-RHS variant of `solve_with_custom_rhs`. Packs `rhs_columns`
+/// (each of length `dim`) into a single column-major buffer of length
+/// `dim * rhs_columns.len()` and submits one call to
+/// `LinearSolver::solve_many`. Backends that override `solve_many` (e.g.
+/// the feral multifrontal solver via `solve_sparse_many`) share workspace
+/// and supernode traversal across columns; backends that fall back to the
+/// default trait impl loop single-RHS solves and pay the same cost as
+/// calling `solve_with_custom_rhs` per column.
+///
+/// Returns a Vec of `(dx, dy)` pairs, one per input RHS, with primal block
+/// length `n` and dual block length `dim - n`.
+pub fn solve_with_custom_rhs_many(
+    n: usize,
+    dim: usize,
+    solver: &mut dyn LinearSolver,
+    rhs_columns: &[&[f64]],
+) -> Result<Vec<(Vec<f64>, Vec<f64>)>, SolverError> {
+    let nrhs = rhs_columns.len();
+    if nrhs == 0 {
+        return Ok(Vec::new());
+    }
+    for col in rhs_columns {
+        if col.len() != dim {
+            return Err(SolverError::DimensionMismatch {
+                expected: dim,
+                got: col.len(),
+            });
+        }
+        if col.iter().any(|v| v.is_nan() || v.is_infinite()) {
+            return Err(SolverError::NumericalFailure(
+                "Custom RHS contains NaN/Inf".to_string(),
+            ));
+        }
+    }
+    let mut packed = vec![0.0; dim * nrhs];
+    for (c, col) in rhs_columns.iter().enumerate() {
+        let off = c * dim;
+        packed[off..off + dim].copy_from_slice(col);
+    }
+    let mut solution = vec![0.0; dim * nrhs];
+    solver.solve_many(&packed, nrhs, &mut solution)?;
+    if solution.iter().any(|v| v.is_nan() || v.is_infinite()) {
+        return Err(SolverError::NumericalFailure(
+            "Custom solve_many solution contains NaN/Inf".to_string(),
+        ));
+    }
+    let mut out = Vec::with_capacity(nrhs);
+    for c in 0..nrhs {
+        let off = c * dim;
+        let dx = solution[off..off + n].to_vec();
+        let dy = solution[off + n..off + dim].to_vec();
+        out.push((dx, dy));
+    }
+    Ok(out)
+}
+
 /// Same as `solve_with_custom_rhs` but also performs iterative refinement
 /// against the supplied matrix. Use this for Mehrotra/Gondzio backsolves where
 /// the cheap (no-refinement) variant would otherwise propagate factorization

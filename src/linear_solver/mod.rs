@@ -617,6 +617,36 @@ pub trait LinearSolver {
     /// Reads rhs and writes the solution into `solution`.
     fn solve(&mut self, rhs: &[f64], solution: &mut [f64]) -> Result<(), SolverError>;
 
+    /// Batched multi-RHS backsolve with the most recent factorization.
+    ///
+    /// `rhs` and `solution` are column-major `n × nrhs` buffers of length
+    /// `n * nrhs`. The default impl loops single-RHS solves; backends like
+    /// feral override to share workspace and supernode traversal across
+    /// columns (feral F1.1 `solve_sparse_many`). Use when several RHSes
+    /// against the same factor are known up front (QF oracle, Gondzio).
+    fn solve_many(
+        &mut self,
+        rhs: &[f64],
+        nrhs: usize,
+        solution: &mut [f64],
+    ) -> Result<(), SolverError> {
+        if nrhs == 0 {
+            return Ok(());
+        }
+        let n = rhs.len() / nrhs;
+        if rhs.len() != n * nrhs || solution.len() != n * nrhs {
+            return Err(SolverError::DimensionMismatch {
+                expected: n * nrhs,
+                got: rhs.len().min(solution.len()),
+            });
+        }
+        for c in 0..nrhs {
+            let off = c * n;
+            self.solve(&rhs[off..off + n], &mut solution[off..off + n])?;
+        }
+        Ok(())
+    }
+
     /// Whether this solver can report inertia.
     fn provides_inertia(&self) -> bool;
 
@@ -638,6 +668,15 @@ pub trait LinearSolver {
     /// surface.
     fn last_factor_diagnostics(&self) -> FactorDiagnostics {
         FactorDiagnostics::default()
+    }
+
+    /// Estimate kappa_1(A) = ||A||_1 * ||A^{-1}||_1 using the Hager-Higham
+    /// power iteration on the cached factorization (feral F2.1). Returns
+    /// `None` if the backend does not implement the estimator. Cost is
+    /// 3-5 backsolves plus an O(nnz) pass — call on demand from logging
+    /// or diagnostics paths, not every iteration.
+    fn estimate_condition_1norm(&mut self) -> Option<f64> {
+        None
     }
 }
 

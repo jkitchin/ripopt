@@ -5038,23 +5038,21 @@ fn compute_quality_function_mu(
         return None;
     }
 
-    // 2) Affine-predictor solve (μ=0 in the centering rows).
+    // 2+3) Affine-predictor and full-step solves submitted as one batched
+    // call. Both RHSes are known up front and use the same factor, so feral's
+    // `solve_sparse_many` (F1.1) shares workspace and supernode traversal
+    // across columns; the default trait impl loops single-RHS solves and
+    // matches the prior behavior. T3.26: mu oracles use inexact backsolves
+    // (allow_inexact=true, IpPDFullSpaceSolver.cpp:229-239).
     let rhs_aff = kkt::affine_predictor_rhs(
         &kkt.rhs, &state.x, &state.x_l, &state.x_u, state.mu, options.kappa_d,
     );
-    // T3.26: mu oracles use inexact backsolves (Ipopt's allow_inexact=true,
-    // IpPDFullSpaceSolver.cpp:229-239). The QF probe only needs σ-discrimination
-    // accuracy, not 1e-10 KKT residual; running 5-step IR here was wasted work
-    // and could mask the genuine factorization error feeding into mu_aff.
-    let (dx_aff, _dy_aff) = kkt::solve_with_custom_rhs(
-        kkt.n, kkt.dim, solver.as_mut(), &rhs_aff,
+    let pairs = kkt::solve_with_custom_rhs_many(
+        kkt.n, kkt.dim, solver.as_mut(), &[&rhs_aff, &kkt.rhs],
     ).ok()?;
+    let (dx_aff, _dy_aff) = pairs[0].clone();
+    let (dx_full, _dy_full) = pairs[1].clone();
     let (dz_l_aff, dz_u_aff) = recover_dz_from_state(state, &dx_aff, 0.0);
-
-    // 3) Full-step solve at μ_cur (the existing rhs is exactly this).
-    let (dx_full, _dy_full) = kkt::solve_with_custom_rhs(
-        kkt.n, kkt.dim, solver.as_mut(), &kkt.rhs,
-    ).ok()?;
     let (dz_l_full, dz_u_full) = recover_dz_from_state(state, &dx_full, state.mu);
 
     // 4) Pre-compute the residuals at the current iterate (needed for the
