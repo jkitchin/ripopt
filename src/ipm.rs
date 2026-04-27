@@ -8318,10 +8318,14 @@ fn recompute_y_after_restoration(
         }
         None => None,
     };
+    // T3.30: keep current y on LS failure or magnitude rejection. Ipopt's
+    // IpDefaultIterateInitializer::least_square_mults zeros y only at the
+    // *initial* iterate; during iteration `IpIpoptAlgorithm::ActualizeHessianAndConstraints`
+    // leaves y unchanged when the LS estimate is rejected. Zeroing mid-run
+    // discards information from a converged dual estimate and biases the
+    // next Newton direction.
     if let Some(y_ls) = y_accepted {
         state.y.copy_from_slice(&y_ls);
-    } else {
-        state.y.fill(0.0);
     }
 }
 
@@ -8347,7 +8351,13 @@ fn maybe_recalc_y_post_step(
     if !gate_on {
         return;
     }
-    if state.constraint_violation() >= options.recalc_y_feas_tol {
+    // T3.30: Ipopt gates recalc_y on `IpCq().curr_constraint_violation()`,
+    // which defaults to NORM_MAX (constr_viol_normtype option). The 1-norm
+    // variant `state.constraint_violation()` is used for filter decisions
+    // and for many-constraint problems is much larger than the max-norm,
+    // making the recalc_y_feas_tol gate spuriously tight.
+    let theta_max = convergence::primal_infeasibility_max(&state.g, &state.g_l, &state.g_u);
+    if theta_max >= options.recalc_y_feas_tol {
         return;
     }
     recompute_y_after_restoration(state, options, n, m);
