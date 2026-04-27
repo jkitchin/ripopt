@@ -248,7 +248,8 @@ pub struct SolverOptions {
     pub linear_solver: LinearSolverChoice,
     /// Maximum consecutive iterations without 1% improvement in primal or dual
     /// infeasibility before declaring stall (NumericalError). 0 = disable stall detection.
-    /// Default: 30.
+    /// Default: 0 (disabled — Ipopt 3.14 has no equivalent stall_iter path; see
+    /// docs/IPOPT_ALGORITHM_SPEC.md §14.x). Retained as an opt-in escape hatch.
     pub stall_iter_limit: usize,
     /// Maximum wall-clock seconds allowed for the first few iterations.
     /// If the solver has completed fewer than 3 iterations after this many seconds,
@@ -455,7 +456,7 @@ impl Default for SolverOptions {
             gondzio_mcc_max: 3,
             proactive_infeasibility_detection: false,
             linear_solver: LinearSolverChoice::default(),
-            stall_iter_limit: 30,
+            stall_iter_limit: 0,
             early_stall_timeout: 120.0,
             recalc_y: false,
             recalc_y_feas_tol: 1e-6,

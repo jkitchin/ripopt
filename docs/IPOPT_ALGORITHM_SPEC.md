@@ -1529,6 +1529,42 @@ it requires a separate corrector-solve dispatch, the
 `skip_corr_if_neg_curv` / `skip_corr_in_monotone_mode` gates, and
 plumbing for the affine vs. primal-dual variant. Deferred.
 
+### 14.8  ripopt-specific stall handler (T2.27, retired)
+
+Earlier ripopt versions ran a custom "progress stall" handler in the main
+IPM loop (`detect_and_handle_progress_stall` in `src/ipm.rs`) that, after
+`stall_iter_limit` consecutive iterations without ≥1 % improvement in
+primal or dual infeasibility, classified the iterate as either `Optimal`
+(when KKT residuals were "near tolerance") or `NumericalError` and
+terminated. **Ipopt 3.14 has no equivalent.** A grep of
+`ref/Ipopt/src/Algorithm/` for `stall_iter` / `StallIter` / equivalent
+stagnation logic returns zero hits — Ipopt relies on the convergence test,
+the filter line search, restoration, watchdog reversal, and tiny-step
+detection (§4) to terminate; it never declares stall on its own.
+
+Audit evidence the handler was masking failures:
+
+- ENGVAL2NE: stall path returned `Optimal` at primal=2.4e-12 but
+  dual=3.1e8. The iterate was infeasible-dual, not optimal.
+- PFIT4: stall path returned `Optimal` at primal=3.4e-9 but dual=4.7e12,
+  compl=0.35.
+- BENNETT5LS-class problems: stall path returned `NumericalError` for
+  iterates that would have converged given a few more iterations.
+
+**Resolution.** The default for `SolverOptions::stall_iter_limit` was
+flipped from `30` to `0` in T2.27, disabling the path. The option is
+retained as an opt-in escape hatch (set non-zero to re-enable) but it is
+not used by the IPM under defaults. Effect on the CUTEst suite (727
+problems, `tol=1e-8`, `max_iter=3000`): **517 → 525 Optimal (+8)**, **532 →
+543 "solved" (Optimal+Acceptable, +11)**. Three problems regressed
+(ENGVAL2NE, PFIT4 to MaxIterations; FLETCHER from Optimal to Acceptable),
+but those were precisely the cases where the stall handler was producing
+false-Optimal verdicts — the regressions are honest.
+
+The dead code is preserved behind the `stall_iter_limit > 0` gate to keep
+the diff small; it can be deleted once we are confident no user has set
+the option.
+
 ---
 
 ## End
