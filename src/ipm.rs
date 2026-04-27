@@ -5973,77 +5973,13 @@ enum StallDecision {
     Return(SolveResult),
 }
 
-/// Overall-progress stall detector: terminate or recover when neither
-/// primal nor dual infeasibility has improved for many iterations.
-///
-/// Two triggers (see block comment in body): (1) tiny steps for half
-/// the `stall_iter_limit`, (2) no metric improvement for the full
-/// limit. Before declaring `NumericalError`:
-/// - If the current point is near-tolerance, attempt a μ boost or a
-///   forced μ decrease (Fixed mode) and restart the filter.
-/// - Re-evaluate with "optimal duals" recomputed from the current
-///   gradient (covers cases where iterative y/z diverged even though
-///   the primal is near-optimal, e.g. HS116, CONCON).
-/// - Optionally revert to the best-du iterate seen so far.
-///
-/// No direct Ipopt parallel; this is a ripopt-specific safety net for
-/// long-running stalls (see CLAUDE.md: CONCON, HS13, HS116).
-///
-/// Extracted from `solve_ipm` as part of the v0.8 main-loop
-/// decomposition.
-#[allow(clippy::too_many_arguments)]
-/// Full two-gate near-tolerance check with optimal dual multipliers. When
-/// duals have diverged but the primal point is near-optimal (HS116,
-/// CONCON), the simple `compl_inf`/`dual_inf` check fails because it uses
-/// the current (diverged) duals. This helper recomputes optimal duals from
-/// the gradient (z = max(0, ∇L) capped at kc*mu/slack), then checks both
-/// the scaled (sc) and unscaled (usc) tolerance gates. Returns
-/// `Some(StallDecision::Return(NumericalError))` when both gates pass —
-/// in which case the caller should exit with NumericalError because the
-/// iterate is good enough to not be a hard failure but the solver can't
-/// drive it further. Returns `None` to let the caller continue with the
-/// remaining stall-recovery logic.
-fn check_stall_near_tolerance_via_optimal_duals(
-    state: &SolverState,
-    options: &SolverOptions,
-    primal_inf: f64,
-    primal_inf_max: f64,
-    compl_inf: f64,
-    stall_near_tol: f64,
-    n: usize,
-    m: usize,
-) -> Option<StallDecision> {
-    let mut gj = state.grad_f.clone();
-    accumulate_jt_y(state, &mut gj);
-    let (opt_zl, opt_zu) = recover_active_set_z(state, &gj, n);
-    let opt_du = dual_inf_with_z(state, &opt_zl, &opt_zu);
-    let opt_co = compl_err_with_z(state, &opt_zl, &opt_zu);
-    let opt_co_best = compl_inf.min(opt_co);
-    let fmult: f64 = l1_norm(&state.y) + l1_norm(&opt_zl) + l1_norm(&opt_zu);
-    let fmult_bnd: f64 = l1_norm(&opt_zl) + l1_norm(&opt_zu);
-    let fsd = compute_residual_scaling(fmult, m + 2 * n);
-    let fsc = compute_residual_scaling(fmult_bnd, 2 * n);
-    let stall_fdu_tol = (stall_near_tol * fsd).max(1e-2);
-    let stall_fco_tol = (stall_near_tol * fsc).max(1e-2);
-    let stall_fpr_tol = stall_near_tol.max(10.0 * options.constr_viol_tol);
-    let sc = primal_inf_max <= stall_fpr_tol
-        && opt_du <= stall_fdu_tol
-        && opt_co_best <= stall_fco_tol;
-    let du_u = compute_dual_inf_unscaled_at_state(state);
-    let usc = primal_inf_max <= 10.0 * options.constr_viol_tol
-        && du_u <= 10.0 * options.dual_inf_tol
-        && opt_co_best <= 10.0 * options.compl_inf_tol;
-    if sc && usc {
-        if options.print_level >= 3 {
-            rip_log!(
-                "ripopt: Stalled but near-tolerance via optimal duals (pr={:.2e}, du_opt={:.2e}, co={:.2e}), returning NumericalError",
-                primal_inf, opt_du, opt_co_best
-            );
-        }
-        return Some(StallDecision::Return(make_result(state, SolveStatus::NumericalError)));
-    }
-    None
-}
+// T3.21 (2026-04-27): retired `check_stall_near_tolerance_via_optimal_duals`.
+// It recomputed "optimal" bound multipliers from ∇L, ran a two-gate
+// near-tolerance check, and exited with NumericalError when both gates
+// passed. The handler was unreachable under defaults (gated behind
+// `options.stall_iter_limit > 0`, default 0 since T2.27) and has no
+// Ipopt analog — Ipopt has no near-tolerance escape hatch on stall.
+// Removed alongside its callsite in `detect_and_handle_progress_stall`.
 
 /// In Fixed (monotone) μ mode, when stall recovery hasn't already kicked
 /// in via a μ boost and μ is still above mu_min, force a μ decrease at
@@ -6275,8 +6211,6 @@ fn detect_and_handle_progress_stall<P: NlpProblem>(
     if iteration <= 50 || options.stall_iter_limit == 0 {
         return StallDecision::Proceed;
     }
-    let n = state.n;
-    let m = state.m;
 
     if !update_stall_counters_and_check_limit(
         stall, state, options, primal_inf_max, dual_inf,
@@ -6295,11 +6229,6 @@ fn detect_and_handle_progress_stall<P: NlpProblem>(
             state, options, primal_inf, primal_inf_max, dual_inf, compl_inf,
             s_d_for_acc, filter, mu_state, stall,
         );
-    }
-    if let Some(decision) = check_stall_near_tolerance_via_optimal_duals(
-        state, options, primal_inf, primal_inf_max, compl_inf, stall_near_tol, n, m,
-    ) {
-        return decision;
     }
     if let Some(decision) = try_boost_mu_for_stall(
         state, options, filter, mu_state, primal_inf_max, stall,
