@@ -1369,6 +1369,101 @@ For a Rust port, the WB06 paper is the single most useful primary source; WB05a/
 
 ---
 
+## 14. ripopt vs Ipopt 3.14 — known representation deviations
+
+This section catalogs places where ripopt's working representation
+diverges from Ipopt 3.14's internal data structures, even when the
+mathematical specification is matched. These are honest deltas to be
+aware of, not bugs.
+
+### 14.1  Implicit slack representation for inequality constraints
+
+**Ipopt 3.14:** transforms `g_L ≤ c(x) ≤ g_U` into an explicit slack
+formulation: introduces `s` as an independent variable, replaces the
+inequality with the equality `c(x) − s = 0`, and applies bounds
+`g_L ≤ s ≤ g_U`. The state vector is `[x; s]`, the KKT system is
+augmented to `(n + m_eq + m_ineq + m_ineq) × …`, and the algorithm's
+primitives (filter trial, fraction-to-boundary, magic step,
+quality-function oracle aff/centering trial point) operate on `s` as
+an independent free variable.
+
+**ripopt:** does **not** introduce explicit `s`. Inequality slacks are
+implicit, computed at evaluation time as `c(x) − g_L` and `g_U − c(x)`.
+`SolverState` carries multipliers `v_l`, `v_u` for the inequality
+constraints but no separate slack vector. The KKT system is
+`(n + m) × (n + m)` (one row per constraint regardless of
+inequality/equality split).
+
+**Equivalence at solutions:** at any KKT point, `s ≡ c(x)` exactly, so
+the converged primal `x`, dual `y`, and bound multipliers `z_l`, `z_u`
+are identical between the two representations. The deviation only
+manifests along the *trial trajectory* during the iteration.
+
+**Consequences (places ripopt necessarily approximates Ipopt's
+behavior):**
+
+- **Magic step (§5.3)** — Ipopt's magic step is a closed-form
+  adjustment to `s` while holding `x` fixed. With implicit `s`, that
+  degree of freedom does not exist, and `apply_magic_step` is a
+  documented no-op. Implemented for spec compliance and as a future
+  wiring point if explicit-`s` mode is added; gated on
+  `SolverOptions::magic_step` (default `true`).
+- **Quality-function μ oracle (§3.5)** — Ipopt's `Q(σ)` evaluates the
+  barrier KKT error at a *trial iterate* obtained from aff/centering
+  steps with `s_trial = s + α·ds`. ripopt's QF (`compute_quality_function_mu`,
+  T2.23) evaluates a linearised `Q(σ)` using `(1−α)·current` for
+  residual reduction; the σ search is capped at `σ_max = 1.0`
+  (Ipopt's spec is `1e2`) because without true nonlinear residual
+  evaluation the linearised Q is degenerate above σ = 1.
+- **Filter trial point** — Ipopt compares `(θ, φ)` at
+  `(x_trial, s_trial)`; ripopt at `(x_trial, c(x_trial))`. θ and φ
+  agree at acceptance (`s_accepted ≡ c(x_accepted)`), but the trial
+  trajectory through the line search differs.
+- **κ_σ correction trajectory** — same issue: ripopt corrects against
+  `c(x_trial)`-derived slack rather than an independent `s_trial`.
+- **Restoration phase is *not* affected** — ripopt's
+  `RestorationNlp` (`src/restoration_nlp.rs`) does carry explicit
+  `p`, `n` slacks for the resto problem itself (T2.22 verified).
+
+**Concern: large-scale problem behavior.** Pre-v0.8 ripopt repeatedly
+struggled on certain large-scale CUTEst problems and AC-OPF instances
+(see e.g. case30_ieee notes elsewhere in this repo). The implicit-slack
+representation is one suspect: in problems with many active inequality
+constraints, the absence of an independent `s` removes a stabilising
+degree of freedom from the line search and from κ_σ correction, which
+may cause ripopt's trial trajectory to diverge from Ipopt's on
+problems where Ipopt's magic step or filter `s_trial` is materially
+load-bearing. We have **not** isolated a single benchmark that fails
+specifically because of implicit slacks — the v0.8 alignment work has
+been deliberately scoped to representation-preserving fixes — but this
+is the natural place to look first if a future regression or
+unresolved large-scale failure cannot be explained by other gaps. If
+such a benchmark is found, the appropriate response is to escalate to
+a full explicit-`s` rewrite (Option 2 in the v0.8 alignment notes).
+Until then we accept the deviation and document it here.
+
+### 14.2  Linearised QF oracle (T2.23)
+
+See §14.1 above. `compute_quality_function_mu` uses a linearised Q and
+σ_max = 1.0 because evaluating the true nonlinear residual at each
+trial σ requires plumbing the problem trait through
+`update_barrier_parameter` (option (a) in T2.23 design notes), which
+crosses five call frames. Acceptable per §14.1; promote to (a) if QF's
+σ search is shown to under-explore on a real benchmark.
+
+### 14.3  Combined-y representation
+
+ripopt represents constraint multipliers as a single `y: Vec<f64>` of
+length `m`, with `v_l`/`v_u` carrying the bound-side multipliers for
+inequality constraints, rather than Ipopt's separate `y_c` (equality)
+and `y_d` (inequality, paired with `s`) vectors. The
+`fix_inequality_mult_signs` post-pass (`src/ipm.rs`) converts between
+representations where needed. Mathematically equivalent at solutions;
+diverges only in intermediate sign conventions on raw multiplier
+arrays, and is documented at the source.
+
+---
+
 ## End
 
-This specification is grounded in Ipopt 3.14 source as of the release branch checked out at `Ipopt/src/Algorithm/`. Every formula and default has a file:line citation. A re-implementation that satisfies all 36 pitfalls in Section 10, the formulas in Sections 1-8, and the defaults in Section 9 will produce iterates that match Ipopt 3.14 to within numerical noise on every problem in the HS, CUTEst, and GAMS nlpbench test suites where Ipopt itself converges.
+This specification is grounded in Ipopt 3.14 source as of the release branch checked out at `Ipopt/src/Algorithm/`. Every formula and default has a file:line citation. A re-implementation that satisfies all 36 pitfalls in Section 10, the formulas in Sections 1-8, and the defaults in Section 9 will produce iterates that match Ipopt 3.14 to within numerical noise on every problem in the HS, CUTEst, and GAMS nlpbench test suites where Ipopt itself converges — modulo the representation deviations cataloged in §14.
