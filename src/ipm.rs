@@ -6958,15 +6958,12 @@ fn initial_evaluate_with_recovery<P: NlpProblem>(
 /// Ipopt's `nlp_scaling_method = gradient-based`:
 ///
 ///   * Objective: if `||∇f(x0)||_∞ > 100`, set `obj_scaling = 100/||∇f||_∞`,
-///     clamped below by `1e-2`.
+///     clamped below by `1e-8` (Ipopt's `nlp_scaling_min_value` default).
 ///   * Constraints: row-wise on `J(x0)`. If `max_j |J_{ij}| > 100`, set
-///     `g_scaling[i] = 100/max_j |J_{ij}|`, clamped below by `1e-2`.
+///     `g_scaling[i] = 100/max_j |J_{ij}|`, clamped below by `1e-8`.
 ///
 /// User-provided scalings (`options.user_obj_scaling`, `options.user_g_scaling`)
 /// take priority — when either is set, skips automatic scaling entirely.
-///
-/// Constraint scaling is skipped when the initial constraint violation exceeds
-/// `1e6` (Ipopt's threshold — at highly infeasible points J has no signal).
 fn compute_nlp_scaling<P: NlpProblem>(
     problem: &P,
     options: &SolverOptions,
@@ -6982,8 +6979,14 @@ fn compute_nlp_scaling<P: NlpProblem>(
         return (os, gs);
     }
 
+    // Ipopt 3.14 defaults: `nlp_scaling_max_gradient=100`,
+    // `nlp_scaling_min_value=1e-8` (`IpGradientScaling.cpp` registration).
+    // The previous `1e-2` floor under-scaled large-coefficient constraint
+    // rows (||row||_∞ ~ 1e6 → 1e-4 in Ipopt vs 1e-2 in ripopt, a 100×
+    // gap). That gap was the root cause of stalled convergence on
+    // Mittelmann arki/qcqp instances.
     let nlp_scaling_max_gradient = 100.0;
-    let nlp_scaling_min_value = 1e-2;
+    let nlp_scaling_min_value = 1e-8;
     let mut grad_f0 = vec![0.0; n_sc];
     let grad_ok = problem.gradient(x0, true, &mut grad_f0);
     let grad_max = if grad_ok {
@@ -7008,9 +7011,12 @@ fn compute_nlp_scaling<P: NlpProblem>(
 /// scaling. Returns a length-`m_sc` vector of scale factors that map
 /// each constraint row to a per-row Jacobian Linf bounded by
 /// `max_gradient` (clamped below by `min_value`). Falls back to all
-/// 1.0 when constraints/Jacobian evaluation fails or the initial
-/// constraint violation exceeds `1e6` (Ipopt's threshold — at highly
-/// infeasible points the Jacobian carries no useful scaling signal).
+/// 1.0 when Jacobian evaluation fails. Mirrors Ipopt 3.14's
+/// `GradientScaling::DetermineScalingParametersImpl`
+/// (`IpGradientScaling.cpp:140-180`) — Ipopt scales unconditionally on
+/// the initial point's Jacobian; an "init_cv >= 1e6" early-exit was
+/// removed (no Ipopt analog and was suppressing scaling exactly on the
+/// highly-infeasible Mittelmann starts where it is most needed).
 fn compute_constraint_row_scaling<P: NlpProblem>(
     problem: &P,
     x0: &[f64],
@@ -7021,19 +7027,6 @@ fn compute_constraint_row_scaling<P: NlpProblem>(
 ) -> Vec<f64> {
     let mut gs = vec![1.0; m_sc];
     if m_sc == 0 {
-        return gs;
-    }
-    let mut g0_sc = vec![0.0; m_sc];
-    let constr_ok = problem.constraints(x0, false, &mut g0_sc);
-    let mut g_l_sc = vec![0.0; m_sc];
-    let mut g_u_sc = vec![0.0; m_sc];
-    problem.constraint_bounds(&mut g_l_sc, &mut g_u_sc);
-    let init_cv = if constr_ok {
-        convergence::primal_infeasibility(&g0_sc, &g_l_sc, &g_u_sc)
-    } else {
-        f64::INFINITY
-    };
-    if init_cv >= 1e6 {
         return gs;
     }
     let mut jac_vals0 = vec![0.0; jac_rows_sc.len()];
