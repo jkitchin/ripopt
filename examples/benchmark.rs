@@ -396,6 +396,7 @@ fn status_string(s: SolveStatus) -> &'static str {
         SolveStatus::RestorationFailed => "RestorationFailed",
         SolveStatus::InternalError => "InternalError",
         SolveStatus::LocalInfeasibility => "LocalInfeasibility",
+        SolveStatus::StopAtTinyStep => "StopAtTinyStep",
     }
 }
 

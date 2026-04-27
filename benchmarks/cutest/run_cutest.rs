@@ -354,6 +354,7 @@ fn ripopt_status_to_string(status: SolveStatus) -> String {
         SolveStatus::LocalInfeasibility => "LocalInfeasibility".to_string(),
         SolveStatus::EvaluationError => "EvaluationError".to_string(),
         SolveStatus::UserRequestedStop => "UserRequestedStop".to_string(),
+        SolveStatus::StopAtTinyStep => "StopAtTinyStep".to_string(),
     }
 }
 

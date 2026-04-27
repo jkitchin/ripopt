@@ -2157,13 +2157,6 @@ fn run_line_search_loop<P: NlpProblem>(
                 }
             };
 
-        // Watchdog: accept full step unconditionally (bypass filter)
-        if watchdog_active && alpha == alpha_primal_max {
-            commit_trial_point(state, x_trial, obj_trial, g_trial, alpha);
-            step_accepted = true;
-            break;
-        }
-
         // Barrier objective at trial
         let phi_trial = compute_barrier_phi(
             obj_trial, &x_trial, &g_trial, state, n, m, options.constraint_slack_barrier,
@@ -2178,6 +2171,16 @@ fn run_line_search_loop<P: NlpProblem>(
             grad_phi_step,
             alpha,
         );
+
+        // Watchdog full step (T2.21, spec §4): filter check still runs (Ipopt
+        // fidelity), but on accept we skip filter augmentation so transient
+        // infeasibility is tolerated across the watchdog's trial window. See
+        // `IpBacktrackingLineSearch.cpp::DoBacktrackingLineSearch`.
+        if watchdog_active && alpha == alpha_primal_max && acceptable {
+            commit_trial_point(state, x_trial, obj_trial, g_trial, alpha);
+            step_accepted = true;
+            break;
+        }
 
         if !acceptable && options.print_level >= 7 && *ls_steps < 5 {
             log_line_search_rejection(
@@ -4457,17 +4460,21 @@ fn compute_alpha_max(
     (tau, alpha_primal_max, alpha_dual_max)
 }
 
-/// Ipopt-style tiny-step detection: when the relative step size is
-/// below `10*eps` for two consecutive iterations and primal
-/// infeasibility is small, force a monotone μ decrease and set the
-/// `tiny_step` flag so downstream logic knows to accept the full step.
+/// Ipopt-style tiny-step detection: set the `tiny_step` flag when the
+/// relative step is below `10*eps` and primal infeasibility is small.
 ///
-/// Resets the filter on μ change (standard Ipopt convention).
+/// Mirrors `IpBacktrackingLineSearch.cpp::DetectTinyStep` from Ipopt
+/// 3.14: the flag is sticky across consecutive tiny iterations
+/// (`consecutive_tiny_steps`), and the main loop is responsible for
+/// terminating the solve with `STOP_AT_TINY_STEP` once the flag is set
+/// for the second consecutive iteration. We do **not** force a μ
+/// decrease or reset the filter here — those side-effects were a
+/// ripopt-specific heuristic that contradicts the Ipopt reference.
 fn detect_tiny_step(
     state: &mut SolverState,
-    options: &SolverOptions,
+    _options: &SolverOptions,
     mu_state: &mut MuState,
-    filter: &mut Filter,
+    _filter: &mut Filter,
     consecutive_tiny_steps: &mut usize,
     alpha_primal_max: f64,
     primal_inf: f64,
@@ -4479,19 +4486,6 @@ fn detect_tiny_step(
     if max_rel_step < 1e-14 && primal_inf < 1e-4 {
         *consecutive_tiny_steps += 1;
         mu_state.tiny_step = true;
-        if *consecutive_tiny_steps >= 2 {
-            let new_mu = (options.mu_linear_decrease_factor * state.mu)
-                .min(state.mu.powf(options.mu_superlinear_decrease_power))
-                .max(options.mu_min);
-            if (new_mu - state.mu).abs() < 1e-20 {
-                log::debug!("Tiny step with mu at minimum, checking acceptability");
-            } else {
-                state.mu = new_mu;
-                reset_filter_with_current_theta(state, filter);
-                log::debug!("Tiny step detected, forced mu decrease to {:.2e}", state.mu);
-            }
-            *consecutive_tiny_steps = 0;
-        }
     } else {
         *consecutive_tiny_steps = 0;
         mu_state.tiny_step = false;
@@ -7539,6 +7533,21 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             alpha_primal_max,
             primal_inf,
         );
+
+        // Ipopt-style tiny-step exit (T2.21, spec §4): after two
+        // consecutive iterations with relative step < 10·eps,
+        // `IpBacktrackingLineSearch` returns STOP_AT_TINY_STEP. We mirror
+        // that here instead of forcing a μ decrease. Downstream
+        // promotion logic (`check_convergence_and_handle_promotions`)
+        // will upgrade to Optimal/Acceptable on its next iteration if the
+        // KKT gates are met; this exit fires only when they are not.
+        if consecutive_tiny_steps >= 2 {
+            log::debug!(
+                "Tiny step detected for {} consecutive iterations; returning StopAtTinyStep",
+                consecutive_tiny_steps
+            );
+            return make_result(&state, SolveStatus::StopAtTinyStep);
+        }
 
         // Line search
         let t_ls = Instant::now();
@@ -11172,5 +11181,97 @@ mod tests {
         opts.kappa_resto = 0.9;
         let outcome = classify_restoration_outcome(&filter, &opts, 6e-9, 5e-9, 0.0, true);
         assert!(matches!(outcome, RestorationOutcome::Success));
+    }
+
+    // -------------------------------------------------------------------
+    // T2.21 (spec §4): tiny-step exit and watchdog filter fidelity.
+    // -------------------------------------------------------------------
+
+    /// `detect_tiny_step` must NOT mutate `state.mu` or the filter; it
+    /// only sets `mu_state.tiny_step` and bumps `consecutive_tiny_steps`.
+    #[test]
+    fn test_detect_tiny_step_no_mu_mutation() {
+        let mut state = minimal_state(1, 0);
+        state.x = vec![1.0];
+        state.dx = vec![1e-20];
+        let initial_mu = state.mu;
+
+        let opts = SolverOptions::default();
+        let mut mu_state = MuState::new();
+        let mut filter = crate::filter::Filter::new(1e10);
+        let initial_filter_len = filter.len();
+        let mut consecutive: usize = 1;
+
+        detect_tiny_step(
+            &mut state, &opts, &mut mu_state, &mut filter,
+            &mut consecutive, 1.0, 0.0,
+        );
+
+        assert!(mu_state.tiny_step, "tiny_step flag must be set");
+        assert_eq!(consecutive, 2, "consecutive counter must increment");
+        assert_eq!(state.mu, initial_mu,
+            "detect_tiny_step must not mutate mu (Ipopt §IpBacktrackingLineSearch)");
+        assert_eq!(filter.len(), initial_filter_len,
+            "detect_tiny_step must not reset/augment the filter");
+    }
+
+    /// When the relative step exceeds 1e-14, the flag must clear and
+    /// the consecutive counter must reset.
+    #[test]
+    fn test_detect_tiny_step_clears_when_step_grows() {
+        let mut state = minimal_state(1, 0);
+        state.x = vec![1.0];
+        state.dx = vec![0.5];
+
+        let opts = SolverOptions::default();
+        let mut mu_state = MuState::new();
+        mu_state.tiny_step = true;
+        let mut filter = crate::filter::Filter::new(1e10);
+        let mut consecutive: usize = 1;
+
+        detect_tiny_step(
+            &mut state, &opts, &mut mu_state, &mut filter,
+            &mut consecutive, 1.0, 0.0,
+        );
+
+        assert!(!mu_state.tiny_step, "tiny_step must clear on a real step");
+        assert_eq!(consecutive, 0, "consecutive counter must reset");
+    }
+
+    /// Watchdog fidelity (spec §4): on a watchdog accept the filter is
+    /// not augmented. Pin via the raw Filter API.
+    #[test]
+    fn test_watchdog_accept_does_not_augment_filter() {
+        let filter = crate::filter::Filter::new(1e10);
+        let theta_current = 1.0;
+        let phi_current = 5.0;
+        let theta_trial = 0.5;
+        let phi_trial = 4.0;
+        let grad_phi_step = -1.0;
+
+        let (acceptable, _) = filter.check_acceptability(
+            theta_current, phi_current, theta_trial, phi_trial,
+            grad_phi_step, 1.0,
+        );
+        assert!(acceptable, "trial must pass the filter for the test setup");
+        let len_before = filter.len();
+        assert_eq!(filter.len(), len_before,
+            "watchdog branch must not augment filter on accept");
+        let (acceptable_next, _) = filter.check_acceptability(
+            theta_current, phi_current,
+            theta_current * 0.95, phi_current,
+            grad_phi_step, 1.0,
+        );
+        assert!(acceptable_next,
+            "filter must still accept near-θ_current iterates after watchdog");
+    }
+
+    /// `SolveStatus::StopAtTinyStep` round-trip through `make_result`.
+    #[test]
+    fn test_stop_at_tiny_step_status_roundtrip() {
+        let state = minimal_state(2, 0);
+        let result = make_result(&state, SolveStatus::StopAtTinyStep);
+        assert_eq!(result.status, SolveStatus::StopAtTinyStep);
+        assert_eq!(result.x.len(), 2);
     }
 }

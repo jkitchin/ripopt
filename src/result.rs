@@ -32,6 +32,13 @@ pub enum SolveStatus {
     EvaluationError,
     /// Intermediate callback returned `false`, requesting early termination.
     UserRequestedStop,
+    /// Search direction has become too small to make further progress.
+    /// Mirrors Ipopt's `STOP_AT_TINY_STEP` from `IpBacktrackingLineSearch.cpp`,
+    /// reported as `Search_Direction_Becomes_Too_Small` in
+    /// `IpReturnCodes_inc.h`. The current iterate is the best ripopt can
+    /// produce with the current barrier subproblem; downstream code is
+    /// expected to treat it analogously to acceptable termination.
+    StopAtTinyStep,
     /// Internal error.
     InternalError,
 }

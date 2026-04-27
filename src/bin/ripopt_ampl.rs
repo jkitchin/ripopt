@@ -87,6 +87,7 @@ fn main() {
             ripopt::SolveStatus::InternalError => "InternalError",
             ripopt::SolveStatus::EvaluationError => "EvaluationError",
             ripopt::SolveStatus::UserRequestedStop => "UserRequestedStop",
+            ripopt::SolveStatus::StopAtTinyStep => "StopAtTinyStep",
         },
         result.iterations
     );
