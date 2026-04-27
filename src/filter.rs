@@ -29,6 +29,14 @@ pub struct Filter {
     eta_phi: f64,
     /// Small constant delta for filter margin.
     delta: f64,
+    /// Maximum permitted log10 increase in the barrier objective per step,
+    /// used by the `obj_max_inc` divergence guard (Ipopt default `5.0`,
+    /// `IpFilterLSAcceptor.cpp:132-139`). The trial is rejected when
+    /// `trial_phi > reference_phi` *and* `log10(trial_phi - reference_phi)
+    /// > obj_max_inc + basval`, where
+    /// `basval = max(1.0, log10(|reference_phi|))`. Exact mirror of
+    /// `IpFilterLSAcceptor.cpp:478-493`.
+    obj_max_inc: f64,
     /// Whether `set_theta_min_from_initial` has already seeded
     /// `theta_max`/`theta_min` from the initial constraint violation.
     /// Mirrors Ipopt's lazy-init sentinel (theta_max_ < 0.0) at
@@ -50,6 +58,7 @@ impl Filter {
             s_phi: 2.3,
             eta_phi: 1e-8,
             delta: 1.0,
+            obj_max_inc: 5.0,
             theta_init_set: false,
         }
     }
@@ -155,6 +164,15 @@ impl Filter {
             return (false, false);
         }
 
+        // T3.4: obj_max_inc divergence guard
+        // (IpFilterLSAcceptor.cpp:478-493). Reject trials where the
+        // barrier objective is climbing faster than `10^obj_max_inc`
+        // relative to the current iterate's φ. Gated by
+        // `trial_phi > reference_phi`; otherwise this is a no-op.
+        if !self.passes_obj_max_inc(phi_current, phi_trial) {
+            return (false, false);
+        }
+
         // Determine step type and check type-specific condition
         let (type_ok, is_switching) = if self.switching_condition(theta_current, grad_phi_step, alpha) {
             // f-type: Armijo on barrier objective. No h-type fallback.
@@ -176,6 +194,31 @@ impl Filter {
         }
 
         (true, is_switching)
+    }
+
+    /// T3.4: Ipopt's `obj_max_inc` divergence guard
+    /// (`IpFilterLSAcceptor.cpp:478-493`). Returns `true` when the trial
+    /// is acceptable on the divergence criterion (which includes the
+    /// case `trial_phi <= reference_phi`); returns `false` only when
+    /// `trial_phi > reference_phi` *and*
+    /// `log10(trial_phi - reference_phi) > obj_max_inc + basval`, where
+    /// `basval = max(1.0, log10(|reference_phi|))`.
+    pub fn passes_obj_max_inc(&self, reference_phi: f64, trial_phi: f64) -> bool {
+        if !(trial_phi > reference_phi) {
+            return true;
+        }
+        let basval = if reference_phi.abs() > 10.0 {
+            reference_phi.abs().log10()
+        } else {
+            1.0
+        };
+        (trial_phi - reference_phi).log10() <= self.obj_max_inc + basval
+    }
+
+    /// Override the `obj_max_inc` default (5.0). Allows tests and the
+    /// IPM driver to plumb `SolverOptions::obj_max_inc` through.
+    pub fn set_obj_max_inc(&mut self, value: f64) {
+        self.obj_max_inc = value;
     }
 
     /// Add a (theta, phi) pair to the filter.
@@ -599,6 +642,64 @@ mod tests {
             theta_current, phi_current, 5.0, 100.0, -0.01, 1.0,
         );
         assert!(!accept, "h-type with no reduction in either must reject");
+    }
+
+    #[test]
+    fn test_obj_max_inc_passes_when_trial_le_reference() {
+        // T3.4: when phi_trial <= phi_reference, the divergence guard
+        // is a no-op (returns true).
+        let filter = Filter::new(100.0);
+        assert!(filter.passes_obj_max_inc(10.0, 5.0), "decrease must pass");
+        assert!(filter.passes_obj_max_inc(10.0, 10.0), "equality must pass");
+        assert!(filter.passes_obj_max_inc(0.0, -1e6), "negative trial must pass");
+    }
+
+    #[test]
+    fn test_obj_max_inc_rejects_huge_increase_small_reference() {
+        // T3.4: with reference_phi = 1.0 (so |ref| <= 10 → basval = 1),
+        // and obj_max_inc = 5 (default), the inequality is
+        //   log10(trial - 1) > 5 + 1 = 6  ⇔  trial - 1 > 1e6
+        // So trial = 2 is fine (log10(1) = 0 <= 6), but trial = 1e7 + 1 fails.
+        let filter = Filter::new(100.0);
+        assert!(filter.passes_obj_max_inc(1.0, 1e6 + 0.5), "below 1e6 increase must pass");
+        assert!(!filter.passes_obj_max_inc(1.0, 1e7 + 2.0), "above 10^6 increase must fail");
+    }
+
+    #[test]
+    fn test_obj_max_inc_basval_scales_with_large_reference() {
+        // T3.4: when |reference_phi| > 10, basval = log10(|ref|), so the
+        // permitted increase scales with |ref|. With ref=1e3, basval=3,
+        // permitted log10 increase = 5 + 3 = 8, ie up to 1e8 absolute.
+        let filter = Filter::new(100.0);
+        assert!(filter.passes_obj_max_inc(1e3, 1e3 + 1e7), "1e7 increase must pass at ref=1e3");
+        assert!(!filter.passes_obj_max_inc(1e3, 1e3 + 1e9), "1e9 increase must fail at ref=1e3");
+    }
+
+    #[test]
+    fn test_obj_max_inc_set_obj_max_inc_setter() {
+        // T3.4: tightening the cap to 0.0 makes any strictly positive
+        // increase fail (basval >= 1 ⇒ log10(Δ) > 0+1=1 means Δ>10).
+        let mut filter = Filter::new(100.0);
+        filter.set_obj_max_inc(0.0);
+        assert!(filter.passes_obj_max_inc(1.0, 5.0), "Δ=4 < 10, still passes at obj_max_inc=0");
+        assert!(!filter.passes_obj_max_inc(1.0, 100.0), "Δ=99 > 10 must fail at obj_max_inc=0");
+    }
+
+    #[test]
+    fn test_check_acceptability_obj_max_inc_blocks_blowup() {
+        // T3.4 end-to-end: a trial that would otherwise pass via h-type
+        // (theta sufficient reduction) is rejected when phi explodes
+        // beyond the obj_max_inc cap.
+        let mut filter = Filter::new(1e10);
+        filter.set_theta_min_from_initial(10.0);
+        let theta_current = 5.0;
+        let phi_current = 1.0;
+        let theta_trial = 0.1; // satisfies sufficient infeasibility reduction
+        let phi_trial = 1e10; // log10(1e10 - 1) ≈ 10 >> 5 + 1 = 6 ⇒ reject
+        let (accept, _) = filter.check_acceptability(
+            theta_current, phi_current, theta_trial, phi_trial, -0.01, 1.0,
+        );
+        assert!(!accept, "obj_max_inc must reject blowup trial");
     }
 
     #[test]

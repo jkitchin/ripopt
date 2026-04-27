@@ -86,6 +86,15 @@ pub struct SolverOptions {
     /// `initial_avg_compl` lazily on the first Free-mode call. When
     /// adaptive mode is off this option has no effect.
     pub mu_max_fact: f64,
+    /// Maximum permitted log10 increase in the barrier objective per line
+    /// search trial step. Mirrors Ipopt 3.14 `obj_max_inc` (default `5.0`,
+    /// `IpFilterLSAcceptor.cpp:132-139`). The trial is rejected when the
+    /// trial barrier objective `phi_trial` exceeds the reference and
+    /// `log10(phi_trial - phi_ref) > obj_max_inc + basval`, where
+    /// `basval = max(1.0, log10(|phi_ref|))`. Catches NaN-adjacent or
+    /// blow-up trials that the filter alone may admit on degenerate
+    /// problems.
+    pub obj_max_inc: f64,
     /// Fraction-to-boundary parameter minimum.
     pub tau_min: f64,
     /// Barrier parameter reduction factor (monotone mode).
@@ -418,6 +427,7 @@ impl Default for SolverOptions {
             mu_init: 0.1,
             mu_min: 1e-11,
             mu_max_fact: 1000.0,
+            obj_max_inc: 5.0,
             tau_min: 0.99,
             mu_linear_decrease_factor: 0.2,
             mu_superlinear_decrease_power: 1.5,
