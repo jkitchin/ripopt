@@ -20,7 +20,7 @@ use super::{Inertia, KktMatrix, LinearSolver, SolverError};
 use feral::numeric::factorize::{
     factorize_multifrontal_with_workspace, FactorWorkspace, NumericParams, SparseFactors,
 };
-use feral::numeric::solve::solve_sparse_refined;
+use feral::numeric::solve::solve_sparse;
 use feral::symbolic::supernode::SupernodeParams;
 use feral::symbolic::{symbolic_factorize, SymbolicFactorization};
 use feral::{CscMatrix, FeralError, ZeroPivotAction};
@@ -291,16 +291,12 @@ impl LinearSolver for FeralLdl {
                 ))
             }
         };
-        let csc = match self.csc.as_ref() {
-            Some(c) => c,
-            None => {
-                return Err(SolverError::NumericalFailure(
-                    "FeralLdl: csc cache lost".into(),
-                ))
-            }
-        };
-
-        let out = solve_sparse_refined(csc, factors, rhs).map_err(Self::map_error)?;
+        // T3.24: feral's `solve_sparse_refined` ran an internal IR loop
+        // (up to 10 steps) on top of the KKT-layer IR in `kkt.rs`. Ipopt's
+        // contract is that the linear solver does a single back-solve and
+        // the IPM owns refinement, so we use plain `solve_sparse` and let
+        // `solve_for_direction_with_ir` drive any refinement.
+        let out = solve_sparse(factors, rhs).map_err(Self::map_error)?;
         if out.len() != solution.len() {
             return Err(SolverError::DimensionMismatch {
                 expected: solution.len(),
