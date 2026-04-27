@@ -21,9 +21,23 @@ use feral::numeric::factorize::{
     factorize_multifrontal_with_workspace, FactorWorkspace, NumericParams, SparseFactors,
 };
 use feral::numeric::solve::solve_sparse;
+use feral::scaling::ScalingStrategy;
 use feral::symbolic::supernode::SupernodeParams;
 use feral::symbolic::{symbolic_factorize, SymbolicFactorization};
 use feral::{CscMatrix, FeralError, ZeroPivotAction};
+
+/// Two-stage `increase_quality` state, mirroring feral's
+/// `Solver::QualityLevel`. T3.37 lifts the same state machine into
+/// the `FeralLdl` wrapper so we get Ipopt's full
+/// `IpTSymLinearSolver::IncreaseQuality` cascade: scaling first,
+/// pivot threshold second.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum QualityLevel {
+    Baseline,
+    ScalingEnabled,
+    PivotRaised,
+    Exhausted,
+}
 
 /// Multifrontal sparse symmetric indefinite solver backed by feral.
 pub struct FeralLdl {
@@ -48,6 +62,9 @@ pub struct FeralLdl {
     /// `pivtol_max` for `increase_quality`. Mirrors the value used by
     /// `feral::Solver` (MA27-style 0.5).
     pivtol_max: f64,
+
+    /// Two-stage escalation state (T3.37).
+    quality_level: QualityLevel,
 }
 
 impl Default for FeralLdl {
@@ -62,8 +79,18 @@ impl FeralLdl {
         // a near-zero pivot is hit, mirroring rmumps' "factor with possibly
         // wrong inertia" semantic. ripopt's inertia-correction loop in
         // `kkt::factor_with_inertia_correction` then perturbs and retries.
+        //
+        // T3.37: default scaling is Identity, not Auto. ripopt owns the KKT
+        // scaling decision via `kkt::ruiz_equilibrate` (activated on demand
+        // through `params.use_scaling`); double-scaling at the linear-solver
+        // layer changes the factored matrix shape and corrupts the inertia
+        // signal that the IPM uses to drive its perturbation handler.
+        // `increase_quality()` flips to `InfNorm` as stage-1 escalation,
+        // matching feral's Solver::increase_quality and Ipopt's
+        // IpTSymLinearSolver::IncreaseQuality cascade.
         let mut numeric_params = NumericParams::default();
         numeric_params.bk.on_zero_pivot = ZeroPivotAction::ForceAccept;
+        numeric_params.scaling = ScalingStrategy::Identity;
 
         Self {
             n: 0,
@@ -76,6 +103,7 @@ impl FeralLdl {
             csc: None,
             coo_to_csc: Vec::new(),
             pivtol_max: 0.5,
+            quality_level: QualityLevel::Baseline,
         }
     }
 
@@ -316,30 +344,54 @@ impl LinearSolver for FeralLdl {
     }
 
     fn increase_quality(&mut self) -> bool {
-        // Stage-2 of feral's Solver::increase_quality: bump the BK
-        // column-relative pivot threshold. Stage-1 (toggling scaling
-        // strategy) is skipped here because feral's NumericParams default
-        // already enables MC64 scaling on indefinite KKTs; ripopt's KKT
-        // path applies its own Ruiz scaling on top in `kkt.rs`.
+        // T3.37: two-stage escalation matching
+        // `IpTSymLinearSolver::IncreaseQuality` and feral's
+        // `Solver::increase_quality`.
+        //   Stage 1: flip Identity → InfNorm scaling (skipped if already non-Identity).
+        //   Stage 2: bump the BK column-relative pivot threshold.
         const FIRST_PIVOT_THRESHOLD: f64 = 0.01;
         const PIVOT_EXPONENT: f64 = 0.75;
         const EPS_CAP: f64 = 1e-12;
 
-        let pivtol = &mut self.numeric_params.bk.pivot_threshold;
-        if *pivtol >= self.pivtol_max - EPS_CAP {
-            return false;
+        match self.quality_level {
+            QualityLevel::Exhausted => false,
+            QualityLevel::Baseline => {
+                if matches!(self.numeric_params.scaling, ScalingStrategy::Identity) {
+                    log::debug!("FeralLdl: escalating scaling Identity -> InfNorm");
+                    self.numeric_params.scaling = ScalingStrategy::InfNorm;
+                    self.quality_level = QualityLevel::ScalingEnabled;
+                } else {
+                    self.bump_pivot_threshold(FIRST_PIVOT_THRESHOLD, PIVOT_EXPONENT, EPS_CAP);
+                }
+                true
+            }
+            QualityLevel::ScalingEnabled | QualityLevel::PivotRaised => {
+                self.bump_pivot_threshold(FIRST_PIVOT_THRESHOLD, PIVOT_EXPONENT, EPS_CAP);
+                true
+            }
         }
-        let new_pivtol = if *pivtol == 0.0 {
-            FIRST_PIVOT_THRESHOLD
+    }
+}
+
+impl FeralLdl {
+    /// Apply stage-2 pivot escalation and update `quality_level`.
+    fn bump_pivot_threshold(&mut self, first_jump: f64, exponent: f64, eps_cap: f64) {
+        let pivtol = &mut self.numeric_params.bk.pivot_threshold;
+        let prev = *pivtol;
+        *pivtol = if *pivtol == 0.0 {
+            first_jump
         } else {
-            pivtol.powf(PIVOT_EXPONENT).min(self.pivtol_max)
+            pivtol.powf(exponent).min(self.pivtol_max)
         };
         log::debug!(
             "FeralLdl: escalating pivot threshold {:.2e} -> {:.2e}",
-            *pivtol,
-            new_pivtol
+            prev,
+            *pivtol
         );
-        *pivtol = new_pivtol;
-        true
+        self.quality_level = if *pivtol >= self.pivtol_max - eps_cap {
+            QualityLevel::Exhausted
+        } else {
+            QualityLevel::PivotRaised
+        };
     }
 }
