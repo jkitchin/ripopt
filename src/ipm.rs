@@ -2173,7 +2173,6 @@ fn run_line_search_loop<P: NlpProblem>(
     phi_current: f64,
     grad_phi_step: f64,
     min_alpha: f64,
-    force_restoration: bool,
     watchdog_active: bool,
     iteration: usize,
     n: usize,
@@ -2188,9 +2187,6 @@ fn run_line_search_loop<P: NlpProblem>(
     *ls_steps = 0;
 
     for _ls_iter in 0..40 {
-        if force_restoration {
-            break;
-        }
         // Intra-iteration early stall check (scaled by problem size).
         // Square problems can have legitimately slow first iterations
         // (mirrors IpBacktrackingLineSearch.cpp:276-280), so we never
@@ -4492,34 +4488,6 @@ fn attempt_soft_restoration<P: NlpProblem>(
 }
 
 
-/// Snapshot of the lowest-objective feasible iterate seen so far. Used
-/// as the fallback iterate returned at `max_iter` exit and as the
-/// `best_x.is_some()` guard for the dual-stagnation revert.
-struct BestFeasibleIterate {
-    obj: f64,
-    x: Option<Vec<f64>>,
-}
-
-impl BestFeasibleIterate {
-    fn new() -> Self {
-        Self { obj: f64::INFINITY, x: None }
-    }
-}
-
-/// Record the current iterate as the best-feasible point seen so far
-/// if it satisfies `constr_viol_tol` and strictly improves `best.obj`.
-fn track_best_feasible(
-    state: &SolverState,
-    options: &SolverOptions,
-    best: &mut BestFeasibleIterate,
-) {
-    let theta_now = state.constraint_violation();
-    if theta_now < options.constr_viol_tol && state.obj < best.obj {
-        best.obj = state.obj;
-        best.x = Some(state.x.clone());
-    }
-}
-
 /// Fraction-to-boundary step limits for primal and dual.
 ///
 /// `tau` = `max(1 - NLP_error, tau_min)` in Free mode or
@@ -5841,26 +5809,6 @@ fn detect_unbounded(
 /// Extracted from `solve_ipm` as part of the v0.8 main-loop
 /// decomposition. Returns `true` when the caller should force
 /// restoration on the next step.
-/// Tracks consecutive primal-infeasibility increases so the divergence
-/// detector can force restoration after a sustained run of growth.
-/// `prev` is the previous iteration's primal_inf, `start` snapshots
-/// `prev` at the moment the run began.
-struct PrimalDivergenceTracker {
-    consecutive_increase: usize,
-    prev: f64,
-    start: f64,
-}
-
-impl PrimalDivergenceTracker {
-    fn new() -> Self {
-        Self {
-            consecutive_increase: 0,
-            prev: f64::INFINITY,
-            start: f64::INFINITY,
-        }
-    }
-}
-
 /// Constraint-violation history with auxiliary flags driving infeasibility
 /// detection: `history` is a bounded ring of recent θ values, `ever_feasible`
 /// is sticky once any θ falls below `constr_viol_tol`, and `stall_count`
@@ -5882,47 +5830,6 @@ impl FeasibilityTracker {
             stall_count: 0,
         }
     }
-}
-
-fn detect_primal_divergence(
-    options: &SolverOptions,
-    iteration: usize,
-    primal_inf: f64,
-    pd: &mut PrimalDivergenceTracker,
-    m: usize,
-) -> bool {
-    let mut force_restoration = false;
-    if m > 0 && iteration > 5 && primal_inf > options.constr_viol_tol {
-        if primal_inf > pd.prev * (1.0 + 1e-6) {
-            if pd.consecutive_increase == 0 {
-                pd.start = pd.prev;
-            }
-            pd.consecutive_increase += 1;
-        } else {
-            pd.consecutive_increase = 0;
-        }
-        // After 8 consecutive increases AND cumulative growth of at least
-        // 20%, force restoration. The growth check prevents triggering on
-        // tiny numerical oscillations.
-        if pd.consecutive_increase >= 8 && primal_inf > 1.2 * pd.start {
-            log::info!(
-                "Primal divergence at iter {}: pr grew for {} consecutive iterations ({:.2e} -> {:.2e}), forcing restoration",
-                iteration, pd.consecutive_increase, pd.start, primal_inf
-            );
-            if options.print_level >= 3 {
-                rip_log!(
-                    "ripopt: Primal divergence detected (pr grew {:.2e} -> {:.2e} over {} iters), re-entering restoration",
-                    pd.start, primal_inf, pd.consecutive_increase
-                );
-            }
-            force_restoration = true;
-            pd.consecutive_increase = 0;
-        }
-    } else {
-        pd.consecutive_increase = 0;
-    }
-    pd.prev = primal_inf;
-    force_restoration
 }
 
 /// Outcome of the overall-progress stall detector.
@@ -6956,16 +6863,8 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
     // Hessian regularization delta from previous iteration (for intermediate callback).
     let mut prev_ic_delta_w: f64 = 0.0;
 
-    // Primal divergence detection: track consecutive iterations where pr is growing.
-    // When pr grows steadily post-restoration, re-trigger restoration rather than
-    // continuing for many iterations with worsening feasibility.
-    let mut pd_tracker = PrimalDivergenceTracker::new();
-
     // Consecutive iterations with obj < -1e20 for robust unbounded detection
     let mut consecutive_unbounded: usize = 0;
-
-    // Best feasible point tracking: save the best (lowest obj) point that is feasible
-    let mut best_feasible = BestFeasibleIterate::new();
 
     // Damped multiplier updates when oscillation detected
     let mut dy_tracker = DyOscillationTracker::new(m);
@@ -7174,14 +7073,6 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             StallDecision::Continue => continue,
             StallDecision::Proceed => {}
         }
-        let force_restoration = detect_primal_divergence(
-            options,
-            iteration,
-            primal_inf,
-            &mut pd_tracker,
-            m,
-        );
-
         let t_kkt = Instant::now();
         let AssembledKkt {
             sigma,
@@ -7360,7 +7251,6 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             phi_current,
             grad_phi_step,
             min_alpha,
-            force_restoration,
             watchdog.active,
             iteration,
             n,
@@ -7507,7 +7397,6 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         let _ = apply_magic_step(&mut state, options);
         reset_slack_multipliers(&mut state, mu_ks);
         maybe_recalc_y_post_step(&mut state, options, n, m, lbfgs_mode);
-        track_best_feasible(&state, options, &mut best_feasible);
 
         // --- Barrier parameter update (free/fixed mode) ---
         // Save mu before so we can detect "mu update found nothing to
