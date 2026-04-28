@@ -536,6 +536,11 @@ impl WatchdogSavedState {
 
 /// Central state struct for the IPM solver.
 pub(crate) struct SolverState {
+    /// kappa_d damping coefficient (T3.9). Read from
+    /// `options.kappa_d` at construction; used by convergence helpers
+    /// to add the one-sided-bound damping term to grad_lag_x without
+    /// threading `options` through every call site.
+    pub kappa_d: f64,
     /// Current primal variables.
     pub x: Vec<f64>,
     /// Current constraint multipliers (lambda/y).
@@ -1029,6 +1034,7 @@ impl SolverState {
         let is_square = m == n || m_eq == n;
 
         Self {
+            kappa_d: options.kappa_d,
             x,
             y,
             z_l,
@@ -4200,31 +4206,43 @@ fn reevaluate_after_step<P: NlpProblem>(
 
 /// Reset the slack-constraint multipliers `v_l`, `v_u` from the
 /// barrier equilibrium `v = mu / slack` after the post-step
-/// re-evaluation.
+/// re-evaluation, then apply the kappa_sigma safeguard clamp to match
+/// Ipopt's `correct_bound_multiplier` for v_L/v_U
+/// (`IpIpoptAlg.cpp:721-758` calls it for ALL FOUR blocks: z_L, z_U,
+/// v_L, v_U; T3.7 alignment).
 ///
 /// A simple reset rather than a Newton update — the dv direction is
 /// approximate (we carry no explicit slacks) and applying FTB on `v`
 /// can restrict `alpha_d` too much. Only active slacks (`v > 0`) are
 /// touched.
 ///
-/// Uses the **current barrier parameter** `state.mu` rather than the
-/// kappa_sigma reference `mu_ks` so that `v · slack` shrinks with each
-/// barrier update; on problems with no variable bounds, `avg_compl`
-/// falls back to `Σ v_l·slack` which would make `mu_ks` self-referential
-/// (= previous `v_l·slack`) and freeze the complementarity residual at
-/// the initial value, blocking convergence (see the
-/// `mixed_equality_inequality` regression). Mirrors Ipopt's
-/// `correct_bound_multiplier`, which clamps against current barrier mu
-/// (`IpIpoptAlg.cpp:1055-1134`).
-fn reset_slack_multipliers(state: &mut SolverState, _mu_ks: f64) {
+/// Uses the **current barrier parameter** `state.mu` for the centered
+/// reset value rather than the kappa_sigma reference `mu_ks` so that
+/// `v · slack` shrinks with each barrier update; on problems with no
+/// variable bounds, `avg_compl` falls back to `Σ v_l·slack` which would
+/// make `mu_ks` self-referential (= previous `v_l·slack`) and freeze
+/// the complementarity residual at the initial value, blocking
+/// convergence (see the `mixed_equality_inequality` regression). The
+/// kappa_sigma safeguard clamp uses `mu_ks` (which IS the kappa_sigma
+/// reference, set in `apply_kappa_sigma_bound_multiplier_reset`) for
+/// the window `[mu_ks/(kappa_sigma·s), kappa_sigma·mu_ks/s]`, matching
+/// Ipopt's structural pattern.
+fn reset_slack_multipliers(state: &mut SolverState, mu_ks: f64) {
     let m = state.m;
     let mu = state.mu;
+    let kappa_sigma = 1e10;
     for i in 0..m {
         if state.v_l[i] > 0.0 && state.g_l[i].is_finite() {
-            state.v_l[i] = mu / slack_gl(state, i);
+            let s = slack_gl(state, i);
+            let v_lo = mu_ks / (kappa_sigma * s);
+            let v_hi = kappa_sigma * mu_ks / s;
+            state.v_l[i] = (mu / s).clamp(v_lo, v_hi);
         }
         if state.v_u[i] > 0.0 && state.g_u[i].is_finite() {
-            state.v_u[i] = mu / slack_gu(state, i);
+            let s = slack_gu(state, i);
+            let v_lo = mu_ks / (kappa_sigma * s);
+            let v_hi = kappa_sigma * mu_ks / s;
+            state.v_u[i] = (mu / s).clamp(v_lo, v_hi);
         }
     }
 }
@@ -9586,11 +9604,12 @@ fn compute_grad_theta_norm(state: &SolverState) -> f64 {
 /// `convergence::dual_infeasibility` at the current iterate using
 /// `state.{grad_f, jac_*, y, z_l, z_u}`. This combination of args
 /// appears at over a dozen call sites; the helper makes them all
-/// uniform.
+/// uniform. T3.9: kappa_d damping term applied via `state.kappa_d`.
 fn compute_dual_inf_at_state(state: &SolverState) -> f64 {
     convergence::dual_infeasibility(
         &state.grad_f, &state.jac_rows, &state.jac_cols, &state.jac_vals,
         &state.y, &state.z_l, &state.z_u, state.n,
+        state.kappa_d, state.mu, &state.x_l, &state.x_u,
     )
 }
 
@@ -9602,6 +9621,7 @@ fn dual_inf_with_z(state: &SolverState, z_l: &[f64], z_u: &[f64]) -> f64 {
     convergence::dual_infeasibility(
         &state.grad_f, &state.jac_rows, &state.jac_cols, &state.jac_vals,
         &state.y, z_l, z_u, state.n,
+        state.kappa_d, state.mu, &state.x_l, &state.x_u,
     )
 }
 
@@ -9621,6 +9641,7 @@ fn compute_dual_inf_unscaled_at_state(state: &SolverState) -> f64 {
     convergence::dual_infeasibility_scaled(
         &state.grad_f, &state.jac_rows, &state.jac_cols, &state.jac_vals,
         &state.y, &state.z_l, &state.z_u, state.n,
+        state.kappa_d, state.mu, &state.x_l, &state.x_u,
     )
 }
 
@@ -10241,6 +10262,7 @@ mod tests {
     // The caller supplies only fields the test exercises; everything else is zeroed.
     fn minimal_state(n: usize, m: usize) -> SolverState {
         SolverState {
+            kappa_d: 0.0,
             x: vec![0.0; n],
             y: vec![0.0; m],
             z_l: vec![0.0; n],

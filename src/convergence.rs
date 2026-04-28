@@ -211,13 +211,17 @@ pub fn primal_infeasibility_max(g: &[f64], g_l: &[f64], g_u: &[f64]) -> f64 {
     max_viol
 }
 
-/// Compute dual infeasibility: ||grad_f - J^T * lambda - z_l + z_u||_inf.
+/// Compute dual infeasibility: ||grad_f + J^T * lambda - z_l + z_u + kappa_d damping||_inf.
 ///
 /// `grad_f`: gradient of objective
 /// `jac_rows`, `jac_cols`, `jac_vals`: Jacobian in COO format
 /// `lambda`: constraint multipliers
 /// `z_l`, `z_u`: bound multipliers
 /// `n`: number of variables
+/// `kappa_d`, `mu`, `x_l`, `x_u`: T3.9 — Ipopt's `curr_grad_lag_x` adds
+///   `+ kappa_d * mu` for one-sided lower-bound vars and
+///   `- kappa_d * mu` for one-sided upper-bound vars
+///   (`IpIpoptCalculatedQuantities.cpp:888-899`, default `kappa_d = 1e-5`).
 #[allow(clippy::too_many_arguments)]
 pub fn dual_infeasibility(
     grad_f: &[f64],
@@ -228,6 +232,10 @@ pub fn dual_infeasibility(
     z_l: &[f64],
     z_u: &[f64],
     n: usize,
+    kappa_d: f64,
+    mu: f64,
+    x_l: &[f64],
+    x_u: &[f64],
 ) -> f64 {
     let mut residual = vec![0.0; n];
 
@@ -243,6 +251,20 @@ pub fn dual_infeasibility(
     for i in 0..n {
         residual[i] -= z_l[i];
         residual[i] += z_u[i];
+    }
+
+    // T3.9: kappa_d damping for one-sided-bound vars (matches Ipopt's
+    // curr_grad_lag_x).
+    if kappa_d > 0.0 {
+        for i in 0..n {
+            let l_fin = x_l[i].is_finite();
+            let u_fin = x_u[i].is_finite();
+            if l_fin && !u_fin {
+                residual[i] += kappa_d * mu;
+            } else if !l_fin && u_fin {
+                residual[i] -= kappa_d * mu;
+            }
+        }
     }
 
     residual.iter().map(|r| r.abs()).fold(0.0f64, f64::max)
@@ -264,6 +286,10 @@ pub fn dual_infeasibility_scaled(
     z_l: &[f64],
     z_u: &[f64],
     n: usize,
+    kappa_d: f64,
+    mu: f64,
+    x_l: &[f64],
+    x_u: &[f64],
 ) -> f64 {
     // T3.1: dropped the ripopt-specific per-component `(1 + |grad_f_i|)`
     // divisor. Ipopt's `IpIpoptCalculatedQuantities::curr_dual_infeasibility`
@@ -272,6 +298,9 @@ pub fn dual_infeasibility_scaled(
     // (`IpOptErrorConvCheck.cpp:208`). The per-component normalisation
     // could declare false-Optimal on problems with one large gradient
     // component shadowing uniformly small residuals.
+    //
+    // T3.9: kappa_d damping for one-sided-bound vars
+    // (IpIpoptCalculatedQuantities.cpp:888-899).
     let mut residual = vec![0.0; n];
     residual[..n].copy_from_slice(&grad_f[..n]);
     for (idx, (&row, &col)) in jac_rows.iter().zip(jac_cols.iter()).enumerate() {
@@ -280,6 +309,17 @@ pub fn dual_infeasibility_scaled(
     for i in 0..n {
         residual[i] -= z_l[i];
         residual[i] += z_u[i];
+    }
+    if kappa_d > 0.0 {
+        for i in 0..n {
+            let l_fin = x_l[i].is_finite();
+            let u_fin = x_u[i].is_finite();
+            if l_fin && !u_fin {
+                residual[i] += kappa_d * mu;
+            } else if !l_fin && u_fin {
+                residual[i] -= kappa_d * mu;
+            }
+        }
     }
     residual.iter().map(|r| r.abs()).fold(0.0f64, f64::max)
 }
@@ -691,12 +731,14 @@ mod tests {
         // Need z_l, z_u such that residual = 0
         let z_l = vec![0.5, 1.5];
         let z_u = vec![0.0, 0.0];
-        let di = dual_infeasibility(&grad_f, &jac_rows, &jac_cols, &jac_vals, &lambda, &z_l, &z_u, n);
+        let x_l = vec![f64::NEG_INFINITY, f64::NEG_INFINITY];
+        let x_u = vec![f64::INFINITY, f64::INFINITY];
+        let di = dual_infeasibility(&grad_f, &jac_rows, &jac_cols, &jac_vals, &lambda, &z_l, &z_u, n, 0.0, 0.0, &x_l, &x_u);
         assert!(di < 1e-12, "Exact stationarity should give 0, got {}", di);
 
         // Nonzero case
         let z_l2 = vec![0.0, 0.0];
-        let di2 = dual_infeasibility(&grad_f, &jac_rows, &jac_cols, &jac_vals, &lambda, &z_l2, &z_u, n);
+        let di2 = dual_infeasibility(&grad_f, &jac_rows, &jac_cols, &jac_vals, &lambda, &z_l2, &z_u, n, 0.0, 0.0, &x_l, &x_u);
         assert!(di2 > 0.1, "Non-stationary should give positive dual_inf");
     }
 
@@ -719,8 +761,10 @@ mod tests {
         let lambda = vec![-0.5];
         let z_l = vec![0.5, 1.5];
         let z_u = vec![0.0, 0.0];
+        let x_l = vec![f64::NEG_INFINITY, f64::NEG_INFINITY];
+        let x_u = vec![f64::INFINITY, f64::INFINITY];
         // At stationarity, both scaled and unscaled should be ~0
-        let di_s = dual_infeasibility_scaled(&grad_f, &jac_rows, &jac_cols, &jac_vals, &lambda, &z_l, &z_u, n);
+        let di_s = dual_infeasibility_scaled(&grad_f, &jac_rows, &jac_cols, &jac_vals, &lambda, &z_l, &z_u, n, 0.0, 0.0, &x_l, &x_u);
         assert!(di_s < 1e-12, "Scaled stationarity should give 0, got {}", di_s);
     }
 }
