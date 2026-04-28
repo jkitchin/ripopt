@@ -3280,6 +3280,7 @@ fn solve_with_quality_escalation(
     mut ic_delta_c: f64,
     n: usize,
     m: usize,
+    ctx: Option<&kkt::BoundResidualContext<'_>>,
 ) -> (Result<(Vec<f64>, Vec<f64>), crate::linear_solver::SolverError>, f64, f64) {
     let ir = kkt::IrParams::from_options(options);
     // T0.14: gate the pretend-singular trigger so it can fire at most
@@ -3287,13 +3288,14 @@ fn solve_with_quality_escalation(
     // as pretend-singular, the standard escalation ladder runs below;
     // any second pretend-singular within the same iter (e.g. from a
     // re-solve after the ladder) will be suppressed by the wrapper.
-    let mut dir_result = kkt::solve_for_direction_iter_aware_with_ir(
+    let mut dir_result = kkt::solve_for_direction_iter_aware_with_ir_ctx(
         kkt_system_opt.as_ref().unwrap(),
         lin_solver,
         inertia_params,
         ic_delta_w,
         ic_delta_c,
         ir,
+        ctx,
     );
     if matches!(dir_result, Err(crate::linear_solver::SolverError::PretendSingular)) {
         if let Some(kkt_system) = kkt_system_opt.as_mut() {
@@ -3305,13 +3307,13 @@ fn solve_with_quality_escalation(
                     let scale = kkt::ruiz_equilibrate(&mut kkt_system.matrix, &mut kkt_system.rhs);
                     kkt_system.scale_factors = Some(scale);
                     if lin_solver.factor(&kkt_system.matrix).is_ok() {
-                        dir_result = kkt::solve_for_direction_with_ir(kkt_system, lin_solver, ic_delta_w, ic_delta_c, ir);
+                        dir_result = kkt::solve_for_direction_with_ir_ctx(kkt_system, lin_solver, ic_delta_w, ic_delta_c, ir, ctx);
                         ps_resolved = !matches!(dir_result, Err(crate::linear_solver::SolverError::PretendSingular));
                     }
                 }
                 if !ps_resolved && lin_solver.increase_quality() {
                     if lin_solver.factor(&kkt_system.matrix).is_ok() {
-                        dir_result = kkt::solve_for_direction_with_ir(kkt_system, lin_solver, ic_delta_w, ic_delta_c, ir);
+                        dir_result = kkt::solve_for_direction_with_ir_ctx(kkt_system, lin_solver, ic_delta_w, ic_delta_c, ir, ctx);
                         ps_resolved = !matches!(dir_result, Err(crate::linear_solver::SolverError::PretendSingular));
                     }
                 }
@@ -3324,7 +3326,7 @@ fn solve_with_quality_escalation(
                 if lin_solver.factor(&perturbed).is_ok() {
                     kkt_system.matrix = perturbed;
                     ic_delta_c = dc;
-                    dir_result = kkt::solve_for_direction_with_ir(kkt_system, lin_solver, ic_delta_w, ic_delta_c, ir);
+                    dir_result = kkt::solve_for_direction_with_ir_ctx(kkt_system, lin_solver, ic_delta_w, ic_delta_c, ir, ctx);
                     ps_resolved = !matches!(dir_result, Err(crate::linear_solver::SolverError::PretendSingular));
                 }
             }
@@ -3341,7 +3343,7 @@ fn solve_with_quality_escalation(
                     ic_delta_w = dw;
                     ic_delta_c = dc;
                     inertia_params.delta_w_last = dw;
-                    dir_result = kkt::solve_for_direction_with_ir(kkt_system, lin_solver, ic_delta_w, ic_delta_c, ir);
+                    dir_result = kkt::solve_for_direction_with_ir_ctx(kkt_system, lin_solver, ic_delta_w, ic_delta_c, ir, ctx);
                 }
             }
             if !inertia_params.use_scaling {
@@ -3726,11 +3728,29 @@ fn solve_full_augmented_direction<P: NlpProblem>(
         }
     }
 
+    // T3.23: build the bound-residual context when the user opts into
+    // 8-block IR. The slice references are scoped to this call only.
+    let empty_r_x: Vec<f64> = Vec::new();
+    let ctx_owned = if options.ir_residual_full_8_block {
+        Some(kkt::BoundResidualContext {
+            x: &state.x,
+            x_l: &state.x_l,
+            x_u: &state.x_u,
+            z_l: &state.z_l,
+            z_u: &state.z_u,
+            mu: state.mu,
+            r_x_full: &empty_r_x,
+        })
+    } else {
+        None
+    };
+
     // Escalated (δ_w, δ_c) values are not read again — the helper mutates
     // kkt_system.matrix, inertia_params, and lin_solver in place, which
     // carries the escalation effect into subsequent iterations.
     let (dir_result, _, _) = solve_with_quality_escalation(
         kkt_system_opt, lin_solver, inertia_params, options, ic_delta_w, ic_delta_c, n, m,
+        ctx_owned.as_ref(),
     );
     // T3.25 follow-up: solve_with_quality_escalation may have called
     // `lin_solver.factor` directly (Ruiz, increase_quality, δ_c

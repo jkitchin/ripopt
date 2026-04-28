@@ -1268,6 +1268,33 @@ pub fn solve_for_direction_with_ir(
     delta_c_ic: f64,
     ir: IrParams,
 ) -> Result<(Vec<f64>, Vec<f64>), crate::linear_solver::SolverError> {
+    solve_for_direction_with_ir_ctx(kkt, solver, delta_w, delta_c_ic, ir, None)
+}
+
+/// T3.23: explicit-IR-config variant that lets the caller pass a
+/// `BoundResidualContext`. When `ctx` is `Some(_)`, the IR loop's
+/// residual ratio is computed over the **8-block** primal-dual system
+/// — i.e. the rhs/sol Amax denominators are extended by the
+/// bound-multiplier complementarity components
+/// (`max_i |μ − z_L_i·s_L_i|`, `max_i |μ − z_U_i·s_U_i|` for rhs;
+/// `max_i |dz_L_i|, |dz_U_i|` for sol, with `dz` recovered from the
+/// current `dx` via Fiacco). The residual numerator stays the 4-block
+/// augmented residual (rows 5-6 are analytically zero under fresh
+/// Fiacco recovery from the converged `dx`); only the *gate* magnitudes
+/// change. This replicates Ipopt's
+/// `IpPDFullSpaceSolver::ComputeResidualRatio` (lines 803-820), which
+/// takes Amax over the full 8-block rhs/sol vectors.
+///
+/// When `ctx` is `None`, behaviour is identical to the legacy 4-block
+/// path.
+pub fn solve_for_direction_with_ir_ctx(
+    kkt: &KktSystem,
+    solver: &mut dyn LinearSolver,
+    delta_w: f64,
+    delta_c_ic: f64,
+    ir: IrParams,
+    ctx: Option<&BoundResidualContext<'_>>,
+) -> Result<(Vec<f64>, Vec<f64>), crate::linear_solver::SolverError> {
     let dim = kkt.dim;
     // The perturbation pair (δ_w, δ_c_ic) is folded into kkt.matrix at
     // factor time; we measure the residual against that augmented matrix.
@@ -1302,15 +1329,63 @@ pub fn solve_for_direction_with_ir(
     let min_refinements = if ir.enabled { ir.steps_required } else { 0 };
     let mut residual = vec![0.0; dim];
 
+    // T3.23: precompute the bound-row rhs Amax (constant across IR
+    // iterations — μ, z_L/U, s_L/U don't change inside the IR loop).
+    let rhs_bound_max: f64 = if let Some(c) = ctx {
+        let mut m = 0.0f64;
+        for i in 0..c.x.len() {
+            if c.x_l[i].is_finite() {
+                let sl = (c.x[i] - c.x_l[i]).max(1e-20);
+                m = m.max((c.mu - c.z_l[i] * sl).abs());
+            }
+            if c.x_u[i].is_finite() {
+                let su = (c.x_u[i] - c.x[i]).max(1e-20);
+                m = m.max((c.mu - c.z_u[i] * su).abs());
+            }
+        }
+        m
+    } else {
+        0.0
+    };
+
     let compute_ratio = |sol: &[f64], resid_negated: &[f64]| -> f64 {
-        let nrm_rhs: f64 = kkt.rhs.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
-        let nrm_res: f64 = sol.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+        let nrm_rhs_4: f64 = kkt.rhs.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+        let nrm_sol_4: f64 = sol.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
         let nrm_resid: f64 = resid_negated.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+
+        // T3.23: extend rhs/sol Amax with bound-multiplier components when
+        // ctx provided. Numerator (residual) stays the augmented 4-block
+        // residual — rows (5)/(6) of the unsymmetric system are zero by
+        // construction under fresh Fiacco recovery from sol[..n].
+        let (nrm_rhs, nrm_sol) = if let Some(c) = ctx {
+            let n = kkt.n;
+            let mut dz_max: f64 = 0.0;
+            for i in 0..n {
+                let dx_i = match kkt.scale_factors {
+                    Some(ref s) => s[i] * sol[i],
+                    None => sol[i],
+                };
+                if c.x_l[i].is_finite() {
+                    let sl = (c.x[i] - c.x_l[i]).max(1e-20);
+                    let dz_l = (c.mu - c.z_l[i] * sl) / sl - (c.z_l[i] / sl) * dx_i;
+                    dz_max = dz_max.max(dz_l.abs());
+                }
+                if c.x_u[i].is_finite() {
+                    let su = (c.x_u[i] - c.x[i]).max(1e-20);
+                    let dz_u = (c.mu - c.z_u[i] * su) / su + (c.z_u[i] / su) * dx_i;
+                    dz_max = dz_max.max(dz_u.abs());
+                }
+            }
+            (nrm_rhs_4.max(rhs_bound_max), nrm_sol_4.max(dz_max))
+        } else {
+            (nrm_rhs_4, nrm_sol_4)
+        };
+
         let max_cond = 1e6;
-        if nrm_rhs + nrm_res == 0.0 {
+        if nrm_rhs + nrm_sol == 0.0 {
             nrm_resid
         } else {
-            nrm_resid / (nrm_res.min(max_cond * nrm_rhs) + nrm_rhs)
+            nrm_resid / (nrm_sol.min(max_cond * nrm_rhs) + nrm_rhs)
         }
     };
 
@@ -1406,6 +1481,7 @@ pub fn solve_for_direction_with_ir(
         // δ_c (lifting the rank deficiency) and re-solves.
         let nrm_rhs: f64 = kkt.rhs.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
         let nrm_res: f64 = solution.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+        let nrm_rhs = nrm_rhs.max(rhs_bound_max);
         let magnitude_ratio = nrm_res / nrm_rhs.max(1.0);
         if magnitude_ratio > 1e10 {
             log::debug!(
@@ -1727,7 +1803,25 @@ pub fn solve_for_direction_iter_aware_with_ir(
     delta_c_ic: f64,
     ir: IrParams,
 ) -> Result<(Vec<f64>, Vec<f64>), crate::linear_solver::SolverError> {
-    match solve_for_direction_with_ir(kkt, solver, delta_w, delta_c_ic, ir) {
+    solve_for_direction_iter_aware_with_ir_ctx(
+        kkt, solver, params, delta_w, delta_c_ic, ir, None,
+    )
+}
+
+/// T3.23: ctx-aware variant of `solve_for_direction_iter_aware_with_ir`.
+/// Forwards `ctx` to `solve_for_direction_with_ir_ctx` so the IR loop
+/// uses the 8-block residual ratio (ipopt-aligned behavior on stiff
+/// bound multipliers).
+pub fn solve_for_direction_iter_aware_with_ir_ctx(
+    kkt: &KktSystem,
+    solver: &mut dyn LinearSolver,
+    params: &mut InertiaCorrectionParams,
+    delta_w: f64,
+    delta_c_ic: f64,
+    ir: IrParams,
+    ctx: Option<&BoundResidualContext<'_>>,
+) -> Result<(Vec<f64>, Vec<f64>), crate::linear_solver::SolverError> {
+    match solve_for_direction_with_ir_ctx(kkt, solver, delta_w, delta_c_ic, ir, ctx) {
         Ok(v) => Ok(v),
         Err(SolverError::PretendSingular) if !params.pretend_singular_used => {
             // First pretend-singular this iter — allow it and record.
@@ -4075,5 +4169,91 @@ mod tests {
         assert!(ratio_full <= ratio_baseline + 1e-15,
             "T3.23: full-residual path must not regress; baseline={}, full={}",
             ratio_baseline, ratio_full);
+    }
+
+    /// T3.23 — Test 4: `solve_for_direction_with_ir_ctx(_, None)` is
+    /// bit-exact equal to `solve_for_direction_with_ir`. The 4-block
+    /// ratio path runs on every existing caller; option-OFF must be
+    /// identical to the legacy code or HS regressions are guaranteed.
+    #[test]
+    fn test_t323_ir_ctx_off_bit_exact() {
+        let n = 2;
+        let m = 1;
+        let mut matrix = SymmetricMatrix::zeros(3);
+        matrix.set(0, 0, 4.0);
+        matrix.set(1, 1, 5.0);
+        matrix.set(2, 0, 1.0);
+        matrix.set(2, 1, -2.0);
+        let kkt = KktSystem {
+            dim: 3, n, m,
+            matrix: KktMatrix::Dense(matrix),
+            rhs: vec![0.7, -0.3, 1.2],
+            delta_c_diag: vec![0.0; m],
+            scale_factors: None,
+            input_atags: None,
+        };
+        let mut solver_a = DenseLdl::new();
+        solver_a.factor(&kkt.matrix).unwrap();
+        let (dx_a, dy_a) = solve_for_direction_with_ir(
+            &kkt, &mut solver_a, 0.0, 0.0, IrParams::default(),
+        ).unwrap();
+        let mut solver_b = DenseLdl::new();
+        solver_b.factor(&kkt.matrix).unwrap();
+        let (dx_b, dy_b) = solve_for_direction_with_ir_ctx(
+            &kkt, &mut solver_b, 0.0, 0.0, IrParams::default(), None,
+        ).unwrap();
+        for i in 0..n { assert_eq!(dx_a[i], dx_b[i],
+            "T3.23 ctx=None: dx[{}] differs ({} vs {})", i, dx_a[i], dx_b[i]); }
+        for i in 0..m { assert_eq!(dy_a[i], dy_b[i],
+            "T3.23 ctx=None: dy[{}] differs ({} vs {})", i, dy_a[i], dy_b[i]); }
+    }
+
+    /// T3.23 — Test 5: with `ctx = Some(_)`, the IR loop's residual
+    /// ratio includes the bound-multiplier 8-block magnitudes. The
+    /// solution itself should still solve the augmented (4-block)
+    /// system to machine precision; only the *gate* magnitudes change.
+    #[test]
+    fn test_t323_ir_ctx_solution_correctness() {
+        // Same well-conditioned KKT as Test 4, with arbitrary bound state.
+        let n = 2;
+        let m = 1;
+        let mut matrix = SymmetricMatrix::zeros(3);
+        matrix.set(0, 0, 4.0);
+        matrix.set(1, 1, 5.0);
+        matrix.set(2, 0, 1.0);
+        matrix.set(2, 1, -2.0);
+        let kkt = KktSystem {
+            dim: 3, n, m,
+            matrix: KktMatrix::Dense(matrix),
+            rhs: vec![0.7, -0.3, 1.2],
+            delta_c_diag: vec![0.0; m],
+            scale_factors: None,
+            input_atags: None,
+        };
+        let x = vec![1.0, 2.0];
+        let x_l = vec![0.5, 1.0];
+        let x_u = vec![f64::INFINITY, f64::INFINITY];
+        let z_l = vec![0.1, 0.2];
+        let z_u = vec![0.0, 0.0];
+        let r_x_full: Vec<f64> = Vec::new();
+        let ctx = BoundResidualContext {
+            x: &x, x_l: &x_l, x_u: &x_u, z_l: &z_l, z_u: &z_u,
+            mu: 1e-3, r_x_full: &r_x_full,
+        };
+        let mut solver = DenseLdl::new();
+        solver.factor(&kkt.matrix).unwrap();
+        let (dx, dy) = solve_for_direction_with_ir_ctx(
+            &kkt, &mut solver, 0.0, 0.0, IrParams::default(), Some(&ctx),
+        ).unwrap();
+        // Recompose and check augmented residual.
+        let mut sol = dx.clone();
+        sol.extend_from_slice(&dy);
+        let mut res = vec![0.0; 3];
+        kkt.matrix.matvec(&sol, &mut res);
+        for i in 0..3 {
+            let r = (kkt.rhs[i] - res[i]).abs();
+            assert!(r < 1e-12,
+                "T3.23 ctx=Some: augmented residual[{}]={} not near zero", i, r);
+        }
     }
 }
