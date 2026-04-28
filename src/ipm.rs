@@ -1606,8 +1606,6 @@ fn solve_inner<P: NlpProblem>(
         rip_log!("ripopt: Failure diagnosis: {:?}", diagnosis);
     }
 
-    try_conservative_ipm_retry(&mut result, problem, options, solve_start);
-
     if !matches!(result.status, SolveStatus::Optimal) {
         if let Some(slack_result) = dispatch_failure_recovery(
             &mut result, problem, options, solve_start, diagnosis,
@@ -1663,51 +1661,6 @@ fn run_initial_solve<P: NlpProblem>(problem: &P, options: &SolverOptions) -> Sol
     } else {
         solve_ipm(problem, options)
     }
-}
-
-/// Conservative IPM retry: revert v0.4.0 algorithmic changes (Gondzio MCC,
-/// Mehrotra PC, stall detection) to recover the pre-regression trajectory.
-/// This is the most reliable recovery for problems sensitive to Newton
-/// direction changes (TRO3X3, STRATEC, MGH10LS, ACOPR30). Only fires for
-/// `n ≤ 200` and a non-Optimal current result; consumes 70% of the
-/// remaining wall-time budget when one is set.
-///
-/// **ripopt-specific (no Ipopt analog).** T2.4 attempted to remove this
-/// per V0.8_IPOPT_ALIGNMENT_PLAN.md §3.1, but the HS regression suite
-/// showed it is load-bearing: HS TP106 (NumericalError, obj 6907 vs
-/// optimum 7049) and HS TP113 (NumericalError, obj 29.7 vs optimum
-/// 24.3) both depend on this retry to converge. Underlying issue is
-/// suspected to be in the Gondzio MCC / Mehrotra PC implementation —
-/// these problems fail with advanced corrections on but converge with
-/// them disabled. Keep until the Gondzio/Mehrotra correctness work
-/// lands as a separate item.
-fn try_conservative_ipm_retry<P: NlpProblem>(
-    result: &mut SolveResult,
-    problem: &P,
-    options: &SolverOptions,
-    solve_start: Instant,
-) {
-    let n_problem = problem.num_variables();
-    if n_problem > 200 || matches!(result.status, SolveStatus::Optimal) {
-        return;
-    }
-    let Some(mut opts) = prepare_fallback_opts(options, &solve_start) else {
-        return;
-    };
-    opts.gondzio_mcc_max = 0;
-    opts.mehrotra_pc = false;
-    opts.stall_iter_limit = 0;
-    opts.proactive_infeasibility_detection = true;
-    opts.max_iter = options.max_iter;
-    if options.max_wall_time > 0.0 {
-        let remaining = options.max_wall_time - solve_start.elapsed().as_secs_f64();
-        opts.max_wall_time = remaining * 0.7;
-    }
-    if options.print_level >= 5 {
-        rip_log!("ripopt: Trying conservative IPM retry (no Gondzio/Mehrotra, no stall detection)");
-    }
-    let candidate = solve_ipm(problem, &opts);
-    adopt_candidate_if_better(result, candidate, options, "Conservative retry", "conservative_ipm");
 }
 
 /// Check if a problem has any inequality constraints (g_l[i] != g_u[i]).
@@ -5777,6 +5730,17 @@ fn check_almost_feasible_guard(
 /// Detect unboundedness by requiring 10 consecutive iterations of
 /// `obj < -1e20` at a feasible iterate. The counter prevents false
 /// positives from transient dips.
+///
+/// **ripopt-specific (T3.22, no Ipopt analog).** Ipopt 3.14 has no
+/// `Unbounded` exit status: it relies on the user to set
+/// `nlp_lower_bound_inf` (default −1e19) and to bound objectives that
+/// could legitimately diverge; an unbounded NLP typically manifests as
+/// `Diverging_Iterates` (`x` magnitude exceeding the
+/// `diverging_iterates_tol` threshold, default 1e20) rather than as an
+/// objective-value test. This routine is a defensive ripopt convenience
+/// for callers that pass an objective with no lower bound — kept until
+/// T3.21 ports Ipopt's diverging-iterates check, after which
+/// `SolveStatus::Unbounded` itself is also up for review.
 fn detect_unbounded(
     state: &SolverState,
     options: &SolverOptions,
