@@ -629,3 +629,115 @@ x1
         "error should name the function, got: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// T-MIT-D: S segment ingestion — `scaling_factor` suffix on
+// objectives / variables / constraints.
+// ---------------------------------------------------------------------------
+//
+// The S-segment header is `S<flags> <count> <name>` where
+//   flags & 3 = kind (0=variable, 1=constraint, 2=objective, 3=problem)
+//   flags & 4 = float bit (0=int, 4=float)
+// followed by `<count>` lines of `<index> <value>`.
+#[test]
+fn nl_parse_scaling_factor_suffix() {
+    // 2 vars, 1 equality constraint x0 + x1 = 1, linear objective x0,
+    // with three `scaling_factor` suffix tables: variable / constraint /
+    // objective. flags=4 marks the values as float.
+    let nl = "\
+g3 1 1 0
+ 2 1 1 0 1
+ 0 1
+ 0 0
+ 0 0 0
+ 0 0 0 0 0
+ 0 0 0 0 0
+ 2 1
+ 0 0
+ 0 0 0 0 0
+O0 0
+n0
+C0
+n0
+b
+3
+3
+G0 1
+0 1
+J0 2
+0 1
+1 1
+k1
+1
+r
+4 1
+x2
+0 0.5
+1 0.5
+S4 2 scaling_factor
+0 2.5
+1 4.0
+S5 1 scaling_factor
+0 7.5
+S6 1 scaling_factor
+0 0.5
+";
+    let data = parse_nl_file(nl).expect("parse failed");
+    assert_eq!(data.suffixes.len(), 3, "expected 3 suffix tables");
+    let sf = data.scaling_factors();
+    assert_eq!(sf.x.as_deref(), Some(&[2.5, 4.0][..]));
+    assert_eq!(sf.g.as_deref(), Some(&[7.5][..]));
+    assert_eq!(sf.obj, Some(0.5));
+}
+
+/// Suffixes whose name is not `scaling_factor` are still captured but
+/// must NOT contribute to `scaling_factors()` extraction.
+#[test]
+fn nl_parse_unrelated_suffix_ignored_by_scaling_factors() {
+    let nl = "\
+g3 1 1 0
+ 2 0 1 0 0
+ 0 1
+ 0 0
+ 2 2 0
+ 0 0 0 0 0
+ 0 0 0 0 0
+ 0 2
+ 0 0
+ 0 0 0 0 0
+O0 0
+o0
+o5
+v0
+n2
+o5
+v1
+n2
+b
+3
+3
+G0 2
+0 0
+1 0
+x2
+0 0
+1 0
+S0 2 ipopt_zL_in
+0 1.0
+1 1.0
+";
+    let data = parse_nl_file(nl).expect("parse failed");
+    assert_eq!(data.suffixes.len(), 1);
+    assert_eq!(data.suffixes[0].name, "ipopt_zL_in");
+    let sf = data.scaling_factors();
+    assert!(sf.is_empty(),
+        "non-scaling_factor suffix must not populate scaling_factors()");
+}
+
+/// `NlScalingFactors::is_empty` correctly distinguishes "no suffixes"
+/// from "suffix present".
+#[test]
+fn nl_scaling_factors_is_empty_default() {
+    let sf = ripopt::nl::NlScalingFactors::default();
+    assert!(sf.is_empty());
+}

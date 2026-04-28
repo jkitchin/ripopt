@@ -1,4 +1,5 @@
 use ripopt::nl::{parse_nl_file, write_sol, NlProblem};
+use ripopt::options::NlpScalingMethod;
 use ripopt::SolverOptions;
 use std::fs;
 use std::io::BufWriter;
@@ -59,6 +60,31 @@ fn main() {
 
     let n_vars = nl_data.header.n_vars;
     let n_constrs = nl_data.header.n_constrs;
+
+    // AMPL `scaling_factor` suffix ingestion (mirrors AmplTNLP.cpp:1110-1165).
+    // When the .nl file ships scaling values via S-segments, route them
+    // into ripopt's user-scaling fields and switch the method to User
+    // unless the caller already overrode any of them on the command line.
+    let scaling = nl_data.scaling_factors();
+    if !scaling.is_empty() {
+        if options.user_obj_scaling.is_none() {
+            options.user_obj_scaling = scaling.obj.or(Some(1.0));
+        }
+        if options.user_g_scaling.is_none() {
+            options.user_g_scaling = scaling.g.clone();
+        }
+        if options.user_x_scaling.is_none() {
+            options.user_x_scaling = scaling.x.clone();
+        }
+        // Only flip to User if the caller hasn't pinned the method
+        // explicitly (we can't distinguish "default" from "set to
+        // Gradient" but Gradient with non-empty user_*_scaling already
+        // short-circuits to user values per `compute_nlp_scaling`'s
+        // back-compat branch).
+        if matches!(options.nlp_scaling_method, NlpScalingMethod::Gradient) {
+            options.nlp_scaling_method = NlpScalingMethod::User;
+        }
+    }
 
     let problem = match NlProblem::from_nl_data(nl_data) {
         Ok(p) => p,
