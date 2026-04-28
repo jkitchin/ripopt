@@ -5978,49 +5978,6 @@ fn check_almost_feasible_guard(
     Some(make_result(state, SolveStatus::NumericalError))
 }
 
-/// Snapshot of the best-dual-feasibility iterate seen so far.
-///
-/// Used by the overall-progress stall detector to revert before a
-/// `NumericalError` exit, and by the dual-stagnation detector to
-/// restart from the good point. `x.is_none()` indicates "no snapshot
-/// yet"; once `x` is `Some` the other fields are also `Some`.
-#[derive(Default)]
-struct BestDuIterate {
-    val: f64,
-    x: Option<Vec<f64>>,
-    y: Option<Vec<f64>>,
-    z_l: Option<Vec<f64>>,
-    z_u: Option<Vec<f64>>,
-}
-
-impl BestDuIterate {
-    fn new() -> Self {
-        Self {
-            val: f64::INFINITY,
-            x: None,
-            y: None,
-            z_l: None,
-            z_u: None,
-        }
-    }
-}
-
-/// Record the current iterate as the best-du point if its dual
-/// infeasibility beats the previous best.
-fn update_best_du_iterate(
-    state: &SolverState,
-    dual_inf: f64,
-    best_du: &mut BestDuIterate,
-) {
-    if dual_inf < best_du.val {
-        best_du.val = dual_inf;
-        best_du.x = Some(state.x.clone());
-        best_du.y = Some(state.y.clone());
-        best_du.z_l = Some(state.z_l.clone());
-        best_du.z_u = Some(state.z_u.clone());
-    }
-}
-
 /// Detect unboundedness by requiring 10 consecutive iterations of
 /// `obj < -1e20` at a feasible iterate. The counter prevents false
 /// positives from transient dips.
@@ -6306,37 +6263,6 @@ fn try_boost_mu_for_stall(
     Some(StallDecision::Continue)
 }
 
-/// Just before declaring NumericalError on stall, revert (x, y, z_l, z_u)
-/// to the best-du iterate when its dual infeasibility is < 10% of the
-/// current iterate's. Post-stall y/z can be corrupted by inertia-escalated
-/// KKT solves (CONCON: iter 48 had du=7e-16, stall at iter 81 has
-/// du=1.03 at the same x).
-fn revert_to_best_du_iterate_if_better<P: NlpProblem>(
-    state: &mut SolverState,
-    problem: &P,
-    options: &SolverOptions,
-    dual_inf: f64,
-    best_du: &BestDuIterate,
-    linear_constraints: Option<&[bool]>,
-    lbfgs_mode: bool,
-) {
-    if best_du.x.is_some() && best_du.val < dual_inf * 0.1 {
-        // Pass &mut None for lbfgs_state — the stall path doesn't need to
-        // refresh the L-BFGS Hessian here (callers do it later if needed).
-        let mut no_lbfgs: Option<LbfgsIpmState> = None;
-        restore_best_du_iterate(
-            state, problem, &mut no_lbfgs, best_du,
-            linear_constraints, lbfgs_mode,
-        );
-        if options.print_level >= 3 {
-            rip_log!(
-                "ripopt: Reverting to best-du iterate (du: {:.2e} -> {:.2e}) before NumericalError exit",
-                dual_inf, best_du.val
-            );
-        }
-    }
-}
-
 /// Update best-so-far primal/dual metrics and the no-progress counter,
 /// and return `true` when the stall limit has been reached.
 ///
@@ -6373,7 +6299,7 @@ fn update_stall_counters_and_check_limit(
 
 fn detect_and_handle_progress_stall<P: NlpProblem>(
     state: &mut SolverState,
-    problem: &P,
+    _problem: &P,
     options: &SolverOptions,
     iteration: usize,
     primal_inf: f64,
@@ -6384,9 +6310,8 @@ fn detect_and_handle_progress_stall<P: NlpProblem>(
     filter: &mut Filter,
     mu_state: &mut MuState,
     stall: &mut ProgressStallTracker,
-    best_du: &BestDuIterate,
-    linear_constraints: Option<&[bool]>,
-    lbfgs_mode: bool,
+    _linear_constraints: Option<&[bool]>,
+    _lbfgs_mode: bool,
 ) -> StallDecision {
     if iteration <= 50 || options.stall_iter_limit == 0 {
         return StallDecision::Proceed;
@@ -6415,10 +6340,6 @@ fn detect_and_handle_progress_stall<P: NlpProblem>(
     ) {
         return decision;
     }
-    revert_to_best_du_iterate_if_better(
-        state, problem, options, dual_inf, best_du,
-        linear_constraints, lbfgs_mode,
-    );
     if options.print_level >= 3 {
         rip_log!(
             "ripopt: Stalled for {} iterations without progress (alpha_p={:.2e}, pr={:.2e}, du={:.2e}), terminating",
@@ -6496,156 +6417,6 @@ fn track_feasibility_and_detect_infeasibility(
     } else if feas.ever_feasible {
         feas.stall_count = 0;
     }
-    None
-}
-
-/// Detect and recover from dual-infeasibility stagnation.
-///
-/// Tracks the best dual-infeasibility seen so far (`last_good_du`,
-/// `last_good_iter`) and, if `du` has failed to halve for ≥500
-/// iterations while a best-du iterate is available, restores that
-/// iterate and resets the filter/μ/inertia state for a fresh start.
-///
-/// Catches restoration-cycling failure modes where the main IPM and
-/// restoration NLP ping-pong and drift away from a near-converged
-/// point for thousands of iterations. No Ipopt parallel — this is a
-/// ripopt-specific safety net.
-///
-/// Extracted from `solve_ipm` as part of the v0.8 main-loop
-/// decomposition. Returns `Some(SolveResult)` only when the restored
-/// point already meets the near-tolerance acceptable level.
-#[allow(clippy::too_many_arguments)]
-/// After reverting to the best-du iterate during dual-stagnation
-/// recovery, check whether the restored point already meets a relaxed
-/// near-tolerance bound (pr ≤ max(100·tol, 10·constr_viol_tol),
-/// du and co ≤ max(100·tol·s_d, 1e-2)). When it does, the solver can
-/// terminate cleanly with NumericalError rather than burning more
-/// iterations on a marginal improvement. Returns Some when the bound
-/// is met, None to continue the cascade.
-fn check_restored_point_near_tolerance(
-    state: &SolverState,
-    options: &SolverOptions,
-) -> Option<SolveResult> {
-    let rest_pr = state.constraint_violation();
-    let rest_du = compute_dual_inf_at_state(state);
-    let rest_co = compute_compl_err_at_state(state);
-    let s_d = compute_s_d_at_state(state);
-    let near_tol = 100.0 * options.tol;
-    let du_tol = (near_tol * s_d).max(1e-2);
-    let co_tol = (near_tol * s_d).max(1e-2);
-    let pr_tol = near_tol.max(10.0 * options.constr_viol_tol);
-    if rest_pr <= pr_tol && rest_du <= du_tol && rest_co <= co_tol {
-        log::debug!(
-            "Restored best-du point passes near-tolerance (pr={:.2e}, du={:.2e}, co={:.2e})",
-            rest_pr, rest_du, rest_co
-        );
-        return Some(make_result(state, SolveStatus::NumericalError));
-    }
-    None
-}
-
-/// Copy the saved best-du iterate back into `state` and re-evaluate.
-/// Each multiplier vector is restored only when its `Option` is
-/// `Some`, allowing snapshots that were primal-only. After the copy,
-/// calls `evaluate_with_linear` to refresh `obj`, `g`, gradients, and
-/// the L-BFGS Hessian. No-op when `best_du.x` is `None`.
-fn restore_best_du_iterate<P: NlpProblem>(
-    state: &mut SolverState,
-    problem: &P,
-    lbfgs_state: &mut Option<LbfgsIpmState>,
-    best_du: &BestDuIterate,
-    linear_constraints: Option<&[bool]>,
-    lbfgs_mode: bool,
-) {
-    let Some(ref bdx) = best_du.x else { return };
-    state.x.copy_from_slice(bdx);
-    if let Some(ref bdy) = best_du.y { state.y.copy_from_slice(bdy); }
-    if let Some(ref bdzl) = best_du.z_l { state.z_l.copy_from_slice(bdzl); }
-    if let Some(ref bdzu) = best_du.z_u { state.z_u.copy_from_slice(bdzu); }
-    let _ = evaluate_and_refresh_lbfgs(state, problem, lbfgs_state, linear_constraints, lbfgs_mode);
-}
-
-/// Tracks dual-infeasibility halving progress so the dual-stagnation
-/// detector can recognize a 500-iteration plateau and revert to the
-/// best-du iterate for a fresh restart. `triggered` latches once per
-/// solve to prevent repeated reverts.
-struct DualStallTracker {
-    last_good_du: f64,
-    last_good_iter: usize,
-    triggered: bool,
-}
-
-impl DualStallTracker {
-    fn new() -> Self {
-        Self {
-            last_good_du: f64::INFINITY,
-            last_good_iter: 0,
-            triggered: false,
-        }
-    }
-}
-
-fn handle_dual_stagnation<P: NlpProblem>(
-    state: &mut SolverState,
-    problem: &P,
-    options: &SolverOptions,
-    iteration: usize,
-    filter: &mut Filter,
-    mu_state: &mut MuState,
-    inertia_params: &mut InertiaCorrectionParams,
-    lbfgs_state: &mut Option<LbfgsIpmState>,
-    dual_stall: &mut DualStallTracker,
-    best_feasible: &BestFeasibleIterate,
-    best_du: &BestDuIterate,
-    linear_constraints: Option<&[bool]>,
-    lbfgs_mode: bool,
-) -> Option<SolveResult> {
-    if iteration == 0 {
-        return None;
-    }
-
-    let current_du = compute_dual_inf_at_state(state);
-    if current_du < 0.5 * dual_stall.last_good_du {
-        dual_stall.last_good_du = current_du;
-        dual_stall.last_good_iter = iteration;
-    }
-
-    let stall_iters = iteration.saturating_sub(dual_stall.last_good_iter);
-    if stall_iters < 500
-        || dual_stall.triggered
-        || current_du <= 100.0 * options.tol
-        || best_feasible.x.is_none()
-    {
-        return None;
-    }
-
-    if best_du.x.is_none() {
-        return None;
-    }
-    log::debug!(
-        "Dual stagnation at iter {}: du={:.2e}, restoring best-du point (du={:.2e} at iter {})",
-        iteration, current_du, dual_stall.last_good_du, dual_stall.last_good_iter
-    );
-    restore_best_du_iterate(
-        state, problem, lbfgs_state, best_du,
-        linear_constraints, lbfgs_mode,
-    );
-
-    // Reset filter and bump mu for a fresh start from the good point.
-    reset_filter_with_current_theta(state, filter);
-    state.mu = (state.mu * 100.0).max(1e-4).min(1e-1);
-    if options.mu_strategy_adaptive {
-        mu_state.mode = MuMode::Free;
-    }
-    mu_state.first_iter_in_mode = true;
-    mu_state.consecutive_restoration_failures = 0;
-    inertia_params.delta_w_last = 0.0;
-
-    if let Some(result) = check_restored_point_near_tolerance(state, options) {
-        return Some(result);
-    }
-
-    dual_stall.triggered = true;
     None
 }
 
@@ -7368,14 +7139,6 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
     // Best feasible point tracking: save the best (lowest obj) point that is feasible
     let mut best_feasible = BestFeasibleIterate::new();
 
-    // Best-du point tracking
-    let mut best_du = BestDuIterate::new();
-
-    // Dual stagnation detection: track best du improvement.
-    // If du hasn't improved significantly over many iterations and we have a
-    // best feasible point, restore it and restart with fresh parameters.
-    let mut dual_stall = DualStallTracker::new();
-
     // Damped multiplier updates when oscillation detected
     let mut dy_tracker = DyOscillationTracker::new(m);
 
@@ -7426,26 +7189,6 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         // search during early iterations.
         let early_timeout = options.early_stall_timeout * ((n + m) as f64 / 200.0).max(1.0);
         if let Some(result) = check_time_limits(&state, iteration, start_time, early_timeout, options) {
-            return result;
-        }
-
-        // Dual stagnation detection (runs every iteration, including restoration).
-        // Catches restoration cycling that drifts from a near-converged point.
-        if let Some(result) = handle_dual_stagnation(
-            &mut state,
-            problem,
-            options,
-            iteration,
-            &mut filter,
-            &mut mu_state,
-            &mut inertia_params,
-            &mut lbfgs_state,
-            &mut dual_stall,
-            &best_feasible,
-            &best_du,
-            linear_constraints.as_deref(),
-            lbfgs_mode,
-        ) {
             return result;
         }
 
@@ -7563,8 +7306,6 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         // acceptable_obj_change_tol gate has a previous f to diff against.
         state.last_obj_for_acceptable = Some(state.obj);
 
-        update_best_du_iterate(&state, dual_inf, &mut best_du);
-
         if let Some(result) = track_feasibility_and_detect_infeasibility(
             &state,
             options,
@@ -7598,7 +7339,6 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             &mut filter,
             &mut mu_state,
             &mut stall,
-            &best_du,
             linear_constraints.as_deref(),
             lbfgs_mode,
         ) {
