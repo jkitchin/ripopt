@@ -1253,14 +1253,25 @@ fn is_strictly_better(current: &SolveResult, candidate: &SolveResult) -> bool {
         return false;
     }
     let current_solved = matches!(current.status, SolveStatus::Optimal);
-    // Treat `current` as having a meaningful objective if it is feasible,
-    // has a finite objective, and primal infeasibility is within the tolerance.
+    if current_solved {
+        // Both Optimal: require strict objective improvement (with tiny
+        // tolerance for FP noise) so a re-solve at the same point isn't
+        // treated as progress.
+        let tol = 1e-8 * current.objective.abs().max(1.0);
+        return candidate.objective < current.objective - tol;
+    }
+    // `current` is non-Optimal. Treat its objective as meaningful only if
+    // it is feasible and finite (`pr ≤ constr_viol_tol`).
     let current_has_good_point = current.objective.is_finite()
         && current.diagnostics.final_primal_inf <= 1e-4;
-    if current_solved || current_has_good_point {
-        // Require strict objective improvement (with tiny tolerance for FP noise).
+    if current_has_good_point {
+        // Adopt the candidate as long as its objective is at-least-as-good
+        // (within FP tolerance). This lets a fallback that confirms
+        // `Optimal` at the same point upgrade a non-Optimal status, while
+        // still rejecting candidates that converge to a clearly worse
+        // local minimum.
         let tol = 1e-8 * current.objective.abs().max(1.0);
-        candidate.objective < current.objective - tol
+        candidate.objective <= current.objective + tol
     } else {
         // current is clearly bad — any Optimal candidate is an improvement.
         true
@@ -4008,7 +4019,6 @@ fn run_post_ls_restoration_cascade<P: NlpProblem>(
     early_timeout: f64,
     feas: &FeasibilityTracker,
     theta_current: f64,
-    phi_current: f64,
 ) -> RestorationCascadeDecision {
     state.diagnostics.filter_rejects += 1;
 
@@ -4018,12 +4028,9 @@ fn run_post_ls_restoration_cascade<P: NlpProblem>(
     // non-soft accept).
     mu_state.consecutive_soft_restoration = 0;
 
-    // Add current point to filter before entering restoration (Ipopt convention).
-    // augment_for_restoration adds the margin entry
-    // (phi - gamma_phi*theta, (1-gamma_theta)*theta) AND bumps theta_max —
-    // this prevents restoration from handing back a point as bad as the entry.
-    filter.add(theta_current, phi_current);
-    filter.augment_for_restoration(theta_current, phi_current);
+    // Filter augmentation happened at the line-search rejection site
+    // (matching IpBacktrackingLineSearch.cpp:566 — PrepareRestoPhaseStart
+    // augments before the almost-feasible guard, not inside the cascade).
 
     // Phase 1: Fast GN restoration
     log::debug!("Line search failed at iteration {}, entering restoration", iteration);
@@ -5807,36 +5814,54 @@ fn store_acceptable_iterate(
 
 /// Just before triggering full restoration, attempt to restore the most
 /// recent acceptable iterate. Returns `Some(SolveResult)` with status
-/// `Acceptable` when (a) a snapshot exists and (b) the current iterate
-/// is near-feasible (`primal_inf < 1e-2 * options.tol` and
-/// `constr_viol_max < 1e-1 * options.constr_viol_tol`) — the regime in
-/// which the restoration NLP is ill-defined because constraints are
-/// already nearly satisfied. Mirrors Ipopt's `RestoreAcceptablePoint` /
-/// `STOP_AT_ACCEPTABLE_POINT` exit in `IpIpoptAlgorithm.cpp`.
-fn try_restore_acceptable_iterate(
+/// Almost-feasibility guard at restoration entry, mirroring Ipopt 3.14
+/// `IpBacktrackingLineSearch.cpp:580-600`. Fires when both
+///
+/// ```text
+/// curr_constraint_violation        <= 1e-2 * tol
+/// unscaled_curr_constr_violation   <= 1e-1 * constr_viol_tol
+/// ```
+///
+/// hold (the second criterion guards against very-large-tol settings).
+/// When the guard fires, restoration is skipped entirely:
+///
+/// - If an acceptable iterate is cached, restore it and exit
+///   `Acceptable` (Ipopt's `ACCEPTABLE_POINT_REACHED` throw at line 591).
+/// - Otherwise abort with `NumericalError` (Ipopt's
+///   `STEP_COMPUTATION_FAILED` throw at line 597 — "Abort in line
+///   search due to no other fall back").
+///
+/// Returning `None` means the guard did not fire and the caller should
+/// proceed to the restoration cascade.
+fn check_almost_feasible_guard(
     state: &mut SolverState,
     options: &SolverOptions,
     filter: &mut Filter,
     primal_inf: f64,
     primal_inf_max: f64,
 ) -> Option<SolveResult> {
-    if state.acceptable_iterate.is_none() {
+    let almost_feasible = primal_inf < 1e-2 * options.tol
+        && primal_inf_max < 1e-1 * options.constr_viol_tol;
+    if !almost_feasible {
         return None;
     }
-    if !(primal_inf < 1e-2 * options.tol
-        && primal_inf_max < 1e-1 * options.constr_viol_tol)
-    {
-        return None;
+    if let Some(snap) = state.acceptable_iterate.take() {
+        if options.print_level >= 3 {
+            rip_log!(
+                "ripopt: almost-feasible guard restoring acceptable iterate from iter {} (pr={:.2e}, pr_max={:.2e}) -> Acceptable",
+                snap.iteration, primal_inf, primal_inf_max
+            );
+        }
+        snap.restore(state, filter);
+        return Some(make_result(state, SolveStatus::Acceptable));
     }
-    let snap = state.acceptable_iterate.take().unwrap();
     if options.print_level >= 3 {
         rip_log!(
-            "ripopt: Restoring acceptable iterate from iter {} (pr={:.2e}, pr_max={:.2e}) -> Acceptable",
-            snap.iteration, primal_inf, primal_inf_max
+            "ripopt: almost-feasible guard with no cached acceptable iterate (pr={:.2e}, pr_max={:.2e}) -> NumericalError",
+            primal_inf, primal_inf_max
         );
     }
-    snap.restore(state, filter);
-    Some(make_result(state, SolveStatus::Acceptable))
+    Some(make_result(state, SolveStatus::NumericalError))
 }
 
 /// Snapshot of the best-dual-feasibility iterate seen so far.
@@ -7648,7 +7673,16 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         }
 
         if !step_accepted {
-            if let Some(result) = try_restore_acceptable_iterate(
+            // Ipopt's `PrepareRestoPhaseStart` augments the filter with
+            // the (theta_current, phi_current) margin entry BEFORE the
+            // almost-feasible guard fires (IpBacktrackingLineSearch.cpp:566
+            // vs :580). Augmenting here means the filter is correctly
+            // updated whether the guard exits or the restoration cascade
+            // runs, and avoids a second augment inside the cascade.
+            filter.add(theta_current, phi_current);
+            filter.augment_for_restoration(theta_current, phi_current);
+
+            if let Some(result) = check_almost_feasible_guard(
                 &mut state,
                 options,
                 &mut filter,
@@ -7676,7 +7710,6 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 early_timeout,
                 &feas,
                 theta_current,
-                phi_current,
             ) {
                 RestorationCascadeDecision::Continue => continue,
                 RestorationCascadeDecision::Return(result) => return result,
@@ -10210,40 +10243,43 @@ mod tests {
     }
 
     #[test]
-    fn test_try_restore_acceptable_iterate_no_snapshot() {
+    fn test_almost_feasible_guard_no_snapshot_aborts() {
+        // Ipopt 3.14 IpBacktrackingLineSearch.cpp:597 throws
+        // STEP_COMPUTATION_FAILED when the almost-feasible guard fires
+        // and no acceptable iterate is cached. Mirror that: return
+        // NumericalError.
         let mut state = minimal_state(1, 0);
         let mut filter = Filter::new(1e4);
         let opts = SolverOptions::default();
-        // No snapshot stored; restore should return None even when predicate holds.
-        let result = try_restore_acceptable_iterate(
+        let result = check_almost_feasible_guard(
             &mut state, &opts, &mut filter,
             1e-12, 1e-12,
         );
-        assert!(result.is_none());
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().status, SolveStatus::NumericalError);
     }
 
     #[test]
-    fn test_try_restore_acceptable_iterate_predicate_blocks_restore() {
+    fn test_almost_feasible_guard_predicate_blocks() {
         let mut state = minimal_state(1, 0);
         state.x = vec![1.0];
         let mut filter = Filter::new(1e4);
         state.acceptable_iterate = Some(IterateSnapshot::capture(&state, &filter, 0));
-        // Mutate x to ensure restore would be observable.
         state.x = vec![5.0];
         let opts = SolverOptions::default();
         // Predicate fails: primal_inf large.
-        let result = try_restore_acceptable_iterate(
+        let result = check_almost_feasible_guard(
             &mut state, &opts, &mut filter,
             1.0, 1.0,
         );
         assert!(result.is_none());
-        // Snapshot retained because restore did not fire.
+        // Snapshot retained because guard did not fire.
         assert!(state.acceptable_iterate.is_some());
         assert_eq!(state.x, vec![5.0]);
     }
 
     #[test]
-    fn test_try_restore_acceptable_iterate_fires() {
+    fn test_almost_feasible_guard_fires_with_snapshot() {
         let mut state = minimal_state(1, 0);
         state.x = vec![1.0];
         let mut filter = Filter::new(1e4);
@@ -10251,7 +10287,7 @@ mod tests {
         state.x = vec![5.0];
         let opts = SolverOptions::default();
         // Predicate holds: pinf < 1e-2 * tol = 1e-10, pinf_max < 1e-1 * 1e-4 = 1e-5
-        let result = try_restore_acceptable_iterate(
+        let result = check_almost_feasible_guard(
             &mut state, &opts, &mut filter,
             1e-12, 1e-12,
         );
