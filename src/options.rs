@@ -149,6 +149,15 @@ pub struct SolverOptions {
     /// restoration). Smaller values let backtracking continue further; the
     /// Ipopt default 0.05 means restoration triggers after ~13 halvings.
     pub alpha_min_frac: f64,
+    /// T3.10: number of consecutive accepted steps whose preceding
+    /// line search ended with a filter-based rejection that triggers a
+    /// filter reset. Mirrors Ipopt 3.14 `filter_reset_trigger`
+    /// (default 5, `IpFilterLSAcceptor.cpp:142`).
+    pub filter_reset_trigger: u32,
+    /// T3.10: maximum number of times the filter may be reset across
+    /// the solve. Mirrors Ipopt 3.14 `max_filter_resets` (default 5;
+    /// 0 disables the heuristic, `IpFilterLSAcceptor.cpp:152`).
+    pub max_filter_resets: u32,
     /// Fraction-to-boundary parameter minimum.
     pub tau_min: f64,
     /// Barrier parameter reduction factor (monotone mode).
@@ -551,6 +560,8 @@ impl Default for SolverOptions {
             mu_max_fact: 1000.0,
             obj_max_inc: 5.0,
             alpha_min_frac: 0.05,
+            filter_reset_trigger: 5,
+            max_filter_resets: 5,
             tau_min: 0.99,
             mu_linear_decrease_factor: 0.2,
             mu_superlinear_decrease_power: 1.5,

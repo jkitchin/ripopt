@@ -2050,7 +2050,7 @@ fn dispatch_soc_attempt<P: NlpProblem>(
     sparse_condensed_system: &Option<kkt::SparseCondensedKktSystem>,
     kkt_system_opt: &Option<kkt::KktSystem>,
     lin_solver: &mut dyn LinearSolver,
-    filter: &Filter,
+    filter: &mut Filter,
     theta_current: f64,
     phi_current: f64,
     grad_phi_step: f64,
@@ -2217,6 +2217,10 @@ fn run_line_search_loop<P: NlpProblem>(
         if watchdog_active && alpha == alpha_primal_max && acceptable {
             commit_trial_point(state, x_trial, obj_trial, g_trial, alpha);
             step_accepted = true;
+            // T3.10: watchdog-accept also runs the filter-reset
+            // bookkeeping so consecutive trapped iterations advance
+            // the counter even when filter augmentation is suppressed.
+            filter.note_acceptance();
             break;
         }
 
@@ -2232,6 +2236,15 @@ fn run_line_search_loop<P: NlpProblem>(
             step_accepted = true;
             if !used_switching {
                 filter.add(theta_current, phi_current);
+            }
+            // T3.10: post-acceptance filter-reset trigger
+            // (`IpFilterLSAcceptor.cpp:407-434`).
+            let reset_fired = filter.note_acceptance();
+            if reset_fired && options.print_level >= 5 {
+                eprintln!(
+                    "  [filter] iter={}: filter reset (resets={})",
+                    state.iter, filter.n_filter_resets()
+                );
             }
             break;
         }
@@ -2252,6 +2265,9 @@ fn run_line_search_loop<P: NlpProblem>(
                 commit_trial_point(state, x_soc, obj_soc, g_soc, alpha_soc);
                 step_accepted = true;
                 filter.add(theta_current, phi_current);
+                // T3.10: SOC-accepted step counts as an accepted step
+                // for the filter-reset heuristic.
+                filter.note_acceptance();
                 break;
             }
         }
@@ -7235,6 +7251,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
     let mut filter = Filter::new(1e4);
     filter.set_obj_max_inc(options.obj_max_inc);
     filter.set_alpha_min_frac(options.alpha_min_frac);
+    filter.set_filter_reset_options(options.filter_reset_trigger, options.max_filter_resets);
 
     // Mehrotra centering parameter from the last iteration's predictor step.
     // Used in the Free-mode mu update: when sigma is available, mu = sigma * mu_current
@@ -8076,7 +8093,7 @@ fn evaluate_soc_trial_and_check<P: NlpProblem>(
     state: &SolverState,
     problem: &P,
     options: &SolverOptions,
-    filter: &Filter,
+    filter: &mut Filter,
     x_soc: Vec<f64>,
     n: usize,
     m: usize,
@@ -8160,7 +8177,7 @@ fn run_soc_loop<P: NlpProblem, F: FnMut(&[f64]) -> Option<Vec<f64>>>(
     state: &SolverState,
     problem: &P,
     options: &SolverOptions,
-    filter: &Filter,
+    filter: &mut Filter,
     g_trial: &[f64],
     theta_current: f64,
     phi_current: f64,
@@ -8221,7 +8238,7 @@ fn attempt_soc<P: NlpProblem>(
     g_trial: &[f64],
     solver: &mut dyn LinearSolver,
     kkt: &kkt::KktSystem,
-    filter: &Filter,
+    filter: &mut Filter,
     theta_current: f64,
     phi_current: f64,
     grad_phi_step: f64,
@@ -8259,7 +8276,7 @@ fn attempt_soc_condensed<P: NlpProblem>(
     g_trial: &[f64],
     solver: &mut DenseLdl,
     condensed: &kkt::CondensedKktSystem,
-    filter: &Filter,
+    filter: &mut Filter,
     theta_current: f64,
     phi_current: f64,
     grad_phi_step: f64,
@@ -8280,7 +8297,7 @@ fn attempt_soc_sparse_condensed<P: NlpProblem>(
     g_trial: &[f64],
     solver: &mut dyn LinearSolver,
     condensed: &kkt::SparseCondensedKktSystem,
-    filter: &Filter,
+    filter: &mut Filter,
     theta_current: f64,
     phi_current: f64,
     grad_phi_step: f64,
@@ -11470,7 +11487,7 @@ mod tests {
     /// not augmented. Pin via the raw Filter API.
     #[test]
     fn test_watchdog_accept_does_not_augment_filter() {
-        let filter = crate::filter::Filter::new(1e10);
+        let mut filter = crate::filter::Filter::new(1e10);
         let theta_current = 1.0;
         let phi_current = 5.0;
         let theta_trial = 0.5;

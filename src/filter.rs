@@ -48,6 +48,25 @@ pub struct Filter {
     /// IpFilterLSAcceptor.cpp:325-339: once seeded, the bounds are
     /// fixed for the rest of the solve.
     theta_init_set: bool,
+    /// T3.10: tracks whether the most recent rejected line-search trial
+    /// (since the last accepted step) was rejected by the filter
+    /// dominance test. Mirrors Ipopt's `last_rejection_due_to_filter_`
+    /// (`IpFilterLSAcceptor.cpp:380, 397`).
+    last_rejection_due_to_filter: bool,
+    /// T3.10: counts consecutive accepted steps whose preceding line
+    /// search ended with a filter-based rejection.
+    count_successive_filter_rejections: u32,
+    /// T3.10: how many filter resets have already fired this solve.
+    /// Capped at `max_filter_resets` to prevent runaway clearing.
+    n_filter_resets: u32,
+    /// T3.10: number of consecutive filter rejections that triggers a
+    /// reset (Ipopt option `filter_reset_trigger`, default 5).
+    filter_reset_trigger: u32,
+    /// T3.10: maximum number of times the filter may be reset across
+    /// the solve (Ipopt option `max_filter_resets`, default 5; 0
+    /// disables the heuristic). Mirrors `IpFilterLSAcceptor.cpp:142,
+    /// 230, 407-414`.
+    max_filter_resets: u32,
 }
 
 impl Filter {
@@ -66,6 +85,11 @@ impl Filter {
             obj_max_inc: 5.0,
             alpha_min_frac: 0.05,
             theta_init_set: false,
+            last_rejection_due_to_filter: false,
+            count_successive_filter_rejections: 0,
+            n_filter_resets: 0,
+            filter_reset_trigger: 5,
+            max_filter_resets: 5,
         }
     }
 
@@ -165,7 +189,7 @@ impl Filter {
     /// 2. Check filter acceptability
     /// When the switching condition holds, the step is purely f-type — no h-type fallback.
     pub fn check_acceptability(
-        &self,
+        &mut self,
         theta_current: f64,
         phi_current: f64,
         theta_trial: f64,
@@ -175,6 +199,7 @@ impl Filter {
     ) -> (bool, bool) {
         // Reject if theta exceeds maximum or NaN
         if theta_trial > self.theta_max || theta_trial.is_nan() || phi_trial.is_nan() {
+            self.last_rejection_due_to_filter = false;
             return (false, false);
         }
 
@@ -184,6 +209,7 @@ impl Filter {
         // relative to the current iterate's φ. Gated by
         // `trial_phi > reference_phi`; otherwise this is a no-op.
         if !self.passes_obj_max_inc(phi_current, phi_trial) {
+            self.last_rejection_due_to_filter = false;
             return (false, false);
         }
 
@@ -199,15 +225,63 @@ impl Filter {
         };
 
         if !type_ok {
+            self.last_rejection_due_to_filter = false;
             return (false, false);
         }
 
         // Check filter acceptability
         if !self.is_acceptable(theta_trial, phi_trial) {
+            self.last_rejection_due_to_filter = true;
             return (false, false);
         }
 
         (true, is_switching)
+    }
+
+    /// T3.10: handle the post-acceptance bookkeeping of the
+    /// filter-reset heuristic. Mirrors Ipopt's
+    /// `IpFilterLSAcceptor.cpp:407-434` block run when a trial point
+    /// passes both the sufficient-reduction test and the filter
+    /// dominance test. Increments the consecutive-filter-rejection
+    /// counter when the most-recent rejected trial in this iteration's
+    /// backtracking sequence was filter-caused; clears the counter
+    /// otherwise. When the counter hits `filter_reset_trigger` and the
+    /// per-solve cap `max_filter_resets` has not been reached, wipes
+    /// the filter entries and returns `true`. (`theta_max`/`theta_min`/
+    /// `gamma_*`/`eta_phi` are NOT touched — only the entry list is
+    /// cleared, matching `IpFilter::Clear`.)
+    pub fn note_acceptance(&mut self) -> bool {
+        if self.max_filter_resets == 0 || self.n_filter_resets >= self.max_filter_resets {
+            self.last_rejection_due_to_filter = false;
+            return false;
+        }
+        let triggered = if self.last_rejection_due_to_filter {
+            self.count_successive_filter_rejections += 1;
+            if self.count_successive_filter_rejections >= self.filter_reset_trigger {
+                self.entries.clear();
+                self.count_successive_filter_rejections = 0;
+                self.n_filter_resets += 1;
+                true
+            } else {
+                false
+            }
+        } else {
+            self.count_successive_filter_rejections = 0;
+            false
+        };
+        self.last_rejection_due_to_filter = false;
+        triggered
+    }
+
+    /// Plumb the T3.10 reset-trigger parameters from `SolverOptions`.
+    pub fn set_filter_reset_options(&mut self, trigger: u32, max_resets: u32) {
+        self.filter_reset_trigger = trigger.max(1);
+        self.max_filter_resets = max_resets;
+    }
+
+    /// Diagnostic accessor: how many filter resets have already fired.
+    pub fn n_filter_resets(&self) -> u32 {
+        self.n_filter_resets
     }
 
     /// T3.4: Ipopt's `obj_max_inc` divergence guard
@@ -523,7 +597,7 @@ mod tests {
 
     #[test]
     fn test_filter_rejects_nan() {
-        let filter = Filter::new(100.0);
+        let mut filter = Filter::new(100.0);
         assert!(!filter.is_acceptable(f64::NAN, 1.0));
         assert!(!filter.is_acceptable(1.0, f64::NAN));
         let (accept, _) = filter.check_acceptability(
