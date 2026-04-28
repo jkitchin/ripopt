@@ -449,6 +449,43 @@ fn apply_option(opts: &mut SolverOptions, key: &str, value: &str) {
                 opts.user_obj_scaling = Some(v);
             }
         }
+        "nlp_scaling_method" => {
+            use ripopt::options::NlpScalingMethod;
+            opts.nlp_scaling_method = match value {
+                "none" => NlpScalingMethod::None,
+                "gradient-based" => NlpScalingMethod::Gradient,
+                "user-scaling" => NlpScalingMethod::User,
+                _ => {
+                    eprintln!("Warning: unknown nlp_scaling_method '{}'", value);
+                    opts.nlp_scaling_method
+                }
+            };
+        }
+        "obj_scaling_factor" => {
+            if let Ok(v) = value.parse() {
+                opts.obj_scaling_factor = v;
+            }
+        }
+        "nlp_scaling_max_gradient" => {
+            if let Ok(v) = value.parse() {
+                opts.nlp_scaling_max_gradient = v;
+            }
+        }
+        "nlp_scaling_min_value" => {
+            if let Ok(v) = value.parse() {
+                opts.nlp_scaling_min_value = v;
+            }
+        }
+        "nlp_scaling_obj_target_gradient" => {
+            if let Ok(v) = value.parse() {
+                opts.nlp_scaling_obj_target_gradient = v;
+            }
+        }
+        "nlp_scaling_constr_target_gradient" => {
+            if let Ok(v) = value.parse() {
+                opts.nlp_scaling_constr_target_gradient = v;
+            }
+        }
         "kkt_dump_dir" => {
             opts.kkt_dump_dir = Some(std::path::PathBuf::from(value));
         }

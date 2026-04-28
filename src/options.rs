@@ -92,6 +92,27 @@ pub enum AlphaForY {
     DualAndFull,
 }
 
+/// NLP scaling method. Mirrors Ipopt 3.14 `nlp_scaling_method`
+/// registered in `IpAlgBuilder.cpp:343-353` and dispatched in
+/// `IpAlgBuilder.cpp:678-696`. The `Equilibration` variant (Curtis-Reid
+/// via Harwell MC19) is omitted — ripopt has no MC19 binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NlpScalingMethod {
+    /// No automatic scaling. `obj_scaling_factor` is still applied
+    /// multiplicatively (matches Ipopt's `NoNLPScalingObject` inheriting
+    /// from `StandardScalingBase`).
+    None,
+    /// Compute `obj_scaling`/`g_scaling` from the gradient and Jacobian
+    /// at the initial point (Ipopt default). Mirrors `GradientScaling::
+    /// DetermineScalingParametersImpl` (`IpGradientScaling.cpp:69-233`).
+    #[default]
+    Gradient,
+    /// Use scaling values supplied via `user_obj_scaling`,
+    /// `user_g_scaling`, `user_x_scaling`. Mirrors Ipopt's
+    /// `UserScaling` which forwards to `TNLP::get_scaling_parameters`.
+    User,
+}
+
 /// Solver options matching Ipopt defaults.
 #[derive(Debug, Clone)]
 pub struct SolverOptions {
@@ -360,6 +381,43 @@ pub struct SolverOptions {
     /// ~38% of the bracket width.
     /// Default: 8.
     pub quality_function_max_section_steps: usize,
+    /// NLP scaling method. Mirrors Ipopt 3.14 `nlp_scaling_method`
+    /// (`IpAlgBuilder.cpp:343-353`). Default `Gradient`.
+    /// When set to `User`, the solver uses values supplied in
+    /// `user_obj_scaling` / `user_g_scaling` / `user_x_scaling`.
+    /// For backwards compatibility, supplying any of those user-scaling
+    /// fields while `nlp_scaling_method = Gradient` (the default) still
+    /// short-circuits the gradient algorithm.
+    pub nlp_scaling_method: NlpScalingMethod,
+    /// Multiplicative factor applied on top of the computed objective
+    /// scale (mirrors Ipopt 3.14 `obj_scaling_factor`,
+    /// `IpNLPScaling.cpp:236-243, 276`). Default `1.0`. A negative value
+    /// is the canonical "maximize" idiom: the IPM still minimizes
+    /// `obj_scaling * f(x)`, so `obj_scaling_factor = -1.0` flips the
+    /// sense. Applied even when `nlp_scaling_method = None`.
+    pub obj_scaling_factor: f64,
+    /// Target gradient magnitude used by gradient-based scaling
+    /// (`nlp_scaling_max_gradient`, `IpGradientScaling.cpp:18-27`). When
+    /// `||grad_f(x0)||_inf` exceeds this, the objective is scaled down by
+    /// `nlp_scaling_max_gradient / max_grad`. Same threshold is applied
+    /// per-row to the constraint Jacobian. Default `100.0`.
+    pub nlp_scaling_max_gradient: f64,
+    /// Floor applied after computing gradient-based scales
+    /// (`nlp_scaling_min_value`, `IpGradientScaling.cpp:46-54`). Default
+    /// `1e-8`. Protects against tiny scales when the initial gradient is
+    /// astronomical.
+    pub nlp_scaling_min_value: f64,
+    /// Per-objective override (`nlp_scaling_obj_target_gradient`,
+    /// `IpGradientScaling.cpp:28-36`). When `> 0`, unconditionally sets
+    /// `obj_scaling = target / max_grad` (skipping the
+    /// `max_grad > nlp_scaling_max_gradient` gate). Default `0.0`
+    /// (disabled).
+    pub nlp_scaling_obj_target_gradient: f64,
+    /// Per-constraint override (`nlp_scaling_constr_target_gradient`,
+    /// `IpGradientScaling.cpp:37-45`). When `> 0`, every constraint row
+    /// receives the same scale `target / max(row_amax)` regardless of
+    /// the threshold. Default `0.0` (disabled).
+    pub nlp_scaling_constr_target_gradient: f64,
     /// User-provided objective scaling factor. When `Some`, bypasses automatic
     /// gradient-based scaling and uses this value directly.
     pub user_obj_scaling: Option<f64>,
@@ -528,6 +586,12 @@ impl Default for SolverOptions {
             mu_oracle_quality_function: true,
             quality_function_centrality: false,
             quality_function_max_section_steps: 8,
+            nlp_scaling_method: NlpScalingMethod::Gradient,
+            obj_scaling_factor: 1.0,
+            nlp_scaling_max_gradient: 100.0,
+            nlp_scaling_min_value: 1e-8,
+            nlp_scaling_obj_target_gradient: 0.0,
+            nlp_scaling_constr_target_gradient: 0.0,
             user_obj_scaling: None,
             user_g_scaling: None,
             user_x_scaling: None,

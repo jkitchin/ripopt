@@ -97,7 +97,8 @@ pub mod trace;
 pub mod warmstart;
 
 pub use options::{
-    BoundMultInitMethod, FixedVariableTreatment, LinearSolverChoice, SolverOptions,
+    BoundMultInitMethod, FixedVariableTreatment, LinearSolverChoice, NlpScalingMethod,
+    SolverOptions,
 };
 pub use problem::NlpProblem;
 pub use result::{SolveResult, SolverDiagnostics, SolveStatus};

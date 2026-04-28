@@ -6995,40 +6995,67 @@ fn compute_nlp_scaling<P: NlpProblem>(
     x0: &[f64],
     jac_rows_sc: &[usize],
 ) -> (f64, Vec<f64>) {
+    use crate::options::NlpScalingMethod;
     let n_sc = problem.num_variables();
     let m_sc = problem.num_constraints();
 
-    if options.user_obj_scaling.is_some() || options.user_g_scaling.is_some() {
-        let os = options.user_obj_scaling.unwrap_or(1.0);
-        let gs = options.user_g_scaling.clone().unwrap_or_else(|| vec![1.0; m_sc]);
-        return (os, gs);
-    }
+    // For backwards compatibility: setting any user_*_scaling field
+    // short-circuits to user-supplied values, regardless of the method
+    // option. This matches the pre-T-MIT-C contract.
+    let user_supplied =
+        options.user_obj_scaling.is_some() || options.user_g_scaling.is_some();
 
-    // Ipopt 3.14 defaults: `nlp_scaling_max_gradient=100`,
-    // `nlp_scaling_min_value=1e-8` (`IpGradientScaling.cpp` registration).
-    // The previous `1e-2` floor under-scaled large-coefficient constraint
-    // rows (||row||_∞ ~ 1e6 → 1e-4 in Ipopt vs 1e-2 in ripopt, a 100×
-    // gap). That gap was the root cause of stalled convergence on
-    // Mittelmann arki/qcqp instances.
-    let nlp_scaling_max_gradient = 100.0;
-    let nlp_scaling_min_value = 1e-8;
-    let mut grad_f0 = vec![0.0; n_sc];
-    let grad_ok = problem.gradient(x0, true, &mut grad_f0);
-    let grad_max = if grad_ok {
-        linf_norm(&grad_f0)
-    } else {
-        0.0
-    };
-    let os = if grad_max > nlp_scaling_max_gradient && grad_max.is_finite() {
-        (nlp_scaling_max_gradient / grad_max).max(nlp_scaling_min_value)
-    } else {
-        1.0
+    let (mut os, gs) = match options.nlp_scaling_method {
+        NlpScalingMethod::None => (1.0, vec![1.0; m_sc]),
+        NlpScalingMethod::User => {
+            let os = options.user_obj_scaling.unwrap_or(1.0);
+            let gs = options.user_g_scaling.clone().unwrap_or_else(|| vec![1.0; m_sc]);
+            (os, gs)
+        }
+        NlpScalingMethod::Gradient if user_supplied => {
+            let os = options.user_obj_scaling.unwrap_or(1.0);
+            let gs = options.user_g_scaling.clone().unwrap_or_else(|| vec![1.0; m_sc]);
+            (os, gs)
+        }
+        NlpScalingMethod::Gradient => {
+            let max_grad = options.nlp_scaling_max_gradient;
+            let min_val = options.nlp_scaling_min_value;
+            let obj_target = options.nlp_scaling_obj_target_gradient;
+
+            let mut grad_f0 = vec![0.0; n_sc];
+            let grad_ok = problem.gradient(x0, true, &mut grad_f0);
+            let grad_amax = if grad_ok { linf_norm(&grad_f0) } else { 0.0 };
+
+            // Mirrors GradientScaling at IpGradientScaling.cpp:101-128.
+            let os = if obj_target > 0.0 {
+                if grad_amax > 0.0 && grad_amax.is_finite() {
+                    (obj_target / grad_amax).max(min_val)
+                } else {
+                    1.0_f64.max(min_val)
+                }
+            } else if grad_amax > max_grad && grad_amax.is_finite() {
+                (max_grad / grad_amax).max(min_val)
+            } else {
+                1.0_f64.max(min_val)
+            };
+
+            let gs = compute_constraint_row_scaling(
+                problem,
+                x0,
+                jac_rows_sc,
+                m_sc,
+                max_grad,
+                min_val,
+                options.nlp_scaling_constr_target_gradient,
+            );
+            (os, gs)
+        }
     };
 
-    let gs = compute_constraint_row_scaling(
-        problem, x0, jac_rows_sc, m_sc,
-        nlp_scaling_max_gradient, nlp_scaling_min_value,
-    );
+    // Apply obj_scaling_factor on top — matches StandardScalingBase
+    // (`IpNLPScaling.cpp:276`: df_ *= obj_scaling_factor_). This is
+    // applied for every method, including `None`.
+    os *= options.obj_scaling_factor;
     (os, gs)
 }
 
@@ -7049,6 +7076,7 @@ fn compute_constraint_row_scaling<P: NlpProblem>(
     m_sc: usize,
     max_gradient: f64,
     min_value: f64,
+    constr_target_gradient: f64,
 ) -> Vec<f64> {
     let mut gs = vec![1.0; m_sc];
     if m_sc == 0 {
@@ -7064,6 +7092,19 @@ fn compute_constraint_row_scaling<P: NlpProblem>(
         if v.is_finite() && v > row_max[row] {
             row_max[row] = v;
         }
+    }
+    if constr_target_gradient > 0.0 {
+        // Ipopt's override path (`IpGradientScaling.cpp:171`): every row
+        // gets the same scale `target / max(row_max)`. Skip if the
+        // global max is zero (degenerate Jacobian).
+        let global_max = row_max.iter().cloned().fold(0.0_f64, f64::max);
+        if global_max > 0.0 && global_max.is_finite() {
+            let s = (constr_target_gradient / global_max).max(min_value);
+            for gi in gs.iter_mut() {
+                *gi = s;
+            }
+        }
+        return gs;
     }
     for i in 0..m_sc {
         if row_max[i] > max_gradient {
@@ -11408,5 +11449,158 @@ mod tests {
         let result = make_result(&state, SolveStatus::StopAtTinyStep);
         assert_eq!(result.status, SolveStatus::StopAtTinyStep);
         assert_eq!(result.x.len(), 2);
+    }
+
+    /// T-MIT-C: scaling mock with explicit gradient and Jacobian rows
+    /// for `compute_nlp_scaling` tests. Constraints/obj values are
+    /// irrelevant — scaling is computed from `grad` and `jac_rows`/
+    /// `jac_vals` only.
+    struct ScalingMock {
+        n: usize,
+        m: usize,
+        grad: Vec<f64>,
+        jac_rows: Vec<usize>,
+        jac_cols: Vec<usize>,
+        jac_vals: Vec<f64>,
+    }
+    impl NlpProblem for ScalingMock {
+        fn num_variables(&self) -> usize { self.n }
+        fn num_constraints(&self) -> usize { self.m }
+        fn bounds(&self, x_l: &mut [f64], x_u: &mut [f64]) {
+            for v in x_l.iter_mut() { *v = f64::NEG_INFINITY; }
+            for v in x_u.iter_mut() { *v = f64::INFINITY; }
+        }
+        fn constraint_bounds(&self, g_l: &mut [f64], g_u: &mut [f64]) {
+            for v in g_l.iter_mut() { *v = 0.0; }
+            for v in g_u.iter_mut() { *v = 0.0; }
+        }
+        fn initial_point(&self, x0: &mut [f64]) { for v in x0.iter_mut() { *v = 0.0; } }
+        fn objective(&self, _: &[f64], _: bool, obj: &mut f64) -> bool { *obj = 0.0; true }
+        fn gradient(&self, _: &[f64], _: bool, grad: &mut [f64]) -> bool {
+            grad.copy_from_slice(&self.grad);
+            true
+        }
+        fn constraints(&self, _: &[f64], _: bool, g: &mut [f64]) -> bool {
+            for v in g.iter_mut() { *v = 0.0; } true
+        }
+        fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            (self.jac_rows.clone(), self.jac_cols.clone())
+        }
+        fn jacobian_values(&self, _: &[f64], _: bool, vals: &mut [f64]) -> bool {
+            vals.copy_from_slice(&self.jac_vals);
+            true
+        }
+        fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
+        fn hessian_values(&self, _: &[f64], _: bool, _: f64, _: &[f64], _: &mut [f64]) -> bool { true }
+    }
+
+    /// T-MIT-C: `nlp_scaling_method = None` returns identity scales,
+    /// then `obj_scaling_factor` multiplies in. Mirrors
+    /// `IpNLPScaling.cpp:276` semantics: factor applied even for the
+    /// `NoNLPScalingObject` path.
+    #[test]
+    fn test_nlp_scaling_none_applies_obj_scaling_factor() {
+        use crate::options::NlpScalingMethod;
+        let p = ScalingMock {
+            n: 2, m: 1,
+            grad: vec![1e6, 1e6], // would trigger gradient scaling if enabled
+            jac_rows: vec![0, 0],
+            jac_cols: vec![0, 1],
+            jac_vals: vec![1e9, 1e9], // ditto
+        };
+        let mut opts = SolverOptions::default();
+        opts.nlp_scaling_method = NlpScalingMethod::None;
+        opts.obj_scaling_factor = -1.0; // canonical "maximize" idiom
+        let (os, gs) = compute_nlp_scaling(&p, &opts, &[0.0, 0.0], &p.jac_rows);
+        assert_eq!(os, -1.0, "method=None must skip gradient scaling and apply factor");
+        assert_eq!(gs, vec![1.0], "method=None must leave constraint scaling identity");
+    }
+
+    /// T-MIT-C: gradient-based scaling with default options scales the
+    /// objective by `max_gradient / ||grad||_inf` when above threshold.
+    #[test]
+    fn test_nlp_scaling_gradient_obj_above_threshold() {
+        let p = ScalingMock {
+            n: 2, m: 0,
+            grad: vec![0.0, 1000.0],
+            jac_rows: vec![],
+            jac_cols: vec![],
+            jac_vals: vec![],
+        };
+        let opts = SolverOptions::default(); // method = Gradient, max=100
+        let (os, _) = compute_nlp_scaling(&p, &opts, &[0.0, 0.0], &p.jac_rows);
+        assert!((os - 0.1).abs() < 1e-12, "expected 100/1000 = 0.1, got {os}");
+    }
+
+    /// T-MIT-C: `nlp_scaling_obj_target_gradient > 0` overrides the
+    /// `max_gradient` gate — the objective is rescaled even when the
+    /// gradient is below `max_gradient`. Matches
+    /// `IpGradientScaling.cpp:108-127`.
+    #[test]
+    fn test_nlp_scaling_gradient_obj_target_override() {
+        let p = ScalingMock {
+            n: 1, m: 0,
+            grad: vec![10.0], // below max_gradient=100, would normally yield os=1
+            jac_rows: vec![], jac_cols: vec![], jac_vals: vec![],
+        };
+        let mut opts = SolverOptions::default();
+        opts.nlp_scaling_obj_target_gradient = 1.0; // force os = 1/10 = 0.1
+        let (os, _) = compute_nlp_scaling(&p, &opts, &[0.0], &p.jac_rows);
+        assert!((os - 0.1).abs() < 1e-12, "target override should give 0.1, got {os}");
+    }
+
+    /// T-MIT-C: `nlp_scaling_constr_target_gradient > 0` makes every
+    /// constraint row receive the same scale `target / global_max`.
+    #[test]
+    fn test_nlp_scaling_gradient_constr_target_override() {
+        let p = ScalingMock {
+            n: 2, m: 2,
+            grad: vec![0.0, 0.0],
+            jac_rows: vec![0, 1],
+            jac_cols: vec![0, 1],
+            jac_vals: vec![1.0, 50.0], // global max = 50, row maxes 1 and 50
+        };
+        let mut opts = SolverOptions::default();
+        opts.nlp_scaling_constr_target_gradient = 5.0; // every row -> 5/50 = 0.1
+        let (_, gs) = compute_nlp_scaling(&p, &opts, &[0.0, 0.0], &p.jac_rows);
+        assert_eq!(gs.len(), 2);
+        assert!((gs[0] - 0.1).abs() < 1e-12, "row 0: expected 0.1, got {}", gs[0]);
+        assert!((gs[1] - 0.1).abs() < 1e-12, "row 1: expected 0.1, got {}", gs[1]);
+    }
+
+    /// T-MIT-C: `obj_scaling_factor` composes multiplicatively with the
+    /// gradient-based result. Mirrors
+    /// `StandardScalingBase::DetermineScaling` at `IpNLPScaling.cpp:276`.
+    #[test]
+    fn test_nlp_scaling_factor_composes_with_gradient() {
+        let p = ScalingMock {
+            n: 1, m: 0,
+            grad: vec![1000.0],
+            jac_rows: vec![], jac_cols: vec![], jac_vals: vec![],
+        };
+        let mut opts = SolverOptions::default();
+        opts.obj_scaling_factor = -2.0;
+        let (os, _) = compute_nlp_scaling(&p, &opts, &[0.0], &p.jac_rows);
+        // Gradient pass would yield 100/1000=0.1, then * -2 = -0.2.
+        assert!((os - (-0.2)).abs() < 1e-12, "expected -0.2, got {os}");
+    }
+
+    /// T-MIT-C: `nlp_scaling_method = User` reads from
+    /// `user_obj_scaling` / `user_g_scaling`, ignoring the gradient.
+    #[test]
+    fn test_nlp_scaling_user_method_uses_user_values() {
+        use crate::options::NlpScalingMethod;
+        let p = ScalingMock {
+            n: 1, m: 2,
+            grad: vec![1e6], // would scale to 1e-4 under Gradient
+            jac_rows: vec![0, 1], jac_cols: vec![0, 0], jac_vals: vec![1.0, 1.0],
+        };
+        let mut opts = SolverOptions::default();
+        opts.nlp_scaling_method = NlpScalingMethod::User;
+        opts.user_obj_scaling = Some(0.5);
+        opts.user_g_scaling = Some(vec![2.0, 3.0]);
+        let (os, gs) = compute_nlp_scaling(&p, &opts, &[0.0], &p.jac_rows);
+        assert_eq!(os, 0.5);
+        assert_eq!(gs, vec![2.0, 3.0]);
     }
 }

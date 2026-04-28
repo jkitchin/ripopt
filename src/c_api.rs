@@ -473,6 +473,13 @@ pub unsafe extern "C" fn ripopt_add_num_option(
         "adaptive_mu_monotone_init_factor" => p.options.adaptive_mu_monotone_init_factor = val,
         "warm_start_target_mu" => p.options.warm_start_target_mu = Some(val),
         "user_obj_scaling" => p.options.user_obj_scaling = Some(val),
+        "obj_scaling_factor" => p.options.obj_scaling_factor = val,
+        "nlp_scaling_max_gradient" => p.options.nlp_scaling_max_gradient = val,
+        "nlp_scaling_min_value" => p.options.nlp_scaling_min_value = val,
+        "nlp_scaling_obj_target_gradient" => p.options.nlp_scaling_obj_target_gradient = val,
+        "nlp_scaling_constr_target_gradient" => {
+            p.options.nlp_scaling_constr_target_gradient = val
+        }
         _ => return 0,
     }
     1
@@ -591,6 +598,15 @@ pub unsafe extern "C" fn ripopt_add_str_option(
             } else {
                 return 0;
             }
+        }
+        "nlp_scaling_method" => {
+            use crate::options::NlpScalingMethod;
+            p.options.nlp_scaling_method = match value {
+                "none" => NlpScalingMethod::None,
+                "gradient-based" => NlpScalingMethod::Gradient,
+                "user-scaling" => NlpScalingMethod::User,
+                _ => return 0,
+            };
         }
         _ => return 0,
     }
