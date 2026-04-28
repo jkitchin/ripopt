@@ -3908,16 +3908,16 @@ fn try_gn_restoration<P: NlpProblem>(
 #[allow(clippy::too_many_arguments)]
 fn apply_restoration_recovery_strategy<P: NlpProblem>(
     state: &mut SolverState,
-    problem: &P,
+    _problem: &P,
     options: &SolverOptions,
     filter: &mut Filter,
     mu_state: &mut MuState,
     inertia_params: &mut InertiaCorrectionParams,
-    lbfgs_state: &mut Option<LbfgsIpmState>,
-    lbfgs_mode: bool,
-    linear_constraints: Option<&[bool]>,
+    _lbfgs_state: &mut Option<LbfgsIpmState>,
+    _lbfgs_mode: bool,
+    _linear_constraints: Option<&[bool]>,
     fail_count: usize,
-    n: usize,
+    _n: usize,
 ) {
     log::debug!("Restoration failed (attempt #{}), trying recovery", fail_count);
     let mu_factors: [f64; 6] = [10.0, 0.1, 100.0, 0.01, 1000.0, 0.001];
@@ -3931,13 +3931,6 @@ fn apply_restoration_recovery_strategy<P: NlpProblem>(
     }
     reset_filter_with_current_theta(state, filter);
     inertia_params.delta_w_last = 0.0;
-
-    if fail_count >= 3 {
-        perturb_x_after_repeated_restoration_failures(
-            state, problem, lbfgs_state, fail_count, n,
-            linear_constraints, lbfgs_mode,
-        );
-    }
 }
 
 /// First-restoration-failure μ update. In Free mode, switch to
@@ -3969,36 +3962,6 @@ fn apply_first_restoration_failure_mu_update(
     }
 }
 
-/// After a third (or later) restoration failure, perturb every
-/// component of `state.x` by `±1e-4·range` with a deterministic
-/// `(7i + 13·fail_count) mod 3` sign pattern, where `range` is the
-/// finite bound width when both bounds exist or `max(|x_i|, 1)`
-/// otherwise. Each component is then re-clamped to its open-bound
-/// interior, and the problem is re-evaluated (refreshing the
-/// L-BFGS Hessian as a side effect). Mirrors the deterministic
-/// perturbation scheme already used by `try_last_resort_perturbation`.
-#[allow(clippy::too_many_arguments)]
-fn perturb_x_after_repeated_restoration_failures<P: NlpProblem>(
-    state: &mut SolverState,
-    problem: &P,
-    lbfgs_state: &mut Option<LbfgsIpmState>,
-    fail_count: usize,
-    n: usize,
-    linear_constraints: Option<&[bool]>,
-    lbfgs_mode: bool,
-) {
-    for i in 0..n {
-        let range = if state.x_l[i].is_finite() && state.x_u[i].is_finite() {
-            state.x_u[i] - state.x_l[i]
-        } else {
-            state.x[i].abs().max(1.0)
-        };
-        let sign = if (i * 7 + fail_count * 13) % 3 == 0 { -1.0 } else { 1.0 };
-        state.x[i] += sign * 1e-4 * range;
-        clamp_to_open_bounds(&mut state.x, &state.x_l, &state.x_u, i);
-    }
-    let _ = evaluate_and_refresh_lbfgs(state, problem, lbfgs_state, linear_constraints, lbfgs_mode);
-}
 
 /// Classify the terminal status when the restoration cascade has exhausted its
 /// retry budget. Returns LocalInfeasibility when the constraint-violation
@@ -4677,104 +4640,6 @@ enum FactorDecision {
 ///
 /// Extracted from `solve_ipm` as part of the v0.8 main-loop
 /// decomposition.
-/// Early-iteration degenerate-starting-point recovery: if KKT factorization
-/// failed in the first 5 iterations, perturb x at increasing scales and try
-/// to refactor a freshly assembled KKT. Returns true if a perturbation
-/// recovered a successful factorization (in which case the caller should
-/// `continue` the IPM loop with the perturbed point).
-fn try_early_perturbation_recovery<P: NlpProblem>(
-    state: &mut SolverState,
-    problem: &P,
-    iteration: usize,
-    n: usize,
-    m: usize,
-    use_sparse: bool,
-    lin_solver: &mut dyn LinearSolver,
-    inertia_params: &mut InertiaCorrectionParams,
-    lbfgs_state: &mut Option<LbfgsIpmState>,
-    filter: &mut Filter,
-    linear_constraints: Option<&[bool]>,
-    lbfgs_mode: bool,
-    kappa_d: f64,
-) -> bool {
-    if iteration >= 5 {
-        return false;
-    }
-    for &perturb_scale in &[1e-4, 1e-3, 1e-2, 5e-2, 1e-1] {
-        let x_saved = state.x.clone();
-        for i in 0..n {
-            let mag = state.x[i].abs().max(1.0);
-            let sign = if (i * 7 + iteration * 13 + (perturb_scale * 1e4) as usize * 3) % 3 == 0 {
-                -1.0
-            } else {
-                1.0
-            };
-            state.x[i] += sign * perturb_scale * mag;
-            clamp_to_open_bounds(&mut state.x, &state.x_l, &state.x_u, i);
-        }
-        reseed_bound_multipliers_from_mu(state, state.mu);
-        let pert_eval_ok = evaluate_and_refresh_lbfgs(state, problem, lbfgs_state, linear_constraints, lbfgs_mode);
-        if pert_eval_ok && obj_and_grad_finite(state) {
-            let sigma_p = compute_sigma_from_state(state);
-            let mut kkt_p = assemble_kkt_from_state(state, n, m, &sigma_p, use_sparse, kappa_d);
-            if kkt::factor_with_inertia_correction(
-                &mut kkt_p, lin_solver, inertia_params, state.mu,
-            ).is_ok() {
-                log::debug!(
-                    "Early perturbation (scale={:.0e}) recovered factorization at iter {}",
-                    perturb_scale, iteration
-                );
-                reset_filter_with_current_theta(state, filter);
-                return true;
-            }
-        }
-        state.x.copy_from_slice(&x_saved);
-    }
-    false
-}
-
-/// Gradient-descent fallback with Armijo backtracking after a KKT
-/// factorization failure. Computes a steepest-descent direction (projected
-/// to satisfy bound feasibility) and bisects alpha up to 20 times until the
-/// objective decreases. On acceptance the state is re-evaluated and the
-/// L-BFGS Hessian updated; returns true so the caller can `continue` the
-/// IPM loop.
-fn try_gradient_descent_fallback<P: NlpProblem>(
-    state: &mut SolverState,
-    problem: &P,
-    n: usize,
-    lbfgs_state: &mut Option<LbfgsIpmState>,
-    linear_constraints: Option<&[bool]>,
-    lbfgs_mode: bool,
-) -> bool {
-    let Some(fallback) = gradient_descent_fallback(state) else {
-        return false;
-    };
-    install_step_directions(state, fallback.0, fallback.1, vec![0.0; n], vec![0.0; n]);
-
-    let mut alpha_fb = 1.0;
-    let obj_current = state.obj;
-    let mut fb_accepted = false;
-    for _ in 0..20 {
-        let x_trial = compute_clamped_trial_x(state, &state.dx, alpha_fb);
-        let mut obj_trial = f64::INFINITY;
-        let obj_ok = problem.objective(&x_trial, true, &mut obj_trial);
-        if obj_ok && obj_trial.is_finite() && obj_trial < obj_current {
-            state.x = x_trial;
-            state.obj = obj_trial;
-            state.alpha_primal = alpha_fb;
-            fb_accepted = true;
-            break;
-        }
-        alpha_fb *= 0.5;
-    }
-    if fb_accepted {
-        let _ = evaluate_and_refresh_lbfgs(state, problem, lbfgs_state, linear_constraints, lbfgs_mode);
-        return true;
-    }
-    false
-}
-
 /// T-MIT-G (Ipopt alignment): on KKT factorization failure (inertia
 /// correction exhausted), trigger restoration directly per
 /// `IpPDFullSpaceSolver.cpp:380-410` and `IpFilterLSAcceptor.cpp` reference
@@ -4848,13 +4713,6 @@ fn recover_from_factor_failure<P: NlpProblem>(
         }
     }
 
-    if try_last_resort_perturbation(
-        state, problem, iteration, n, lbfgs_state, filter,
-        linear_constraints, lbfgs_mode,
-    ) {
-        log::debug!("recover_from_factor_failure[iter {}]: last_resort_perturbation succeeded", iteration);
-        return FactorDecision::Continue;
-    }
     FactorDecision::Return(make_result(state, SolveStatus::NumericalError))
 }
 
@@ -4936,36 +4794,6 @@ fn factor_kkt_with_recovery<P: NlpProblem>(
         lin_solver, inertia_params, lbfgs_state, filter, mu_state, restoration,
         linear_constraints, lbfgs_mode, deadline,
     )
-}
-
-/// Last-resort perturbation after restoration has also failed: cumulatively
-/// perturb x at scales 1e-3, 1e-2, 1e-1 and accept the first scale at which
-/// problem evaluation produces a finite objective. On success the filter is
-/// reset and theta_min recomputed; returns true so the caller can continue.
-fn try_last_resort_perturbation<P: NlpProblem>(
-    state: &mut SolverState,
-    problem: &P,
-    iteration: usize,
-    n: usize,
-    lbfgs_state: &mut Option<LbfgsIpmState>,
-    filter: &mut Filter,
-    linear_constraints: Option<&[bool]>,
-    lbfgs_mode: bool,
-) -> bool {
-    for &perturb_scale in &[1e-3, 1e-2, 1e-1] {
-        for i in 0..n {
-            let mag = state.x[i].abs().max(1.0);
-            let sign = if (i * 7 + iteration * 13) % 3 == 0 { -1.0 } else { 1.0 };
-            state.x[i] += sign * perturb_scale * mag;
-            clamp_to_open_bounds(&mut state.x, &state.x_l, &state.x_u, i);
-        }
-        let pert2_ok = evaluate_and_refresh_lbfgs(state, problem, lbfgs_state, linear_constraints, lbfgs_mode);
-        if pert2_ok && !state.obj.is_nan() && !state.obj.is_infinite() {
-            reset_filter_with_current_theta(state, filter);
-            return true;
-        }
-    }
-    false
 }
 
 /// Update the barrier parameter μ (interior-point centering parameter) once

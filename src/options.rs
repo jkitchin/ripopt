@@ -341,8 +341,8 @@ pub struct SolverOptions {
     /// Maximum wall-clock seconds allowed for the first few iterations.
     /// If the solver has completed fewer than 3 iterations after this many seconds,
     /// it returns NumericalError to trigger fallback strategies.
-    /// 0.0 disables early stall detection.
-    /// Default: 10.0.
+    /// 0.0 disables early stall detection (default; T3.15 retired).
+    /// Mirrors no Ipopt option — wall-clock kill belongs to `max_cpu_time`.
     pub early_stall_timeout: f64,
     /// Recompute equality multipliers `y` via the augmented least-squares
     /// system after each accepted step once the iterate is sufficiently
@@ -618,7 +618,7 @@ impl Default for SolverOptions {
             proactive_infeasibility_detection: false,
             linear_solver: LinearSolverChoice::default(),
             stall_iter_limit: 0,
-            early_stall_timeout: 120.0,
+            early_stall_timeout: 0.0,
             recalc_y: false,
             recalc_y_feas_tol: 1e-6,
             alpha_for_y: AlphaForY::default(),
