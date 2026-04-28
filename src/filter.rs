@@ -924,4 +924,114 @@ mod tests {
         // alpha = -tau * s / ds = 0.99 * 0.01 / 1.0 = 0.0099
         assert!((alpha2 - 0.0099).abs() < 1e-12);
     }
+
+    /// T3.10 helper: simulate one full iteration where a single trial step
+    /// was rejected by the filter dominance test (and not by Armijo /
+    /// obj_max_inc / theta_max). The post-acceptance hook in `ipm.rs`
+    /// runs on the *next* iteration's accepted step, so we mark the bit
+    /// directly here.
+    fn simulate_filter_rejected_iter(filter: &mut Filter) -> bool {
+        // Force a check_acceptability call that fails the filter test.
+        // Add a dominating entry, then offer a worse trial that still
+        // satisfies sufficient-reduction (h-type theta drop) so we hit
+        // the filter branch (not the type_ok branch). Bound checks pass.
+        filter.add(0.5, 5.0);
+        let theta_current = 1.0;
+        let phi_current = 10.0;
+        // Trial: theta_trial < theta_current * (1-gamma_theta) so h-type
+        // sufficient_infeasibility_reduction passes. But (theta_trial,
+        // phi_trial) is dominated by the (0.5, 5.0) filter entry.
+        let theta_trial = 0.6;
+        let phi_trial = 6.0;
+        let (accept, _) = filter.check_acceptability(
+            theta_current, phi_current, theta_trial, phi_trial, -0.01, 1.0,
+        );
+        assert!(!accept, "trial should be filter-rejected for the test");
+        // Now invoke the post-acceptance hook; it consumes the
+        // last_rejection_due_to_filter flag.
+        filter.note_acceptance()
+    }
+
+    #[test]
+    fn test_filter_reset_fires_after_trigger_consecutive_rejections() {
+        // T3.10: with default trigger=5, the 5th consecutive accepted
+        // step preceded by a filter-rejected trial fires the reset.
+        let mut filter = Filter::new(100.0);
+        for i in 0..4 {
+            let fired = simulate_filter_rejected_iter(&mut filter);
+            assert!(!fired, "reset must not fire on iter {}", i);
+            assert_eq!(filter.n_filter_resets(), 0);
+        }
+        let fired = simulate_filter_rejected_iter(&mut filter);
+        assert!(fired, "5th consecutive filter-rejected accept must trigger reset");
+        assert_eq!(filter.n_filter_resets(), 1);
+        assert!(filter.is_empty(), "reset must clear filter entries");
+    }
+
+    #[test]
+    fn test_filter_reset_counter_resets_on_clean_acceptance() {
+        // T3.10: an accepted step *not* preceded by a filter rejection
+        // resets the consecutive counter to zero.
+        let mut filter = Filter::new(100.0);
+        for _ in 0..4 {
+            let fired = simulate_filter_rejected_iter(&mut filter);
+            assert!(!fired);
+        }
+        // Clean acceptance (no prior filter rejection): counter should reset.
+        let fired_clean = filter.note_acceptance();
+        assert!(!fired_clean);
+        // Now another filter-rejected iteration: counter starts back at 1,
+        // so reset must NOT fire.
+        let fired = simulate_filter_rejected_iter(&mut filter);
+        assert!(!fired, "counter should have reset after clean acceptance");
+        assert_eq!(filter.n_filter_resets(), 0);
+    }
+
+    #[test]
+    fn test_filter_reset_capped_by_max_filter_resets() {
+        // T3.10: after `max_filter_resets` resets, further filter
+        // rejections must not trigger another reset.
+        let mut filter = Filter::new(100.0);
+        // Tight cap to keep the test fast: trigger=2, max_resets=2.
+        filter.set_filter_reset_options(2, 2);
+        // Reset #1.
+        assert!(!simulate_filter_rejected_iter(&mut filter));
+        assert!(simulate_filter_rejected_iter(&mut filter));
+        assert_eq!(filter.n_filter_resets(), 1);
+        // Reset #2.
+        assert!(!simulate_filter_rejected_iter(&mut filter));
+        assert!(simulate_filter_rejected_iter(&mut filter));
+        assert_eq!(filter.n_filter_resets(), 2);
+        // Cap reached: further filter-rejected iterations must not reset.
+        for _ in 0..10 {
+            let fired = simulate_filter_rejected_iter(&mut filter);
+            assert!(!fired, "no reset must fire past max_filter_resets");
+        }
+        assert_eq!(filter.n_filter_resets(), 2);
+    }
+
+    #[test]
+    fn test_filter_reset_disabled_when_max_resets_zero() {
+        // T3.10: `max_filter_resets = 0` disables the heuristic entirely.
+        let mut filter = Filter::new(100.0);
+        filter.set_filter_reset_options(1, 0);
+        for _ in 0..20 {
+            let fired = simulate_filter_rejected_iter(&mut filter);
+            assert!(!fired, "max_filter_resets=0 must disable resets");
+        }
+        assert_eq!(filter.n_filter_resets(), 0);
+        assert!(!filter.is_empty(), "filter entries must persist when disabled");
+    }
+
+    #[test]
+    fn test_filter_reset_trigger_set_floored_at_one() {
+        // T3.10: trigger=0 would cause a runaway reset on every accepted
+        // step; the setter floors it to 1. With trigger=1 the very first
+        // filter-rejected accept fires a reset.
+        let mut filter = Filter::new(100.0);
+        filter.set_filter_reset_options(0, 5);
+        let fired = simulate_filter_rejected_iter(&mut filter);
+        assert!(fired, "trigger=0 floored to 1 should fire on first rejection");
+        assert_eq!(filter.n_filter_resets(), 1);
+    }
 }

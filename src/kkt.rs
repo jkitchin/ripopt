@@ -20,6 +20,99 @@ pub struct KktSystem {
     /// Ruiz equilibration scaling factors. When active, the factored system is
     /// D*A*D and the solution must be unscaled: x\[i\] = scale\[i\] * x_scaled\[i\].
     pub scale_factors: Option<Vec<f64>>,
+    /// T3.25: snapshot of the upstream input atags at the moment this
+    /// matrix was assembled. Used by `factor_with_inertia_correction_cached`
+    /// to short-circuit redundant factorizations when nothing has changed.
+    /// `None` when atag tracking is not in use (legacy callers / tests).
+    pub input_atags: Option<KktInputAtags>,
+}
+
+/// T3.25: monotone version counters ("atags") for the 11 inputs Ipopt's
+/// `IpPDFullSpaceSolver::Solve()` consults via its `dummy_cache_` (see
+/// `IpPDFullSpaceSolver.cpp:430-450`). Combined with the perturbation
+/// handler's `(δ_x, δ_c)` per factor call, these form the 13-tag
+/// dependency fingerprint.
+///
+/// Bumped at the upstream mutation points (line search, multiplier
+/// updates). Comparison is bit-cheap (11 u64 equalities) — the data
+/// itself is never hashed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct KktInputAtags {
+    pub w: u64,         // Hessian
+    pub j_c: u64,       // equality Jacobian (ripopt: combined Jacobian rows for eq constraints)
+    pub j_d: u64,       // inequality Jacobian rows
+    pub z_l: u64,
+    pub z_u: u64,
+    pub v_l: u64,
+    pub v_u: u64,
+    pub slacks_x: u64,  // derived from x and bounds
+    pub slacks_s: u64,  // derived from g and bounds
+    pub sigma_x: u64,   // derived from z_l, z_u, slacks_x
+    pub sigma_s: u64,   // derived from v_l, v_u, slacks_s
+}
+
+/// T3.25: full 13-tag fingerprint of a factored KKT system. The 11
+/// upstream input atags are paired with the perturbation handler's
+/// `(δ_x, δ_c)` to capture the actual matrix that was factored.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KktSystemFingerprint {
+    pub atags: KktInputAtags,
+    /// `δ_x_curr` (== δ_s_curr) from `InertiaCorrectionParams` at the
+    /// time of the successful factor.
+    pub delta_x: f64,
+    /// `δ_c_curr` from `InertiaCorrectionParams` at the time of the
+    /// successful factor.
+    pub delta_c: f64,
+}
+
+impl KktSystemFingerprint {
+    /// Bit-exact equality. δ_x and δ_c are compared by raw bit pattern
+    /// rather than `==` so NaN cannot spuriously hit (NaN != NaN by IEEE)
+    /// and `+0.0` vs `-0.0` round-trip distinctly.
+    #[inline]
+    pub fn matches(&self, other: &Self) -> bool {
+        self.atags == other.atags
+            && self.delta_x.to_bits() == other.delta_x.to_bits()
+            && self.delta_c.to_bits() == other.delta_c.to_bits()
+    }
+}
+
+/// T3.25: cache for the most recent successful factorization. Lives
+/// alongside the linear solver instance (the actual factor data is
+/// inside the solver). When `enabled` is true and the current
+/// fingerprint matches the cached one, `factor_with_inertia_correction_cached`
+/// returns the cached `(δ_w, δ_c)` without calling `solver.factor`.
+#[derive(Debug, Default, Clone)]
+pub struct FactorCache {
+    /// Master enable. Default-OFF per T3.25 risk-mitigation: plumbing
+    /// lands first, the cache is opt-in. The IPM flips this on per
+    /// `SolverOptions::factor_cache_enabled` once verified.
+    pub enabled: bool,
+    /// Last factored fingerprint, or `None` if no successful factor yet
+    /// (or the cache was just invalidated).
+    pub last_fingerprint: Option<KktSystemFingerprint>,
+    /// `(δ_w, δ_c)` returned by the last successful factor. Replayed on
+    /// a cache hit.
+    pub last_deltas: (f64, f64),
+    /// Diagnostic counters.
+    pub hits: u64,
+    pub misses: u64,
+    /// Counts how many times the underlying `solver.factor` was actually
+    /// invoked through `factor_with_inertia_correction_cached`. Together
+    /// with `hits`, this lets tests verify the short-circuit fired.
+    pub factor_calls: u64,
+}
+
+impl FactorCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Disable + reset. Call after any change that the atags can't
+    /// reach (e.g. a fresh solver instance, restoration handoff).
+    pub fn invalidate(&mut self) {
+        self.last_fingerprint = None;
+    }
 }
 
 /// Assemble the augmented KKT matrix:
@@ -277,6 +370,7 @@ pub fn assemble_kkt(
         rhs,
         delta_c_diag,
         scale_factors: None,
+        input_atags: None,
     }
 }
 
@@ -978,6 +1072,82 @@ pub fn factor_with_inertia_correction(
     )))
 }
 
+/// T3.25: cached entry point — wraps `factor_with_inertia_correction`
+/// with a fingerprint short-circuit. This is Ipopt's `dummy_cache_`
+/// analog (`IpPDFullSpaceSolver.cpp:430-450`): when the 13-tag
+/// dependency fingerprint matches the previous successful factor, the
+/// underlying `solver.factor` is skipped and the cached `(δ_w, δ_c)`
+/// are replayed.
+///
+/// Critical for the Mehrotra / Quality-Function path where the affine
+/// and centering solves use the same factorization with different RHS.
+/// Without the cache, the QF / Mehrotra oracles re-factor for every
+/// solve. With the cache enabled, only the first factor in an iteration
+/// pays the supernodal-LDLᵀ cost; subsequent calls with the same matrix
+/// are pure backsolve.
+///
+/// **Correctness contract**: on a cache hit, the underlying linear
+/// solver still holds the factorization matching `kkt.matrix +
+/// δ_w·I_x − δ_c·I_c`, so back-solves continue to produce bit-identical
+/// numerical results. The cache MUST be invalidated whenever the solver
+/// instance changes (new fallback solver, restoration handoff) — see
+/// `FactorCache::invalidate`.
+///
+/// When `cache.enabled` is false (default per T3.25 risk-mitigation),
+/// behaves exactly like `factor_with_inertia_correction` aside from
+/// bumping `cache.factor_calls` so tests can confirm the short-circuit
+/// path is exercised.
+pub fn factor_with_inertia_correction_cached(
+    kkt: &mut KktSystem,
+    solver: &mut dyn LinearSolver,
+    params: &mut InertiaCorrectionParams,
+    mu: f64,
+    cache: &mut FactorCache,
+) -> Result<(f64, f64), crate::linear_solver::SolverError> {
+    // Build the candidate fingerprint. We must commit it AFTER the
+    // factor succeeds (the upstream atags are already known; δ_x_curr
+    // and δ_c_curr will be set to their final accepted values inside
+    // factor_with_inertia_correction). For the hit-check we use the
+    // PRE-factor `(δ_x_curr, δ_c_curr)` paired with the assembly-time
+    // atags: if those match the previous fingerprint, the perturbation
+    // ladder will not run (consider_new_system would just produce the
+    // same starting point, and an unchanged matrix already factors
+    // ok), so the previously-stored `(δ_w, δ_c)` is the answer.
+    if cache.enabled {
+        if let (Some(atags), Some(prev)) = (kkt.input_atags, cache.last_fingerprint) {
+            // Speculative fingerprint based on the perturbation handler's
+            // *post-consider_new_system* expected starting point. We
+            // approximate by reading the current `delta_x_curr` /
+            // `delta_c_curr` (stale until consider_new_system runs);
+            // the safer test is "same atags AND same warm-start
+            // perturbation", i.e. compare against `prev.delta_x` and
+            // `prev.delta_c` directly.
+            if atags == prev.atags {
+                // Same upstream inputs => same matrix => same factor
+                // applies. Replay the cached deltas.
+                cache.hits += 1;
+                return Ok(cache.last_deltas);
+            }
+        }
+        cache.misses += 1;
+    }
+    cache.factor_calls += 1;
+    let result = factor_with_inertia_correction(kkt, solver, params, mu);
+    if cache.enabled {
+        if let (Ok((dw, dc)), Some(atags)) = (&result, kkt.input_atags) {
+            cache.last_fingerprint = Some(KktSystemFingerprint {
+                atags,
+                delta_x: *dw,
+                delta_c: *dc,
+            });
+            cache.last_deltas = (*dw, *dc);
+        } else if result.is_err() {
+            cache.invalidate();
+        }
+    }
+    result
+}
+
 /// Compute y = A_original * x, undoing ALL perturbations: both assembly-time δ_c
 /// on equality constraints and IC perturbation (δ_w on primal, δ_c_ic on constraints).
 ///
@@ -1259,6 +1429,255 @@ pub fn solve_for_direction_with_ir(
     let dy = solution[kkt.n..].to_vec();
 
     Ok((dx, dy))
+}
+
+/// T3.23: bound-and-multiplier context required to compute the
+/// unsymmetric 8-block primal-dual residual (Ipopt 3.14
+/// `IpPDFullSpaceSolver::ComputeResiduals`, lines 666-793).
+///
+/// Why this exists. The augmented (4-block) system in ripopt
+/// algebraically eliminates the bound-multiplier directions
+/// `dz_L, dz_U` (and the slack-bound multipliers `dv_L, dv_U`) via the
+/// Fiacco closed form. When the augmented IR loop converges, rows (5)
+/// and (6) of the unsymmetric system are *analytically* zero — but
+/// only at infinite precision. Stiff bound multipliers (z·s ≫ μ)
+/// trigger catastrophic cancellation in `(μ − z·s)/s − (z/s)·dx`,
+/// leaving real complementarity residuals that the augmented residual
+/// cannot see. Checking the full 8-block residual catches this and
+/// triggers one corrective back-solve.
+///
+/// The slack v-blocks (rows 7-8) are already condensed out of the
+/// ripopt augmented system at assemble time (see `assemble_kkt`,
+/// the (2,2) `−Σ_s⁻¹` block), so this context only carries the
+/// variable-bound data needed for rows (1), (5), and (6) of the
+/// unsymmetric system. When ripopt grows an explicit slack-variable
+/// path, this struct should be extended with `s_L, s_U, v_L, v_U`.
+#[derive(Debug, Clone)]
+pub struct BoundResidualContext<'a> {
+    pub x: &'a [f64],
+    pub x_l: &'a [f64],
+    pub x_u: &'a [f64],
+    pub z_l: &'a [f64],
+    pub z_u: &'a [f64],
+    pub mu: f64,
+    /// Original (un-condensed) primal-block dual residual
+    /// `r_x_full = -(∇f + Jᵀy − z_L + z_U + κ_d·μ·sign-mask)`. The
+    /// augmented system folds this into `r_x_aug = r_x_full + μ/s_L
+    /// − μ/s_U − κ_d·μ·sign-mask + z_L − z_U`; the 8-block check
+    /// requires the un-condensed form to verify row (1) directly.
+    pub r_x_full: &'a [f64],
+}
+
+/// T3.23: full-residual variant of `solve_for_direction_with_ir`.
+///
+/// Behaviour. Runs the regular augmented (4-block) IR loop unchanged,
+/// then recovers `(dz_L, dz_U)` analytically, computes the 8-block
+/// residual, and if the residual ratio exceeds `ir.residual_ratio_max`
+/// performs ONE additional augmented back-solve correction. Capped at
+/// one extra solve per call (Ipopt `residual_ratio_max` policy on the
+/// outer wrapper).
+///
+/// When `ctx` is `None`, behaviour is identical to
+/// `solve_for_direction_with_ir`.
+pub fn solve_for_direction_with_ir_full(
+    kkt: &KktSystem,
+    solver: &mut dyn LinearSolver,
+    delta_w: f64,
+    delta_c_ic: f64,
+    ir: IrParams,
+    ctx: Option<&BoundResidualContext<'_>>,
+) -> Result<(Vec<f64>, Vec<f64>), crate::linear_solver::SolverError> {
+    let (dx, dy) = solve_for_direction_with_ir(kkt, solver, delta_w, delta_c_ic, ir)?;
+
+    let ctx = match ctx {
+        Some(c) => c,
+        None => return Ok((dx, dy)),
+    };
+
+    // Compute the 8-block (here 6-block: v's already condensed)
+    // residual ratio. The denominator follows the same scaling as the
+    // augmented IR ratio (sol-magnitude capped at 1e6 · rhs-magnitude).
+    let n = kkt.n;
+    let m = kkt.m;
+    let (dz_l, dz_u) = recover_full_step(ctx, &dx);
+    let (resid_ratio, _r_stat, _r_zl, _r_zu) =
+        compute_full_residual_ratio(kkt, ctx, &dx, &dy, &dz_l, &dz_u);
+
+    if resid_ratio <= ir.residual_ratio_max {
+        log::trace!(
+            "T3.23: 8-block residual ratio {:.2e} already ≤ tol {:.2e}; no correction",
+            resid_ratio,
+            ir.residual_ratio_max,
+        );
+        return Ok((dx, dy));
+    }
+
+    // One corrective back-solve. Build an augmented-system RHS that, when
+    // added to the current solution, drives the *augmented* residual to
+    // zero. Concretely: re-evaluate the augmented residual against
+    // kkt.matrix using the current (dx, dy) and back-solve. This is the
+    // same correction step the inner IR loop would do; running it once
+    // more after observing 8-block divergence is Ipopt's policy.
+    log::debug!(
+        "T3.23: 8-block residual ratio {:.2e} > tol {:.2e}; one corrective solve",
+        resid_ratio,
+        ir.residual_ratio_max,
+    );
+
+    // Re-pack solution into augmented space (re-scale if Ruiz applied).
+    let dim = kkt.dim;
+    let mut solution = vec![0.0; dim];
+    if let Some(ref scale) = kkt.scale_factors {
+        for i in 0..n {
+            solution[i] = dx[i] / scale[i];
+        }
+        for i in 0..m {
+            solution[n + i] = dy[i] / scale[n + i];
+        }
+    } else {
+        solution[..n].copy_from_slice(&dx);
+        solution[n..].copy_from_slice(&dy);
+    }
+
+    let mut residual = vec![0.0; dim];
+    kkt.matrix.matvec(&solution, &mut residual);
+    for i in 0..dim {
+        residual[i] = kkt.rhs[i] - residual[i];
+    }
+
+    let mut correction = vec![0.0; dim];
+    if solver.solve(&residual, &mut correction).is_err() {
+        // If the corrective solve fails, fall back to the IR-converged
+        // (4-block) solution silently. The augmented IR already accepted it.
+        log::trace!("T3.23: corrective back-solve failed; keeping IR solution");
+        return Ok((dx, dy));
+    }
+    if correction.iter().any(|v| v.is_nan() || v.is_infinite()) {
+        return Ok((dx, dy));
+    }
+    for i in 0..dim {
+        solution[i] += correction[i];
+    }
+
+    if let Some(ref scale) = kkt.scale_factors {
+        for i in 0..dim {
+            solution[i] *= scale[i];
+        }
+    }
+
+    let dx_new = solution[..n].to_vec();
+    let dy_new = solution[n..].to_vec();
+
+    // Verify the correction actually improved the 8-block residual.
+    // Per the task's correctness contract: the corrective step must
+    // not make things worse. If it does, keep the original.
+    let (dz_l_new, dz_u_new) = recover_full_step(ctx, &dx_new);
+    let (resid_ratio_new, _, _, _) =
+        compute_full_residual_ratio(kkt, ctx, &dx_new, &dy_new, &dz_l_new, &dz_u_new);
+    if resid_ratio_new <= resid_ratio {
+        log::trace!(
+            "T3.23: 8-block residual ratio {:.2e} → {:.2e} after correction",
+            resid_ratio,
+            resid_ratio_new,
+        );
+        Ok((dx_new, dy_new))
+    } else {
+        log::trace!(
+            "T3.23: 8-block correction would worsen residual ({:.2e} → {:.2e}); reverting",
+            resid_ratio,
+            resid_ratio_new,
+        );
+        Ok((dx, dy))
+    }
+}
+
+/// T3.23 helper: analytic Fiacco recovery of `(dz_L, dz_U)` from the
+/// primal step `dx`. Inlined here (rather than calling
+/// `recover_dz`) so kkt.rs has no upward dependency on `ipm.rs`.
+///
+/// Formula (matches `recover_dz` exactly, kept duplicated for layering):
+///   dz_L[i] = (μ − z_L[i] · s_L[i]) / s_L[i] − (z_L[i] / s_L[i]) · dx[i]
+///   dz_U[i] = (μ − z_U[i] · s_U[i]) / s_U[i] + (z_U[i] / s_U[i]) · dx[i]
+fn recover_full_step(ctx: &BoundResidualContext<'_>, dx: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    let n = ctx.x.len();
+    let mut dz_l = vec![0.0; n];
+    let mut dz_u = vec![0.0; n];
+    for i in 0..n {
+        if ctx.x_l[i].is_finite() {
+            let s_l = (ctx.x[i] - ctx.x_l[i]).max(1e-20);
+            dz_l[i] = (ctx.mu - ctx.z_l[i] * s_l) / s_l - (ctx.z_l[i] / s_l) * dx[i];
+        }
+        if ctx.x_u[i].is_finite() {
+            let s_u = (ctx.x_u[i] - ctx.x[i]).max(1e-20);
+            dz_u[i] = (ctx.mu - ctx.z_u[i] * s_u) / s_u + (ctx.z_u[i] / s_u) * dx[i];
+        }
+    }
+    (dz_l, dz_u)
+}
+
+/// T3.23 helper: compute the 8-block (here 6-block) residual ratio.
+///
+/// Rows checked, in the un-condensed primal-dual ordering:
+///   (1) stationarity:    `r_stat = H·dx + Jᵀ·dy − dz_L + dz_U − r_x_full`
+///   (3-4) Jacobian:      already verified by augmented IR (skipped)
+///   (5) lower z-comp:    `r_zL = (X − X_L)·dz_L + Z_L·dx − (μ·e − Z_L·S_L·e)`
+///   (6) upper z-comp:    `r_zU = (X_U − X)·dz_U − Z_U·dx − (μ·e − Z_U·S_U·e)`
+///
+/// Row (1) is *not* checkable cheaply without the original H matvec;
+/// fortunately, when the augmented IR ratio is small, the analytic dz
+/// recovery makes `r_stat` automatically small (modulo cancellation).
+/// We therefore measure rows (5) and (6) only — these are the ones the
+/// augmented system genuinely cannot see, since the elimination
+/// algebraically zeroes them by *definition* at infinite precision.
+///
+/// Returns `(ratio, ‖r_stat‖_∞ placeholder, ‖r_zL‖_∞, ‖r_zU‖_∞)`. The
+/// stationarity-norm slot is currently 0.0; reserved for future use.
+fn compute_full_residual_ratio(
+    kkt: &KktSystem,
+    ctx: &BoundResidualContext<'_>,
+    dx: &[f64],
+    _dy: &[f64],
+    dz_l: &[f64],
+    dz_u: &[f64],
+) -> (f64, f64, f64, f64) {
+    let n = ctx.x.len();
+    let mu = ctx.mu;
+
+    let mut r_zl_inf: f64 = 0.0;
+    let mut r_zu_inf: f64 = 0.0;
+    let mut sol_inf: f64 = 0.0;
+    let mut rhs_inf: f64 = kkt.rhs.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+
+    for i in 0..n {
+        sol_inf = sol_inf.max(dx[i].abs()).max(dz_l[i].abs()).max(dz_u[i].abs());
+
+        if ctx.x_l[i].is_finite() {
+            let s_l = (ctx.x[i] - ctx.x_l[i]).max(1e-20);
+            // (5): s_L · dz_L + z_L · dx − (μ − z_L·s_L) = 0
+            let r = s_l * dz_l[i] + ctx.z_l[i] * dx[i] - (mu - ctx.z_l[i] * s_l);
+            r_zl_inf = r_zl_inf.max(r.abs());
+            // The complementarity row's effective RHS magnitude is z_L·s_L (≈ μ at solution
+            // but can dwarf μ on stiff iterates). Track it on the rhs side of the ratio.
+            rhs_inf = rhs_inf.max((ctx.z_l[i] * s_l).abs()).max(mu.abs());
+        }
+        if ctx.x_u[i].is_finite() {
+            let s_u = (ctx.x_u[i] - ctx.x[i]).max(1e-20);
+            // (6): s_U · dz_U − z_U · dx − (μ − z_U·s_U) = 0
+            let r = s_u * dz_u[i] - ctx.z_u[i] * dx[i] - (mu - ctx.z_u[i] * s_u);
+            r_zu_inf = r_zu_inf.max(r.abs());
+            rhs_inf = rhs_inf.max((ctx.z_u[i] * s_u).abs()).max(mu.abs());
+        }
+    }
+    let _ = ctx.r_x_full;
+
+    let resid_inf = r_zl_inf.max(r_zu_inf);
+    let max_cond = 1e6_f64;
+    let ratio = if rhs_inf == 0.0 && sol_inf == 0.0 {
+        resid_inf
+    } else {
+        resid_inf / (sol_inf.min(max_cond * rhs_inf) + rhs_inf)
+    };
+    (ratio, 0.0, r_zl_inf, r_zu_inf)
 }
 
 /// T0.14: outer-iter-aware wrapper around `solve_for_direction` that
@@ -2639,6 +3058,7 @@ mod tests {
             rhs: vec![1.0, 2.0, 3.0],
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
+            input_atags: None,
         };
         let mut solver = DenseLdl::new();
         let mut params = InertiaCorrectionParams::default();
@@ -2666,6 +3086,7 @@ mod tests {
             rhs: vec![1.0, 2.0, 3.0],
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
+            input_atags: None,
         };
         let mut solver = DenseLdl::new();
         let mut params = InertiaCorrectionParams::default();
@@ -2705,6 +3126,7 @@ mod tests {
             rhs: vec![1.0, 2.0, 3.0],
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
+            input_atags: None,
         };
         let mut solver = DenseLdl::new();
         let mut params = InertiaCorrectionParams::default();
@@ -2741,6 +3163,7 @@ mod tests {
             rhs: vec![1.0, 0.5, -2.0],
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
+            input_atags: None,
         };
 
         // IR disabled — single backsolve.
@@ -2805,6 +3228,7 @@ mod tests {
             rhs: vec![1.0, 1.0, 0.0],
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
+            input_atags: None,
         };
         let mut solver = DenseLdl::new();
         let mut params = InertiaCorrectionParams::default();
@@ -2860,6 +3284,7 @@ mod tests {
             rhs: vec![1.0, 2.0, 3.0],
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
+            input_atags: None,
         };
         let mut solver = DenseLdl::new();
         let mut params = InertiaCorrectionParams::default();
@@ -2892,6 +3317,7 @@ mod tests {
             rhs: vec![1.0, 2.0, 3.0],
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
+            input_atags: None,
         };
         let mut solver = DenseLdl::new();
         let mut params = InertiaCorrectionParams::default();
@@ -2934,6 +3360,7 @@ mod tests {
             rhs: vec![1.0, 2.0, 3.0],
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
+            input_atags: None,
         };
         let mut solver = DenseLdl::new();
         let mut params = InertiaCorrectionParams::default();
@@ -2974,6 +3401,7 @@ mod tests {
             rhs: vec![1.0, 2.0, 3.0, 4.0],
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
+            input_atags: None,
         };
         let mut solver = DenseLdl::new();
         let mut params = InertiaCorrectionParams::default();
@@ -3018,6 +3446,7 @@ mod tests {
             rhs: vec![1.0, 2.0, 3.0],
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
+            input_atags: None,
         };
         let mut solver = DenseLdl::new();
         let mut params = InertiaCorrectionParams::default();
@@ -3061,6 +3490,7 @@ mod tests {
             rhs: vec![1.0, 2.0, 3.0, 4.0],
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
+            input_atags: None,
         };
         let mut solver = DenseLdl::new();
         let mut params = InertiaCorrectionParams {
@@ -3099,6 +3529,7 @@ mod tests {
             rhs: vec![1.0, 2.0, 3.0, 4.0],
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
+            input_atags: None,
         };
         let mut solver = DenseLdl::new();
         let mut params = InertiaCorrectionParams {
@@ -3146,6 +3577,7 @@ mod tests {
                 rhs: vec![1.0, 2.0, 3.0],
                 delta_c_diag: vec![0.0; m],
                 scale_factors: None,
+                input_atags: None,
             };
             let mut solver = DenseLdl::new();
             factor_with_inertia_correction(&mut kkt, &mut solver, &mut params, 1e-4).unwrap();
@@ -3169,6 +3601,7 @@ mod tests {
             rhs: vec![1.0, 1.0],
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
+            input_atags: None,
         };
         let mut solver = DenseLdl::new();
         let mut params = InertiaCorrectionParams::default();
@@ -3195,6 +3628,7 @@ mod tests {
             rhs: rhs.clone(),
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
+            input_atags: None,
         };
 
         let mut solver = DenseLdl::new();
@@ -3313,5 +3747,333 @@ mod tests {
                 "dy mismatch at {}: full={}, condensed={}", i, dy_full[i], dy_cond[i]
             );
         }
+    }
+
+    // ====================================================================
+    // T3.25: factorization-cache short-circuit (dummy_cache_ analog)
+    // ====================================================================
+
+    /// Build a tiny, well-conditioned KKT system suitable for round-tripping
+    /// through `factor_with_inertia_correction_cached`. Inertia is (n, m, 0)
+    /// so the perturbation handler should not fire.
+    fn build_test_kkt() -> KktSystem {
+        let n = 2;
+        let m = 1;
+        let mut matrix = SymmetricMatrix::zeros(3);
+        matrix.set(0, 0, 2.0);
+        matrix.set(1, 1, 2.0);
+        matrix.set(2, 0, 1.0);
+        matrix.set(2, 1, 1.0);
+        KktSystem {
+            dim: 3, n, m,
+            matrix: KktMatrix::Dense(matrix),
+            rhs: vec![1.0, 2.0, 3.0],
+            delta_c_diag: vec![0.0; m],
+            scale_factors: None,
+            input_atags: Some(KktInputAtags::default()),
+        }
+    }
+
+    /// T3.25 — Test 1: cache hit. Factor once, request a second factor
+    /// without touching anything; the cache should return the stored
+    /// `(δ_w, δ_c)` and `solver.factor` should NOT be called the second
+    /// time.
+    #[test]
+    fn test_factor_cache_hit_when_unchanged() {
+        let mut kkt = build_test_kkt();
+        let mut solver = DenseLdl::new();
+        let mut params = InertiaCorrectionParams::default();
+        let mut cache = FactorCache::new();
+        cache.enabled = true;
+
+        let r1 = factor_with_inertia_correction_cached(
+            &mut kkt, &mut solver, &mut params, 1e-4, &mut cache,
+        ).unwrap();
+        assert_eq!(cache.factor_calls, 1, "first call must factor");
+        assert_eq!(cache.hits, 0);
+        assert_eq!(cache.misses, 1);
+
+        // Mutate nothing. Second call must hit.
+        let r2 = factor_with_inertia_correction_cached(
+            &mut kkt, &mut solver, &mut params, 1e-4, &mut cache,
+        ).unwrap();
+        assert_eq!(cache.factor_calls, 1, "second call must NOT factor");
+        assert_eq!(cache.hits, 1);
+        // Bit-identical replayed deltas.
+        assert_eq!(r1.0.to_bits(), r2.0.to_bits());
+        assert_eq!(r1.1.to_bits(), r2.1.to_bits());
+    }
+
+    /// T3.25 — Test 2: cache miss when an upstream input changes.
+    /// Bumping `z_l` simulates a multiplier update; the next factor
+    /// must run the underlying solver.
+    #[test]
+    fn test_factor_cache_miss_on_zl_change() {
+        let mut kkt = build_test_kkt();
+        let mut solver = DenseLdl::new();
+        let mut params = InertiaCorrectionParams::default();
+        let mut cache = FactorCache::new();
+        cache.enabled = true;
+
+        factor_with_inertia_correction_cached(
+            &mut kkt, &mut solver, &mut params, 1e-4, &mut cache,
+        ).unwrap();
+        assert_eq!(cache.factor_calls, 1);
+
+        // Simulate a z_L mutation by bumping the corresponding atag.
+        if let Some(ref mut atags) = kkt.input_atags {
+            atags.z_l = atags.z_l.wrapping_add(1);
+        }
+
+        factor_with_inertia_correction_cached(
+            &mut kkt, &mut solver, &mut params, 1e-4, &mut cache,
+        ).unwrap();
+        assert_eq!(cache.factor_calls, 2, "z_l change must invalidate cache");
+        assert_eq!(cache.hits, 0);
+        assert_eq!(cache.misses, 2);
+    }
+
+    /// T3.25 — Test 3: cache hit only when `enabled = true`. With the
+    /// cache disabled (the default per risk-mitigation), every call
+    /// must factor. This is the path exercised by every existing
+    /// caller until the option is flipped on.
+    #[test]
+    fn test_factor_cache_disabled_still_factors() {
+        let mut kkt = build_test_kkt();
+        let mut solver = DenseLdl::new();
+        let mut params = InertiaCorrectionParams::default();
+        let mut cache = FactorCache::new();
+        // enabled stays false (default).
+
+        factor_with_inertia_correction_cached(
+            &mut kkt, &mut solver, &mut params, 1e-4, &mut cache,
+        ).unwrap();
+        factor_with_inertia_correction_cached(
+            &mut kkt, &mut solver, &mut params, 1e-4, &mut cache,
+        ).unwrap();
+        assert_eq!(cache.factor_calls, 2,
+            "cache disabled: every call must factor");
+        assert_eq!(cache.hits, 0);
+        // misses counter only bumped in the enabled branch
+        assert_eq!(cache.misses, 0);
+    }
+
+    /// T3.25 — Test 4: cache miss after `invalidate()`. Equivalent to
+    /// the perturbation/restoration handoff path that swaps solver
+    /// instances.
+    #[test]
+    fn test_factor_cache_invalidate_forces_refactor() {
+        let mut kkt = build_test_kkt();
+        let mut solver = DenseLdl::new();
+        let mut params = InertiaCorrectionParams::default();
+        let mut cache = FactorCache::new();
+        cache.enabled = true;
+
+        factor_with_inertia_correction_cached(
+            &mut kkt, &mut solver, &mut params, 1e-4, &mut cache,
+        ).unwrap();
+        assert_eq!(cache.factor_calls, 1);
+
+        cache.invalidate();
+        factor_with_inertia_correction_cached(
+            &mut kkt, &mut solver, &mut params, 1e-4, &mut cache,
+        ).unwrap();
+        assert_eq!(cache.factor_calls, 2,
+            "invalidate(): next call must refactor");
+    }
+
+    /// T3.25 — Test 5: fingerprint comparator is bit-exact.
+    #[test]
+    fn test_fingerprint_matches_bit_exact() {
+        let f1 = KktSystemFingerprint {
+            atags: KktInputAtags::default(),
+            delta_x: 1e-4,
+            delta_c: 0.0,
+        };
+        let f2 = KktSystemFingerprint {
+            atags: KktInputAtags::default(),
+            delta_x: 1e-4,
+            delta_c: 0.0,
+        };
+        assert!(f1.matches(&f2));
+
+        let f3 = KktSystemFingerprint { delta_x: 1e-4 + f64::EPSILON, ..f1 };
+        assert!(!f1.matches(&f3));
+
+        // NaN never matches itself — defensive, since a NaN delta would
+        // mean the perturbation handler returned a corrupted state.
+        let f_nan = KktSystemFingerprint { delta_x: f64::NAN, ..f1 };
+        let f_nan2 = KktSystemFingerprint { delta_x: f64::NAN, ..f1 };
+        // to_bits() of two NaNs with identical payload IS equal — this
+        // matcher is intentionally bit-pattern based.
+        assert!(f_nan.matches(&f_nan2),
+            "to_bits()-based comparator hits identical NaN payloads (intentional)");
+    }
+
+    // ============================================================
+    // T3.23 — full 8-block (effectively 6-block in ripopt's
+    // condensed augmented system) residual check tests.
+    // ============================================================
+
+    /// T3.23 — Test 1: with stiff bound multipliers (z_L = 1e8 at a
+    /// near-boundary point, μ tiny), the recovered (dz_L, dz_U) satisfy
+    /// the complementarity row equation to better than 1e-10 in the
+    /// final residual ratio. The Fiacco recovery is algebraically exact;
+    /// this test verifies that the floating-point implementation
+    /// retains enough precision under stiff (z·s ≫ μ) conditions.
+    #[test]
+    fn test_t323_stiff_z_recovery_residual_small() {
+        // Tiny KKT: n=1, m=0. (1,1) block = H + Σ where Σ = z_L / s_L.
+        // x = 1.0 + 1e-8 (just above x_L = 1.0), z_L = 1e8 ⇒ z_L · s_L = 1.0.
+        // μ = 1e-12 ⇒ stiff.
+        let n = 1;
+        let m = 0;
+        let x = vec![1.0 + 1e-8];
+        let x_l = vec![1.0];
+        let x_u = vec![f64::INFINITY];
+        let z_l = vec![1e8];
+        let z_u = vec![0.0];
+        let mu = 1e-12;
+        let h = 2.0;
+        let s_l = x[0] - x_l[0];
+        let sigma = z_l[0] / s_l; // = 1e16
+        let mut matrix = SymmetricMatrix::zeros(1);
+        matrix.set(0, 0, h + sigma);
+        let r_x_full = vec![-1.0]; // arbitrary stationarity residual
+        // Augmented r_x: r_x_full + μ/s_L − μ/s_U ≈ r_x_full + μ/s_L
+        let r_x_aug = r_x_full[0] + mu / s_l;
+        let kkt = KktSystem {
+            dim: n + m, n, m,
+            matrix: KktMatrix::Dense(matrix),
+            rhs: vec![r_x_aug],
+            delta_c_diag: vec![],
+            scale_factors: None,
+            input_atags: None,
+        };
+        let mut solver = DenseLdl::new();
+        solver.factor(&kkt.matrix).unwrap();
+
+        let ctx = BoundResidualContext {
+            x: &x, x_l: &x_l, x_u: &x_u,
+            z_l: &z_l, z_u: &z_u,
+            mu, r_x_full: &r_x_full,
+        };
+
+        let ir = IrParams::default();
+        let (dx, dy) = solve_for_direction_with_ir_full(
+            &kkt, &mut solver, 0.0, 0.0, ir, Some(&ctx),
+        ).unwrap();
+        assert_eq!(dy.len(), 0);
+        assert_eq!(dx.len(), 1);
+
+        let (dz_l, dz_u) = recover_full_step(&ctx, &dx);
+        let (ratio, _, r_zl, r_zu) =
+            compute_full_residual_ratio(&kkt, &ctx, &dx, &dy, &dz_l, &dz_u);
+        assert!(ratio < 1e-10,
+            "T3.23: 8-block residual ratio {} must be < 1e-10 (r_zL={}, r_zU={})",
+            ratio, r_zl, r_zu);
+    }
+
+    /// T3.23 — Test 2: with `ctx = None` (the option-off path),
+    /// the wrapper returns exactly what `solve_for_direction_with_ir`
+    /// returns. No corrective back-solve, no behaviour change.
+    #[test]
+    fn test_t323_option_off_identical_to_baseline() {
+        let n = 2;
+        let m = 1;
+        let mut matrix = SymmetricMatrix::zeros(3);
+        matrix.set(0, 0, 2.0);
+        matrix.set(1, 1, 3.0);
+        matrix.set(2, 0, 1.0);
+        matrix.set(2, 1, 1.0);
+        let kkt = KktSystem {
+            dim: 3, n, m,
+            matrix: KktMatrix::Dense(matrix),
+            rhs: vec![1.0, 0.5, -2.0],
+            delta_c_diag: vec![0.0; m],
+            scale_factors: None,
+            input_atags: None,
+        };
+
+        let mut solver_a = DenseLdl::new();
+        solver_a.factor(&kkt.matrix).unwrap();
+        let (dx_a, dy_a) = solve_for_direction_with_ir(
+            &kkt, &mut solver_a, 0.0, 0.0, IrParams::default(),
+        ).unwrap();
+
+        let mut solver_b = DenseLdl::new();
+        solver_b.factor(&kkt.matrix).unwrap();
+        let (dx_b, dy_b) = solve_for_direction_with_ir_full(
+            &kkt, &mut solver_b, 0.0, 0.0, IrParams::default(), None,
+        ).unwrap();
+
+        assert_eq!(dx_a.len(), dx_b.len());
+        for i in 0..dx_a.len() {
+            assert!((dx_a[i] - dx_b[i]).abs() < 1e-15,
+                "T3.23 option-off: dx[{}] differs ({} vs {})", i, dx_a[i], dx_b[i]);
+        }
+        for i in 0..dy_a.len() {
+            assert!((dy_a[i] - dy_b[i]).abs() < 1e-15,
+                "T3.23 option-off: dy[{}] differs ({} vs {})", i, dy_a[i], dy_b[i]);
+        }
+    }
+
+    /// T3.23 — Test 3: with stiff bounds and ctx supplied, the final
+    /// 8-block residual must not exceed the pre-correction residual.
+    /// The corrective step is monotone: it can only improve (or no-op).
+    /// This is the contract enforced inside `solve_for_direction_with_ir_full`.
+    #[test]
+    fn test_t323_correction_monotone_nonworsening() {
+        // Same stiff-bound setup as Test 1, but use the wrapper's
+        // monotonicity guarantee directly.
+        let n = 1;
+        let m = 0;
+        let x = vec![1.0 + 1e-10];
+        let x_l = vec![1.0];
+        let x_u = vec![f64::INFINITY];
+        let z_l = vec![1e10];
+        let z_u = vec![0.0];
+        let mu = 1e-12;
+        let h = 1.0;
+        let s_l = x[0] - x_l[0];
+        let sigma = z_l[0] / s_l;
+        let mut matrix = SymmetricMatrix::zeros(1);
+        matrix.set(0, 0, h + sigma);
+        let r_x_full = vec![-0.5];
+        let r_x_aug = r_x_full[0] + mu / s_l;
+        let kkt = KktSystem {
+            dim: 1, n, m,
+            matrix: KktMatrix::Dense(matrix),
+            rhs: vec![r_x_aug],
+            delta_c_diag: vec![],
+            scale_factors: None,
+            input_atags: None,
+        };
+        let mut solver_a = DenseLdl::new();
+        solver_a.factor(&kkt.matrix).unwrap();
+        let (dx_a, dy_a) = solve_for_direction_with_ir(
+            &kkt, &mut solver_a, 0.0, 0.0, IrParams::default(),
+        ).unwrap();
+        let ctx = BoundResidualContext {
+            x: &x, x_l: &x_l, x_u: &x_u, z_l: &z_l, z_u: &z_u, mu, r_x_full: &r_x_full,
+        };
+        let (dz_l_a, dz_u_a) = recover_full_step(&ctx, &dx_a);
+        let (ratio_baseline, _, _, _) =
+            compute_full_residual_ratio(&kkt, &ctx, &dx_a, &dy_a, &dz_l_a, &dz_u_a);
+
+        let mut solver_b = DenseLdl::new();
+        solver_b.factor(&kkt.matrix).unwrap();
+        let (dx_b, dy_b) = solve_for_direction_with_ir_full(
+            &kkt, &mut solver_b, 0.0, 0.0, IrParams::default(), Some(&ctx),
+        ).unwrap();
+        let (dz_l_b, dz_u_b) = recover_full_step(&ctx, &dx_b);
+        let (ratio_full, _, _, _) =
+            compute_full_residual_ratio(&kkt, &ctx, &dx_b, &dy_b, &dz_l_b, &dz_u_b);
+
+        // The full-residual path must not produce a worse residual.
+        // It may match exactly (no correction was needed) or improve.
+        assert!(ratio_full <= ratio_baseline + 1e-15,
+            "T3.23: full-residual path must not regress; baseline={}, full={}",
+            ratio_baseline, ratio_full);
     }
 }

@@ -81,7 +81,7 @@ use crate::options::BoundMultInitMethod;
 use crate::options::FixedVariableTreatment;
 use crate::options::SolverOptions;
 use crate::problem::NlpProblem;
-use crate::restoration::RestorationPhase;
+use crate::restoration::{OuterBarrierContext, RestorationPhase};
 use crate::trace;
 use crate::restoration_nlp::RestorationNlp;
 use crate::result::{SolveResult, SolverDiagnostics, SolveStatus};
@@ -531,6 +531,12 @@ impl WatchdogSavedState {
         state.obj = self.obj;
         state.g = self.g.clone();
         state.grad_f = self.grad_f.clone();
+        // T3.25 follow-up: watchdog revert mutates x/y/z/v outside the
+        // line-search choke point that bumps atags. Bump them and drop
+        // the cache so the next factor cannot replay a stale `(δ_w,
+        // δ_c)` against a now-wrong matrix.
+        state.bump_all_kkt_atags();
+        state.factor_cache.invalidate();
     }
 }
 
@@ -629,6 +635,58 @@ pub(crate) struct SolverState {
     /// acceptable-level relative-change gate
     /// (`acceptable_obj_change_tol`). `None` on iteration 0.
     pub last_obj_for_acceptable: Option<f64>,
+    /// T3.25: monotone version counters for the upstream KKT inputs.
+    /// Bumped at the coarse mutation events the IPM controls (line
+    /// search step accepted, multiplier update, callback re-evaluation
+    /// after a new x). Snapshotted into `KktSystem.input_atags` at
+    /// assembly time and consulted by `FactorCache` to short-circuit
+    /// redundant factorizations within a single iteration (QF mu oracle
+    /// → main step, Mehrotra predictor → corrector, Gondzio MCC).
+    pub kkt_atags: kkt::KktInputAtags,
+    /// T3.25 follow-up: per-iteration factorization cache shared
+    /// across the QF mu oracle, the main IPM step, and the condensed
+    /// fallback retries. Initialised from
+    /// `SolverOptions::factor_cache_enabled` in `SolverState::new`;
+    /// when the option is `false` every call is a forced miss
+    /// (`factor_with_inertia_correction_cached` still tracks
+    /// `factor_calls` for diagnostics).
+    pub factor_cache: kkt::FactorCache,
+}
+
+impl SolverState {
+    /// T3.25: invalidate all 11 KKT-input atags. Coarse hammer used
+    /// after restoration handoffs, snapshot restores, and any other
+    /// path where state mutates outside the line-search choke point.
+    /// Cheap (11 increments); correctness over precision.
+    #[inline]
+    pub fn bump_all_kkt_atags(&mut self) {
+        let a = &mut self.kkt_atags;
+        a.w = a.w.wrapping_add(1);
+        a.j_c = a.j_c.wrapping_add(1);
+        a.j_d = a.j_d.wrapping_add(1);
+        a.z_l = a.z_l.wrapping_add(1);
+        a.z_u = a.z_u.wrapping_add(1);
+        a.v_l = a.v_l.wrapping_add(1);
+        a.v_u = a.v_u.wrapping_add(1);
+        a.slacks_x = a.slacks_x.wrapping_add(1);
+        a.slacks_s = a.slacks_s.wrapping_add(1);
+        a.sigma_x = a.sigma_x.wrapping_add(1);
+        a.sigma_s = a.sigma_s.wrapping_add(1);
+    }
+
+    /// T3.25: bump just the dual-multiplier atags (z_l, z_u, v_l, v_u),
+    /// plus their derived `sigma_x` and `sigma_s` views. Used by paths
+    /// that update bound multipliers without changing the primal x.
+    #[inline]
+    pub fn bump_dual_atags(&mut self) {
+        let a = &mut self.kkt_atags;
+        a.z_l = a.z_l.wrapping_add(1);
+        a.z_u = a.z_u.wrapping_add(1);
+        a.v_l = a.v_l.wrapping_add(1);
+        a.v_u = a.v_u.wrapping_add(1);
+        a.sigma_x = a.sigma_x.wrapping_add(1);
+        a.sigma_s = a.sigma_s.wrapping_add(1);
+    }
 }
 
 /// Barrier parameter mode (Ipopt's adaptive mu strategy).
@@ -1095,6 +1153,12 @@ impl SolverState {
             is_square,
             acceptable_iterate: None,
             last_obj_for_acceptable: None,
+            kkt_atags: kkt::KktInputAtags::default(),
+            factor_cache: {
+                let mut c = kkt::FactorCache::new();
+                c.enabled = options.factor_cache_enabled;
+                c
+            },
         }
     }
 
@@ -2349,6 +2413,9 @@ fn advance_z_to_trial(state: &mut SolverState, alpha_d: f64) {
             state.z_u[i] = (state.z_u[i] + alpha_d * state.dz_u[i]).max(1e-20);
         }
     }
+    // T3.25: bump dual atags so a downstream factor doesn't reuse a
+    // stale fingerprint after this trial-step write.
+    state.bump_dual_atags();
 }
 
 /// Apply the kappa_sigma reset to bound multipliers (Ipopt's
@@ -3008,7 +3075,15 @@ fn restore_after_solve_failure<P: NlpProblem>(
     linear_constraints: Option<&[bool]>,
     deadline: Option<Instant>,
 ) -> SolveRestoreOutcome {
-    let (x_rest, success) = restoration.restore(
+    // T3.12: capture the outer (parent) μ + bounds so the GN restoration
+    // can implement IpRestoFilterConvCheck::TestOrigProgress when
+    // `options.restore_early_exit_outer_filter` is enabled.
+    let outer_ctx = OuterBarrierContext {
+        mu_outer: state.mu,
+        x_l: &state.x_l,
+        x_u: &state.x_u,
+    };
+    let (x_rest, success) = restoration.restore_with_outer(
         &state.x, &state.x_l, &state.x_u, &state.g_l, &state.g_u,
         &state.jac_rows, &state.jac_cols, n, m, options,
         &|theta, phi| filter.is_acceptable(theta, phi),
@@ -3016,10 +3091,16 @@ fn restore_after_solve_failure<P: NlpProblem>(
         &|x_eval, jac_out| problem.jacobian_values(x_eval, true, jac_out),
         Some(&|x_eval: &[f64], obj_out: &mut f64| problem.objective(x_eval, true, obj_out)),
         deadline,
+        Some(&outer_ctx),
     );
     if success {
         state.x = x_rest;
         state.alpha_primal = 0.0;
+        // T3.25 follow-up: hand-rolled `state.x = ...` outside the line
+        // search choke point. Bump atags and drop the cache so the
+        // post-restoration factor doesn't replay a stale fingerprint.
+        state.bump_all_kkt_atags();
+        state.factor_cache.invalidate();
         let _ = evaluate_and_refresh_lbfgs(state, problem, lbfgs_state, linear_constraints, lbfgs_mode);
         return SolveRestoreOutcome::Continue;
     }
@@ -3423,9 +3504,17 @@ fn fall_back_to_full_kkt_after_condensed_failure<P: NlpProblem>(
     deadline: Option<Instant>,
 ) -> CondensedDirectionOutcome {
     let mut kkt = assemble_kkt_from_state(state, n, m, sigma, use_sparse, options.kappa_d);
-    let fb_ic = kkt::factor_with_inertia_correction(
-        &mut kkt, lin_solver, inertia_params, state.mu,
-    );
+    // T3.25 follow-up: shared `lin_solver` instance, so the cache is
+    // valid if the upstream atags + (δ_x, δ_c) still match the last
+    // committed factor.
+    let fb_ic = {
+        let mut cache = std::mem::take(&mut state.factor_cache);
+        let r = kkt::factor_with_inertia_correction_cached(
+            &mut kkt, lin_solver, inertia_params, state.mu, &mut cache,
+        );
+        state.factor_cache = cache;
+        r
+    };
     if fb_ic.is_err() {
         return apply_solve_failure_restoration(
             state, problem, options, n, m, filter, restoration,
@@ -3539,6 +3628,13 @@ fn solve_full_augmented_direction<P: NlpProblem>(
     let (dir_result, _, _) = solve_with_quality_escalation(
         kkt_system_opt, lin_solver, inertia_params, options, ic_delta_w, ic_delta_c, n, m,
     );
+    // T3.25 follow-up: solve_with_quality_escalation may have called
+    // `lin_solver.factor` directly (Ruiz, increase_quality, δ_c
+    // perturbation, δ_w escalation) — bypassing the cached entry
+    // point. The factorization the solver now holds no longer matches
+    // the cache's `(δ_w, δ_c)`. Coarse invalidate so the next factor
+    // call cannot replay stale deltas.
+    state.factor_cache.invalidate();
     let (mut dx_dir, mut dy_dir) = match dir_result {
         Ok(d) => d,
         Err(e) => {
@@ -3595,7 +3691,12 @@ fn solve_for_search_direction<P: NlpProblem>(
     let mut mehrotra_aff: Option<(Vec<f64>, Vec<f64>, Vec<f64>, f64)> = None;
 
     let (dx, dy) = if let Some(cond) = condensed_system.as_ref() {
-        match solve_dense_condensed_direction(
+        // T3.25 follow-up: dense-condensed factors a Schur complement via
+        // `bunch_kaufman_factor` on a private DenseLdl. The shared
+        // `lin_solver`'s factorization is unchanged, but to be defensive
+        // against future shared-state reuse we invalidate the cache here.
+        state.factor_cache.invalidate();
+        let outcome = match solve_dense_condensed_direction(
             state, problem, options, n, m, use_sparse, cond, sigma,
             kkt_system_opt, lin_solver, inertia_params, filter, restoration,
             lbfgs_state, lbfgs_mode, linear_constraints, deadline,
@@ -3606,11 +3707,20 @@ fn solve_for_search_direction<P: NlpProblem>(
             }
             CondensedDirectionOutcome::Continue => return DirectionSolveDecision::Continue,
             CondensedDirectionOutcome::Return(r) => return DirectionSolveDecision::Return(r),
-        }
+        };
+        state.factor_cache.invalidate();
+        outcome
     } else if let Some(sc) = sparse_condensed_system.as_ref() {
-        solve_sparse_condensed_direction(
+        // T3.25 follow-up: sparse-condensed calls `lin_solver.factor` on
+        // the Schur complement S, overwriting the shared solver's
+        // factorization. Invalidate before/after so a subsequent cached
+        // entry does not replay augmented-KKT deltas against S's factors.
+        state.factor_cache.invalidate();
+        let outcome = solve_sparse_condensed_direction(
             state, sc, sigma, n, m, use_sparse, lin_solver, inertia_params, options.kappa_d,
-        )
+        );
+        state.factor_cache.invalidate();
+        outcome
     } else {
         match solve_full_augmented_direction(
             state, problem, options, iteration, n, m, kkt_system_opt, lin_solver,
@@ -3813,7 +3923,13 @@ fn try_gn_restoration<P: NlpProblem>(
     m: usize,
     deadline: Option<Instant>,
 ) -> bool {
-    let (x_rest, gn_success) = restoration.restore(
+    // T3.12: outer-NLP barrier context for TestOrigProgress.
+    let outer_ctx = OuterBarrierContext {
+        mu_outer: state.mu,
+        x_l: &state.x_l,
+        x_u: &state.x_u,
+    };
+    let (x_rest, gn_success) = restoration.restore_with_outer(
         &state.x,
         &state.x_l,
         &state.x_u,
@@ -3829,6 +3945,7 @@ fn try_gn_restoration<P: NlpProblem>(
         &|x_eval, jac_out| problem.jacobian_values(x_eval, true, jac_out),
         Some(&|x_eval: &[f64], obj_out: &mut f64| problem.objective(x_eval, true, obj_out)),
         deadline,
+        Some(&outer_ctx),
     );
 
     if gn_success {
@@ -3880,6 +3997,11 @@ fn apply_restoration_recovery_strategy<P: NlpProblem>(
     }
     reset_filter_with_current_theta(state, filter);
     inertia_params.delta_w_last = 0.0;
+    // T3.25 follow-up: μ change rescales sigma which feeds the Hessian
+    // (1,1) block diagonal — the matrix differs from the cached one.
+    // Belt-and-braces: bump atags AND drop the cache.
+    state.bump_all_kkt_atags();
+    state.factor_cache.invalidate();
 }
 
 /// First-restoration-failure μ update. In Free mode, switch to
@@ -4132,7 +4254,13 @@ fn reevaluate_after_step<P: NlpProblem>(
     }
 
     // α halving exhausted: try restoration.
-    let (x_rest, success) = restoration.restore(
+    // T3.12: outer-NLP barrier context for TestOrigProgress.
+    let outer_ctx = OuterBarrierContext {
+        mu_outer: state.mu,
+        x_l: &state.x_l,
+        x_u: &state.x_u,
+    };
+    let (x_rest, success) = restoration.restore_with_outer(
         &state.x, &state.x_l, &state.x_u, &state.g_l, &state.g_u,
         &state.jac_rows, &state.jac_cols, n, m, options,
         &|theta, phi| filter.is_acceptable(theta, phi),
@@ -4140,10 +4268,15 @@ fn reevaluate_after_step<P: NlpProblem>(
         &|x_eval, jac_out| problem.jacobian_values(x_eval, true, jac_out),
         Some(&|x_eval: &[f64], obj_out: &mut f64| problem.objective(x_eval, true, obj_out)),
         deadline,
+        Some(&outer_ctx),
     );
     if success {
         state.x = x_rest;
         state.alpha_primal = 0.0;
+        // T3.25 follow-up: hand-rolled `state.x = ...` outside the line
+        // search choke point. Bump atags and drop the cache.
+        state.bump_all_kkt_atags();
+        state.factor_cache.invalidate();
         if state.evaluate_with_linear(problem, 1.0, linear_constraints, lbfgs_mode) {
             update_lbfgs_hessian(lbfgs_state, state);
             return PostStepEvalDecision::Continue;
@@ -4345,6 +4478,8 @@ impl SoftRestoSnapshot {
         state.grad_f = self.grad_f;
         state.jac_vals = self.jac_vals;
         state.alpha_primal = self.alpha_primal;
+        // T3.25: snapshot restore touches every tracked input.
+        state.bump_all_kkt_atags();
     }
 }
 
@@ -4401,6 +4536,9 @@ fn attempt_soft_restoration<P: NlpProblem>(
         state.z_l[i] = (state.z_l[i] + alpha_d * state.dz_l[i]).max(0.0);
         state.z_u[i] = (state.z_u[i] + alpha_d * state.dz_u[i]).max(0.0);
     }
+    // T3.25: soft-resto trial step writes x and duals directly (does
+    // not go through commit_trial_point), so bump atags ourselves.
+    state.bump_all_kkt_atags();
 
     // Re-evaluate obj + grad + constraints + jac (skip Hessian — soft test
     // only inspects gradient-level info).
@@ -4594,7 +4732,13 @@ fn recover_from_factor_failure<P: NlpProblem>(
     lbfgs_mode: bool,
     deadline: Option<Instant>,
 ) -> FactorDecision {
-    let (x_rest, success) = restoration.restore(
+    // T3.12: outer-NLP barrier context for TestOrigProgress.
+    let outer_ctx = OuterBarrierContext {
+        mu_outer: state.mu,
+        x_l: &state.x_l,
+        x_u: &state.x_u,
+    };
+    let (x_rest, success) = restoration.restore_with_outer(
         &state.x, &state.x_l, &state.x_u, &state.g_l, &state.g_u,
         &state.jac_rows, &state.jac_cols, n, m, options,
         &|theta, phi| filter.is_acceptable(theta, phi),
@@ -4602,6 +4746,7 @@ fn recover_from_factor_failure<P: NlpProblem>(
         &|x_eval, jac_out| problem.jacobian_values(x_eval, true, jac_out),
         Some(&|x_eval: &[f64], obj_out: &mut f64| problem.objective(x_eval, true, obj_out)),
         deadline,
+        Some(&outer_ctx),
     );
     if success {
         // T-MIT-G: detect restoration returning essentially the same x.
@@ -4677,8 +4822,25 @@ fn factor_kkt_with_recovery<P: NlpProblem>(
         };
         rip_log!("ripopt: Factoring KKT dim={} nnz={}...", dim, nnz);
     }
-    let inertia_result =
-        kkt::factor_with_inertia_correction(kkt_system, lin_solver, inertia_params, state.mu);
+    // T3.25 follow-up: route through the cached entry point. Same
+    // `lin_solver` instance persists across iterations, so a cache hit
+    // (atags + (δ_x, δ_c) match the previous accepted factor) replays
+    // (δ_w, δ_c) without re-factoring. In practice the upstream atags
+    // bump on every accepted line-search step, so cross-iteration hits
+    // require a no-op iteration; the cache primarily exists to be
+    // bit-identical with the no-cache path and to be future-proof for
+    // intra-iteration secondary factorisations.
+    let inertia_result = {
+        // Move the cache out of `state` (state is borrowed mutably for
+        // `state.mu` below); put it back unconditionally before
+        // returning.
+        let mut cache = std::mem::take(&mut state.factor_cache);
+        let r = kkt::factor_with_inertia_correction_cached(
+            kkt_system, lin_solver, inertia_params, state.mu, &mut cache,
+        );
+        state.factor_cache = cache;
+        r
+    };
     if options.print_level >= 5 {
         rip_log!("ripopt: KKT factorization took {:.3}s (ok={})",
             t_fact.elapsed().as_secs_f64(), inertia_result.is_ok());
@@ -4861,6 +5023,7 @@ fn compute_quality_function_mu(
     mu_state: &mut MuState,
     avg_compl: f64,
     use_sparse: bool,
+    factor_cache: &mut kkt::FactorCache,
 ) -> Option<f64> {
     let n = state.n;
     let m = state.m;
@@ -4869,12 +5032,36 @@ fn compute_quality_function_mu(
         return None;
     }
 
-    // 1) Assemble + factor KKT at the current iterate.
+    // 1) Assemble + factor KKT at the current iterate. T3.25 follow-up:
+    // the QF oracle uses a *local* fallback solver instance, distinct
+    // from the main-loop `lin_solver`. A cache hit on the shared cache
+    // would replay `(δ_w, δ_c)` whose underlying factorization lives in
+    // the main loop's solver — incorrect for this local solver. Use a
+    // private per-call cache that mirrors the shared cache's `enabled`
+    // flag, so the cached entry point is exercised on this path
+    // (factor_calls bumps) but the shared cache remains valid for the
+    // main loop's next factor.
     let sigma_vec = compute_sigma_from_state(state);
     let mut kkt = assemble_kkt_from_state(state, n, m, &sigma_vec, use_sparse, options.kappa_d);
+    // Stamp the upstream atags onto the fresh KktSystem so the cached
+    // entry point can fingerprint it (assemble_kkt_from_state predates
+    // T3.25 and does not propagate atags).
+    if kkt.input_atags.is_none() {
+        kkt.input_atags = Some(state.kkt_atags);
+    }
     let mut solver = new_fallback_solver(use_sparse);
     let mut inertia_params = InertiaCorrectionParams::default();
-    if kkt::factor_with_inertia_correction(&mut kkt, solver.as_mut(), &mut inertia_params, state.mu).is_err() {
+    let mut local_cache = kkt::FactorCache::new();
+    local_cache.enabled = factor_cache.enabled;
+    let factor_result = kkt::factor_with_inertia_correction_cached(
+        &mut kkt, solver.as_mut(), &mut inertia_params, state.mu, &mut local_cache,
+    );
+    // Fold the local diagnostic counters into the shared cache so tests
+    // can observe that the QF path exercised the cached entry point.
+    factor_cache.factor_calls += local_cache.factor_calls;
+    factor_cache.hits += local_cache.hits;
+    factor_cache.misses += local_cache.misses;
+    if factor_result.is_err() {
         return None;
     }
 
@@ -5204,6 +5391,8 @@ fn switch_to_fixed_mode_with_adaptive_init(
             state.z_u = snap.z_u;
             state.v_l = snap.v_l;
             state.v_u = snap.v_u;
+            // T3.25: rollback touches every tracked KKT input.
+            state.bump_all_kkt_atags();
             log::debug!("Free→Fixed rollback: restored accepted_point");
         }
     }
@@ -5255,7 +5444,18 @@ fn apply_free_mode_sufficient_progress_update(
         // T2.23: try the Ipopt-style Quality Function oracle first
         // (spec §3.5, IpQualityFunctionMuOracle.cpp). Falls back to the
         // Loqo formula on aff/centering solve failure.
-        state.mu = compute_quality_function_mu(state, options, mu_state, avg_compl, use_sparse)
+        //
+        // T3.25 follow-up: move the factor cache out of `state`, run
+        // the oracle with `&state` + the cache borrowed exclusively,
+        // then put the cache back. This avoids a double mutable borrow
+        // on `state` without resorting to raw pointers, and preserves
+        // the diagnostic counters across the call.
+        let mut cache = std::mem::take(&mut state.factor_cache);
+        let qf_mu = compute_quality_function_mu(
+            state, options, mu_state, avg_compl, use_sparse, &mut cache,
+        );
+        state.factor_cache = cache;
+        state.mu = qf_mu
             .unwrap_or_else(|| compute_loqo_mu(state, options, mu_state, avg_compl));
     } else if avg_compl > 0.0 {
         // T2.3: dropped the ripopt-specific `μ/5` floor that fired when
@@ -8102,6 +8302,13 @@ fn apply_restoration_success<P: NlpProblem>(
     mu_state.first_iter_in_mode = true;
     mu_state.ref_vals.clear();
     mu_state.consecutive_restoration_failures = 0;
+    // T3.25 follow-up: restoration handoff replaces x/y/z/v wholesale.
+    // The atag updates above (via the writes to state.x etc.) do NOT
+    // bump kkt_atags by themselves, so drop the cache explicitly. This
+    // is the coarse "invalidate at boundary" path the T3.25 report
+    // recommended over fine-grained per-write atag plumbing.
+    state.bump_all_kkt_atags();
+    state.factor_cache.invalidate();
     true
 }
 
@@ -9442,7 +9649,7 @@ fn assemble_kkt_from_state(
     use_sparse: bool,
     kappa_d: f64,
 ) -> kkt::KktSystem {
-    kkt::assemble_kkt(
+    let mut sys = kkt::assemble_kkt(
         n, m,
         &state.hess_rows, &state.hess_cols, &state.hess_vals,
         &state.jac_rows, &state.jac_cols, &state.jac_vals,
@@ -9450,7 +9657,14 @@ fn assemble_kkt_from_state(
         &state.y, &state.z_l, &state.z_u,
         &state.x, &state.x_l, &state.x_u, state.mu, kappa_d,
         use_sparse, &state.v_l, &state.v_u,
-    )
+    );
+    // T3.25: snapshot the upstream atags. The assembled matrix is a
+    // pure function of (W, J, sigma_x, sigma_s, slacks, multipliers),
+    // so the atag tuple uniquely identifies it. The perturbation
+    // (δ_x, δ_c) is layered on at factor time and tracked separately
+    // by `FactorCache`.
+    sys.input_atags = Some(state.kkt_atags);
+    sys
 }
 
 /// Commit a trial point as the new iterate: writes `x`, `obj`, `g`,
@@ -9468,6 +9682,18 @@ fn commit_trial_point(
     state.obj = obj_trial;
     state.g = g_trial;
     state.alpha_primal = alpha;
+    // T3.25: x and g have changed → slacks_x, slacks_s, sigma_x, sigma_s
+    // are now stale. The Hessian and Jacobian also typically get
+    // re-evaluated against the new x downstream of this commit, so bump
+    // them too. This is a coarse-grained, conservative bump: the IPM
+    // re-evaluates after every accepted step regardless.
+    state.kkt_atags.slacks_x = state.kkt_atags.slacks_x.wrapping_add(1);
+    state.kkt_atags.slacks_s = state.kkt_atags.slacks_s.wrapping_add(1);
+    state.kkt_atags.sigma_x = state.kkt_atags.sigma_x.wrapping_add(1);
+    state.kkt_atags.sigma_s = state.kkt_atags.sigma_s.wrapping_add(1);
+    state.kkt_atags.w = state.kkt_atags.w.wrapping_add(1);
+    state.kkt_atags.j_c = state.kkt_atags.j_c.wrapping_add(1);
+    state.kkt_atags.j_d = state.kkt_atags.j_d.wrapping_add(1);
 }
 
 /// Sum of absolute values of all Lagrange multipliers in the iterate:
@@ -9697,6 +9923,11 @@ fn populate_final_diagnostics(state: &SolverState) -> SolverDiagnostics {
     diag.final_dual_inf = compute_dual_inf_at_state(state);
     diag.final_compl = compute_compl_err_at_state(state);
     diag.final_s_d = compute_s_d_at_state(state);
+    // T3.25 follow-up: surface cache counters so tests can verify the
+    // cached entry point fired and benchmarks can quantify hit rates.
+    diag.factor_cache_hits = state.factor_cache.hits;
+    diag.factor_cache_misses = state.factor_cache.misses;
+    diag.factor_cache_factor_calls = state.factor_cache.factor_calls;
     diag
 }
 
@@ -9790,6 +10021,8 @@ mod tests {
             is_square: false,
             acceptable_iterate: None,
             last_obj_for_acceptable: None,
+            kkt_atags: kkt::KktInputAtags::default(),
+            factor_cache: kkt::FactorCache::new(),
         }
     }
 
@@ -10726,7 +10959,8 @@ mod tests {
         let mut mu_state = MuState::new();
         let avg = compute_avg_complementarity(&state);
         assert!(avg > 0.0, "test state must have positive avg_compl");
-        let mu = compute_quality_function_mu(&state, &opts, &mut mu_state, avg, false);
+        let mut cache = kkt::FactorCache::new();
+        let mu = compute_quality_function_mu(&state, &opts, &mut mu_state, avg, false, &mut cache);
         let mu = mu.expect("QF oracle should produce μ on a well-formed iterate");
         let cap = opts.mu_max_fact * avg;
         assert!(mu >= opts.mu_min, "μ below mu_min: {}", mu);
@@ -10741,7 +10975,8 @@ mod tests {
         let state = qf_minimal_state();
         let opts = SolverOptions::default();
         let mut mu_state = MuState::new();
-        let mu = compute_quality_function_mu(&state, &opts, &mut mu_state, 0.0, false);
+        let mut cache = kkt::FactorCache::new();
+        let mu = compute_quality_function_mu(&state, &opts, &mut mu_state, 0.0, false, &mut cache);
         assert!(mu.is_none(), "QF oracle must reject avg_compl ≤ 0");
     }
 
@@ -10759,11 +10994,13 @@ mod tests {
 
         let opts_off = SolverOptions { quality_function_centrality: false, ..SolverOptions::default() };
         let mut mus_off = MuState::new();
-        let mu_off = compute_quality_function_mu(&state, &opts_off, &mut mus_off, avg, false)
+        let mut cache_off = kkt::FactorCache::new();
+        let mu_off = compute_quality_function_mu(&state, &opts_off, &mut mus_off, avg, false, &mut cache_off)
             .expect("QF off");
         let opts_on = SolverOptions { quality_function_centrality: true, ..SolverOptions::default() };
         let mut mus_on = MuState::new();
-        let mu_on = compute_quality_function_mu(&state, &opts_on, &mut mus_on, avg, false)
+        let mut cache_on = kkt::FactorCache::new();
+        let mu_on = compute_quality_function_mu(&state, &opts_on, &mut mus_on, avg, false, &mut cache_on)
             .expect("QF on");
         let cap = opts_off.mu_max_fact * avg;
         for mu in [mu_off, mu_on] {
@@ -10831,6 +11068,139 @@ mod tests {
         let ratio = on / off;
         assert!(ratio < 2.0 && ratio > 0.5,
             "QF iterations diverge from Loqo: off={} on={}", r_off.iterations, r_on.iterations);
+    }
+
+    // ---- T3.25 follow-up: factor cache wiring (QF / Mehrotra / Gondzio) ----
+
+    /// Tiny equality-constrained QP `min 0.5·(x²+y²+z²) s.t. x+y+z = 3` with
+    /// optimum at (1,1,1). Three variables, one equality constraint —
+    /// exercises the full augmented KKT path (n+m=4, no condensed dispatch).
+    struct CachedQpProblem;
+    impl NlpProblem for CachedQpProblem {
+        fn num_variables(&self) -> usize { 3 }
+        fn num_constraints(&self) -> usize { 1 }
+        fn bounds(&self, x_l: &mut [f64], x_u: &mut [f64]) {
+            for i in 0..3 { x_l[i] = f64::NEG_INFINITY; x_u[i] = f64::INFINITY; }
+        }
+        fn constraint_bounds(&self, g_l: &mut [f64], g_u: &mut [f64]) {
+            g_l[0] = 3.0; g_u[0] = 3.0;
+        }
+        fn initial_point(&self, x0: &mut [f64]) { x0[0] = 0.0; x0[1] = 0.0; x0[2] = 0.0; }
+        fn objective(&self, x: &[f64], _: bool, obj: &mut f64) -> bool {
+            *obj = 0.5 * (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]);
+            true
+        }
+        fn gradient(&self, x: &[f64], _: bool, g: &mut [f64]) -> bool {
+            g[0] = x[0]; g[1] = x[1]; g[2] = x[2]; true
+        }
+        fn constraints(&self, x: &[f64], _: bool, g: &mut [f64]) -> bool {
+            g[0] = x[0] + x[1] + x[2]; true
+        }
+        fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            (vec![0, 0, 0], vec![0, 1, 2])
+        }
+        fn jacobian_values(&self, _: &[f64], _: bool, v: &mut [f64]) -> bool {
+            v[0] = 1.0; v[1] = 1.0; v[2] = 1.0; true
+        }
+        fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            (vec![0, 1, 2], vec![0, 1, 2])
+        }
+        fn hessian_values(&self, _: &[f64], _: bool, obj_factor: f64, _: &[f64], v: &mut [f64]) -> bool {
+            v[0] = obj_factor; v[1] = obj_factor; v[2] = obj_factor; true
+        }
+    }
+
+    /// T3.25 follow-up — Test 1: with `factor_cache_enabled = true`, the
+    /// QF mu oracle path must exercise the cached entry point at least
+    /// once during the IPM iteration. The QF oracle's local cache is
+    /// folded back into the shared diagnostic counters, so any
+    /// quality-function-eligible iterate produces a `factor_calls`
+    /// increment beyond zero.
+    #[test]
+    fn test_factor_cache_fires_when_enabled_on_small_qp() {
+        let problem = CachedQpProblem;
+        let mut opts = SolverOptions::default();
+        opts.factor_cache_enabled = true;
+        opts.mu_oracle_quality_function = true;
+        opts.mu_strategy_adaptive = true;
+        let r = solve_ipm(&problem, &opts);
+        assert_eq!(r.status, SolveStatus::Optimal,
+            "small QP must solve to optimal with cache enabled, got {:?}",
+            r.status);
+        assert!(r.diagnostics.factor_cache_factor_calls >= 1,
+            "cached entry point must be invoked at least once, got factor_calls={}",
+            r.diagnostics.factor_cache_factor_calls);
+        // Hits + misses can be 0 if every call landed on the cache-disabled
+        // branch (e.g. the QF oracle's local cache always re-factors). The
+        // important assertion is that the cached entry point ran at all.
+    }
+
+    /// T3.25 follow-up — Test 2: bit-identical solve with the cache off
+    /// vs on. A cache HIT replays the prior factorization; if the math
+    /// is correct, it must produce the same numerical iterate. We
+    /// compare final x, objective, and status to bit-exact equality.
+    #[test]
+    fn test_factor_cache_bit_identical_off_vs_on() {
+        let problem = CachedQpProblem;
+
+        let opts_off = SolverOptions {
+            factor_cache_enabled: false,
+            mu_oracle_quality_function: true,
+            mu_strategy_adaptive: true,
+            ..SolverOptions::default()
+        };
+        let r_off = solve_ipm(&problem, &opts_off);
+
+        let opts_on = SolverOptions {
+            factor_cache_enabled: true,
+            mu_oracle_quality_function: true,
+            mu_strategy_adaptive: true,
+            ..SolverOptions::default()
+        };
+        let r_on = solve_ipm(&problem, &opts_on);
+
+        assert_eq!(r_off.status, r_on.status,
+            "status must match: off={:?} on={:?}", r_off.status, r_on.status);
+        assert_eq!(r_off.iterations, r_on.iterations,
+            "iteration count must match: off={} on={}",
+            r_off.iterations, r_on.iterations);
+        assert_eq!(r_off.objective.to_bits(), r_on.objective.to_bits(),
+            "objective must be bit-identical: off={:.17e} on={:.17e}",
+            r_off.objective, r_on.objective);
+        for i in 0..r_off.x.len() {
+            assert_eq!(r_off.x[i].to_bits(), r_on.x[i].to_bits(),
+                "x[{}] must be bit-identical: off={:.17e} on={:.17e}",
+                i, r_off.x[i], r_on.x[i]);
+        }
+
+        // Sanity: cache-off run must report zero hits (cache disabled
+        // means the enabled branch never increments hits/misses).
+        assert_eq!(r_off.diagnostics.factor_cache_hits, 0);
+        assert_eq!(r_off.diagnostics.factor_cache_misses, 0);
+    }
+
+    /// T3.25 follow-up — Test 3: cache-disabled is a true no-op pass-
+    /// through. Exercising the same problem must produce the same
+    /// numerical result as a baseline run (regression guard against
+    /// silent behaviour changes from threading the cache plumbing).
+    #[test]
+    fn test_factor_cache_disabled_is_noop_on_small_qp() {
+        let problem = CachedQpProblem;
+        let opts = SolverOptions {
+            factor_cache_enabled: false,
+            ..SolverOptions::default()
+        };
+        let r = solve_ipm(&problem, &opts);
+        assert_eq!(r.status, SolveStatus::Optimal);
+        // x → (1, 1, 1)
+        for i in 0..3 {
+            assert!((r.x[i] - 1.0).abs() < 1e-6,
+                "x[{}] should be ~1.0, got {}", i, r.x[i]);
+        }
+        assert_eq!(r.diagnostics.factor_cache_hits, 0,
+            "disabled cache must never report hits");
+        assert_eq!(r.diagnostics.factor_cache_misses, 0,
+            "disabled cache must never report misses");
     }
 
     // ---- T2.22 kappa_resto / restoration acceptance (spec §7.7) ----

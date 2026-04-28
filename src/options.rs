@@ -277,6 +277,21 @@ pub struct SolverOptions {
     /// square-problem convention; ripopt's `RestorationPhase` enforces
     /// this automatically when `is_square`).
     pub kappa_resto: f64,
+    /// T3.12: enable Ipopt's `RestoFilterConvCheck::TestOrigProgress`
+    /// early-exit. When `true` (and the caller supplies the outer-NLP
+    /// barrier context: μ_outer, x_l, x_u, n_orig), the GN restoration
+    /// loop tests acceptability of `(θ_outer, φ_outer)` against the
+    /// outer filter after every successful trial step and exits early
+    /// on the first acceptable iterate. φ_outer here is the *outer*
+    /// barrier objective `f(x) − μ_outer · Σ log(slack_i)`, matching
+    /// `IpRestoFilterConvCheck.cpp:53-60` which reads `IpData().curr_mu()`
+    /// of the parent algorithm.
+    ///
+    /// Default: `false` (behaviour matches the pre-T3.12 GN restoration
+    /// — only the post-loop filter check uses the raw objective). The
+    /// flag is wired but kept off by default so the change can land
+    /// behind a single switch and be enabled / benchmarked in isolation.
+    pub restore_early_exit_outer_filter: bool,
     /// Enable slack variable fallback for inequality problems. When the initial
     /// solve fails, retry with explicit slack variables (g(x)-s=0, bounds on s).
     /// Default: true.
@@ -496,6 +511,46 @@ pub struct SolverOptions {
     /// Mirrors Ipopt's `residual_improvement_factor`
     /// (`IpPDFullSpaceSolver.cpp:72-79`, default 0.999999999).
     pub residual_improvement_factor: f64,
+    /// T3.23: when true, after the augmented (4-block) IR loop converges,
+    /// expand `(dx, ds, dy_c, dy_d)` to the full primal-dual step
+    /// `(dx, ds, dy_c, dy_d, dz_L, dz_U, dv_L, dv_U)` via the analytic
+    /// Fiacco recovery and re-check the residual on the unsymmetric
+    /// 8-block system (in ripopt's condensed augmented system the
+    /// v-blocks are already eliminated, leaving the 6 stationarity
+    /// + Jacobian + z-complementarity rows). If the residual ratio
+    /// exceeds `residual_ratio_max`, perform ONE extra back-solve
+    /// correction. Mirrors Ipopt 3.14 `IpPDFullSpaceSolver::ComputeResiduals`
+    /// (lines 666-793).
+    ///
+    /// Default: `false`. **Honest finding**: in ripopt's condensed
+    /// augmented formulation the rows the 8-block check would catch
+    /// (z-complementarity rows 5-6) are zero by construction in exact
+    /// arithmetic — the augmented system uses the same Fiacco recovery
+    /// formula that produces them. Floating-point cancellation in
+    /// `(μ − z·s)/s` is the only source of nonzero residual, and that
+    /// can't be improved by another augmented back-solve (which uses
+    /// the same elimination). Plumbing lives in
+    /// `kkt::solve_for_direction_with_ir_full` for a future
+    /// unsymmetric-IR pathway; the IPM main loop currently does not
+    /// dispatch to it. Flip to `true` only when an unsymmetric KKT
+    /// solver lands.
+    pub ir_residual_full_8_block: bool,
+    /// T3.25 follow-up: enable the factorization cache (`dummy_cache_`
+    /// analog from `IpPDFullSpaceSolver.cpp:430-450`). When `true`, the
+    /// IPM threads a single `FactorCache` through every
+    /// `factor_with_inertia_correction_cached` call site (main step,
+    /// QF mu oracle, condensed-fallback retries) so that consecutive
+    /// solves whose 13-tag dependency fingerprint matches skip the
+    /// underlying supernodal-LDLᵀ refactor and replay the cached
+    /// `(δ_w, δ_c)`.
+    ///
+    /// Default: `false`. Plumbing landed in T3.25; the cache is opt-in
+    /// pending benchmark validation. Cache hits are bit-identical with
+    /// the no-cache path by construction (the underlying solver still
+    /// holds the matching factorization), so flipping this on is
+    /// expected to be a pure win for problems where multiple solves
+    /// per iteration share a matrix.
+    pub factor_cache_enabled: bool,
     /// If set, serialize each KKT matrix (main IPM loop only) to this directory
     /// after factorization. Writes two files per iteration:
     ///   `<kkt_dump_name>_<iter:04>.mtx`  — Matrix Market format, symmetric, lower triangle
@@ -607,6 +662,7 @@ impl Default for SolverOptions {
             restoration_max_iter: 200,
             disable_nlp_restoration: false,
             kappa_resto: 0.9,
+            restore_early_exit_outer_filter: false,
             enable_slack_fallback: true,
             enable_lbfgs_fallback: true,
             enable_preprocessing: true,
@@ -653,6 +709,18 @@ impl Default for SolverOptions {
             residual_ratio_max: 1e-10,
             residual_ratio_singular: 1e-5,
             residual_improvement_factor: 0.999999999,
+            // T3.23: default OFF. Analysis (see kkt.rs::compute_full_residual_ratio
+            // doc) shows the complementarity residual rows (5)-(6) are zero by
+            // construction in exact arithmetic when the analytic Fiacco recovery
+            // is used — the elimination is the same formula. The check therefore
+            // measures only floating-point cancellation in `(μ − z·s)`, which is
+            // tiny on well-conditioned problems and not actionable via another
+            // augmented back-solve (the corrective solve uses the same elimination).
+            // The plumbing is in place; flip to true once a true unsymmetric-IR
+            // path is added (T3.23 follow-up).
+            ir_residual_full_8_block: false,
+            // T3.25 follow-up: cache stays off by default until benchmarked.
+            factor_cache_enabled: false,
             bound_mult_init_method: BoundMultInitMethod::Constant,
             bound_mult_init_val: 1.0,
             fixed_variable_treatment: FixedVariableTreatment::RelaxBounds,

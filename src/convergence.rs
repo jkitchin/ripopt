@@ -767,4 +767,120 @@ mod tests {
         let di_s = dual_infeasibility_scaled(&grad_f, &jac_rows, &jac_cols, &jac_vals, &lambda, &z_l, &z_u, n, 0.0, 0.0, &x_l, &x_u);
         assert!(di_s < 1e-12, "Scaled stationarity should give 0, got {}", di_s);
     }
+
+    /// T3.9: For a one-sided lower-bounded variable, the kappa_d damping
+    /// should add `+ kappa_d * mu` to grad_lag, exactly canceling a small
+    /// negative raw residual driven by an over-estimated z_l.
+    /// Mirrors `IpIpoptCalculatedQuantities.cpp:888-899`.
+    #[test]
+    fn test_dual_infeasibility_kappa_d_one_sided_lower_cancels() {
+        let n = 1;
+        let grad_f = vec![1.0];
+        let jac_rows: Vec<usize> = vec![];
+        let jac_cols: Vec<usize> = vec![];
+        let jac_vals: Vec<f64> = vec![];
+        let lambda: Vec<f64> = vec![];
+        // raw grad_lag = grad_f - z_l = 1.0 - (1.0 + 1e-6) = -1e-6
+        let z_l = vec![1.0 + 1e-6];
+        let z_u = vec![0.0];
+        let x_l = vec![0.0];
+        let x_u = vec![f64::INFINITY];
+        let kappa_d = 1e-5;
+        let mu = 0.1;
+        // damped = -1e-6 + kappa_d*mu = -1e-6 + 1e-6 = 0
+        let di = dual_infeasibility(
+            &grad_f, &jac_rows, &jac_cols, &jac_vals, &lambda, &z_l, &z_u, n,
+            kappa_d, mu, &x_l, &x_u,
+        );
+        assert!(di < 1e-15, "damped one-sided-lower should be ~0, got {}", di);
+
+        // Without damping, the residual should be visible at 1e-6.
+        let di_undamped = dual_infeasibility(
+            &grad_f, &jac_rows, &jac_cols, &jac_vals, &lambda, &z_l, &z_u, n,
+            0.0, 0.0, &x_l, &x_u,
+        );
+        assert!(
+            (di_undamped - 1e-6).abs() < 1e-15,
+            "undamped should expose 1e-6 residual, got {}",
+            di_undamped,
+        );
+    }
+
+    /// T3.9: For a one-sided upper-bounded variable, the kappa_d damping
+    /// should subtract `kappa_d * mu` from grad_lag, canceling a small
+    /// positive raw residual.
+    #[test]
+    fn test_dual_infeasibility_kappa_d_one_sided_upper_cancels() {
+        let n = 1;
+        let grad_f = vec![-1.0];
+        let jac_rows: Vec<usize> = vec![];
+        let jac_cols: Vec<usize> = vec![];
+        let jac_vals: Vec<f64> = vec![];
+        let lambda: Vec<f64> = vec![];
+        // raw grad_lag = grad_f + z_u = -1.0 + (1.0 + 1e-6) = +1e-6
+        let z_l = vec![0.0];
+        let z_u = vec![1.0 + 1e-6];
+        let x_l = vec![f64::NEG_INFINITY];
+        let x_u = vec![0.0];
+        let kappa_d = 1e-5;
+        let mu = 0.1;
+        // damped = +1e-6 - kappa_d*mu = +1e-6 - 1e-6 = 0
+        let di = dual_infeasibility(
+            &grad_f, &jac_rows, &jac_cols, &jac_vals, &lambda, &z_l, &z_u, n,
+            kappa_d, mu, &x_l, &x_u,
+        );
+        assert!(di < 1e-15, "damped one-sided-upper should be ~0, got {}", di);
+    }
+
+    /// T3.9: A free (no-bounds) variable receives no damping; the
+    /// residual is exactly |grad_f|.
+    #[test]
+    fn test_dual_infeasibility_kappa_d_free_var_undamped() {
+        let n = 1;
+        let grad_f = vec![0.5];
+        let jac_rows: Vec<usize> = vec![];
+        let jac_cols: Vec<usize> = vec![];
+        let jac_vals: Vec<f64> = vec![];
+        let lambda: Vec<f64> = vec![];
+        let z_l = vec![0.0];
+        let z_u = vec![0.0];
+        let x_l = vec![f64::NEG_INFINITY];
+        let x_u = vec![f64::INFINITY];
+        let di = dual_infeasibility(
+            &grad_f, &jac_rows, &jac_cols, &jac_vals, &lambda, &z_l, &z_u, n,
+            1e-5, 0.1, &x_l, &x_u,
+        );
+        assert!(
+            (di - 0.5).abs() < 1e-15,
+            "free var must not be damped, got {}",
+            di,
+        );
+    }
+
+    /// T3.9: A two-sided-bounded variable should see the +kappa_d*mu
+    /// and -kappa_d*mu terms cancel, leaving the raw residual unchanged.
+    /// Mirrors Ipopt's `Px_L*1 - Px_U*1` projection algebra.
+    #[test]
+    fn test_dual_infeasibility_kappa_d_two_sided_no_net_damping() {
+        let n = 1;
+        let grad_f = vec![0.25];
+        let jac_rows: Vec<usize> = vec![];
+        let jac_cols: Vec<usize> = vec![];
+        let jac_vals: Vec<f64> = vec![];
+        let lambda: Vec<f64> = vec![];
+        let z_l = vec![0.0];
+        let z_u = vec![0.0];
+        // Two-sided: both bounds finite — net damping must be zero.
+        let x_l = vec![-1.0];
+        let x_u = vec![1.0];
+        let di = dual_infeasibility(
+            &grad_f, &jac_rows, &jac_cols, &jac_vals, &lambda, &z_l, &z_u, n,
+            1e-5, 0.1, &x_l, &x_u,
+        );
+        assert!(
+            (di - 0.25).abs() < 1e-15,
+            "two-sided var must see no net damping, got {}",
+            di,
+        );
+    }
 }

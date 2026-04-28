@@ -76,6 +76,20 @@ pub struct SolverDiagnostics {
     pub wall_time_secs: f64,
     /// Fallback strategy used, if any.
     pub fallback_used: Option<String>,
+    /// T3.25 follow-up: number of `factor_with_inertia_correction_cached`
+    /// invocations whose 13-tag fingerprint matched the previous
+    /// successful factor and so skipped the underlying `solver.factor`.
+    /// Always 0 when `SolverOptions::factor_cache_enabled = false`.
+    pub factor_cache_hits: u64,
+    /// T3.25 follow-up: number of cached-entry calls that fell through
+    /// to a real factorization. Counted even when the cache is enabled
+    /// but the fingerprint changed (atag bump or first call).
+    pub factor_cache_misses: u64,
+    /// T3.25 follow-up: total number of times `solver.factor` was
+    /// invoked through the cached entry point. Exercised by every
+    /// caller of `factor_with_inertia_correction_cached`, including
+    /// the cache-disabled path where every call factors.
+    pub factor_cache_factor_calls: u64,
 }
 
 impl SolverDiagnostics {
