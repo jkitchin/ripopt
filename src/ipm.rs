@@ -671,6 +671,26 @@ struct MuState {
     /// upper bound on adaptive μ (`IpAdaptiveMuUpdate.cpp:267-273`).
     /// `None` until the first oracle call captures it.
     initial_avg_compl: Option<f64>,
+    /// T3.11: snapshot of the last Free-mode iterate that satisfied
+    /// `CheckSufficientProgress` (Ipopt `accepted_point_`,
+    /// `IpAdaptiveMuUpdate.cpp:541-545`). Restored on the Free→Fixed
+    /// switch when `adaptive_mu_restore_previous_iterate` is on. `None`
+    /// until the option fires the first capture.
+    accepted_iterate: Option<AcceptedIterateSnapshot>,
+}
+
+/// T3.11: full primal-dual iterate snapshot used by the
+/// `adaptive_mu_restore_previous_iterate` rollback. Mirrors Ipopt's
+/// `IteratesVector` payload (`IpAdaptiveMuUpdate.cpp:367-369`); slacks
+/// are implicit in ripopt so only x/y/z_l/z_u/v_l/v_u are stored.
+#[derive(Clone)]
+struct AcceptedIterateSnapshot {
+    x: Vec<f64>,
+    y: Vec<f64>,
+    z_l: Vec<f64>,
+    z_u: Vec<f64>,
+    v_l: Vec<f64>,
+    v_u: Vec<f64>,
 }
 
 impl MuState {
@@ -687,6 +707,7 @@ impl MuState {
             consecutive_soft_restoration: 0,
             dual_inf_window: Vec::with_capacity(4),
             initial_avg_compl: None,
+            accepted_iterate: None,
         }
     }
 
@@ -5421,6 +5442,22 @@ fn switch_to_fixed_mode_with_adaptive_init(
     mu_state.consecutive_insufficient = 0;
     log::debug!("Switching to fixed mu mode (insufficient progress or tiny step)");
     switch_mu_mode(state, mu_state, MuMode::Fixed);
+    // T3.11: optional rollback to the last Free-mode iterate that
+    // satisfied `CheckSufficientProgress`. Mirrors Ipopt
+    // `IpAdaptiveMuUpdate.cpp:362-370`. Only mu/tau are recomputed
+    // afterwards; the snapshot is consumed on use so a subsequent
+    // Fixed→Free→Fixed cycle re-captures.
+    if options.adaptive_mu_restore_previous_iterate {
+        if let Some(snap) = mu_state.accepted_iterate.take() {
+            state.x = snap.x;
+            state.y = snap.y;
+            state.z_l = snap.z_l;
+            state.z_u = snap.z_u;
+            state.v_l = snap.v_l;
+            state.v_u = snap.v_u;
+            log::debug!("Free→Fixed rollback: restored accepted_point");
+        }
+    }
     let avg_compl = compute_avg_complementarity(state);
     if avg_compl > 0.0 {
         state.mu = (options.adaptive_mu_monotone_init_factor * avg_compl)
@@ -5450,6 +5487,20 @@ fn apply_free_mode_sufficient_progress_update(
 ) {
     mu_state.consecutive_insufficient = 0;
     mu_state.remember_accepted(kkt_error);
+    // T3.11: capture the accepted iterate so a later Free→Fixed switch
+    // can roll back to it. Mirrors Ipopt
+    // `RememberCurrentPointAsAccepted` (IpAdaptiveMuUpdate.cpp:541-545):
+    // only enabled under `adaptive_mu_restore_previous_iterate`.
+    if options.adaptive_mu_restore_previous_iterate {
+        mu_state.accepted_iterate = Some(AcceptedIterateSnapshot {
+            x: state.x.clone(),
+            y: state.y.clone(),
+            z_l: state.z_l.clone(),
+            z_u: state.z_u.clone(),
+            v_l: state.v_l.clone(),
+            v_u: state.v_u.clone(),
+        });
+    }
     let avg_compl = compute_avg_complementarity(state);
     if options.mu_oracle_quality_function && avg_compl > 0.0 {
         // T2.23: try the Ipopt-style Quality Function oracle first

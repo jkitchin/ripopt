@@ -256,6 +256,13 @@ pub struct SolverOptions {
     pub mu_allow_fast_monotone_decrease: bool,
     /// Initial factor for mu in fixed mode: mu = this * avg_compl. Default: 0.8.
     pub adaptive_mu_monotone_init_factor: f64,
+    /// On a Free→Fixed mode switch, restore the most recent iterate that
+    /// was accepted while in Free mode (snapshot taken whenever
+    /// `CheckSufficientProgress` returned true). Mirrors Ipopt option
+    /// `adaptive_mu_restore_previous_iterate` (default `false`,
+    /// `IpAdaptiveMuUpdate.cpp:175,308-311,362-370`). When `false` the
+    /// switch keeps the current iterate; only mu/tau change.
+    pub adaptive_mu_restore_previous_iterate: bool,
     /// Maximum iterations for restoration NLP subproblem. Default: 200.
     pub restoration_max_iter: usize,
     /// Disable NLP restoration (prevents recursion in inner solve). Default: false.
@@ -596,6 +603,7 @@ impl Default for SolverOptions {
             barrier_tol_factor: 10.0,
             mu_allow_fast_monotone_decrease: true,
             adaptive_mu_monotone_init_factor: 0.8,
+            adaptive_mu_restore_previous_iterate: false,
             restoration_max_iter: 200,
             disable_nlp_restoration: false,
             kappa_resto: 0.9,
