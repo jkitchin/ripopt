@@ -365,6 +365,7 @@ name = "feral"
 version = "0.1.0"
 dependencies = [
  "feral-amd",
+ "feral-amf",
  "feral-kahip",
  "feral-metis",
  "feral-ordering-core",
@@ -377,6 +378,13 @@ dependencies = [
 
 [[package]]
 name = "feral-amd"
+version = "0.1.0"
+dependencies = [
+ "feral-ordering-core",
+]
+
+[[package]]
+name = "feral-amf"
 version = "0.1.0"
 dependencies = [
  "feral-ordering-core",

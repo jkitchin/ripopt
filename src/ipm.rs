@@ -4720,15 +4720,20 @@ fn try_gradient_descent_fallback<P: NlpProblem>(
     false
 }
 
-/// Cascade tried after a KKT factorization failure (inertia correction
-/// could not produce the required signature). In order:
-///   1. Early-iteration perturbation recovery (degenerate starting point).
-///   2. Gradient-descent fallback with Armijo backtracking.
-///   3. Gauss–Newton restoration.
-///   4. Last-resort cumulative x perturbation.
-/// Each succeeded path returns `FactorDecision::Continue` so the main
-/// loop restarts the iteration; otherwise the cascade ends with
-/// `FactorDecision::Return(NumericalError)`.
+/// T-MIT-G (Ipopt alignment): on KKT factorization failure (inertia
+/// correction exhausted), trigger restoration directly per
+/// `IpPDFullSpaceSolver.cpp:380-410` and `IpFilterLSAcceptor.cpp` reference
+/// path. Pre-restoration heuristics removed: `try_early_perturbation_recovery`
+/// (random x-perturbation) and `try_gradient_descent_fallback` (Armijo
+/// backtracking on steepest descent) had no Ipopt counterpart and were
+/// silently "succeeding" every iter on Mittelmann ex8_2_2 with tiny
+/// meaningless steps, freezing inf_pr/inf_du/mu while obj drifted —
+/// preventing restoration from ever firing.
+///
+/// Cascade now:
+///   1. Restoration (`restoration.restore`).
+///   2. Last-resort cumulative x-perturbation (kept as final safety net).
+///   3. `NumericalError`.
 #[allow(clippy::too_many_arguments)]
 fn recover_from_factor_failure<P: NlpProblem>(
     state: &mut SolverState,
@@ -4737,30 +4742,17 @@ fn recover_from_factor_failure<P: NlpProblem>(
     iteration: usize,
     n: usize,
     m: usize,
-    use_sparse: bool,
-    lin_solver: &mut dyn LinearSolver,
-    inertia_params: &mut InertiaCorrectionParams,
+    _use_sparse: bool,
+    _lin_solver: &mut dyn LinearSolver,
+    _inertia_params: &mut InertiaCorrectionParams,
     lbfgs_state: &mut Option<LbfgsIpmState>,
     filter: &mut Filter,
+    mu_state: &mut MuState,
     restoration: &mut RestorationPhase,
     linear_constraints: Option<&[bool]>,
     lbfgs_mode: bool,
     deadline: Option<Instant>,
 ) -> FactorDecision {
-    if try_early_perturbation_recovery(
-        state, problem, iteration, n, m, use_sparse,
-        lin_solver, inertia_params, lbfgs_state, filter,
-        linear_constraints, lbfgs_mode, options.kappa_d,
-    ) {
-        return FactorDecision::Continue;
-    }
-
-    if try_gradient_descent_fallback(
-        state, problem, n, lbfgs_state, linear_constraints, lbfgs_mode,
-    ) {
-        return FactorDecision::Continue;
-    }
-
     let (x_rest, success) = restoration.restore(
         &state.x, &state.x_l, &state.x_u, &state.g_l, &state.g_u,
         &state.jac_rows, &state.jac_cols, n, m, options,
@@ -4771,21 +4763,47 @@ fn recover_from_factor_failure<P: NlpProblem>(
         deadline,
     );
     if success {
-        state.x = x_rest;
-        state.alpha_primal = 0.0;
-        let _ = evaluate_and_refresh_lbfgs(state, problem, lbfgs_state, linear_constraints, lbfgs_mode);
-        return FactorDecision::Continue;
+        // T-MIT-G: detect restoration returning essentially the same x.
+        // When factor fails on a feasible interior point, restoration
+        // converges trivially and would cycle forever. Aligns with
+        // Ipopt RestoFilterConvCheck::TestOrigProgress detecting
+        // "restoration cannot make progress on feasibility" → fail.
+        let unchanged = x_rest.iter().zip(state.x.iter())
+            .all(|(a, b)| (a - b).abs() <= 1e-12 * a.abs().max(b.abs()).max(1.0));
+        if unchanged {
+            log::warn!(
+                "recover_from_factor_failure[iter {}]: restoration returned unchanged x \
+                 (factor fails on feasible point — likely structural Jacobian rank deficiency)",
+                iteration
+            );
+            return FactorDecision::Return(make_result(state, SolveStatus::NumericalError));
+        }
+        // T-MIT-G: use the full Ipopt-aligned restoration-success handler
+        // (`apply_restoration_success`) instead of a bare `state.x = x_rest`.
+        // The bare assignment left μ at the corrupted post-failed-step value
+        // (often 1e19 sentinel) and never reset bound/y multipliers, so the
+        // next factor would fail again with the same Sigma indefinite — an
+        // infinite loop.
+        if apply_restoration_success(
+            state, filter, mu_state, options, n, m, problem, &x_rest,
+            None, linear_constraints, lbfgs_mode, lbfgs_state,
+        ) {
+            log::debug!("recover_from_factor_failure[iter {}]: restoration succeeded", iteration);
+            return FactorDecision::Continue;
+        }
     }
 
     if try_last_resort_perturbation(
         state, problem, iteration, n, lbfgs_state, filter,
         linear_constraints, lbfgs_mode,
     ) {
+        log::debug!("recover_from_factor_failure[iter {}]: last_resort_perturbation succeeded", iteration);
         return FactorDecision::Continue;
     }
     FactorDecision::Return(make_result(state, SolveStatus::NumericalError))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn factor_kkt_with_recovery<P: NlpProblem>(
     state: &mut SolverState,
     problem: &P,
@@ -4799,6 +4817,7 @@ fn factor_kkt_with_recovery<P: NlpProblem>(
     inertia_params: &mut InertiaCorrectionParams,
     lbfgs_state: &mut Option<LbfgsIpmState>,
     filter: &mut Filter,
+    mu_state: &mut MuState,
     restoration: &mut RestorationPhase,
     timings: &mut PhaseTimings,
     prev_ic_delta_w: &mut f64,
@@ -4859,7 +4878,7 @@ fn factor_kkt_with_recovery<P: NlpProblem>(
 
     recover_from_factor_failure(
         state, problem, options, iteration, n, m, use_sparse,
-        lin_solver, inertia_params, lbfgs_state, filter, restoration,
+        lin_solver, inertia_params, lbfgs_state, filter, mu_state, restoration,
         linear_constraints, lbfgs_mode, deadline,
     )
 }
@@ -7291,8 +7310,8 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
     let mut log_line_count: usize = 0;
     if options.print_level >= 3 {
         rip_log!(
-            "{:>4}  {:>14}  {:>10}  {:>10}  {:>10}  {:>8}  {:>8}  {:>3}",
-            "iter", "objective", "inf_pr", "inf_du", "mu", "alpha_pr", "alpha_du", "ls"
+            "{:>4}  {:>14}  {:>10}  {:>10}  {:>10}  {:>10}  {:>8}  {:>8}  {:>3}",
+            "iter", "objective", "inf_pr", "inf_du", "compl", "mu", "alpha_pr", "alpha_du", "ls"
         );
     }
 
@@ -7355,7 +7374,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         log_iteration_row(
             iteration,
             &state,
-            primal_inf,
+            primal_inf_max,
             dual_inf,
             compl_inf,
             ls_steps,
@@ -7551,6 +7570,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             &mut inertia_params,
             &mut lbfgs_state,
             &mut filter,
+            &mut mu_state,
             &mut restoration,
             &mut timings,
             &mut prev_ic_delta_w,
