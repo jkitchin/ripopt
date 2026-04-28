@@ -1023,11 +1023,45 @@ pub struct IrParams {
     /// Hard cap on IR steps. Mirrors Ipopt's `max_refinement_steps`
     /// (default 10).
     pub max_steps: usize,
+    /// Acceptance threshold for the residual ratio. IR continues
+    /// while `residual_ratio > residual_ratio_max`. Mirrors Ipopt's
+    /// `residual_ratio_max` (default 1e-10).
+    pub residual_ratio_max: f64,
+    /// Threshold above which an IR-failed solve is declared singular
+    /// (caller must trigger PerturbForSingularity). Below this, the
+    /// IR-stalled solve is accepted. Mirrors Ipopt's
+    /// `residual_ratio_singular` (default 1e-5).
+    pub residual_ratio_singular: f64,
+    /// Stagnation factor for the IR give-up condition. Mirrors
+    /// Ipopt's `residual_improvement_factor` (default 0.999999999).
+    pub residual_improvement_factor: f64,
 }
 
 impl Default for IrParams {
     fn default() -> Self {
-        Self { enabled: true, steps_required: 1, max_steps: 10 }
+        Self {
+            enabled: true,
+            steps_required: 1,
+            max_steps: 10,
+            residual_ratio_max: 1e-10,
+            residual_ratio_singular: 1e-5,
+            residual_improvement_factor: 0.999_999_999,
+        }
+    }
+}
+
+impl IrParams {
+    /// Build an `IrParams` from `SolverOptions`, mapping all five
+    /// Ipopt `IpPDFullSpaceSolver` options.
+    pub fn from_options(options: &crate::options::SolverOptions) -> Self {
+        Self {
+            enabled: options.use_ic_refinement,
+            steps_required: options.iterative_refinement_steps_required,
+            max_steps: options.max_refinement_steps,
+            residual_ratio_max: options.residual_ratio_max,
+            residual_ratio_singular: options.residual_ratio_singular,
+            residual_improvement_factor: options.residual_improvement_factor,
+        }
     }
 }
 
@@ -1089,88 +1123,119 @@ pub fn solve_for_direction_with_ir(
         ));
     }
 
-    // Iterative refinement on the augmented system. Ipopt 3.14 default:
-    // max_refinement_steps = 10, min_refinement_steps = 1. When
-    // `ir.enabled = false` the loop is skipped entirely.
+    // Iterative refinement on the augmented system. Mirrors Ipopt
+    // 3.14 `IpPDFullSpaceSolver::Solve`: continue while
+    // `iter < min_refinement_steps OR residual_ratio > residual_ratio_max`,
+    // give up when iter > min, ratio still > tol, AND either iter > max
+    // or `ratio > improvement_factor * ratio_old` (stagnation/regression).
     let max_refinements = if ir.enabled { ir.max_steps } else { 0 };
     let min_refinements = if ir.enabled { ir.steps_required } else { 0 };
     let mut residual = vec![0.0; dim];
-    let mut prev_res_norm = f64::MAX;
-    for ref_iter in 0..max_refinements {
-        if use_unregularized_residual {
-            matvec_original(kkt, &solution, &mut residual, delta_w, delta_c_ic);
+
+    let compute_ratio = |sol: &[f64], resid_negated: &[f64]| -> f64 {
+        let nrm_rhs: f64 = kkt.rhs.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+        let nrm_res: f64 = sol.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+        let nrm_resid: f64 = resid_negated.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+        let max_cond = 1e6;
+        if nrm_rhs + nrm_res == 0.0 {
+            nrm_resid
         } else {
-            kkt.matrix.matvec(&solution, &mut residual);
+            nrm_resid / (nrm_res.min(max_cond * nrm_rhs) + nrm_rhs)
         }
-        let mut res_norm: f64 = 0.0;
-        for i in 0..dim {
-            residual[i] = kkt.rhs[i] - residual[i];
-            res_norm = res_norm.max(residual[i].abs());
+    };
+
+    // Initial residual + ratio (before any IR step)
+    if use_unregularized_residual {
+        matvec_original(kkt, &solution, &mut residual, delta_w, delta_c_ic);
+    } else {
+        kkt.matrix.matvec(&solution, &mut residual);
+    }
+    for i in 0..dim {
+        residual[i] = kkt.rhs[i] - residual[i];
+    }
+    let mut residual_ratio = compute_ratio(&solution, &residual);
+    let mut residual_ratio_old = residual_ratio;
+    let mut num_iter_ref: usize = 0;
+    let mut quit_refinement = false;
+
+    while !quit_refinement
+        && (num_iter_ref < min_refinements || residual_ratio > ir.residual_ratio_max)
+    {
+        if num_iter_ref >= max_refinements && num_iter_ref >= min_refinements {
+            // Reached the hard cap and the floor is met; the give-up
+            // check below will trip on this iteration after the next
+            // back-solve attempt would be wasted. Break here.
+            break;
         }
 
-        // Always do at least `min_refinements` steps; only after that
-        // can the residual-tolerance and stagnation early-outs fire.
-        if ref_iter + 1 > min_refinements {
-            if res_norm < 1e-12 {
-                break;
-            }
-            let stagnation_factor = if use_unregularized_residual { 0.9 } else { 1.0 - 1e-6 };
-            if res_norm > stagnation_factor * prev_res_norm {
-                break;
-            }
-        }
-        prev_res_norm = res_norm;
-
-        // Solve A_regularized * correction = residual
         let mut correction = vec![0.0; dim];
         if solver.solve(&residual, &mut correction).is_err() {
             break;
         }
-
-        // Update solution
         for i in 0..dim {
             solution[i] += correction[i];
         }
-    }
+        if solution.iter().any(|v| v.is_nan() || v.is_infinite()) {
+            return Err(crate::linear_solver::SolverError::NumericalFailure(
+                "KKT solution contains NaN/Inf during IR".to_string(),
+            ));
+        }
 
-    // Pretend-singular check using Ipopt's normwise residual ratio.
-    // ratio = ||resid||_inf / (min(||sol||_inf, 1e6 * ||rhs||_inf) + ||rhs||_inf)
-    // If ratio > 1e-5 after iterative refinement, the system is numerically singular.
-    {
         if use_unregularized_residual {
             matvec_original(kkt, &solution, &mut residual, delta_w, delta_c_ic);
         } else {
             kkt.matrix.matvec(&solution, &mut residual);
         }
-        let nrm_rhs: f64 = kkt.rhs.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
-        let nrm_res: f64 = solution.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
-        let nrm_resid: f64 = (0..dim).map(|i| (kkt.rhs[i] - residual[i]).abs()).fold(0.0f64, f64::max);
-        let max_cond = 1e6;
-        let residual_ratio = if nrm_rhs + nrm_res == 0.0 {
-            nrm_resid
-        } else {
-            nrm_resid / (nrm_res.min(max_cond * nrm_rhs) + nrm_rhs)
-        };
+        for i in 0..dim {
+            residual[i] = kkt.rhs[i] - residual[i];
+        }
+        residual_ratio = compute_ratio(&solution, &residual);
+        num_iter_ref += 1;
 
-        if residual_ratio > 1e-5 {
-            log::debug!("KKT residual ratio {:.2e} > 1e-5 — pretend singular", residual_ratio);
+        // Ipopt give-up: residual_ratio > tol AND num_iter > min AND
+        //                (num_iter > max OR residual_ratio > improvement_factor * old)
+        if residual_ratio > ir.residual_ratio_max
+            && num_iter_ref > min_refinements
+            && (num_iter_ref > max_refinements
+                || residual_ratio > ir.residual_improvement_factor * residual_ratio_old)
+        {
+            quit_refinement = true;
+        }
+        residual_ratio_old = residual_ratio;
+    }
+
+    // Post-IR singularity decision: replicates Ipopt's "S" vs "s"
+    // (`IpPDFullSpaceSolver.cpp:323-329`). When the IR loop gave up
+    // and `residual_ratio < residual_ratio_singular`, accept the
+    // solution despite the imperfect residual; otherwise raise
+    // `PretendSingular` so the caller can request a singular-branch
+    // perturbation.
+    {
+        if residual_ratio > ir.residual_ratio_singular {
+            log::debug!(
+                "KKT residual ratio {:.2e} > singular {:.2e} — pretend singular",
+                residual_ratio,
+                ir.residual_ratio_singular,
+            );
             return Err(SolverError::PretendSingular);
         }
-        if residual_ratio > 1e-10 {
-            log::debug!("KKT residual ratio {:.2e} (above target 1e-10, proceeding)", residual_ratio);
+        if residual_ratio > ir.residual_ratio_max {
+            log::debug!(
+                "KKT residual ratio {:.2e} (above target {:.2e}, accepting under singular threshold {:.2e})",
+                residual_ratio,
+                ir.residual_ratio_max,
+                ir.residual_ratio_singular,
+            );
         }
 
-        // Solution-magnitude safeguard. Ipopt's residual_ratio check caps
-        // ||sol|| at 1e6·||rhs|| in the denominator (IpPDFullSpaceSolver.cpp:815
-        // "ToDo: ... safeguard against incredibly large solution vectors"), so
-        // when J is rank-deficient iterative refinement can converge to a
-        // null-space solution with tiny residual but enormous norm. Fraction-
-        // to-boundary then drives α→0 and the solver stalls.
-        //
-        // Rule: if ||sol||_inf / max(||rhs||_inf, 1) > κ, treat as pretend-
-        // singular so the upstream chain applies δ_c (lifting the rank
-        // deficiency) and re-solves. κ=1e10 is permissive enough for
-        // genuinely ill-conditioned (but not rank-deficient) systems.
+        // Solution-magnitude safeguard (rank-deficiency guard kept
+        // from the prior implementation). Ipopt's denominator caps
+        // ||sol|| at 1e6·||rhs||, so an IR loop can converge to a
+        // null-space solution with tiny residual but enormous norm.
+        // Treat as pretend-singular so the upstream chain applies
+        // δ_c (lifting the rank deficiency) and re-solves.
+        let nrm_rhs: f64 = kkt.rhs.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+        let nrm_res: f64 = solution.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
         let magnitude_ratio = nrm_res / nrm_rhs.max(1.0);
         if magnitude_ratio > 1e10 {
             log::debug!(
@@ -1224,7 +1289,26 @@ pub fn solve_for_direction_iter_aware(
     delta_w: f64,
     delta_c_ic: f64,
 ) -> Result<(Vec<f64>, Vec<f64>), crate::linear_solver::SolverError> {
-    match solve_for_direction(kkt, solver, delta_w, delta_c_ic) {
+    solve_for_direction_iter_aware_with_ir(
+        kkt, solver, params, delta_w, delta_c_ic, IrParams::default(),
+    )
+}
+
+/// T-MIT-F: explicit-IR-config variant of
+/// `solve_for_direction_iter_aware`. Threads the user-tunable IR
+/// settings (`min/max_refinement_steps`, `residual_ratio_max`,
+/// `residual_ratio_singular`, `residual_improvement_factor`) into
+/// the underlying back-solve so the caller can match Ipopt's
+/// `IpPDFullSpaceSolver` options exactly.
+pub fn solve_for_direction_iter_aware_with_ir(
+    kkt: &KktSystem,
+    solver: &mut dyn LinearSolver,
+    params: &mut InertiaCorrectionParams,
+    delta_w: f64,
+    delta_c_ic: f64,
+    ir: IrParams,
+) -> Result<(Vec<f64>, Vec<f64>), crate::linear_solver::SolverError> {
+    match solve_for_direction_with_ir(kkt, solver, delta_w, delta_c_ic, ir) {
         Ok(v) => Ok(v),
         Err(SolverError::PretendSingular) if !params.pretend_singular_used => {
             // First pretend-singular this iter — allow it and record.
@@ -2662,7 +2746,7 @@ mod tests {
         // IR disabled — single backsolve.
         let mut solver_a = DenseLdl::new();
         solver_a.factor(&kkt.matrix).unwrap();
-        let ir_off = IrParams { enabled: false, steps_required: 0, max_steps: 0 };
+        let ir_off = IrParams { enabled: false, steps_required: 0, max_steps: 0, ..IrParams::default() };
         let (dx_a, dy_a) = solve_for_direction_with_ir(&kkt, &mut solver_a, 0.0, 0.0, ir_off).unwrap();
         let mut sol_a = dx_a.clone();
         sol_a.extend_from_slice(&dy_a);

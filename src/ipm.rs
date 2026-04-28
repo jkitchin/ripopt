@@ -3087,26 +3087,36 @@ fn maybe_revert_mehrotra_deflection(
 /// Each rung re-factors and re-solves; the loop exits once the
 /// solve no longer reports `PretendSingular`. Returns the final
 /// `dir_result` and the (possibly increased) `(ic_delta_w, ic_delta_c)`.
+///
+/// T-MIT-F: the underlying `solve_for_direction*` calls receive an
+/// `IrParams` built from `options`, so the IR loop's
+/// `min/max_refinement_steps`, `residual_ratio_max/singular`, and
+/// `residual_improvement_factor` come from the user's options
+/// instead of hardcoded constants. This matches Ipopt's
+/// `IpPDFullSpaceSolver` option surface 1:1.
 fn solve_with_quality_escalation(
     kkt_system_opt: &mut Option<kkt::KktSystem>,
     lin_solver: &mut dyn LinearSolver,
     inertia_params: &mut InertiaCorrectionParams,
+    options: &SolverOptions,
     mut ic_delta_w: f64,
     mut ic_delta_c: f64,
     n: usize,
     m: usize,
 ) -> (Result<(Vec<f64>, Vec<f64>), crate::linear_solver::SolverError>, f64, f64) {
+    let ir = kkt::IrParams::from_options(options);
     // T0.14: gate the pretend-singular trigger so it can fire at most
     // once per outer iter. After this call, if the system was reported
     // as pretend-singular, the standard escalation ladder runs below;
     // any second pretend-singular within the same iter (e.g. from a
     // re-solve after the ladder) will be suppressed by the wrapper.
-    let mut dir_result = kkt::solve_for_direction_iter_aware(
+    let mut dir_result = kkt::solve_for_direction_iter_aware_with_ir(
         kkt_system_opt.as_ref().unwrap(),
         lin_solver,
         inertia_params,
         ic_delta_w,
         ic_delta_c,
+        ir,
     );
     if matches!(dir_result, Err(crate::linear_solver::SolverError::PretendSingular)) {
         if let Some(kkt_system) = kkt_system_opt.as_mut() {
@@ -3118,13 +3128,13 @@ fn solve_with_quality_escalation(
                     let scale = kkt::ruiz_equilibrate(&mut kkt_system.matrix, &mut kkt_system.rhs);
                     kkt_system.scale_factors = Some(scale);
                     if lin_solver.factor(&kkt_system.matrix).is_ok() {
-                        dir_result = kkt::solve_for_direction(kkt_system, lin_solver, ic_delta_w, ic_delta_c);
+                        dir_result = kkt::solve_for_direction_with_ir(kkt_system, lin_solver, ic_delta_w, ic_delta_c, ir);
                         ps_resolved = !matches!(dir_result, Err(crate::linear_solver::SolverError::PretendSingular));
                     }
                 }
                 if !ps_resolved && lin_solver.increase_quality() {
                     if lin_solver.factor(&kkt_system.matrix).is_ok() {
-                        dir_result = kkt::solve_for_direction(kkt_system, lin_solver, ic_delta_w, ic_delta_c);
+                        dir_result = kkt::solve_for_direction_with_ir(kkt_system, lin_solver, ic_delta_w, ic_delta_c, ir);
                         ps_resolved = !matches!(dir_result, Err(crate::linear_solver::SolverError::PretendSingular));
                     }
                 }
@@ -3137,7 +3147,7 @@ fn solve_with_quality_escalation(
                 if lin_solver.factor(&perturbed).is_ok() {
                     kkt_system.matrix = perturbed;
                     ic_delta_c = dc;
-                    dir_result = kkt::solve_for_direction(kkt_system, lin_solver, ic_delta_w, ic_delta_c);
+                    dir_result = kkt::solve_for_direction_with_ir(kkt_system, lin_solver, ic_delta_w, ic_delta_c, ir);
                     ps_resolved = !matches!(dir_result, Err(crate::linear_solver::SolverError::PretendSingular));
                 }
             }
@@ -3154,7 +3164,7 @@ fn solve_with_quality_escalation(
                     ic_delta_w = dw;
                     ic_delta_c = dc;
                     inertia_params.delta_w_last = dw;
-                    dir_result = kkt::solve_for_direction(kkt_system, lin_solver, ic_delta_w, ic_delta_c);
+                    dir_result = kkt::solve_for_direction_with_ir(kkt_system, lin_solver, ic_delta_w, ic_delta_c, ir);
                 }
             }
             if !inertia_params.use_scaling {
@@ -3535,7 +3545,7 @@ fn solve_full_augmented_direction<P: NlpProblem>(
     // kkt_system.matrix, inertia_params, and lin_solver in place, which
     // carries the escalation effect into subsequent iterations.
     let (dir_result, _, _) = solve_with_quality_escalation(
-        kkt_system_opt, lin_solver, inertia_params, ic_delta_w, ic_delta_c, n, m,
+        kkt_system_opt, lin_solver, inertia_params, options, ic_delta_w, ic_delta_c, n, m,
     );
     let (mut dx_dir, mut dy_dir) = match dir_result {
         Ok(d) => d,

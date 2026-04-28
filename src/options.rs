@@ -458,6 +458,28 @@ pub struct SolverOptions {
     /// `max_refinement_steps` cap when the residual exceeds the
     /// acceptance threshold. Default: 1.
     pub iterative_refinement_steps_required: usize,
+    /// T-MIT-F: hard cap on IR steps per KKT solve. Mirrors Ipopt's
+    /// `max_refinement_steps` (`IpPDFullSpaceSolver.cpp:48-54`,
+    /// default 10).
+    pub max_refinement_steps: usize,
+    /// T-MIT-F: residual-ratio acceptance threshold for the IR loop.
+    /// IR continues while `residual_ratio > residual_ratio_max`.
+    /// Mirrors Ipopt's `residual_ratio_max`
+    /// (`IpPDFullSpaceSolver.cpp:55-62`, default 1e-10).
+    pub residual_ratio_max: f64,
+    /// T-MIT-F: residual-ratio threshold above which an IR-failed
+    /// solve is declared singular and the perturbation handler is
+    /// asked to step the singular branch. Below this, an IR-stalled
+    /// solve is accepted ("S" code in Ipopt's iteration log).
+    /// Mirrors `residual_ratio_singular`
+    /// (`IpPDFullSpaceSolver.cpp:63-70`, default 1e-5).
+    pub residual_ratio_singular: f64,
+    /// T-MIT-F: stagnation factor for the IR give-up condition. IR
+    /// gives up when iters > min and either iters > max or
+    /// `residual_ratio > improvement_factor * residual_ratio_old`.
+    /// Mirrors Ipopt's `residual_improvement_factor`
+    /// (`IpPDFullSpaceSolver.cpp:72-79`, default 0.999999999).
+    pub residual_improvement_factor: f64,
     /// If set, serialize each KKT matrix (main IPM loop only) to this directory
     /// after factorization. Writes two files per iteration:
     ///   `<kkt_dump_name>_<iter:04>.mtx`  — Matrix Market format, symmetric, lower triangle
@@ -608,6 +630,10 @@ impl Default for SolverOptions {
             magic_step: true,
             use_ic_refinement: true,
             iterative_refinement_steps_required: 1,
+            max_refinement_steps: 10,
+            residual_ratio_max: 1e-10,
+            residual_ratio_singular: 1e-5,
+            residual_improvement_factor: 0.999999999,
             bound_mult_init_method: BoundMultInitMethod::Constant,
             bound_mult_init_val: 1.0,
             fixed_variable_treatment: FixedVariableTreatment::RelaxBounds,
