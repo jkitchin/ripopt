@@ -2569,15 +2569,116 @@ fn apply_damped_y_update(
     tracker.prev_dy = Some(state.dy.clone());
 }
 
-fn update_dual_variables(
+/// T3.32: closed-form 1D minimizer of the dual-infeasibility quadratic
+/// `phi(α) = ||r_x + α·J^T·dy||² + ||r_s − α·dy_d||²` per Ipopt
+/// `IpBacktrackingLineSearch.cpp:969-998`.
+///
+/// At call time `state.x` is the trial primal point (committed by the
+/// line-search), but `state.grad_f` and `state.jac_vals` were
+/// evaluated at the pre-step iterate. We re-evaluate both at the
+/// trial point into local buffers so the formula uses the same
+/// quantities Ipopt does (`grad_lag_x_trial` with current y/z, and
+/// `J(x_trial)^T·dy`). Cost: one objective gradient + one Jacobian
+/// values evaluation per accepted step. Paid only when this option
+/// is selected (default `Primal` does no work here).
+///
+/// In ripopt's implicit-slack representation, the s-row residual is
+///   `r_s_i = -y_i - v_l_i + v_u_i`     for inequality rows i
+///   `r_s_i = 0`                          for equality rows i
+/// and `dy_d` is the inequality-row slice of `state.dy` (zero on
+/// equality rows). The closed-form minimum is `α* = -b/a` clipped to
+/// the appropriate interval.
+fn compute_min_dual_infeas_alpha<P: NlpProblem>(
+    state: &SolverState,
+    problem: &P,
+    mode: AlphaForY,
+    alpha_p: f64,
+    alpha_d: f64,
+) -> f64 {
+    let n = state.n;
+    let m = state.m;
+
+    // Evaluate grad_f and Jacobian values at the trial primal point.
+    // `state.x` already holds the trial coords (committed pre-call).
+    let mut grad_f_trial = vec![0.0_f64; n];
+    if !problem.gradient(&state.x, true, &mut grad_f_trial) {
+        return alpha_p; // graceful fallback
+    }
+    let mut jac_trial = vec![0.0_f64; state.jac_vals.len()];
+    if !problem.jacobian_values(&state.x, false, &mut jac_trial) {
+        return alpha_p;
+    }
+
+    // r_x = grad_lag_x(trial) = grad_f_trial + J(trial)^T · y_curr − z_L + z_U.
+    // (The kappa_d damping is omitted here to match Ipopt's formula on
+    // line 977 which uses the raw `grad_lag_x` without the damping
+    // term — Ipopt resets y_c/y_d to current via `BackupCurrent` at
+    // 975-980 then queries `curr_grad_lag_x_amax_func()`.)
+    let mut r_x = grad_f_trial.clone();
+    for (idx, (&row, &col)) in state.jac_rows.iter().zip(state.jac_cols.iter()).enumerate() {
+        r_x[col] += jac_trial[idx] * state.y[row];
+    }
+    for i in 0..n {
+        r_x[i] -= state.z_l[i];
+        r_x[i] += state.z_u[i];
+    }
+
+    // r_s and dy_d are zero on equality rows; on inequality rows
+    // r_s_i = -y_i - v_l_i + v_u_i and dy_d_i = state.dy[i].
+    let mut r_s = vec![0.0_f64; m];
+    let mut dy_d = vec![0.0_f64; m];
+    for i in 0..m {
+        if !constraint_is_equality(state, i) {
+            r_s[i] = -state.y[i] - state.v_l[i] + state.v_u[i];
+            dy_d[i] = state.dy[i];
+        }
+    }
+
+    // Jt_dy = J(trial)^T · dy (for all rows; equality contribution
+    // automatically participates in the y_c half of the formula).
+    let mut jt_dy = vec![0.0_f64; n];
+    for (idx, (&row, &col)) in state.jac_rows.iter().zip(state.jac_cols.iter()).enumerate() {
+        jt_dy[col] += jac_trial[idx] * state.dy[row];
+    }
+
+    // a = ||Jt_dy||² + ||dy_d||²
+    let a: f64 = jt_dy.iter().map(|v| v * v).sum::<f64>()
+        + dy_d.iter().map(|v| v * v).sum::<f64>();
+    // b = r_x · Jt_dy − r_s · dy_d
+    let b: f64 = r_x.iter().zip(jt_dy.iter()).map(|(rx, jd)| rx * jd).sum::<f64>()
+        - r_s.iter().zip(dy_d.iter()).map(|(rs, dd)| rs * dd).sum::<f64>();
+
+    // Closed-form minimum α* = -b/a. Guard a==0 (Δy entirely zero) by
+    // falling back to alpha_p (matches Ipopt's behavior — α_y is
+    // irrelevant when dy = 0).
+    if a <= 0.0 {
+        return alpha_p;
+    }
+    let alpha_star = -b / a;
+
+    // Clip per mode.
+    match mode {
+        AlphaForY::MinDualInfeas => alpha_star.clamp(0.0, 1.0),
+        AlphaForY::SaferMinDualInfeas => {
+            let lo = alpha_p.min(alpha_d);
+            let hi = alpha_p.max(alpha_d);
+            alpha_star.clamp(lo, hi)
+        }
+        _ => unreachable!("compute_min_dual_infeas_alpha called with non-min-dual-infeas mode"),
+    }
+}
+
+fn update_dual_variables<P: NlpProblem>(
     state: &mut SolverState,
     mu_state: &MuState,
     alpha_dual_max: f64,
     tracker: &mut DyOscillationTracker,
     options: &SolverOptions,
+    problem: &P,
 ) -> f64 {
-    // T3.32 simple modes: pick alpha_y per `alpha_for_y` option,
-    // matching Ipopt IpBacktrackingLineSearch.cpp:84-104.
+    // T3.32: pick alpha_y per `alpha_for_y` option, matching Ipopt
+    // IpBacktrackingLineSearch.cpp:84-104 (simple modes) and
+    // :969-998 (closed-form 1D minimizer for MinDualInfeas variants).
     let alpha_p = state.alpha_primal;
     let alpha_d = alpha_dual_max;
     let alpha_y = match options.alpha_for_y {
@@ -2591,6 +2692,9 @@ fn update_dual_variables(
         }
         AlphaForY::DualAndFull => {
             if alpha_d >= options.alpha_for_y_tol { 1.0 } else { alpha_d }
+        }
+        AlphaForY::MinDualInfeas | AlphaForY::SaferMinDualInfeas => {
+            compute_min_dual_infeas_alpha(state, problem, options.alpha_for_y, alpha_p, alpha_d)
         }
     };
 
@@ -7529,6 +7633,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             alpha_dual_max,
             &mut dy_tracker,
             options,
+            problem,
         );
 
         match reevaluate_after_step(
@@ -8115,6 +8220,13 @@ fn reset_bound_multipliers_after_restoration(state: &mut SolverState, n: usize) 
 /// If the augmented solve fails or the result exceeds
 /// `constr_mult_init_max` (matching Ipopt
 /// DefaultIterateInitializer::least_square_mults), zero out y.
+/// LS y refresh after restoration entry. Uses the reduced 2-block
+/// system (no slack-multiplier coupling) and applies the
+/// `constr_mult_init_max` magnitude clamp as a robustness guard for
+/// the post-restoration handoff. This is ripopt-specific defense; Ipopt
+/// has no equivalent reset-time clamp because its restoration path
+/// hands back fresh y from `RestoIpoptNLP`. The post-step recalc_y
+/// uses `recompute_y_post_step_full_augmented` instead.
 fn recompute_y_after_restoration(
     state: &mut SolverState,
     options: &SolverOptions,
@@ -8128,6 +8240,7 @@ fn recompute_y_after_restoration(
         &state.grad_f, &state.jac_rows, &state.jac_cols, &state.jac_vals,
         &state.g_l, &state.g_u, n, m,
         Some(&state.z_l), Some(&state.z_u),
+        None,
     );
     let y_accepted = match y_ls_result {
         Some(y_ls) => {
@@ -8136,13 +8249,41 @@ fn recompute_y_after_restoration(
         }
         None => None,
     };
-    // T3.30: keep current y on LS failure or magnitude rejection. Ipopt's
+    // Keep current y on LS failure or magnitude rejection. Ipopt's
     // IpDefaultIterateInitializer::least_square_mults zeros y only at the
     // *initial* iterate; during iteration `IpIpoptAlgorithm::ActualizeHessianAndConstraints`
     // leaves y unchanged when the LS estimate is rejected. Zeroing mid-run
     // discards information from a converged dual estimate and biases the
     // next Newton direction.
     if let Some(y_ls) = y_accepted {
+        state.y.copy_from_slice(&y_ls);
+    }
+}
+
+/// T3.30 (full): post-step `recalc_y` aligned with `IpIpoptAlg.cpp:782-816`.
+///
+/// Solves Ipopt's full 4-block LS system (eliminated to a (n+m) augmented
+/// matrix with `−1` diagonals on inequality rows and `(v_L − v_U)` RHS
+/// contributions). Unlike the restoration-entry path, no
+/// `constr_mult_init_max` magnitude clamp — Ipopt accepts the LS y
+/// unconditionally on solver success and skips the recalc on solver
+/// failure. Bound multipliers `z_L`, `z_U`, `v_L`, `v_U` are held fixed
+/// (matches `IpIpoptAlg.cpp:803-806` carry-over).
+fn recompute_y_post_step_full_augmented(
+    state: &mut SolverState,
+    n: usize,
+    m: usize,
+) {
+    if m == 0 {
+        return;
+    }
+    let y_ls_result = compute_ls_multiplier_estimate_augmented(
+        &state.grad_f, &state.jac_rows, &state.jac_cols, &state.jac_vals,
+        &state.g_l, &state.g_u, n, m,
+        Some(&state.z_l), Some(&state.z_u),
+        Some((&state.v_l, &state.v_u)),
+    );
+    if let Some(y_ls) = y_ls_result {
         state.y.copy_from_slice(&y_ls);
     }
 }
@@ -8178,7 +8319,9 @@ fn maybe_recalc_y_post_step(
     if theta_max >= options.recalc_y_feas_tol {
         return;
     }
-    recompute_y_after_restoration(state, options, n, m);
+    // T3.30: Ipopt-aligned post-step recalc uses the full 4-block LS system
+    // (slack/v_L/v_U coupling) and accepts unconditionally on solver success.
+    recompute_y_post_step_full_augmented(state, n, m);
 }
 
 /// Reset constraint-slack barrier multipliers v_L, v_U after restoration,
@@ -8837,12 +8980,25 @@ fn compute_ls_multiplier_estimate(
 /// structural zeros on the lower `(2,2)` diagonal so the sparse
 /// solver sees a non-singular pattern. Used by
 /// `compute_ls_multiplier_estimate_augmented`.
+/// Build the (n+m) × (n+m) symmetric augmented matrix for the LS
+/// multiplier estimate.
+///
+/// `inequality_diag` toggles between Ipopt's two LS systems:
+/// - `inequality_diag = None` → reduced 2-block system used for the
+///   initial-iterate LS init (`IpDefaultIterateInitializer.cpp:382-409`)
+///   and for restoration entry: lower-right (m,m) block is zero.
+/// - `inequality_diag = Some(slice)` → 4-block-equivalent system used
+///   for post-step `recalc_y` (`IpLeastSquareMults.cpp:80-94`): for
+///   inequality rows i (where `slice[i] = true`), the (n+i, n+i) entry
+///   is `-1.0`; for equality rows it stays at 0. Eliminating the slack
+///   block from Ipopt's 4-block system gives this structure.
 fn build_ls_augmented_matrix(
     jac_rows: &[usize],
     jac_cols: &[usize],
     jac_vals: &[f64],
     n: usize,
     m: usize,
+    inequality_diag: Option<&[bool]>,
 ) -> crate::linear_solver::SparseSymmetricMatrix {
     use crate::linear_solver::SparseSymmetricMatrix;
     let nnz_est = n + jac_rows.len() + m;
@@ -8865,7 +9021,11 @@ fn build_ls_augmented_matrix(
     for j in 0..m {
         ssm.triplet_rows.push(n + j);
         ssm.triplet_cols.push(n + j);
-        ssm.triplet_vals.push(0.0);
+        let diag = match inequality_diag {
+            Some(flags) if flags[j] => -1.0,
+            _ => 0.0,
+        };
+        ssm.triplet_vals.push(diag);
     }
     ssm
 }
@@ -8881,21 +9041,45 @@ fn compute_ls_multiplier_estimate_augmented(
     m: usize,
     z_l: Option<&[f64]>,
     z_u: Option<&[f64]>,
+    slack_mults: Option<(&[f64], &[f64])>,
 ) -> Option<Vec<f64>> {
     if m == 0 {
         return None;
     }
 
-    // RHS: [grad_f − z_L + z_U; 0]
+    // T3.30: when slack-multiplier inputs `(v_L, v_U)` are passed, build the
+    // 4-block-equivalent augmented system per Ipopt
+    // `IpLeastSquareMults.cpp:80-94`. Eliminating the explicit-slack block
+    // yields a (n+m) symmetric system whose only difference from the reduced
+    // 2-block form is: (a) a `-1.0` diagonal on the (m,m) lower-right block
+    // for inequality rows; (b) a `(v_L − v_U)` contribution to the bottom
+    // half of the RHS on inequality rows. Equality rows match the reduced
+    // form exactly. When `slack_mults = None` we fall back to the 2-block
+    // form (initial-iterate / restoration entry path).
+    let inequality_flags: Option<Vec<bool>> = slack_mults.map(|_| {
+        (0..m)
+            .map(|i| !(g_l[i].is_finite() && g_u[i].is_finite()
+                       && (g_l[i] - g_u[i]).abs() < 1e-15))
+            .collect()
+    });
+
+    // RHS: [grad_f − z_L + z_U; (v_L − v_U) per inequality row, else 0]
     let mut rhs = vec![0.0_f64; n + m];
     for i in 0..n {
         rhs[i] = grad_f[i];
         if let Some(zl) = z_l { rhs[i] -= zl[i]; }
         if let Some(zu) = z_u { rhs[i] += zu[i]; }
     }
+    if let (Some((v_l, v_u)), Some(flags)) = (slack_mults, inequality_flags.as_ref()) {
+        for j in 0..m {
+            if flags[j] {
+                rhs[n + j] = v_l[j] - v_u[j];
+            }
+        }
+    }
 
     let matrix = KktMatrix::Sparse(build_ls_augmented_matrix(
-        jac_rows, jac_cols, jac_vals, n, m,
+        jac_rows, jac_cols, jac_vals, n, m, inequality_flags.as_deref(),
     ));
     let mut solver = new_sparse_solver();
     if solver.factor(&matrix).is_err() {
@@ -10762,6 +10946,137 @@ mod tests {
         let opts = SolverOptions { recalc_y: true, ..SolverOptions::default() };
         maybe_recalc_y_post_step(&mut state, &opts, 1, 1, false);
         assert_eq!(state.y, vec![999.0], "infeasible iterate must skip recalc_y");
+    }
+
+    /// T3.30 full augmented system: on an inequality constraint with
+    /// nonzero `(v_L − v_U)`, the post-step recalc must produce a
+    /// different y than the reduced 2-block system. Setup:
+    ///   n=1, m=1, lower-only inequality g_l=0 g_u=+inf, J=1, grad_f=2,
+    ///   z=0, v_L=1, v_U=0. After eliminating slack:
+    ///     y_d = J·sol_x − (v_L − v_U) = sol_x − 1
+    ///     sol_x + J·y_d = grad_f  ⇒  2·sol_x − 1 = 2  ⇒  sol_x = 1.5
+    ///     y_d = 0.5 (positive → consistent with lower-bound sign).
+    ///   The reduced 2-block system would yield y = 2 (no v coupling).
+    #[test]
+    fn test_recalc_y_full_augmented_inequality_uses_v_l_v_u() {
+        let mut state = ls_y_equals_two_state(0.5, false);
+        state.g_l = vec![0.0];
+        state.g_u = vec![f64::INFINITY];
+        state.v_l = vec![1.0];
+        state.v_u = vec![0.0];
+        let opts = SolverOptions { recalc_y: true, ..SolverOptions::default() };
+        maybe_recalc_y_post_step(&mut state, &opts, 1, 1, false);
+        assert!(
+            (state.y[0] - 0.5).abs() < 1e-10,
+            "full-augmented LS y mismatch: got {} expected 0.5", state.y[0]
+        );
+    }
+
+    /// T3.30: on equality rows the full and reduced systems must agree.
+    /// Ipopt's slack/v_d coupling only enters for inequality rows.
+    #[test]
+    fn test_recalc_y_full_augmented_equality_matches_reduced() {
+        let mut state = ls_y_equals_two_state(0.0, true);
+        // Equality row: v_L/v_U values must be ignored.
+        state.v_l = vec![100.0];
+        state.v_u = vec![50.0];
+        let opts = SolverOptions { recalc_y: true, ..SolverOptions::default() };
+        maybe_recalc_y_post_step(&mut state, &opts, 1, 1, false);
+        assert!(
+            (state.y[0] - 2.0).abs() < 1e-10,
+            "equality row should match reduced: got {}", state.y[0]
+        );
+    }
+
+    /// T3.32 closed-form 1D minimizer for `MinDualInfeas`. Setup:
+    ///   n=1, m=1, equality (g_l = g_u = 0), grad_f_trial = 2,
+    ///   J = 1, y = 0.5, z = 0, dy = -3, v = 0.
+    ///   r_x = 2 + 1·0.5 = 2.5
+    ///   Jt_dy = 1·(-3) = -3
+    ///   r_s = 0, dy_d = 0 (equality row)
+    ///   a = 9 + 0 = 9
+    ///   b = 2.5·(-3) − 0 = -7.5
+    ///   α* = -b/a = 7.5/9 ≈ 0.8333
+    ///   Clamped to [0, 1] → 0.8333.
+    #[test]
+    fn test_min_dual_infeas_closed_form_equality_row() {
+        struct ConstantProblem;
+        impl NlpProblem for ConstantProblem {
+            fn num_variables(&self) -> usize { 1 }
+            fn num_constraints(&self) -> usize { 1 }
+            fn bounds(&self, x_l: &mut [f64], x_u: &mut [f64]) {
+                x_l[0] = f64::NEG_INFINITY; x_u[0] = f64::INFINITY;
+            }
+            fn constraint_bounds(&self, g_l: &mut [f64], g_u: &mut [f64]) {
+                g_l[0] = 0.0; g_u[0] = 0.0;
+            }
+            fn initial_point(&self, x0: &mut [f64]) { x0[0] = 0.0; }
+            fn objective(&self, _: &[f64], _: bool, obj: &mut f64) -> bool { *obj = 0.0; true }
+            fn gradient(&self, _: &[f64], _: bool, grad: &mut [f64]) -> bool { grad[0] = 2.0; true }
+            fn constraints(&self, _: &[f64], _: bool, g: &mut [f64]) -> bool { g[0] = 0.0; true }
+            fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![0], vec![0]) }
+            fn jacobian_values(&self, _: &[f64], _: bool, vals: &mut [f64]) -> bool { vals[0] = 1.0; true }
+            fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
+            fn hessian_values(&self, _: &[f64], _: bool, _: f64, _: &[f64], _: &mut [f64]) -> bool { true }
+        }
+        let mut state = minimal_state(1, 1);
+        state.g_l = vec![0.0];
+        state.g_u = vec![0.0];
+        state.y = vec![0.5];
+        state.dy = vec![-3.0];
+        state.jac_rows = vec![0];
+        state.jac_cols = vec![0];
+        state.jac_vals = vec![1.0];
+
+        let alpha = compute_min_dual_infeas_alpha(
+            &state, &ConstantProblem, AlphaForY::MinDualInfeas, 0.5, 0.5,
+        );
+        assert!(
+            (alpha - 7.5 / 9.0).abs() < 1e-10,
+            "MinDualInfeas got {}, expected {}", alpha, 7.5 / 9.0
+        );
+    }
+
+    /// T3.32 SaferMinDualInfeas: same closed form but clipped to
+    /// `[min(α_p, α_d), max(α_p, α_d)]`. With α_p = 0.2, α_d = 0.5,
+    /// the interval is [0.2, 0.5] and α* = 0.833 clamps to 0.5.
+    #[test]
+    fn test_safer_min_dual_infeas_clips_to_alpha_bracket() {
+        struct ConstantProblem;
+        impl NlpProblem for ConstantProblem {
+            fn num_variables(&self) -> usize { 1 }
+            fn num_constraints(&self) -> usize { 1 }
+            fn bounds(&self, x_l: &mut [f64], x_u: &mut [f64]) {
+                x_l[0] = f64::NEG_INFINITY; x_u[0] = f64::INFINITY;
+            }
+            fn constraint_bounds(&self, g_l: &mut [f64], g_u: &mut [f64]) {
+                g_l[0] = 0.0; g_u[0] = 0.0;
+            }
+            fn initial_point(&self, x0: &mut [f64]) { x0[0] = 0.0; }
+            fn objective(&self, _: &[f64], _: bool, obj: &mut f64) -> bool { *obj = 0.0; true }
+            fn gradient(&self, _: &[f64], _: bool, grad: &mut [f64]) -> bool { grad[0] = 2.0; true }
+            fn constraints(&self, _: &[f64], _: bool, g: &mut [f64]) -> bool { g[0] = 0.0; true }
+            fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![0], vec![0]) }
+            fn jacobian_values(&self, _: &[f64], _: bool, vals: &mut [f64]) -> bool { vals[0] = 1.0; true }
+            fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
+            fn hessian_values(&self, _: &[f64], _: bool, _: f64, _: &[f64], _: &mut [f64]) -> bool { true }
+        }
+        let mut state = minimal_state(1, 1);
+        state.g_l = vec![0.0];
+        state.g_u = vec![0.0];
+        state.y = vec![0.5];
+        state.dy = vec![-3.0];
+        state.jac_rows = vec![0];
+        state.jac_cols = vec![0];
+        state.jac_vals = vec![1.0];
+
+        let alpha = compute_min_dual_infeas_alpha(
+            &state, &ConstantProblem, AlphaForY::SaferMinDualInfeas, 0.2, 0.5,
+        );
+        assert!(
+            (alpha - 0.5).abs() < 1e-10,
+            "SaferMinDualInfeas should clamp to max(α_p, α_d) = 0.5, got {}", alpha
+        );
     }
 
     // ---- Magic step (T2.24, spec §5.3) ----

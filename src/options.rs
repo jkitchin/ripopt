@@ -69,8 +69,8 @@ impl Default for LinearSolverChoice {
 
 /// Step length used to update the equality multipliers `y` after a
 /// Newton step. Mirrors Ipopt 3.14 `alpha_for_y` option
-/// (`IpBacktrackingLineSearch.cpp:84-104`). T3.32 ports the simple
-/// modes; min/max-dual-infeas variants are deferred.
+/// (`IpBacktrackingLineSearch.cpp:84-104` and the closed-form 1D
+/// minimizer at `:969-998`). All seven Ipopt modes are implemented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AlphaForY {
     /// `alpha_y = alpha_primal` (Ipopt default).
@@ -90,6 +90,16 @@ pub enum AlphaForY {
     /// Use full step when alpha_dual_max exceeds the gate; else
     /// alpha_dual_max.
     DualAndFull,
+    /// Closed-form 1D minimizer of `||grad_lag(trial, y + α·dy)||²`
+    /// over α ∈ [0, 1]. Costs one fresh grad_f + Jacobian evaluation
+    /// at the trial point per accepted step. Mirrors Ipopt's
+    /// `min_dual_infeas` (`IpBacktrackingLineSearch.cpp:969-996`).
+    MinDualInfeas,
+    /// Same minimizer as `MinDualInfeas` but clipped to
+    /// `[min(α_p, α_d), max(α_p, α_d)]` instead of `[0, 1]`. Mirrors
+    /// Ipopt's `safer_min_dual_infeas` (line 992) — guarantees α_y is
+    /// bracketed between the primal and dual step lengths.
+    SaferMinDualInfeas,
 }
 
 /// NLP scaling method. Mirrors Ipopt 3.14 `nlp_scaling_method`
