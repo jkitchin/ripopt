@@ -498,12 +498,14 @@ fn run_single_solver(name: &str, solver: &str) {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
+            let ir_full_8_block = std::env::var("RIPOPT_IR_8BLOCK").is_ok();
             let options = SolverOptions {
                 tol: 1e-8,
                 max_iter: 3000,
                 print_level,
                 mu_strategy_adaptive: true,
                 max_wall_time: 30.0,
+                ir_residual_full_8_block: ir_full_8_block,
                 ..SolverOptions::default()
             };
 
