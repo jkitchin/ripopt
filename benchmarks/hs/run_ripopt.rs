@@ -80,14 +80,26 @@ fn main() {
         .unwrap_or(1);
 
     let force_sparse = std::env::var("RIPOPT_FORCE_SPARSE").is_ok();
+    let factor_cache = std::env::var("RIPOPT_FACTOR_CACHE").is_ok();
+    let resto_outer_filter = std::env::var("RIPOPT_RESTORE_OUTER_FILTER").is_ok();
+    let ir_full_8_block = std::env::var("RIPOPT_IR_8BLOCK").is_ok();
     let options = SolverOptions {
         tol: 1e-8,
         max_iter: 3000,
         print_level: 0,
         mu_strategy_adaptive: true,
         sparse_threshold: if force_sparse { 0 } else { 100 },
+        factor_cache_enabled: factor_cache,
+        restore_early_exit_outer_filter: resto_outer_filter,
+        ir_residual_full_8_block: ir_full_8_block,
         ..SolverOptions::default()
     };
+    if factor_cache || resto_outer_filter || ir_full_8_block {
+        eprintln!(
+            "T3 options: factor_cache={} resto_outer_filter={} ir_8block={}",
+            factor_cache, resto_outer_filter, ir_full_8_block
+        );
+    }
 
     print_system_info();
     eprintln!("Solving all HS problems with ripopt ({} timing runs)...", n_timing_runs);

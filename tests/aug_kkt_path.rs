@@ -1,8 +1,6 @@
-//! A7 smoke tests: end-to-end solves with `options.use_augmented_kkt = true`.
-//!
-//! These exercise the augmented (4-block) KKT path through the IPM driver.
-//! Mehrotra/MCC/SOC are disabled in this branch (kkt_system_opt = None
-//! short-circuits MCC; SOC/cond_solver_for_soc = None short-circuits SOC).
+//! A7 smoke tests: end-to-end solves through the augmented-KKT path
+//! (the only path after A7.6). Mehrotra and SOC are wired in. Gondzio
+//! MCC is retired (not in Ipopt 3.14).
 //! The tests are deliberately small so they isolate the wiring path rather
 //! than stress the algorithm.
 
@@ -41,7 +39,7 @@ impl NlpProblem for UnconstrainedQuadratic {
 
 #[test]
 fn aug_path_unconstrained_quadratic_finds_minimum() {
-    let opts = SolverOptions { print_level: 0, use_augmented_kkt: true, ..SolverOptions::default() };
+    let opts = SolverOptions { print_level: 0, ..SolverOptions::default() };
     let r = ripopt::solve(&UnconstrainedQuadratic, &opts);
     assert_eq!(r.status, SolveStatus::Optimal, "status={:?}", r.status);
     assert!((r.x[0] - 1.0).abs() < 1e-6, "x1={}", r.x[0]);
@@ -78,7 +76,7 @@ impl NlpProblem for BoundConstrainedScalar {
 
 #[test]
 fn aug_path_bound_constrained_scalar_hits_upper_bound() {
-    let opts = SolverOptions { print_level: 0, use_augmented_kkt: true, ..SolverOptions::default() };
+    let opts = SolverOptions { print_level: 0, ..SolverOptions::default() };
     let r = ripopt::solve(&BoundConstrainedScalar, &opts);
     assert_eq!(r.status, SolveStatus::Optimal, "status={:?}", r.status);
     assert!((r.x[0] - 1.0).abs() < 1e-6, "x={}", r.x[0]);
@@ -123,7 +121,7 @@ impl NlpProblem for EqualityConstrained {
 
 #[test]
 fn aug_path_equality_constrained_quadratic() {
-    let opts = SolverOptions { print_level: 0, use_augmented_kkt: true, ..SolverOptions::default() };
+    let opts = SolverOptions { print_level: 0, ..SolverOptions::default() };
     let r = ripopt::solve(&EqualityConstrained, &opts);
     assert_eq!(r.status, SolveStatus::Optimal, "status={:?}", r.status);
     assert!((r.x[0] - 1.0).abs() < 1e-6, "x1={}", r.x[0]);
@@ -172,7 +170,7 @@ impl NlpProblem for InequalityConstrained {
 
 #[test]
 fn aug_path_inequality_constrained_quadratic() {
-    let opts = SolverOptions { print_level: 0, use_augmented_kkt: true, ..SolverOptions::default() };
+    let opts = SolverOptions { print_level: 0, ..SolverOptions::default() };
     let r = ripopt::solve(&InequalityConstrained, &opts);
     assert_eq!(r.status, SolveStatus::Optimal, "status={:?}", r.status);
     assert!((r.x[0] - 1.0).abs() < 1e-6, "x1={}", r.x[0]);

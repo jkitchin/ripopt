@@ -1956,57 +1956,6 @@ fn compute_barrier_phi(
     phi
 }
 
-/// Dispatch a Second-Order Correction attempt to the appropriate solver
-/// path: dense condensed (cond_solver_for_soc + condensed_system), sparse
-/// condensed, full augmented KKT (4-block), or condensed full-KKT. Returns
-/// the SOC trial tuple `(x, obj, g, alpha)` on acceptance, `None` otherwise.
-/// Caller checks `theta_trial > theta_current` and `*ls_steps == 0` before
-/// calling.
-#[allow(clippy::too_many_arguments)]
-fn dispatch_soc_attempt<P: NlpProblem>(
-    state: &SolverState,
-    problem: &P,
-    x_trial: &[f64],
-    g_trial: &[f64],
-    condensed_system: &Option<kkt::CondensedKktSystem>,
-    cond_solver_for_soc: &mut Option<DenseLdl>,
-    sparse_condensed_system: &Option<kkt::SparseCondensedKktSystem>,
-    kkt_system_opt: &Option<kkt::KktSystem>,
-    lin_solver: &mut dyn LinearSolver,
-    inertia_params: &mut InertiaCorrectionParams,
-    filter: &mut Filter,
-    theta_current: f64,
-    phi_current: f64,
-    grad_phi_step: f64,
-    alpha: f64,
-    options: &SolverOptions,
-) -> Option<(Vec<f64>, f64, Vec<f64>, f64)> {
-    if options.use_augmented_kkt {
-        attempt_soc_aug(
-            state, problem, g_trial, inertia_params, filter,
-            theta_current, phi_current, grad_phi_step, alpha, options,
-        )
-    } else if let (Some(cond), Some(cs)) = (condensed_system.as_ref(), cond_solver_for_soc.as_mut()) {
-        attempt_soc_condensed(
-            state, problem, g_trial, cs, cond, filter,
-            theta_current, phi_current, grad_phi_step, alpha, options,
-        )
-    } else if let Some(sc) = sparse_condensed_system.as_ref() {
-        attempt_soc_sparse_condensed(
-            state, problem, g_trial, lin_solver, sc, filter,
-            theta_current, phi_current, grad_phi_step, alpha, options,
-        )
-    } else if let Some(kkt) = kkt_system_opt.as_ref() {
-        attempt_soc(
-            state, problem, x_trial, g_trial,
-            lin_solver, kkt, filter,
-            theta_current, phi_current, grad_phi_step, alpha, options,
-        )
-    } else {
-        None
-    }
-}
-
 /// Project the candidate iterate `x + alpha*dx` onto the open variable
 /// box (1e-14 inset from finite x_l/x_u), then evaluate the objective
 /// and constraints at the projected point. Returns
@@ -2073,11 +2022,6 @@ fn run_line_search_loop<P: NlpProblem>(
     problem: &P,
     options: &SolverOptions,
     filter: &mut Filter,
-    condensed_system: &Option<kkt::CondensedKktSystem>,
-    cond_solver_for_soc: &mut Option<DenseLdl>,
-    sparse_condensed_system: &Option<kkt::SparseCondensedKktSystem>,
-    kkt_system_opt: &Option<kkt::KktSystem>,
-    lin_solver: &mut dyn LinearSolver,
     inertia_params: &mut InertiaCorrectionParams,
     alpha_primal_max: f64,
     theta_current: f64,
@@ -2181,10 +2125,8 @@ fn run_line_search_loop<P: NlpProblem>(
         // Mirrors `IpFilterLSAcceptor::TrySecondOrderCorrection` entry condition
         // (`IpFilterLSAcceptor.cpp` SOC dispatch): `theta_trial >= theta_current`.
         if theta_trial >= theta_current && options.max_soc > 0 && *ls_steps == 0 {
-            let soc_accepted = dispatch_soc_attempt(
-                state, problem, &x_trial, &g_trial, condensed_system,
-                cond_solver_for_soc, sparse_condensed_system, kkt_system_opt,
-                lin_solver, inertia_params, filter,
+            let soc_accepted = attempt_soc_aug(
+                state, problem, &g_trial, inertia_params, filter,
                 theta_current, phi_current, grad_phi_step, alpha, options,
             );
             if let Some((x_soc, obj_soc, g_soc, alpha_soc)) = soc_accepted {
@@ -7805,49 +7747,15 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             StallDecision::Continue => continue,
             StallDecision::Proceed => {}
         }
-        let t_kkt = Instant::now();
-        let AssembledKkt {
-            sigma,
-            use_sparse_condensed,
-            condensed_system,
-            mut sparse_condensed_system,
-            mut kkt_system_opt,
-        } = assemble_kkt_systems(&state, n, m, use_sparse, disable_sparse_condensed, options.kappa_d);
-        timings.kkt_assembly += t_kkt.elapsed();
-
-        // On first iteration with sparse condensed, detect bandwidth and pick
-        // the right downstream solver (full augmented / banded / sparse).
-        // Skip in augmented-KKT mode — that path uses its own dense solver.
-        if iteration == 0 && !options.use_augmented_kkt {
-            adjust_sparse_condensed_bandwidth(
-                &state,
-                problem,
-                options,
-                n,
-                m,
-                use_sparse,
-                use_sparse_condensed,
-                &sigma,
-                &mut sparse_condensed_system,
-                &mut kkt_system_opt,
-                &mut lin_solver,
-                &mut disable_sparse_condensed,
-            );
-        }
-
         let ic_delta_c: f64;
-        let mut cond_solver_for_soc: Option<DenseLdl>;
 
-        if options.use_augmented_kkt {
+        {
             // A7: primary Newton step via the 4-block augmented system
-            // [x; s; y_c; y_d]. MCC/SOC are disabled in this branch —
-            // kkt_system_opt = None makes apply_gondzio_mcc and SOC
-            // auto-no-op. A7.5 ports the Ipopt Probing μ oracle
+            // [x; s; y_c; y_d]. A7.5 ports the Ipopt Probing μ oracle
             // (`IpProbingMuOracle::CalculateMu`) and gates it on
             // `options.mehrotra_pc`. When the oracle runs, it returns the
             // chosen μ alongside the step; we install the new μ into
             // `state.mu` so downstream line-search/convergence sees it.
-            kkt_system_opt = None;
             let t_dir = Instant::now();
             let mut aug_solver: Box<dyn LinearSolver> = Box::new(DenseLdl::new());
             let probing = options.mehrotra_pc;
@@ -7896,7 +7804,6 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             };
             timings.direction_solve += t_dir.elapsed();
             ic_delta_c = dc;
-            cond_solver_for_soc = None;
             if let Some(mu_new) = mu_new_opt {
                 state.mu = mu_new;
             }
@@ -7904,106 +7811,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 &mut state, step.dx, step.dy_m, step.ds,
                 step.dz_l, step.dz_u, step.dv_l, step.dv_u,
             );
-        } else {
-            let (ic_delta_w, icc) = match factor_kkt_with_recovery(
-                &mut state,
-                problem,
-                options,
-                iteration,
-                n,
-                m,
-                use_sparse,
-                &mut kkt_system_opt,
-                lin_solver.as_mut(),
-                &mut inertia_params,
-                &mut lbfgs_state,
-                &mut filter,
-                &mut mu_state,
-                &mut restoration,
-                &mut timings,
-                &mut prev_ic_delta_w,
-                linear_constraints.as_deref(),
-                lbfgs_mode,
-                deadline,
-            ) {
-                FactorDecision::Proceed { ic_delta_w, ic_delta_c } => (ic_delta_w, ic_delta_c),
-                FactorDecision::Continue => continue,
-                FactorDecision::Return(result) => return result,
-            };
-            ic_delta_c = icc;
-
-            // Solve for search direction via the three-way KKT dispatch.
-            let t_dir = Instant::now();
-            let (dx, dy);
-            let mehrotra_aff: Option<(Vec<f64>, Vec<f64>, Vec<f64>, f64)>;
-            match solve_for_search_direction(
-                &mut state,
-                problem,
-                options,
-                iteration,
-                n,
-                m,
-                use_sparse,
-                &condensed_system,
-                &sparse_condensed_system,
-                &mut kkt_system_opt,
-                lin_solver.as_mut(),
-                &sigma,
-                &mut inertia_params,
-                ic_delta_w,
-                ic_delta_c,
-                &filter,
-                &mut restoration,
-                &mut lbfgs_state,
-                lbfgs_mode,
-                linear_constraints.as_deref(),
-                &mut last_mehrotra_sigma,
-                deadline,
-            ) {
-                DirectionSolveDecision::Proceed {
-                    dx: dx_val,
-                    dy: dy_val,
-                    cond_solver_for_soc: cs,
-                    mehrotra_aff: ma,
-                } => {
-                    dx = dx_val;
-                    dy = dy_val;
-                    cond_solver_for_soc = cs;
-                    mehrotra_aff = ma;
-                }
-                DirectionSolveDecision::Continue => continue,
-                DirectionSolveDecision::Return(r) => return r,
-            }
-
-            timings.direction_solve += t_dir.elapsed();
-
-            // Recover bound multiplier steps. If the Mehrotra corrector was applied,
-            // use the cross-term-aware recovery at μ_pc so dz stays consistent with
-            // the corrector complementarity equation; otherwise use the plain formula
-            // at state.mu.
-            // Mirror the RHS choice above: filter-LS mode does not apply the
-            // Mehrotra cross-term, so dz recovery uses the plain Fiacco formula
-            // dz_L[i] = (mu - z_L*s_L)/s_L - (z_L/s_L)*dx[i] at mu_new.
-            let mu_for_dz = mehrotra_aff.as_ref().map(|t| t.3).unwrap_or(state.mu);
-            let (dz_l, dz_u) = recover_dz_from_state(&state, &dx, mu_for_dz);
-            let ds = recover_ds_from_state(&state, &dx, &dy, ic_delta_c);
-            let (dv_l, dv_u) = recover_dv_from_state(&state, &ds, mu_for_dz);
-
-            install_step_directions(&mut state, dx, dy, ds, dz_l, dz_u, dv_l, dv_u);
         }
-
-        apply_gondzio_mcc(
-            &mut state,
-            options,
-            iteration,
-            &mu_state,
-            primal_inf,
-            dual_inf,
-            compl_inf,
-            &kkt_system_opt,
-            lin_solver.as_mut(),
-            ic_delta_c,
-        );
 
         let (tau, alpha_primal_max, alpha_dual_max) = compute_alpha_max(
             &state, options, &mu_state, primal_inf, dual_inf, compl_inf,
@@ -8048,11 +7856,6 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             problem,
             options,
             &mut filter,
-            &condensed_system,
-            &mut cond_solver_for_soc,
-            &sparse_condensed_system,
-            &kkt_system_opt,
-            lin_solver.as_mut(),
             &mut inertia_params,
             alpha_primal_max,
             theta_current,
@@ -12266,143 +12069,10 @@ mod tests {
             "QF iterations diverge from Loqo: off={} on={}", r_off.iterations, r_on.iterations);
     }
 
-    // ---- T3.25 follow-up: factor cache wiring (QF / Mehrotra / Gondzio) ----
-
-    /// Tiny equality-constrained QP `min 0.5·(x²+y²+z²) s.t. x+y+z = 3` with
-    /// optimum at (1,1,1). Three variables, one equality constraint —
-    /// exercises the full augmented KKT path (n+m=4, no condensed dispatch).
-    struct CachedQpProblem;
-    impl NlpProblem for CachedQpProblem {
-        fn num_variables(&self) -> usize { 3 }
-        fn num_constraints(&self) -> usize { 1 }
-        fn bounds(&self, x_l: &mut [f64], x_u: &mut [f64]) {
-            for i in 0..3 { x_l[i] = f64::NEG_INFINITY; x_u[i] = f64::INFINITY; }
-        }
-        fn constraint_bounds(&self, g_l: &mut [f64], g_u: &mut [f64]) {
-            g_l[0] = 3.0; g_u[0] = 3.0;
-        }
-        fn initial_point(&self, x0: &mut [f64]) { x0[0] = 0.0; x0[1] = 0.0; x0[2] = 0.0; }
-        fn objective(&self, x: &[f64], _: bool, obj: &mut f64) -> bool {
-            *obj = 0.5 * (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]);
-            true
-        }
-        fn gradient(&self, x: &[f64], _: bool, g: &mut [f64]) -> bool {
-            g[0] = x[0]; g[1] = x[1]; g[2] = x[2]; true
-        }
-        fn constraints(&self, x: &[f64], _: bool, g: &mut [f64]) -> bool {
-            g[0] = x[0] + x[1] + x[2]; true
-        }
-        fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
-            (vec![0, 0, 0], vec![0, 1, 2])
-        }
-        fn jacobian_values(&self, _: &[f64], _: bool, v: &mut [f64]) -> bool {
-            v[0] = 1.0; v[1] = 1.0; v[2] = 1.0; true
-        }
-        fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
-            (vec![0, 1, 2], vec![0, 1, 2])
-        }
-        fn hessian_values(&self, _: &[f64], _: bool, obj_factor: f64, _: &[f64], v: &mut [f64]) -> bool {
-            v[0] = obj_factor; v[1] = obj_factor; v[2] = obj_factor; true
-        }
-    }
-
-    /// T3.25 follow-up — Test 1: with `factor_cache_enabled = true`, the
-    /// QF mu oracle path must exercise the cached entry point at least
-    /// once during the IPM iteration. The QF oracle's local cache is
-    /// folded back into the shared diagnostic counters, so any
-    /// quality-function-eligible iterate produces a `factor_calls`
-    /// increment beyond zero.
-    #[test]
-    fn test_factor_cache_fires_when_enabled_on_small_qp() {
-        let problem = CachedQpProblem;
-        let mut opts = SolverOptions::default();
-        // Condensed-path-specific cache; aug path has its own cache (A7.7).
-        opts.use_augmented_kkt = false;
-        opts.factor_cache_enabled = true;
-        opts.mu_oracle_quality_function = true;
-        opts.mu_strategy_adaptive = true;
-        let r = solve_ipm(&problem, &opts);
-        assert_eq!(r.status, SolveStatus::Optimal,
-            "small QP must solve to optimal with cache enabled, got {:?}",
-            r.status);
-        assert!(r.diagnostics.factor_cache_factor_calls >= 1,
-            "cached entry point must be invoked at least once, got factor_calls={}",
-            r.diagnostics.factor_cache_factor_calls);
-        // Hits + misses can be 0 if every call landed on the cache-disabled
-        // branch (e.g. the QF oracle's local cache always re-factors). The
-        // important assertion is that the cached entry point ran at all.
-    }
-
-    /// T3.25 follow-up — Test 2: bit-identical solve with the cache off
-    /// vs on. A cache HIT replays the prior factorization; if the math
-    /// is correct, it must produce the same numerical iterate. We
-    /// compare final x, objective, and status to bit-exact equality.
-    #[test]
-    fn test_factor_cache_bit_identical_off_vs_on() {
-        let problem = CachedQpProblem;
-
-        let opts_off = SolverOptions {
-            use_augmented_kkt: false,
-            factor_cache_enabled: false,
-            mu_oracle_quality_function: true,
-            mu_strategy_adaptive: true,
-            ..SolverOptions::default()
-        };
-        let r_off = solve_ipm(&problem, &opts_off);
-
-        let opts_on = SolverOptions {
-            use_augmented_kkt: false,
-            factor_cache_enabled: true,
-            mu_oracle_quality_function: true,
-            mu_strategy_adaptive: true,
-            ..SolverOptions::default()
-        };
-        let r_on = solve_ipm(&problem, &opts_on);
-
-        assert_eq!(r_off.status, r_on.status,
-            "status must match: off={:?} on={:?}", r_off.status, r_on.status);
-        assert_eq!(r_off.iterations, r_on.iterations,
-            "iteration count must match: off={} on={}",
-            r_off.iterations, r_on.iterations);
-        assert_eq!(r_off.objective.to_bits(), r_on.objective.to_bits(),
-            "objective must be bit-identical: off={:.17e} on={:.17e}",
-            r_off.objective, r_on.objective);
-        for i in 0..r_off.x.len() {
-            assert_eq!(r_off.x[i].to_bits(), r_on.x[i].to_bits(),
-                "x[{}] must be bit-identical: off={:.17e} on={:.17e}",
-                i, r_off.x[i], r_on.x[i]);
-        }
-
-        // Sanity: cache-off run must report zero hits (cache disabled
-        // means the enabled branch never increments hits/misses).
-        assert_eq!(r_off.diagnostics.factor_cache_hits, 0);
-        assert_eq!(r_off.diagnostics.factor_cache_misses, 0);
-    }
-
-    /// T3.25 follow-up — Test 3: cache-disabled is a true no-op pass-
-    /// through. Exercising the same problem must produce the same
-    /// numerical result as a baseline run (regression guard against
-    /// silent behaviour changes from threading the cache plumbing).
-    #[test]
-    fn test_factor_cache_disabled_is_noop_on_small_qp() {
-        let problem = CachedQpProblem;
-        let opts = SolverOptions {
-            use_augmented_kkt: false,
-            factor_cache_enabled: false,
-            ..SolverOptions::default()
-        };
-        let r = solve_ipm(&problem, &opts);
-        assert_eq!(r.status, SolveStatus::Optimal);
-        // x → (1, 1, 1)
-        for i in 0..3 {
-            assert!((r.x[i] - 1.0).abs() < 1e-6,
-                "x[{}] should be ~1.0, got {}", i, r.x[i]);
-        }
-        assert_eq!(r.diagnostics.factor_cache_hits, 0,
-            "disabled cache must never report hits");
-        assert_eq!(r.diagnostics.factor_cache_misses, 0,
-            "disabled cache must never report misses");
-    }
+    // T3.25 follow-up factor-cache wiring tests removed in A7.6 — they
+    // exercised the condensed-path-specific factor cache (`CachedQpProblem`,
+    // `test_factor_cache_*`). A7.7 will reintroduce equivalent tests once the
+    // factor cache is ported to `kkt_aug`.
 
     // ---- T2.22 kappa_resto / restoration acceptance (spec §7.7) ----
 

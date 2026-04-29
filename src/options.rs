@@ -193,20 +193,6 @@ pub struct SolverOptions {
     /// (`||r_d||_inf`) is computed from the UN-damped gradient.
     /// Set to `0.0` to disable.
     pub kappa_d: f64,
-    /// A7 (Ipopt-alignment): use the full augmented KKT path for the
-    /// primary Newton direction solve. When `true`, the IPM driver calls
-    /// `kkt_aug::aug_step_from_state` (4-block, dim `n + n_d + n_c + n_d`,
-    /// matching `IpStdAugSystemSolver`) instead of the condensed
-    /// `kkt::assemble_kkt` + `solve_for_direction*` path.
-    ///
-    /// **A7.6 (default ON, 2026-04-28)**: HS bisect (113/120 aug vs 83/120
-    /// condensed) confirmed the augmented path strictly dominates the
-    /// condensed path. Mehrotra/Probing μ oracle (A7.5) and SOC (A7.5b)
-    /// are both implemented for the aug path. Gondzio MCC (A7.5c) is NOT
-    /// in Ipopt 3.14 — the aug path correctly skips it via the
-    /// `kkt_system_opt = None` gate. Setting this flag to `false` falls
-    /// back to the condensed path, which is being retired (A7.6 cleanup).
-    pub use_augmented_kkt: bool,
     /// Bound push for initial point (kappa_1 in Ipopt).
     pub bound_push: f64,
     /// Bound fraction for initial point (kappa_2 in Ipopt).
@@ -664,7 +650,6 @@ impl Default for SolverOptions {
             print_level: 5,
             bound_relax_factor: 1e-8,
             kappa_d: 1e-5,
-            use_augmented_kkt: true,
             bound_push: 1e-2,
             bound_frac: 1e-2,
             slack_bound_push: 1e-2,
