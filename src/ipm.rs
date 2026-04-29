@@ -8608,6 +8608,48 @@ fn commit_trial_point(
     g_trial: Vec<f64>,
     alpha: f64,
 ) {
+    // A8.4 step trace: env-gated diagnostic for centering-stall debugging.
+    // Set RIPOPT_TRACE_STEP=1 to log ‖Δx‖, ‖α·Δx‖, |Δx_eff|, and the
+    // achieved relative move ‖Δx_eff‖/‖x‖. A frozen iterate at α=1 with
+    // ‖α·Δx‖_inf at machine-epsilon · ‖x‖_inf is the smoking gun for
+    // a near-singular augmented system producing a near-zero direction
+    // that the linear solver still reports as nonsingular.
+    if std::env::var("RIPOPT_TRACE_STEP").is_ok() {
+        let dx_inf = linf_norm(&state.dx);
+        let alpha_dx_inf = alpha * dx_inf;
+        let mut x_inf = 0.0_f64;
+        let mut diff_inf = 0.0_f64;
+        for i in 0..state.n {
+            let xi = state.x[i].abs();
+            if xi > x_inf { x_inf = xi; }
+            let d = (x_trial[i] - state.x[i]).abs();
+            if d > diff_inf { diff_inf = d; }
+        }
+        let dy_inf = linf_norm(&state.dy);
+        let rel = if x_inf > 0.0 { diff_inf / x_inf } else { diff_inf };
+        // Σ-pin diagnostic: smallest x-slack and largest z give the worst
+        // diagonal entry of W + Σ. If min_slack · max_z >> κ_σ·μ the κ_σ
+        // clamp has failed to keep z*s in band.
+        let mut min_s_x = f64::INFINITY;
+        let mut max_z_x = 0.0_f64;
+        for i in 0..state.n {
+            if state.x_l[i].is_finite() {
+                let s = state.x[i] - state.x_l[i];
+                if s > 0.0 && s < min_s_x { min_s_x = s; }
+            }
+            if state.x_u[i].is_finite() {
+                let s = state.x_u[i] - state.x[i];
+                if s > 0.0 && s < min_s_x { min_s_x = s; }
+            }
+            if state.z_l[i].abs() > max_z_x { max_z_x = state.z_l[i].abs(); }
+            if state.z_u[i].abs() > max_z_x { max_z_x = state.z_u[i].abs(); }
+        }
+        eprintln!(
+            "[step] α={:.3e} ‖Δx‖={:.3e} ‖α·Δx‖={:.3e} |Δx_eff|={:.3e} ‖x‖={:.3e} rel={:.3e} ‖Δy‖={:.3e} min_s={:.3e} max_z={:.3e} max_Σ≈{:.3e}",
+            alpha, dx_inf, alpha_dx_inf, diff_inf, x_inf, rel, dy_inf,
+            min_s_x, max_z_x, max_z_x / min_s_x.max(1e-300),
+        );
+    }
     state.x = x_trial;
     state.obj = obj_trial;
     state.g = g_trial;
