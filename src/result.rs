@@ -90,6 +90,17 @@ pub struct SolverDiagnostics {
     /// caller of `factor_with_inertia_correction_cached`, including
     /// the cache-disabled path where every call factors.
     pub factor_cache_factor_calls: u64,
+    /// B11: cumulative NLP-callback counts surfaced in the final
+    /// summary. ripopt's `constraints` and `jacobian_values` fill the
+    /// joint c/d block in one call, so `n_constr_evals`/`n_jac_evals`
+    /// count both the equality and the inequality side; the printed
+    /// summary repeats the same value on the equality and inequality
+    /// rows for Ipopt-format compatibility.
+    pub n_obj_evals: usize,
+    pub n_grad_evals: usize,
+    pub n_constr_evals: usize,
+    pub n_jac_evals: usize,
+    pub n_hess_evals: usize,
 }
 
 impl SolverDiagnostics {

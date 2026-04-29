@@ -558,12 +558,6 @@ pub unsafe extern "C" fn ripopt_add_str_option(
         "disable_nlp_restoration" => {
             p.options.disable_nlp_restoration = value == "yes";
         }
-        "enable_slack_fallback" => {
-            p.options.enable_slack_fallback = value == "yes";
-        }
-        "enable_lbfgs_fallback" => {
-            p.options.enable_lbfgs_fallback = value == "yes";
-        }
         "enable_preprocessing" => {
             p.options.enable_preprocessing = value == "yes";
         }
@@ -576,9 +570,6 @@ pub unsafe extern "C" fn ripopt_add_str_option(
                 "exact" => p.options.hessian_approximation_lbfgs = false,
                 _ => return 0,
             }
-        }
-        "enable_lbfgs_hessian_fallback" => {
-            p.options.enable_lbfgs_hessian_fallback = value == "yes";
         }
         "mehrotra_pc" => {
             p.options.mehrotra_pc = value == "yes";

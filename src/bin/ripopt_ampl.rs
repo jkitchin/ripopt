@@ -217,11 +217,6 @@ fn print_help() {
     println!("    mehrotra_pc=<bool>                   Mehrotra predictor-corrector [no]");
     println!("    gondzio_mcc_max=<int>                Max Gondzio centrality corrections [3]");
     println!();
-    println!("  Fallback Strategies");
-    println!("    enable_slack_fallback=<bool>         Retry with explicit slack variables [yes]");
-    println!("    enable_lbfgs_fallback=<bool>         L-BFGS fallback for unconstrained [yes]");
-    println!("    enable_lbfgs_hessian_fallback=<bool> Retry with L-BFGS Hessian [yes]");
-    println!();
     println!("  Preprocessing & Diagnostics");
     println!("    enable_preprocessing=<bool>          Eliminate fixed vars & redundant constraints [yes]");
     println!("    proactive_infeasibility_detection=<bool> Early infeasibility detection [no]");
@@ -403,15 +398,6 @@ fn apply_option(opts: &mut SolverOptions, key: &str, value: &str) {
         "disable_nlp_restoration" => {
             opts.disable_nlp_restoration = value == "yes" || value == "true" || value == "1";
         }
-        "slack_fallback" | "enable_slack_fallback" => {
-            opts.enable_slack_fallback = value == "yes" || value == "true" || value == "1";
-        }
-        "lbfgs_fallback" | "enable_lbfgs_fallback" => {
-            opts.enable_lbfgs_fallback = value == "yes" || value == "true" || value == "1";
-        }
-        "lbfgs_hessian_fallback" | "enable_lbfgs_hessian_fallback" => {
-            opts.enable_lbfgs_hessian_fallback = value == "yes" || value == "true" || value == "1";
-        }
         "enable_preprocessing" => {
             opts.enable_preprocessing = value == "yes" || value == "true" || value == "1";
         }
@@ -517,6 +503,12 @@ fn apply_option(opts: &mut SolverOptions, key: &str, value: &str) {
         }
         "kkt_dump_name" => {
             opts.kkt_dump_name = value.to_string();
+        }
+        "ir_residual_full_8_block" => {
+            opts.ir_residual_full_8_block = value == "yes" || value == "true" || value == "1";
+        }
+        "factor_cache_enabled" => {
+            opts.factor_cache_enabled = value == "yes" || value == "true" || value == "1";
         }
         _ => {
             eprintln!("Warning: unknown option '{}'", key);

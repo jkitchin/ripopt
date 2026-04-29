@@ -92,6 +92,13 @@ impl FeralLdl {
         let mut numeric_params = NumericParams::default();
         numeric_params.bk.on_zero_pivot = ZeroPivotAction::ForceAccept;
         numeric_params.scaling = ScalingStrategy::Identity;
+        // Raise the absolute "this pivot is zero" threshold from f64::EPSILON
+        // (~2.22e-16). Combined with the inertia reinterpretation in
+        // `convert_inertia`, this puts feral's reporting on the same footing
+        // as MUMPS/MA57: tiny pivots end up in the negative bucket (where the
+        // (2,2) regularization places them anyway) instead of the zero bucket.
+        numeric_params.bk.zero_tol = 1e-10;
+        numeric_params.bk.zero_tol_2x2 = 1e-20;
 
         Self {
             n: 0,
@@ -116,10 +123,39 @@ impl FeralLdl {
     }
 
     fn convert_inertia(i: feral::Inertia) -> Inertia {
+        // Reinterpret feral's `zero` count as additional `negative` pivots.
+        //
+        // Rationale: feral is the only sparse symmetric indefinite solver in
+        // the Ipopt ecosystem that exposes a `zero` bucket. MUMPS/MA57/MA86/
+        // SSIDS all use delayed pivoting (small pivots get postponed, never
+        // declared zero); Pardiso/WSMP perturb tiny pivots to nonzero values.
+        // None of them ever return `zero > 0` to the IPM. As a result Ipopt's
+        // PerturbForSingularity is effectively dead code in production —
+        // every near-rank-deficient KKT routes through PerturbForWrongInertia
+        // (which has the second-layer δ_c reset that PerturbForSingularity
+        // lacks).
+        //
+        // We use `ZeroPivotAction::ForceAccept` above, so feral's flagged-zero
+        // pivots ARE in the factor — they're just below `zero_tol` in
+        // magnitude. For the augmented KKT after δ_c regularization, near-
+        // zero pivots in the Schur block carry an effective sign of -δ_c
+        // (negative), so promoting them to `negative` is the right inertia
+        // assignment in the regularized problem. ripopt's existing inertia-
+        // correction ladder will adjust if the assignment is wrong: a
+        // promoted-but-actually-positive pivot just causes the wrong-inertia
+        // ladder to escalate δ_w one step, no harm done.
+        //
+        // TODO: push this reinterpretation into feral itself. Cleaner home
+        // is the `factorize_multifrontal_with_workspace` inertia counter:
+        // when ForceAccept is on, a sub-`zero_tol` pivot's sign goes to
+        // positive/negative bucket per the actual sign bit of the (forced)
+        // pivot value, and `inertia.zero` is reserved for exact zeros. That
+        // matches MUMPS/MA57/SSIDS semantics natively. See dev/journal/
+        // when this gets done.
         Inertia {
             positive: i.positive,
-            negative: i.negative,
-            zero: i.zero,
+            negative: i.negative + i.zero,
+            zero: 0,
         }
     }
 

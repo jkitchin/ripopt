@@ -21,8 +21,19 @@ pub enum ConvergenceStatus {
 
 /// Information needed to check convergence.
 pub struct ConvergenceInfo {
-    /// Primal infeasibility: max |c_i(x)| for violated constraints.
+    /// User-facing primal infeasibility: max raw bound-violation on g.
+    /// Equality rows: `|g − g_l|`. Inequality rows: `max(g_l−g, 0) +
+    /// max(g−g_u, 0)`. This is what the unscaled (top-level) convergence
+    /// gate and the restoration trigger see.
     pub primal_inf: f64,
+    /// Slack-coupling primal infeasibility for the scaled (barrier-level)
+    /// gate: equality rows `|g − g_l|`, inequality rows `|g − s|` where `s`
+    /// is the explicit slack iterate. Mirrors Ipopt's
+    /// `IpIpoptCalculatedQuantities::curr_primal_infeasibility`
+    /// (`||c||_∞ ∪ ||d − s||_∞`). When the caller has not yet plumbed `s`
+    /// through, set this equal to `primal_inf` (degrades to the user-side
+    /// residual, never tighter than Ipopt's).
+    pub primal_inf_internal: f64,
     /// Dual infeasibility: ||grad_f + J^T y - z_l + z_u||_inf using iterative z.
     pub dual_inf: f64,
     /// Dual infeasibility using iterative z with component-wise scaling (for unscaled gate).
@@ -70,7 +81,7 @@ pub fn meets_acceptable_thresholds(
     const ACCEPTABLE_CONSTR_VIOL_TOL: f64 = 1e-2;
     const ACCEPTABLE_COMPL_INF_TOL: f64 = 1e-2;
 
-    let scaled_ok = info.primal_inf <= ACCEPTABLE_TOL
+    let scaled_ok = info.primal_inf_internal <= ACCEPTABLE_TOL
         && info.dual_inf <= ACCEPTABLE_TOL * s_d
         && info.compl_inf <= ACCEPTABLE_TOL * s_c;
     let unscaled_ok = info.primal_inf <= ACCEPTABLE_CONSTR_VIOL_TOL
@@ -143,8 +154,10 @@ pub fn check_convergence_with_last_obj(
     let compl_tol = options.tol * s_c;
 
     // Strict convergence: BOTH scaled AND unscaled must pass.
-    // All checks use iterative z (matches Ipopt's curr_dual_infeasibility).
-    let scaled_ok = info.primal_inf <= primal_tol
+    // Scaled (barrier-level) uses Ipopt's `||c||_∞ ∪ ||d − s||_∞` slack-
+    // coupling residual; unscaled (top-level/restoration) uses the user-
+    // facing raw bound violation on g.
+    let scaled_ok = info.primal_inf_internal <= primal_tol
         && info.dual_inf <= dual_tol
         && info.compl_inf <= compl_tol;
     let unscaled_ok = info.primal_inf <= options.constr_viol_tol
@@ -209,6 +222,56 @@ pub fn primal_infeasibility_max(g: &[f64], g_l: &[f64], g_u: &[f64]) -> f64 {
         }
     }
     max_viol
+}
+
+/// Slack-coupling primal infeasibility (Ipopt's barrier-level
+/// `inf_pr` = `||c(x)||_∞ ∪ ||d(x) − s||_∞`).
+///
+/// Equality rows (`g_l == g_u`) contribute `|g[i] − g_l[i]|`.
+/// Inequality rows contribute `|g[i] − s[i]|`, since the IPM iterates an
+/// explicit slack `s` with `g_l ≤ s ≤ g_u` and the equation
+/// `g(x) − s = 0` is the actual constraint the Newton system enforces
+/// (`IpIpoptCalculatedQuantities.cpp::curr_primal_infeasibility`,
+/// 1-norm overload). The 1-norm flavor is used inside the filter line
+/// search; the max-norm flavor (see `primal_infeasibility_internal_max`)
+/// is used for the barrier-level convergence test.
+pub fn primal_infeasibility_internal(
+    g: &[f64],
+    s: &[f64],
+    g_l: &[f64],
+    g_u: &[f64],
+) -> f64 {
+    let mut sum = 0.0f64;
+    for i in 0..g.len() {
+        if is_equality_constraint(g_l[i], g_u[i]) {
+            sum += (g[i] - g_l[i]).abs();
+        } else {
+            sum += (g[i] - s[i]).abs();
+        }
+    }
+    sum
+}
+
+/// Max-norm variant of [`primal_infeasibility_internal`]; used for the
+/// barrier-level convergence test (Ipopt's E_mu primal residual).
+pub fn primal_infeasibility_internal_max(
+    g: &[f64],
+    s: &[f64],
+    g_l: &[f64],
+    g_u: &[f64],
+) -> f64 {
+    let mut m = 0.0f64;
+    for i in 0..g.len() {
+        let r = if is_equality_constraint(g_l[i], g_u[i]) {
+            (g[i] - g_l[i]).abs()
+        } else {
+            (g[i] - s[i]).abs()
+        };
+        if r > m {
+            m = r;
+        }
+    }
+    m
 }
 
 /// Compute dual infeasibility: ||grad_f + J^T * lambda - z_l + z_u + kappa_d damping||_inf.
@@ -435,6 +498,7 @@ mod tests {
     fn test_convergence_optimal() {
         let info = ConvergenceInfo {
             primal_inf: 1e-10,
+            primal_inf_internal: 1e-10,
             dual_inf: 1e-10,
             dual_inf_unscaled: 1e-10,
             compl_inf: 1e-10,
@@ -457,6 +521,7 @@ mod tests {
     fn test_convergence_not_converged() {
         let info = ConvergenceInfo {
             primal_inf: 1e-3,
+            primal_inf_internal: 1e-3,
             dual_inf: 1e-3,
             dual_inf_unscaled: 1e-3,
             compl_inf: 1e-3,
@@ -481,6 +546,7 @@ mod tests {
         // not |f| (Ipopt IpOptErrorConvCheck.cpp:255).
         let info = ConvergenceInfo {
             primal_inf: 1e-3,
+            primal_inf_internal: 1e-3,
             dual_inf: 1e-3,
             dual_inf_unscaled: 1e-3,
             compl_inf: 1e-3,
@@ -503,7 +569,8 @@ mod tests {
     fn test_convergence_diverging_uses_x_not_obj() {
         // T0.6: |f| huge but ‖x‖_∞ small ⇒ NOT diverging.
         let info = ConvergenceInfo {
-            primal_inf: 1e-3, dual_inf: 1e-3, dual_inf_unscaled: 1e-3,
+            primal_inf: 1e-3, primal_inf_internal: 1e-3,
+            dual_inf: 1e-3, dual_inf_unscaled: 1e-3,
             compl_inf: 1e-3, mu: 1e-11, objective: 1e60,
             multiplier_sum: 0.0, multiplier_count: 0,
             bound_multiplier_sum: 0.0, bound_multiplier_count: 0,
@@ -518,7 +585,8 @@ mod tests {
         // T0.5: |Δf| / max(1, |f|) = |10.001 - 10.0| / 10.001 ≈ 1e-4.
         // With acceptable_obj_change_tol = 1e-2, gate passes.
         let info = ConvergenceInfo {
-            primal_inf: 1e-7, dual_inf: 1e-7, dual_inf_unscaled: 1e-7,
+            primal_inf: 1e-7, primal_inf_internal: 1e-7,
+            dual_inf: 1e-7, dual_inf_unscaled: 1e-7,
             compl_inf: 1e-7, mu: 0.0, objective: 10.001,
             multiplier_sum: 0.0, multiplier_count: 0,
             bound_multiplier_sum: 0.0, bound_multiplier_count: 0,
@@ -535,7 +603,8 @@ mod tests {
         // T0.5: |Δf| / max(1, |f|) = |11.0 - 10.0| / 11.0 ≈ 0.091.
         // With acceptable_obj_change_tol = 1e-2, gate blocks.
         let info = ConvergenceInfo {
-            primal_inf: 1e-7, dual_inf: 1e-7, dual_inf_unscaled: 1e-7,
+            primal_inf: 1e-7, primal_inf_internal: 1e-7,
+            dual_inf: 1e-7, dual_inf_unscaled: 1e-7,
             compl_inf: 1e-7, mu: 0.0, objective: 11.0,
             multiplier_sum: 0.0, multiplier_count: 0,
             bound_multiplier_sum: 0.0, bound_multiplier_count: 0,
@@ -551,7 +620,8 @@ mod tests {
     fn test_meets_acceptable_thresholds_no_prev_obj_skips_gate() {
         // T0.5: last_obj = None (iter 0) skips the gate.
         let info = ConvergenceInfo {
-            primal_inf: 1e-7, dual_inf: 1e-7, dual_inf_unscaled: 1e-7,
+            primal_inf: 1e-7, primal_inf_internal: 1e-7,
+            dual_inf: 1e-7, dual_inf_unscaled: 1e-7,
             compl_inf: 1e-7, mu: 0.0, objective: 11.0,
             multiplier_sum: 0.0, multiplier_count: 0,
             bound_multiplier_sum: 0.0, bound_multiplier_count: 0,
@@ -567,6 +637,7 @@ mod tests {
     fn test_convergence_acceptable() {
         let info = ConvergenceInfo {
             primal_inf: 1e-7,
+            primal_inf_internal: 1e-7,
             dual_inf: 1e-7,
             dual_inf_unscaled: 1e-7,
             compl_inf: 1e-7,
@@ -590,6 +661,7 @@ mod tests {
     fn test_convergence_acceptable_insufficient_count() {
         let info = ConvergenceInfo {
             primal_inf: 1e-7,
+            primal_inf_internal: 1e-7,
             dual_inf: 1e-7,
             dual_inf_unscaled: 1e-7,
             compl_inf: 1e-7,
@@ -614,6 +686,7 @@ mod tests {
         // Large multipliers should scale the dual tolerance
         let info = ConvergenceInfo {
             primal_inf: 1e-10,
+            primal_inf_internal: 1e-10,
             dual_inf: 5e-5, // Would fail without scaling
             dual_inf_unscaled: 5e-5,
             compl_inf: 1e-10,
@@ -654,6 +727,7 @@ mod tests {
         // Scaled dual_inf small, but iterative dual_inf_unscaled large.
         let info = ConvergenceInfo {
             primal_inf: 1e-10,
+            primal_inf_internal: 1e-10,
             dual_inf: 1e-10,
             dual_inf_unscaled: 1.5, // > dual_inf_tol=1.0
             compl_inf: 1e-10,

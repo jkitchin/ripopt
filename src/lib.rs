@@ -81,6 +81,7 @@ pub mod convergence;
 pub mod filter;
 pub mod ipm;
 pub mod kkt;
+pub mod kkt_aug;
 pub mod lbfgs;
 pub mod linearity;
 pub mod linear_solver;

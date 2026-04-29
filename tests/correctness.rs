@@ -1733,9 +1733,6 @@ fn intermediate_callback_early_stop() {
     let options = SolverOptions {
         print_level: 0,
         enable_preprocessing: false,
-        enable_lbfgs_fallback: false,
-        enable_slack_fallback: false,
-        enable_lbfgs_hessian_fallback: false,
         ..SolverOptions::default()
     };
     let result = ripopt::solve(&HS071, &options);

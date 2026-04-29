@@ -156,6 +156,7 @@ pub fn assemble_kkt(
     g: &[f64],
     g_l: &[f64],
     g_u: &[f64],
+    s: &[f64],
     y: &[f64],
     _z_l: &[f64],
     _z_u: &[f64],
@@ -165,8 +166,8 @@ pub fn assemble_kkt(
     mu: f64,
     kappa_d: f64,
     use_sparse: bool,
-    _v_l: &[f64],
-    _v_u: &[f64],
+    v_l: &[f64],
+    v_u: &[f64],
 ) -> KktSystem {
     let dim = n + m;
     let capacity = hess_rows.len() + jac_rows.len() + n + m;
@@ -248,12 +249,18 @@ pub fn assemble_kkt(
 
     // RHS: primal residual r_p (last m entries) and (2,2) block for inequality constraints.
     //
-    // After condensing the slack variables from the KKT system, the condensed system is:
-    //   [H + Σ_x    J^T         ] [Δx]   [r_d                            ]
-    //   [J          -Σ_s^{-1}   ] [Δy] = [Σ_s^{-1} * (y + μ/s_l - μ/s_u)]
+    // After condensing the slacks `s` out of Ipopt's full augmented system
+    // (`IpStdAugSystemSolver.cpp:232-468`), the algebraically equivalent
+    // condensed (n+m) system reads:
+    //   [H + Σ_x    J^T         ] [Δx]   [r_d                                       ]
+    //   [J          -Σ_s^{-1}   ] [Δy] = [-(g - s) + Σ_s^{-1} * (y + μ/s_l - μ/s_u)]
     //
-    // where Σ_s = z_sl/s_l + z_su/s_u is the barrier contribution from constraint slacks,
-    // z_sl, z_su are the slack bound multipliers, and s_l = g - g_l, s_u = g_u - g.
+    // where Σ_s = v_L/s_l + v_U/s_u is the barrier contribution from the
+    // slack bound multipliers, s_l = s - g_l, s_u = g_u - s, and (g - s)
+    // is the d-block primal residual carried by row 4 of Ipopt's full
+    // system. The Δs recovery downstream is `Δs = J·Δx + (g - s) − δ_d·Δy`,
+    // i.e. just row 4 rearranged, which yields Σ_s^{-1}·(Δy − grad_lag_s)
+    // exactly when the d-row RHS includes the -(g - s) term above.
     //
     // For equality constraints: no slack, (2,2) = 0, r_c = -(g - g_l).
     // For infeasible inequality constraints: no barrier, r_c = -(g - bound).
@@ -270,29 +277,26 @@ pub fn assemble_kkt(
         let mut any_feasible = false;
         let mut rhs_infeasible = 0.0;
 
-        // T0.11 (Ipopt 3.14 alignment): synthetic slack-bound multipliers
-        // v_L, v_U use the explicit positive parts of the combined
-        // multiplier y, then apply Ipopt's κ_σ safeguard. Sign convention
-        // here: with y on the slack equality g(x) − s = 0 and v_L, v_U ≥ 0
-        // on the slack box, stationarity gives y = v_U − v_L, so
-        //   v_L = max(−y, 0)  (lower-bound slack multiplier)
-        //   v_U = max( y, 0)  (upper-bound slack multiplier)
-        // The earlier `max(|y|, μ/s)` floor masked degenerate y by injecting
-        // a barrier surrogate, but if y is degenerate the issue is upstream
-        // (filter, line search), not the synthetic floor. Replace with
-        // κ_σ = 1e10 clamp of v_L·s_L (resp. v_U·s_U) into [μ/κ_σ, κ_σ·μ],
-        // matching Ipopt's bound-multiplier reset (Wächter & Biegler 2006
-        // eq. (16); IpIpoptCalculatedQuantities ComputePDSystem).
+        // Slack-bound multipliers v_L, v_U: use the explicit state vectors
+        // (initialized by `IpDefaultIterateInitializer.cpp` to
+        // `bound_mult_init_val = 1.0` and updated each iter by the dual
+        // Newton step). Apply Ipopt's κ_σ = 1e10 safeguard:
+        //   z·s ∈ [μ/κ_σ, κ_σ·μ]   ⇔   z ∈ [μ/(κ_σ·s), κ_σ·μ/s]
+        // (Wächter & Biegler 2006 eq. (16); `IpIpoptCalculatedQuantities`).
+        // Earlier versions synthesized v_L = max(−y, 0), v_U = max(y, 0)
+        // from the constraint multiplier y, but that collapses to 0 at
+        // iter 0 (y_init = 0) and the κ_σ clamp then pulls v down to
+        // μ/(κ_σ·s) — 1e10× smaller than μ/s — exploding the condensed
+        // RHS by κ_σ on problems with strictly interior inequality
+        // constraints (e.g. arki0003 had |rhs|_inf ≈ 1e13 before).
         let kappa_sigma = 1e10_f64;
         if g_l[i].is_finite() {
-            let slack = g[i] - g_l[i];
+            let slack = s[i] - g_l[i];
             if slack >= -1e-8 {
                 let safe_slack = slack.max(mu.max(1e-10));
-                // v_L = max(-y, 0), then κ_σ-clamp to [μ/(κ_σ·s), κ_σ·μ/s].
-                let mut z_sl = (-y[i]).max(0.0);
-                let z_lo = mu / (kappa_sigma * safe_slack);
-                let z_hi = kappa_sigma * mu / safe_slack;
-                z_sl = z_sl.clamp(z_lo, z_hi);
+                let mu_over_s = mu / safe_slack;
+                let mut z_sl = v_l[i];
+                z_sl = z_sl.max(mu_over_s / kappa_sigma).min(kappa_sigma * mu_over_s);
                 sigma_s += z_sl / safe_slack;
                 rhs_correction += mu / safe_slack;
                 any_feasible = true;
@@ -302,14 +306,12 @@ pub fn assemble_kkt(
             }
         }
         if g_u[i].is_finite() {
-            let slack = g_u[i] - g[i];
+            let slack = g_u[i] - s[i];
             if slack >= -1e-8 {
                 let safe_slack = slack.max(mu.max(1e-10));
-                // v_U = max(y, 0), then κ_σ-clamp to [μ/(κ_σ·s), κ_σ·μ/s].
-                let mut z_su = y[i].max(0.0);
-                let z_lo = mu / (kappa_sigma * safe_slack);
-                let z_hi = kappa_sigma * mu / safe_slack;
-                z_su = z_su.clamp(z_lo, z_hi);
+                let mu_over_s = mu / safe_slack;
+                let mut z_su = v_u[i];
+                z_su = z_su.max(mu_over_s / kappa_sigma).min(kappa_sigma * mu_over_s);
                 sigma_s += z_su / safe_slack;
                 rhs_correction -= mu / safe_slack;
                 any_feasible = true;
@@ -324,8 +326,21 @@ pub fn assemble_kkt(
             // (2,2) block: -Σ_s^{-1} (always negative, correct for KKT inertia)
             matrix.add(n + i, n + i, -sigma_s_inv);
             has_sigma_s[i] = true;
-            // RHS: Σ_s^{-1} * (y + μ/s_l - μ/s_u) + infeasible contributions
-            rhs[n + i] = sigma_s_inv * rhs_correction + rhs_infeasible;
+            // RHS: -(g - s) + Σ_s^{-1} * (y + μ/s_l - μ/s_u) + infeasible contributions.
+            // The -(g - s) term is the d-block primal residual from Ipopt's
+            // full augmented system row 4. Without it, the linear solve ignores
+            // the c_d(x) − s mismatch and the Δs recovery below dumps the full
+            // residual into Δs, producing huge slack-step FTB clamps when the
+            // initial slacks differ from c_d(x_0) (e.g. arki0003 row 1097
+            // had |g − s| ≈ 1.16e8, ds ≈ 1.16e8, α_pr clamped to 8.5e-11).
+            rhs[n + i] = -(g[i] - s[i]) + sigma_s_inv * rhs_correction + rhs_infeasible;
+            if std::env::var("RIPOPT_TRACE_RHS").is_ok() && rhs[n + i].abs() > 1e10 {
+                eprintln!(
+                    "  rhs-trace: row n+{}={} sigma_s={:.3e} sigma_s_inv={:.3e} rhs_corr={:.3e} rhs_infeas={:.3e} rhs[n+i]={:.3e} y={:.3e} g={:.3e} g_l={:.3e} g_u={:.3e}",
+                    i, n+i, sigma_s, sigma_s_inv, rhs_correction, rhs_infeasible, rhs[n + i],
+                    y[i], g[i], g_l[i], g_u[i]
+                );
+            }
         } else {
             // All infeasible: just drive toward feasibility
             rhs[n + i] = rhs_infeasible;
@@ -810,6 +825,25 @@ impl InertiaCorrectionParams {
         false
     }
 
+    /// A5/A6 augmented-system bridge: identical semantics to the
+    /// internal `consider_new_system`, exposed under a fresh name so
+    /// `kkt_aug::factor_aug_with_inertia_correction` can drive the
+    /// state machine without making the original method `pub` and
+    /// without depending on the internal name.
+    pub fn consider_new_system_aug(&mut self, mu: f64) -> Option<(f64, f64)> {
+        self.consider_new_system(mu)
+    }
+
+    /// A5/A6 augmented-system bridge for `perturb_for_singularity`.
+    pub fn perturb_for_singularity_aug(&mut self, mu: f64) -> bool {
+        self.perturb_for_singularity(mu)
+    }
+
+    /// A5/A6 augmented-system bridge for `perturb_for_wrong_inertia`.
+    pub fn perturb_for_wrong_inertia_aug(&mut self, mu: f64) -> bool {
+        self.perturb_for_wrong_inertia(mu)
+    }
+
     /// `finalize_test` (`IpPDPerturbationHandler.cpp:470-538`). Commits
     /// the most-recent probe outcome to the persistent flags. Called
     /// at the start of `consider_new_system` and `perturb_for_wrong_inertia`.
@@ -868,42 +902,44 @@ impl InertiaCorrectionParams {
     }
 }
 
-/// Check if a factorization produces acceptable backward error for the KKT system.
-/// Does a trial solve and checks ||b - Ax|| / (||x|| + ||b||).
-/// Returns true if backward error <= 1e-6.
-fn check_factorization_backward_error(
-    kkt: &KktSystem,
-    solver: &mut dyn LinearSolver,
-) -> bool {
-    check_factorization_backward_error_with_matrix(&kkt.matrix, &kkt.rhs, solver)
-}
-
-/// Check backward error using a specific matrix (may differ from kkt.matrix when perturbed).
-/// Uses a lenient threshold (1e-4) since iterative refinement in solve_for_direction
-/// will improve accuracy. This catches only grossly unreliable factorizations.
-fn check_factorization_backward_error_with_matrix(
-    matrix: &KktMatrix,
+/// Sanity-probe a factorization with a single solve.
+///
+/// Returns `true` iff `solver.solve(rhs, ·)` succeeds and produces a
+/// finite solution. This is intentionally **not** a backward-error
+/// gate — accuracy is the responsibility of the IPM-layer iterative
+/// refinement (`solve_for_direction_with_ir`). The probe only rejects
+/// factorizations that produce NaN/Inf, which would corrupt downstream
+/// state regardless of refinement.
+///
+/// Historically this function checked `max_berr ≤ 1e-4` to guard
+/// against faer's pivot-sign inertia mis-classifying rank-deficient
+/// matrices. That guard is now redundant: feral's `zero_tol = 1e-10`
+/// + `ZeroPivotAction::ForceAccept` already catch true rank deficiency
+/// at factor time, and the IPM IR handles the residual ill-conditioning
+/// that the berr threshold used to flag.
+fn check_factorization_finite_with_matrix(
+    _matrix: &KktMatrix,
     rhs: &[f64],
     solver: &mut dyn LinearSolver,
 ) -> bool {
     let dim = rhs.len();
     let mut solution = vec![0.0; dim];
     if solver.solve(rhs, &mut solution).is_err() {
+        if std::env::var("RIPOPT_TRACE_PERTURB").is_ok() {
+            eprintln!("    finite-check: solver.solve failed");
+        }
         return false;
     }
     if solution.iter().any(|v| v.is_nan() || v.is_infinite()) {
+        if std::env::var("RIPOPT_TRACE_PERTURB").is_ok() {
+            eprintln!("    finite-check: nan/inf in solution");
+        }
         return false;
     }
-    let mut residual = vec![0.0; dim];
-    matrix.matvec(&solution, &mut residual);
-    let x_norm: f64 = solution.iter().map(|v| v.abs()).fold(0.0f64, f64::max).max(1.0);
-    let mut max_berr: f64 = 0.0;
-    for i in 0..dim {
-        let abs_res = (rhs[i] - residual[i]).abs();
-        let denom = x_norm + rhs[i].abs().max(1e-30);
-        max_berr = max_berr.max(abs_res / denom);
+    if std::env::var("RIPOPT_TRACE_PERTURB").is_ok() {
+        eprintln!("    finite-check: ok");
     }
-    max_berr <= 1e-4
+    true
 }
 
 /// Perform KKT factorization with the PD perturbation handler.
@@ -922,12 +958,13 @@ fn check_factorization_backward_error_with_matrix(
 ///      the second-layer recovery in `perturb_for_wrong_inertia` adds
 ///      δ_c and restarts the δ_x ladder once.
 ///
-/// Backward-error verification (a faer-specific guard, since faer
-/// computes inertia from pivot signs and can mis-classify rank-
-/// deficient matrices that pivot-sign-correctly) sits inside the
-/// success branch: an exact-inertia factorization that fails the
-/// backward-error probe is treated as a singular result, looping back
-/// through `perturb_for_singularity`.
+/// A single-solve finite-result probe sits inside the success branch:
+/// an exact-inertia factorization that produces NaN/Inf on a probe
+/// solve is treated as a singular result, looping back through
+/// `perturb_for_singularity`. Numerical accuracy beyond NaN/Inf is the
+/// responsibility of the IPM-layer iterative refinement, not this
+/// gate — `zero_tol`-based pivot detection in feral already catches
+/// genuine rank deficiency at factor time.
 ///
 /// Returns the final `(δ_w, δ_c)` actually applied. On unrecoverable
 /// failure (cap exhausted with second-layer recovery also failing),
@@ -986,10 +1023,10 @@ pub fn factor_with_inertia_correction(
         let (positive, negative, zero) = match inertia {
             Some(i) => (i.positive, i.negative, i.zero),
             None => {
-                // Backend doesn't report inertia — accept the factor and
-                // verify only via backward error. This branch is exercised
-                // by tests that stub out the linear solver.
-                if check_factorization_backward_error_with_matrix(&perturbed, &kkt.rhs, solver) {
+                // Backend doesn't report inertia — accept the factor as long
+                // as a probe solve produces a finite result. This branch is
+                // exercised by tests that stub out the linear solver.
+                if check_factorization_finite_with_matrix(&perturbed, &kkt.rhs, solver) {
                     kkt.matrix = perturbed;
                     params.delta_w_last = if dx > 0.0 { dx } else { params.delta_w_last };
                     params.delta_c_last = if dc > 0.0 { dc } else { params.delta_c_last };
@@ -1007,10 +1044,17 @@ pub fn factor_with_inertia_correction(
             }
         };
 
+        if std::env::var("RIPOPT_TRACE_PERTURB").is_ok() {
+            eprintln!(
+                "  perturb-trace: dx={:.2e} dc={:.2e} -> inertia(+{}, -{}, 0:{}) target({}+, {}-, 0)",
+                dx, dc, positive, negative, zero, n, m
+            );
+        }
         let exact_ok = positive == n && negative == m && zero == 0;
         if exact_ok {
-            // Backward-error guard for faer pivot-sign inertia.
-            if check_factorization_backward_error_with_matrix(&perturbed, &kkt.rhs, solver) {
+            // Sanity-probe the factor with a single solve; the IPM-layer IR
+            // (`solve_for_direction_with_ir`) is responsible for accuracy.
+            if check_factorization_finite_with_matrix(&perturbed, &kkt.rhs, solver) {
                 kkt.matrix = perturbed;
                 params.delta_w_last = if dx > 0.0 { dx } else { params.delta_w_last };
                 params.delta_c_last = if dc > 0.0 { dc } else { params.delta_c_last };
@@ -1447,6 +1491,16 @@ pub fn solve_for_direction_with_ir_ctx(
             quit_refinement = true;
         }
         residual_ratio_old = residual_ratio;
+    }
+
+    if std::env::var("RIPOPT_TRACE_IR").is_ok() {
+        let nrm_sol: f64 = solution.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+        let nrm_rhs: f64 = kkt.rhs.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+        eprintln!(
+            "  ir-trace: iters={} ratio_final={:.3e} (max={:.3e}, sing={:.3e}) |sol|_inf={:.3e} |rhs|_inf={:.3e}",
+            num_iter_ref, residual_ratio, ir.residual_ratio_max, ir.residual_ratio_singular,
+            nrm_sol, nrm_rhs
+        );
     }
 
     // Post-IR singularity decision: replicates Ipopt's "S" vs "s"
@@ -1893,6 +1947,92 @@ pub fn recover_dz(
     (dz_l, dz_u)
 }
 
+/// Recover slack-bound multiplier steps `dv_L`, `dv_U` from
+/// complementarity, analogous to `recover_dz` but for inequality slacks.
+///
+/// For inequality constraint i with lower slack s_L = g(x) − g_L:
+///   ds_L = (J·dx)_i  (slack moves with the constraint value)
+///   dv_L = (μ − v_L·s_L) / s_L − (v_L / s_L) · ds_L
+///
+/// For upper slack s_U = g_U − g(x):
+///   ds_U = −(J·dx)_i
+///   dv_U = (μ − v_U·s_U) / s_U + (v_U / s_U) · (J·dx)_i
+///
+/// Equality constraints are skipped (no slack-bound multiplier).
+pub fn recover_dv(
+    m: usize,
+    g_l: &[f64],
+    g_u: &[f64],
+    s: &[f64],
+    v_l: &[f64],
+    v_u: &[f64],
+    ds: &[f64],
+    mu: f64,
+) -> (Vec<f64>, Vec<f64>) {
+    let mut dv_l = vec![0.0; m];
+    let mut dv_u = vec![0.0; m];
+    for i in 0..m {
+        // Skip equality constraints (g_l == g_u, both finite).
+        if g_l[i].is_finite() && g_u[i].is_finite() && (g_l[i] - g_u[i]).abs() < 1e-14 {
+            continue;
+        }
+        if g_l[i].is_finite() {
+            let s_l = (s[i] - g_l[i]).max(1e-20);
+            // dv_L = (μ − v_L·s_L)/s_L − (v_L/s_L)·ds_L,  ds_L = ds.
+            dv_l[i] = (mu - v_l[i] * s_l) / s_l - (v_l[i] / s_l) * ds[i];
+        }
+        if g_u[i].is_finite() {
+            let s_u = (g_u[i] - s[i]).max(1e-20);
+            // dv_U = (μ − v_U·s_U)/s_U − (v_U/s_U)·ds_U,  ds_U = −ds.
+            dv_u[i] = (mu - v_u[i] * s_u) / s_u + (v_u[i] / s_u) * ds[i];
+        }
+    }
+    (dv_l, dv_u)
+}
+
+/// Recover the slack-iterate step `ds` from `dx`, `dy`, and the slack-row
+/// residual.
+///
+/// For inequality row `i` (treats `g_l[i] == g_u[i]` as equality and skips):
+/// `ds[i] = (J·dx)[i] + (g[i] − s[i]) − δ_d[i]·dy[i]`
+///
+/// Reference: `IpStdAugSystemSolver.cpp:431-465` — the slack equation is
+/// `J·dx − ds + r_d = 0` with `r_d = -(g − s) + δ_d·dy`.
+/// `δ_d` is the per-row perturbation applied to inequality rows during
+/// inertia/singularity correction (analog of `δ_c` for equalities).
+/// In B3, `δ_d` is `&[]` (treated as zero); B-cross3 wires the actual
+/// perturbation when the handler escalates.
+pub fn recover_ds(
+    n: usize,
+    m: usize,
+    jac_rows: &[usize],
+    jac_cols: &[usize],
+    jac_vals: &[f64],
+    g: &[f64],
+    g_l: &[f64],
+    g_u: &[f64],
+    s: &[f64],
+    dx: &[f64],
+    dy: &[f64],
+    delta_d: &[f64],
+) -> Vec<f64> {
+    let mut ds = vec![0.0; m];
+    for (idx, (&row, &col)) in jac_rows.iter().zip(jac_cols.iter()).enumerate() {
+        if col < n && row < m {
+            ds[row] += jac_vals[idx] * dx[col];
+        }
+    }
+    for i in 0..m {
+        if g_l[i].is_finite() && g_u[i].is_finite() && (g_l[i] - g_u[i]).abs() < 1e-14 {
+            ds[i] = 0.0;
+            continue;
+        }
+        let dd = delta_d.get(i).copied().unwrap_or(0.0);
+        ds[i] += g[i] - s[i] - dd * dy[i];
+    }
+    ds
+}
+
 /// Compute the affine-scaling (μ=0) predictor RHS for Mehrotra predictor-corrector.
 ///
 /// Returns a copy of the existing KKT RHS with the centering terms (μ/s) removed.
@@ -2247,6 +2387,7 @@ pub fn assemble_condensed_kkt(
     g: &[f64],
     g_l: &[f64],
     g_u: &[f64],
+    s: &[f64],
     y: &[f64],
     _z_l: &[f64],
     _z_u: &[f64],
@@ -2255,8 +2396,8 @@ pub fn assemble_condensed_kkt(
     x_u: &[f64],
     mu: f64,
     kappa_d: f64,
-    _v_l: &[f64],
-    _v_u: &[f64],
+    v_l: &[f64],
+    v_u: &[f64],
 ) -> CondensedKktSystem {
     // Build the condensed system directly from problem data without assembling
     // the full (n+m)×(n+m) KKT matrix. This saves O((n+m)^2) memory and work.
@@ -2318,17 +2459,16 @@ pub fn assemble_condensed_kkt(
         let mut any_feasible = false;
         let mut rhs_infeasible = 0.0;
 
-        // T0.11: synthetic v_L / v_U use explicit positive parts of y
-        // with κ_σ = 1e10 clamp (see assemble_kkt for derivation).
+        // Slack-bound multipliers v_L, v_U: explicit state with κ_σ band.
+        // See `assemble_kkt` for the rationale.
         let kappa_sigma = 1e10_f64;
         if g_l[i].is_finite() {
-            let slack = g[i] - g_l[i];
+            let slack = s[i] - g_l[i];
             if slack >= -1e-8 {
                 let safe_slack = slack.max(mu.max(1e-10));
-                let mut z_sl = (-y[i]).max(0.0);
-                let z_lo = mu / (kappa_sigma * safe_slack);
-                let z_hi = kappa_sigma * mu / safe_slack;
-                z_sl = z_sl.clamp(z_lo, z_hi);
+                let mu_over_s = mu / safe_slack;
+                let mut z_sl = v_l[i];
+                z_sl = z_sl.max(mu_over_s / kappa_sigma).min(kappa_sigma * mu_over_s);
                 sigma_s += z_sl / safe_slack;
                 rhs_correction += mu / safe_slack;
                 any_feasible = true;
@@ -2337,13 +2477,12 @@ pub fn assemble_condensed_kkt(
             }
         }
         if g_u[i].is_finite() {
-            let slack = g_u[i] - g[i];
+            let slack = g_u[i] - s[i];
             if slack >= -1e-8 {
                 let safe_slack = slack.max(mu.max(1e-10));
-                let mut z_su = y[i].max(0.0);
-                let z_lo = mu / (kappa_sigma * safe_slack);
-                let z_hi = kappa_sigma * mu / safe_slack;
-                z_su = z_su.clamp(z_lo, z_hi);
+                let mu_over_s = mu / safe_slack;
+                let mut z_su = v_u[i];
+                z_su = z_su.max(mu_over_s / kappa_sigma).min(kappa_sigma * mu_over_s);
                 sigma_s += z_su / safe_slack;
                 rhs_correction -= mu / safe_slack;
                 any_feasible = true;
@@ -2601,6 +2740,7 @@ pub fn assemble_sparse_condensed_kkt(
     g: &[f64],
     g_l: &[f64],
     g_u: &[f64],
+    s: &[f64],
     y: &[f64],
     _z_l: &[f64],
     _z_u: &[f64],
@@ -2609,8 +2749,8 @@ pub fn assemble_sparse_condensed_kkt(
     x_u: &[f64],
     mu: f64,
     kappa_d: f64,
-    _v_l: &[f64],
-    _v_u: &[f64],
+    v_l: &[f64],
+    v_u: &[f64],
 ) -> SparseCondensedKktSystem {
     // Estimate nnz: hess + diagonal + J^T*D_c^{-1}*J fill
     // For each constraint row with k nonzeros, the outer product has k*(k+1)/2 entries.
@@ -2699,17 +2839,16 @@ pub fn assemble_sparse_condensed_kkt(
         let mut any_feasible = false;
         let mut rhs_infeasible = 0.0;
 
-        // T0.11: synthetic v_L / v_U use explicit positive parts of y
-        // with κ_σ = 1e10 clamp (see assemble_kkt for derivation).
+        // Slack-bound multipliers v_L, v_U: explicit state with κ_σ band.
+        // See `assemble_kkt` for the rationale.
         let kappa_sigma = 1e10_f64;
         if g_l[i].is_finite() {
-            let slack = g[i] - g_l[i];
+            let slack = s[i] - g_l[i];
             if slack >= -1e-8 {
                 let safe_slack = slack.max(mu.max(1e-10));
-                let mut z_sl = (-y[i]).max(0.0);
-                let z_lo = mu / (kappa_sigma * safe_slack);
-                let z_hi = kappa_sigma * mu / safe_slack;
-                z_sl = z_sl.clamp(z_lo, z_hi);
+                let mu_over_s = mu / safe_slack;
+                let mut z_sl = v_l[i];
+                z_sl = z_sl.max(mu_over_s / kappa_sigma).min(kappa_sigma * mu_over_s);
                 sigma_s += z_sl / safe_slack;
                 rhs_correction += mu / safe_slack;
                 any_feasible = true;
@@ -2718,13 +2857,12 @@ pub fn assemble_sparse_condensed_kkt(
             }
         }
         if g_u[i].is_finite() {
-            let slack = g_u[i] - g[i];
+            let slack = g_u[i] - s[i];
             if slack >= -1e-8 {
                 let safe_slack = slack.max(mu.max(1e-10));
-                let mut z_su = y[i].max(0.0);
-                let z_lo = mu / (kappa_sigma * safe_slack);
-                let z_hi = kappa_sigma * mu / safe_slack;
-                z_su = z_su.clamp(z_lo, z_hi);
+                let mu_over_s = mu / safe_slack;
+                let mut z_su = v_u[i];
+                z_su = z_su.max(mu_over_s / kappa_sigma).min(kappa_sigma * mu_over_s);
                 sigma_s += z_su / safe_slack;
                 rhs_correction -= mu / safe_slack;
                 any_feasible = true;
@@ -2923,7 +3061,7 @@ mod tests {
         let kkt = assemble_kkt(
             n, m, &hess_rows, &hess_cols, &hess_vals,
             &[], &[], &[], &sigma, &grad_f,
-            &[], &[], &[], &[], &z_l, &z_u,
+            &[], &[], &[], &[], &[], &z_l, &z_u,
             &x, &x_l, &x_u, 0.1, 0.0, false, &[], &[],
         );
 
@@ -2958,10 +3096,11 @@ mod tests {
 
         let v_l = vec![0.0; m];
         let v_u = vec![0.0; m];
+        let s = g.clone();
         let kkt = assemble_kkt(
             n, m, &hess_rows, &hess_cols, &hess_vals,
             &jac_rows, &jac_cols, &jac_vals, &sigma, &grad_f,
-            &g, &g_l, &g_u, &y, &z_l, &z_u,
+            &g, &g_l, &g_u, &s, &y, &z_l, &z_u,
             &x, &x_l, &x_u, 0.1, 0.0, false, &v_l, &v_u,
         );
 
@@ -3004,10 +3143,11 @@ mod tests {
 
         let v_l = vec![0.0; m];
         let v_u = vec![0.0; m];
+        let s = g.clone();
         let kkt = assemble_kkt(
             n, m, &hess_rows, &hess_cols, &hess_vals,
             &jac_rows, &jac_cols, &jac_vals, &sigma, &grad_f,
-            &g, &g_l, &g_u, &y, &z_l, &z_u,
+            &g, &g_l, &g_u, &s, &y, &z_l, &z_u,
             &x, &x_l, &x_u, 0.1, 0.0, false, &v_l, &v_u,
         );
 
@@ -3024,48 +3164,47 @@ mod tests {
     ///
     /// Setup: single inequality constraint g(x) ≥ g_l with y = -1.5
     /// (negative ⇒ v_L is positive in ripopt's sign convention),
-    /// slack s = 0.3, μ = 0.01.  v_L = max(-y, 0) = max(1.5, 0) = 1.5.
-    /// κ_σ-clamp: bounds = [μ/(κ_σ·s), κ_σ·μ/s] = [3.3e-12, 3.3e8],
-    /// 1.5 sits inside, so v_L = 1.5. Σ_s = v_L/s = 5.0.
-    /// (2,2) block = -1/Σ_s = -0.2.
+    /// Inequality with explicit v_L = 1.5, slack = 0.3, μ = 0.01.
+    /// κ_σ band [μ/(κ_σ·s), κ_σ·μ/s] = [3.3e-12, 3.3e8] contains 1.5,
+    /// so v_L is unclamped. Σ_s = v_L/s = 5.0, (2,2) = -1/Σ_s = -0.2.
     #[test]
-    fn test_assemble_kkt_synthetic_vL_uses_positive_part() {
+    fn test_assemble_kkt_explicit_vL_within_kappa_sigma_band() {
         let n = 1;
         let m = 1;
         let hess_rows = vec![0]; let hess_cols = vec![0]; let hess_vals = vec![1.0];
         let jac_rows = vec![0]; let jac_cols = vec![0]; let jac_vals = vec![1.0];
         let sigma = vec![0.0];
         let grad_f = vec![0.0];
-        // x = 1.3, g(x) = x = 1.3, g_l = 1.0, slack = 0.3.
         let g = vec![1.3];
         let g_l = vec![1.0];
         let g_u = vec![f64::INFINITY];
-        let y = vec![-1.5]; // negative y ⇒ v_L = -y = 1.5
+        let y = vec![0.0];
         let x = vec![1.3];
         let x_l = vec![f64::NEG_INFINITY];
         let x_u = vec![f64::INFINITY];
         let z_l = vec![0.0]; let z_u = vec![0.0];
-        let v_l = vec![0.0; m]; let v_u = vec![0.0; m];
+        let v_l = vec![1.5]; let v_u = vec![0.0; m];
         let mu = 0.01;
 
+        let s = g.clone();
         let kkt = assemble_kkt(
             n, m, &hess_rows, &hess_cols, &hess_vals,
             &jac_rows, &jac_cols, &jac_vals, &sigma, &grad_f,
-            &g, &g_l, &g_u, &y, &z_l, &z_u,
+            &g, &g_l, &g_u, &s, &y, &z_l, &z_u,
             &x, &x_l, &x_u, mu, 0.0, false, &v_l, &v_u,
         );
-        // Σ_s = v_L / s = 1.5 / 0.3 = 5.0  ⇒ (2,2) = -1/5 = -0.2
         let d_22 = kkt.matrix.get(1, 1);
         assert!((d_22 - (-0.2)).abs() < 1e-9,
-            "T0.11: (2,2) block should be -1/Σ_s = -0.2 with v_L = max(-y,0) = 1.5; got {}", d_22);
+            "(2,2) block should be -1/Σ_s = -0.2 with v_L = 1.5; got {}", d_22);
     }
 
-    /// T0.11: degenerate y (here y = 0) yields v_L = max(-y, 0) = 0,
-    /// which is then κ_σ-clamped UP to μ/(κ_σ·s) — the lower clamp
-    /// bound, not the old `μ/s` floor. Σ_s ends up tiny and the
-    /// (2,2) block accordingly large in magnitude.
+    /// v_L = 0 (uninitialized / inactive bound) gets κ_σ-floored to
+    /// μ/(κ_σ·s) instead of producing a degenerate Σ_s = 0. With μ = 0.01,
+    /// s = 0.3, κ_σ = 1e10: clamped v_L ≈ 3.3e-12, Σ_s ≈ 1.1e-11,
+    /// (2,2) ≈ -9e10. This guards against accidentally feeding zero v_L
+    /// into the assembly without crashing the linear solve.
     #[test]
-    fn test_assemble_kkt_synthetic_vL_kappa_sigma_clamp() {
+    fn test_assemble_kkt_explicit_vL_zero_gets_kappa_sigma_floor() {
         let n = 1;
         let m = 1;
         let hess_rows = vec![0]; let hess_cols = vec![0]; let hess_vals = vec![1.0];
@@ -3075,7 +3214,7 @@ mod tests {
         let g = vec![1.3];
         let g_l = vec![1.0];
         let g_u = vec![f64::INFINITY];
-        let y = vec![0.0]; // degenerate
+        let y = vec![0.0];
         let x = vec![1.3];
         let x_l = vec![f64::NEG_INFINITY];
         let x_u = vec![f64::INFINITY];
@@ -3083,18 +3222,19 @@ mod tests {
         let v_l = vec![0.0; m]; let v_u = vec![0.0; m];
         let mu = 0.01;
 
+        let s = g.clone();
         let kkt = assemble_kkt(
             n, m, &hess_rows, &hess_cols, &hess_vals,
             &jac_rows, &jac_cols, &jac_vals, &sigma, &grad_f,
-            &g, &g_l, &g_u, &y, &z_l, &z_u,
+            &g, &g_l, &g_u, &s, &y, &z_l, &z_u,
             &x, &x_l, &x_u, mu, 0.0, false, &v_l, &v_u,
         );
-        // v_L = max(0, 0) = 0 ⇒ clamped UP to μ/(κ_σ·s) = 0.01/(1e10·0.3) ≈ 3.33e-12.
-        // Σ_s ≈ 1.11e-11 ⇒ (2,2) ≈ -9e10.
-        // Old code would have used μ/s = 0.0333 ⇒ Σ_s ≈ 0.111 ⇒ (2,2) ≈ -9.0.
         let d_22 = kkt.matrix.get(1, 1);
-        assert!(d_22 < -1e9,
-            "T0.11: degenerate y with κ_σ clamp should produce huge |(2,2)| (got {}); old μ/s floor would give ≈ -9.0", d_22);
+        // Σ_s = (μ/(κ_σ·s)) / s = μ / (κ_σ·s²) = 0.01 / (1e10·0.09) ≈ 1.111e-11
+        // (2,2) = -1/Σ_s ≈ -9e10
+        let expected = -9e10;
+        let rel = (d_22 - expected).abs() / expected.abs();
+        assert!(rel < 1e-3, "(2,2) should be ≈ -9e10 with κ_σ floor; got {}", d_22);
     }
 
     #[test]
@@ -3123,10 +3263,11 @@ mod tests {
 
         let v_l = vec![0.0; m];
         let v_u = vec![0.0; m];
+        let s = g.clone();
         let kkt = assemble_kkt(
             n, m, &hess_rows, &hess_cols, &hess_vals,
             &jac_rows, &jac_cols, &jac_vals, &sigma, &grad_f,
-            &g, &g_l, &g_u, &y, &z_l, &z_u,
+            &g, &g_l, &g_u, &s, &y, &z_l, &z_u,
             &x, &x_l, &x_u, mu, 0.0, false, &v_l, &v_u,
         );
 
@@ -3806,10 +3947,11 @@ mod tests {
         // Solve with full KKT
         let v_l = vec![0.0; m];
         let v_u = vec![0.0; m];
+        let s = g.clone();
         let mut full_kkt = assemble_kkt(
             n, m, &hess_rows, &hess_cols, &hess_vals,
             &jac_rows, &jac_cols, &jac_vals, &sigma, &grad_f,
-            &g, &g_l, &g_u, &y, &z_l, &z_u, &x, &x_l, &x_u, mu, 0.0, false,
+            &g, &g_l, &g_u, &s, &y, &z_l, &z_u, &x, &x_l, &x_u, mu, 0.0, false,
             &v_l, &v_u,
         );
         let mut full_solver = DenseLdl::new();
@@ -3821,7 +3963,7 @@ mod tests {
         let condensed = assemble_condensed_kkt(
             n, m, &hess_rows, &hess_cols, &hess_vals,
             &jac_rows, &jac_cols, &jac_vals, &sigma, &grad_f,
-            &g, &g_l, &g_u, &y, &z_l, &z_u, &x, &x_l, &x_u, mu, 0.0,
+            &g, &g_l, &g_u, &s, &y, &z_l, &z_u, &x, &x_l, &x_u, mu, 0.0,
             &v_l, &v_u,
         );
         let mut cond_solver = DenseLdl::new();

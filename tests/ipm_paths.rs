@@ -300,7 +300,6 @@ fn ipm_unbounded_detection() {
     let problem = UnboundedProblem;
     let options = SolverOptions {
         print_level: 0,
-        enable_lbfgs_fallback: false,
         ..SolverOptions::default()
     };
     let result = ripopt::solve(&problem, &options);
@@ -541,7 +540,6 @@ fn ipm_lbfgs_fallback_unconstrained() {
     let problem = RosenbrockLbfgs;
     let options = SolverOptions {
         print_level: 0,
-        enable_lbfgs_fallback: true,
         ..SolverOptions::default()
     };
     let result = ripopt::solve(&problem, &options);

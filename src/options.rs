@@ -193,6 +193,20 @@ pub struct SolverOptions {
     /// (`||r_d||_inf`) is computed from the UN-damped gradient.
     /// Set to `0.0` to disable.
     pub kappa_d: f64,
+    /// A7 (Ipopt-alignment): use the full augmented KKT path for the
+    /// primary Newton direction solve. When `true`, the IPM driver calls
+    /// `kkt_aug::aug_step_from_state` (4-block, dim `n + n_d + n_c + n_d`,
+    /// matching `IpStdAugSystemSolver`) instead of the condensed
+    /// `kkt::assemble_kkt` + `solve_for_direction*` path.
+    ///
+    /// **A7.6 (default ON, 2026-04-28)**: HS bisect (113/120 aug vs 83/120
+    /// condensed) confirmed the augmented path strictly dominates the
+    /// condensed path. Mehrotra/Probing μ oracle (A7.5) and SOC (A7.5b)
+    /// are both implemented for the aug path. Gondzio MCC (A7.5c) is NOT
+    /// in Ipopt 3.14 — the aug path correctly skips it via the
+    /// `kkt_system_opt = None` gate. Setting this flag to `false` falls
+    /// back to the condensed path, which is being retired (A7.6 cleanup).
+    pub use_augmented_kkt: bool,
     /// Bound push for initial point (kappa_1 in Ipopt).
     pub bound_push: f64,
     /// Bound fraction for initial point (kappa_2 in Ipopt).
@@ -239,7 +253,17 @@ pub struct SolverOptions {
     /// Allow the adaptive barrier rule to increase mu when complementarity is large
     /// (e.g., after restoration or stall recovery). Default: true.
     pub mu_allow_increase: bool,
-    /// Use least-squares estimate for initial constraint multipliers. Default: true.
+    /// Use least-squares estimate for initial constraint multipliers.
+    ///
+    /// Mirrors Ipopt 3.14's `least_square_init_y` option
+    /// (`IpDefaultIterateInitializer.cpp:84-90`), default **`no`**:
+    /// Ipopt initializes y = 0 unless the user explicitly opts in. With
+    /// `true`, ripopt computes the LS estimate
+    /// `min ||∇f + J^T y||²`; rejected if `‖y_LS‖_∞ > constr_mult_init_max`,
+    /// in which case y is set to 0. The LS estimate can dominate the iter-0
+    /// dual residual on poorly-scaled problems where `‖J^T y_LS‖_∞ ≫ ‖∇f‖_∞`,
+    /// producing a much larger initial KKT than Ipopt's y=0 baseline.
+    /// Default: false (matches Ipopt).
     pub least_squares_mult_init: bool,
     /// Maximum absolute value for LS multiplier init; if exceeded, fall back to zero. Default: 1000.0.
     pub constr_mult_init_max: f64,
@@ -302,13 +326,6 @@ pub struct SolverOptions {
     /// flag is wired but kept off by default so the change can land
     /// behind a single switch and be enabled / benchmarked in isolation.
     pub restore_early_exit_outer_filter: bool,
-    /// Enable slack variable fallback for inequality problems. When the initial
-    /// solve fails, retry with explicit slack variables (g(x)-s=0, bounds on s).
-    /// Default: true.
-    pub enable_slack_fallback: bool,
-    /// Enable L-BFGS fallback for unconstrained problems. When IPM fails with
-    /// MaxIterations or NumericalError, retry with L-BFGS. Default: true.
-    pub enable_lbfgs_fallback: bool,
     /// Enable preprocessing to eliminate fixed variables and redundant constraints.
     /// Default: true.
     pub enable_preprocessing: bool,
@@ -320,12 +337,6 @@ pub struct SolverOptions {
     /// Equivalent to Ipopt's `hessian_approximation = "limited-memory"`.
     /// Default: false.
     pub hessian_approximation_lbfgs: bool,
-    /// Automatic L-BFGS Hessian fallback. When the exact-Hessian IPM fails
-    /// (MaxIterations, NumericalError, or RestorationFailed), retry with
-    /// L-BFGS Hessian approximation. Useful when the user-provided Hessian
-    /// is ill-conditioned, buggy, or overly sparse.
-    /// Default: true.
-    pub enable_lbfgs_hessian_fallback: bool,
     /// Enable Mehrotra predictor-corrector for barrier parameter selection.
     ///
     /// After factoring the KKT system, solves an affine-scaling predictor step
@@ -485,6 +496,19 @@ pub struct SolverOptions {
     pub warm_start_z_l: Option<Vec<f64>>,
     /// Initial upper-bound multipliers for warm starting.
     pub warm_start_z_u: Option<Vec<f64>>,
+    /// B9: optional initial constraint slack iterate `s` for warm
+    /// starting. When supplied (and `warm_start = true`), values are
+    /// copied into `state.s` after the default slack-push initializer
+    /// has run; equality rows are kept at their sentinel `s = g_l`.
+    /// Out-of-bound entries are projected back into a strict interior
+    /// of `[g_l, g_u]` so the IPM's barrier remains well-defined.
+    pub warm_start_s: Option<Vec<f64>>,
+    /// B9: optional initial constraint-slack lower-bound multipliers
+    /// `v_l` for warm starting. Mirrors `warm_start_z_l`.
+    pub warm_start_v_l: Option<Vec<f64>>,
+    /// B9: optional initial constraint-slack upper-bound multipliers
+    /// `v_u` for warm starting. Mirrors `warm_start_z_u`.
+    pub warm_start_v_u: Option<Vec<f64>>,
     /// T0.12 (Ipopt 3.14 alignment): enable iterative refinement on the
     /// full augmented KKT system in `kkt::solve_for_direction`. When
     /// `false`, only a single backsolve is performed (no refinement
@@ -640,6 +664,7 @@ impl Default for SolverOptions {
             print_level: 5,
             bound_relax_factor: 1e-8,
             kappa_d: 1e-5,
+            use_augmented_kkt: true,
             bound_push: 1e-2,
             bound_frac: 1e-2,
             slack_bound_push: 1e-2,
@@ -658,7 +683,7 @@ impl Default for SolverOptions {
             nlp_upper_bound_inf: 1e19,
             kappa: 10.0,
             mu_allow_increase: true,
-            least_squares_mult_init: true,
+            least_squares_mult_init: false,
             constr_mult_init_max: 1000.0,
             constraint_slack_barrier: true,
             max_wall_time: 0.0,
@@ -673,12 +698,9 @@ impl Default for SolverOptions {
             disable_nlp_restoration: false,
             kappa_resto: 0.9,
             restore_early_exit_outer_filter: false,
-            enable_slack_fallback: true,
-            enable_lbfgs_fallback: true,
             enable_preprocessing: true,
             detect_linear_constraints: true,
             hessian_approximation_lbfgs: false,
-            enable_lbfgs_hessian_fallback: true,
             mehrotra_pc: false,
             gondzio_mcc_max: 3,
             proactive_infeasibility_detection: false,
@@ -705,6 +727,9 @@ impl Default for SolverOptions {
             warm_start_y: None,
             warm_start_z_l: None,
             warm_start_z_u: None,
+            warm_start_s: None,
+            warm_start_v_l: None,
+            warm_start_v_u: None,
             kkt_dump_dir: None,
             kkt_dump_name: "problem".to_string(),
             slack_move: {

@@ -670,7 +670,9 @@ impl RestorationPhase {
             // Sparse path: build J_a * J_a^T in COO triplet format for large problems.
             // Uses a HashMap to accumulate entries, then factors with sparse solver.
             use std::collections::HashMap;
-            use crate::linear_solver::{KktMatrix, SparseSymmetricMatrix};
+            use crate::linear_solver::SparseSymmetricMatrix;
+            #[cfg(feature = "rmumps")]
+            use crate::linear_solver::KktMatrix;
             let mut triplet_map: HashMap<(usize, usize), f64> = HashMap::new();
             for col_ents in &col_entries {
                 for &(ai, val_i) in col_ents {
@@ -704,11 +706,10 @@ impl RestorationPhase {
                 ssm.triplet_cols.push(c);
                 ssm.triplet_vals.push(v);
             }
-            let matrix = KktMatrix::Sparse(ssm);
-
             #[cfg(feature = "rmumps")]
             {
                 use crate::linear_solver::multifrontal::MultifrontalLdl;
+                let matrix = KktMatrix::Sparse(ssm);
                 let mut sparse_solver = MultifrontalLdl::new();
                 if sparse_solver.factor(&matrix).is_err() {
                     return None;
@@ -719,7 +720,7 @@ impl RestorationPhase {
             }
             #[cfg(not(feature = "rmumps"))]
             {
-                // Fall back to dense if no sparse solver available
+                let _ = ssm;
                 return None;
             }
         }
