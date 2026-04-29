@@ -432,3 +432,149 @@ correctness against the Ipopt reference, not benchmark-tuning.
 - (Optional A8.5-implementation-time addition) Trace
   `final_ratio` from `solve_aug_with_ir` so you can confirm
   the fail-up loop fires only when expected.
+
+### A8.5: implemented and reverted — IR-residual feedback DOES NOT help (2026-04-29)
+
+**Status: reverted. Negative result, kept here so future sessions
+do not re-implement the same fix.**
+
+A8.5 was implemented as designed above:
+
+- Added `IR_RATIO_SINGULAR_DEFAULT = 1e-5` and
+  `A85_MAX_ESCALATIONS = 5` to `src/kkt_aug.rs`.
+- Added `factor_solve_aug_with_feedback` helper that wraps
+  `factor_aug_with_inertia_correction` + `solve_aug_with_ir`
+  and, on `final_ratio ≥ 1e-5`, calls
+  `perturb_for_singularity_pub` and re-factors+re-IRs, capped
+  at 5 escalations.
+- Wired into `aug_step_from_state` (line ~1063) and
+  `aug_step_from_state_mehrotra` (affine probe at ~1336).
+
+**Head-to-head measurement** (`max_iter=1500`,
+`max_wall_time=600`, both runs hit the wall-time cap):
+
+| metric          | baseline (no A8.5) | with A8.5 |
+|-----------------|--------------------|-----------|
+| iterations      | 850                | 450       |
+| final obj       | **3.7953e3** ✓     | 3.96e3 ✗  |
+| final mu        | 1.57e-4            | **322** (mu went UP) |
+| primal_inf      | 1.06e-2            | 1.65e-4   |
+| dual_inf        | **1.57e6**         | 5.92e7    |
+| compl           | 0.256              | 8.68e4    |
+| restoration_count | 1                | 4         |
+| mu_mode_switches  | 234              | 122       |
+
+**Why A8.5 is harmful in arki0003 (and why the doc-A8.5
+hypothesis was wrong about Σ-pin escape):**
+
+1. **δ-perturbation cannot break a Σ-pin.** At the freeze, the
+   pinned variable has Σ_x = z/s ≈ 2.3e16 on the (1,1) diagonal.
+   `apply_aug_perturbation` adds δ_x to that diagonal. After 5
+   escalations of `get_deltas_for_wrong_inertia`
+   (factor 8 each step starting from `delta_w_init = 1e-4`),
+   δ_x reaches ~ 0.4 — **30 orders of magnitude smaller than
+   the Σ entry**. The matrix is unchanged in the directions
+   that matter; the Newton direction is essentially the same as
+   before.
+
+2. **The "escaped" steps are noise.** The slightly different
+   δ-perturbation produces a Newton step whose residual ratio
+   is technically below `1e-5` but whose direction is still
+   driven by the Σ-pinned variable. Each such step disturbs
+   the dual update at full α=1, and the line search no longer
+   has a clean Armijo signal.
+
+3. **Disturbed dual updates → mu blowup.** With the iterate
+   slightly off the central path, the adaptive μ strategy
+   (mu_mode_switches=122 even with A8.5 active) ramps μ UP
+   to drive feasibility, eventually reaching μ=322 — far
+   worse than the original "frozen at near-optimal" state.
+
+4. **Doc A8.5 §"Expected impact" was speculative.** The Ipopt
+   `lg(rg) ≈ −10` evidence cited δ_x ≈ 1e−10 in Ipopt's
+   arki0003 trace. But Ipopt does not have the Σ-pin in the
+   same place ripopt does (different bound_relax interaction
+   at iter 0; different fraction-to-boundary trajectory).
+   Ipopt's δ-escalation works because it does not enter the
+   Σ-pin regime at all; it is not "what saves Ipopt from
+   Σ-pin."
+
+**Real bottleneck (revealed by the longer baseline run):**
+The freeze is not the disease — it is the IPM noise floor on
+top of **diverging duals**. After 850 iters:
+
+- x and s are correct (obj = 3.7953e3 matches Ipopt to 0.01%)
+- primal_inf = 1.06e-2 (decent, not great)
+- dual_inf = **1.57e6** (target: 1.0)
+- compl = 0.256 (target: 1e-4)
+- 234 mu_mode_switches (i.e., adaptive μ flips every ~3 iters)
+
+Decomposing dual_inf = ‖∇f − J^T·y − z_L + z_U‖_∞:
+‖∇f‖_∞ = O(1), ‖z‖_∞ = O(1e6), and on optimal x the J^T·y
+contribution must cancel ∇f to within machine precision.
+Instead it is contributing 1.57e6, meaning the y values are
+≈ 6 orders of magnitude too large.
+
+So the **A8.1-A8.3** iter-0 LS-y fix gave us a clean start
+(|J^T·y|_∞ = 1.0 at iter 0, matching Ipopt's 1.49) but **the
+dual updates that follow integrate y away** from the correct
+values over the centering phase. Ipopt's analogous trajectory
+keeps y bounded and reaches dual_inf < 1.0 in 318 iters.
+
+**Hypotheses for the dual divergence (A8.6+ work):**
+
+- The mu-strategy oscillation (234 switches over 850 iters)
+  injects high-frequency noise into the y-update, and there
+  is no damping. Ipopt's adaptive switch is more conservative
+  about flipping (free-mode → fixed-mode is one-way except in
+  specific recovery branches). Worth comparing the ripopt
+  `MuStrategy::reset` triggers against Ipopt's
+  `IpAdaptiveMuUpdate.cpp` mode-switch logic.
+
+- A potential J-row scaling issue: if y is 1e6 times too
+  large but J^T·y "looks right" mod-cancellation, the
+  individual y_i may be fine but a few are huge. Need a
+  per-constraint dual_inf decomposition (which i has the
+  largest |y_i| at iter 850?).
+
+- The dual-step fraction-to-boundary recurrence: if α_du is
+  consistently capped at a small value (e.g., 0.01) in some
+  iters, and α_pr = 1.0, then x advances on Newton's
+  schedule but y trails. Over hundreds of iters this is a
+  divergence. Worth tracing α_pr vs α_du at every iter.
+
+- The `kappa_d` damping term in the gradient-of-Lagrangian RHS
+  may be wrong: `compl_x_inf = max(s·z) − μ·κ_d` per Ipopt.
+  Mis-aligned κ_d would steadily bias the dual-update RHS.
+
+**A8.5 code state.** Reverted at HEAD. The instrumentation
+constants and helper were removed via `git checkout
+src/kkt_aug.rs`. 295 lib tests pass on the revert.
+
+**A8.6+ next steps (do NOT re-implement A8.5).**
+
+1. Add a per-iter trace of `‖y‖_∞`, the worst-|y_i|
+   constraint index, α_pr vs α_du, and mu-mode in
+   `commit_trial_point`. Run on arki0003 for 100, 300, 500,
+   850 iters and look at how y drifts.
+2. Compare against an Ipopt log on the same problem at the
+   same iters (use `print_user_options=yes
+   print_level=4`). Identify the iter where the trajectories
+   first diverge in y.
+3. From the divergence iter, work backward to the responsible
+   subroutine — μ-switch, fraction-to-boundary, or RHS
+   construction.
+
+**Lessons.**
+- "Implement what Ipopt does" without verifying the
+  underlying assumption (Σ-pin escape via δ-perturbation) is
+  a load-bearing trap. The Ipopt reference is correct **for
+  Ipopt's iterates**; ripopt's iterates may be in a regime
+  Ipopt never visits.
+- Run the candidate fix to convergence (or wall-time) and
+  compare ALL diagnostics, not just the freeze symptom. A8.5
+  superficially "escaped the freeze" but in fact made every
+  KKT measure worse.
+- Always run the head-to-head with a disable env var
+  (`RIPOPT_DISABLE_A85=1` here) before committing — same
+  binary, two runs, one switch.

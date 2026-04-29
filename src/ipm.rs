@@ -8631,23 +8631,31 @@ fn commit_trial_point(
         // diagonal entry of W + Σ. If min_slack · max_z >> κ_σ·μ the κ_σ
         // clamp has failed to keep z*s in band.
         let mut min_s_x = f64::INFINITY;
+        let mut min_s_idx = usize::MAX;
+        let mut min_s_side = "";
         let mut max_z_x = 0.0_f64;
         for i in 0..state.n {
             if state.x_l[i].is_finite() {
                 let s = state.x[i] - state.x_l[i];
-                if s > 0.0 && s < min_s_x { min_s_x = s; }
+                if s > 0.0 && s < min_s_x { min_s_x = s; min_s_idx = i; min_s_side = "L"; }
             }
             if state.x_u[i].is_finite() {
                 let s = state.x_u[i] - state.x[i];
-                if s > 0.0 && s < min_s_x { min_s_x = s; }
+                if s > 0.0 && s < min_s_x { min_s_x = s; min_s_idx = i; min_s_side = "U"; }
             }
             if state.z_l[i].abs() > max_z_x { max_z_x = state.z_l[i].abs(); }
             if state.z_u[i].abs() > max_z_x { max_z_x = state.z_u[i].abs(); }
         }
+        let (xv, bv) = if min_s_idx < state.n {
+            let xv = state.x[min_s_idx];
+            let bv = if min_s_side == "L" { state.x_l[min_s_idx] } else { state.x_u[min_s_idx] };
+            (xv, bv)
+        } else { (f64::NAN, f64::NAN) };
         eprintln!(
-            "[step] α={:.3e} ‖Δx‖={:.3e} ‖α·Δx‖={:.3e} |Δx_eff|={:.3e} ‖x‖={:.3e} rel={:.3e} ‖Δy‖={:.3e} min_s={:.3e} max_z={:.3e} max_Σ≈{:.3e}",
-            alpha, dx_inf, alpha_dx_inf, diff_inf, x_inf, rel, dy_inf,
-            min_s_x, max_z_x, max_z_x / min_s_x.max(1e-300),
+            "[step] α={:.3e} ‖Δx‖={:.3e} rel={:.3e} ‖Δy‖={:.3e} min_s={:.3e}@{}{} x={:.6e} bnd={:.6e} max_z={:.3e} max_Σ≈{:.3e}",
+            alpha, dx_inf, rel, dy_inf,
+            min_s_x, min_s_idx, min_s_side, xv, bv, max_z_x,
+            max_z_x / min_s_x.max(1e-300),
         );
     }
     state.x = x_trial;
