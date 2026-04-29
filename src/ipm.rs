@@ -1132,7 +1132,7 @@ impl SolverState {
         let hess_nnz = hess_rows.len();
 
         let mut y = compute_initial_y_with_ls(
-            problem, options, &x, &jac_rows, &jac_cols, &g_l, &g_u, n, m, jac_nnz,
+            problem, options, &x, &z_l, &z_u, &jac_rows, &jac_cols, &g_l, &g_u, n, m, jac_nnz,
         );
 
         if options.warm_start {
@@ -5391,17 +5391,25 @@ fn initialize_slack_iterate(state: &mut SolverState, m: usize, options: &SolverO
 /// multipliers are initialized to `bound_mult_init_val` (default 1.0), the
 /// same constant used for x-bound multipliers, NOT to `mu_init / slack`.
 ///
-/// B-cross7: after setting v_L, v_U we also overwrite the LS-init y on
-/// inequality rows so the slack-side dual residual
-/// `−y_d − v_L + v_U` is zero at iteration 0. Ipopt's
-/// `IpDefaultIterateInitializer.cpp:382-409` solves a single LS over
-/// (y_c, y_d) with the v contribution included; eliminating y_d gives
-/// `y_d = v_U − v_L` algebraically, with y_c then chosen to minimise the
-/// remaining x-side residual. ripopt's current LS code does not see
-/// v_L/v_U, so we correct y_d here once v_L/v_U are known. y_c
-/// (equality rows) is left as the LS estimate.
+/// A8.3: When `least_squares_mult_init` is OFF, ripopt forces the slack
+/// dual residual `−y_d − v_L + v_U` to zero at iter 0 by setting
+/// `y_d := v_U − v_L`. This is the algebraic elimination that ignores
+/// the `J_d J_c^T` off-diagonal coupling — fine when y_c is also ≈ 0,
+/// but a 1000× iter-0 dual blow-up on problems where the inequality
+/// Jacobian has columns with O(1e3) summed coefficients (e.g.
+/// Mittelmann arki0003).
+///
+/// When `least_squares_mult_init` is ON (Ipopt's default), the LS solve
+/// already chose `y_c` to minimize `‖∇f − z_L + z_U + J^T y‖²` with
+/// `y_d = 0` implicitly; overwriting `y_d` here would re-introduce the
+/// J_d^T·(±1) contribution that the LS picked specifically to avoid. So
+/// we leave y untouched in that path. This trades exact slack-side
+/// stationarity at iter 0 (which Ipopt also does not enforce — its
+/// `IpLeastSquareMults.cpp:53-81` 4-block LS chooses (y_c, y_d) jointly,
+/// not piecewise) for the much larger reduction in iter-0 ‖J^T y‖.
 fn initialize_constraint_slack_multipliers(state: &mut SolverState, m: usize, options: &SolverOptions) {
     let v_init = options.bound_mult_init_val;
+    let ls_active = options.least_squares_mult_init && m > 0 && m != state.n;
     for i in 0..m {
         if constraint_is_equality(state, i) {
             continue;
@@ -5412,7 +5420,9 @@ fn initialize_constraint_slack_multipliers(state: &mut SolverState, m: usize, op
         if state.g_u[i].is_finite() {
             state.v_u[i] = v_init;
         }
-        state.y[i] = state.v_u[i] - state.v_l[i];
+        if !ls_active {
+            state.y[i] = state.v_u[i] - state.v_l[i];
+        }
     }
 }
 
@@ -7477,6 +7487,8 @@ fn compute_initial_y_with_ls<P: NlpProblem>(
     problem: &P,
     options: &SolverOptions,
     x: &[f64],
+    z_l: &[f64],
+    z_u: &[f64],
     jac_rows: &[usize],
     jac_cols: &[usize],
     g_l: &[f64],
@@ -7503,7 +7515,13 @@ fn compute_initial_y_with_ls<P: NlpProblem>(
     if !grad_ok || !jac_ok {
         return vec![0.0; m];
     }
-    compute_ls_multiplier_estimate(
+    // A8.1+A8.2: thread z_L, z_U through so the LS RHS becomes
+    //   ∇f − P_L·z_L + P_U·z_U
+    // matching Ipopt 3.14 `IpLeastSquareMults.cpp:53-81` exactly. Without
+    // this, the LS estimate over-fits to a sparse ∇f and produces y with
+    // ‖y‖_∞ in the hundreds (well below the 1000 discard threshold) on
+    // problems where most z*-padded RHS entries are O(1).
+    compute_ls_multiplier_estimate_with_z(
         &grad_f_init,
         jac_rows,
         jac_cols,
@@ -7513,28 +7531,10 @@ fn compute_initial_y_with_ls<P: NlpProblem>(
         n,
         m,
         options.constr_mult_init_max,
+        Some(z_l),
+        Some(z_u),
     )
     .unwrap_or_else(|| vec![0.0; m])
-}
-
-/// Compute least-squares multiplier estimate: min ||grad_f + J^T y||^2.
-/// Solves the normal equations (J J^T) y = -J grad_f.
-/// Uses dense Bunch-Kaufman for small problems, sparse LDL^T for large ones.
-/// Returns Some(y) if successful and all estimates are within threshold; None otherwise.
-fn compute_ls_multiplier_estimate(
-    grad_f: &[f64],
-    jac_rows: &[usize],
-    jac_cols: &[usize],
-    jac_vals: &[f64],
-    g_l: &[f64],
-    g_u: &[f64],
-    n: usize,
-    m: usize,
-    max_abs_threshold: f64,
-) -> Option<Vec<f64>> {
-    compute_ls_multiplier_estimate_with_z(
-        grad_f, jac_rows, jac_cols, jac_vals, g_l, g_u, n, m, max_abs_threshold, None, None,
-    )
 }
 
 /// Compute least-squares multiplier estimate via the Ipopt-exact augmented

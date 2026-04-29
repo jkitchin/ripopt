@@ -241,15 +241,25 @@ pub struct SolverOptions {
     pub mu_allow_increase: bool,
     /// Use least-squares estimate for initial constraint multipliers.
     ///
-    /// Mirrors Ipopt 3.14's `least_square_init_y` option
-    /// (`IpDefaultIterateInitializer.cpp:84-90`), default **`no`**:
-    /// Ipopt initializes y = 0 unless the user explicitly opts in. With
-    /// `true`, ripopt computes the LS estimate
-    /// `min ||∇f + J^T y||²`; rejected if `‖y_LS‖_∞ > constr_mult_init_max`,
-    /// in which case y is set to 0. The LS estimate can dominate the iter-0
-    /// dual residual on poorly-scaled problems where `‖J^T y_LS‖_∞ ≫ ‖∇f‖_∞`,
-    /// producing a much larger initial KKT than Ipopt's y=0 baseline.
-    /// Default: false (matches Ipopt).
+    /// Mirrors the basic LS-y init that Ipopt 3.14's
+    /// `IpDefaultIterateInitializer::SetInitialIterates` runs at
+    /// `cpp:340 → least_square_mults() (cpp:669-743)`. This LS solve
+    /// runs **unconditionally** in Ipopt as long as
+    /// `constr_mult_init_max > 0` (default 1000); the stronger
+    /// `least_square_init_duals` option (`cpp:102-111`, default `no`)
+    /// is a separate, additional LS solve that re-initializes z and v
+    /// as well — that one is *not* what this flag controls.
+    ///
+    /// With `true`, ripopt solves `min ‖∇f − z_L + z_U + J^T y‖²`; the
+    /// estimate is rejected if `‖y_LS‖_∞ > constr_mult_init_max`, in
+    /// which case y is set to 0. Disabling this flag leaves y at the
+    /// constant `v_U − v_L` post-correction (≈ ±1 for one-sided
+    /// inequalities), which produces a 1000× larger iter-0 dual
+    /// residual than Ipopt on problems like Mittelmann arki0003 where
+    /// the Jacobian has columns with O(1e3) coefficients summed across
+    /// inequality rows.
+    ///
+    /// Default: **true** (matches Ipopt 3.14's cold-start behavior).
     pub least_squares_mult_init: bool,
     /// Maximum absolute value for LS multiplier init; if exceeded, fall back to zero. Default: 1000.0.
     pub constr_mult_init_max: f64,
@@ -668,7 +678,7 @@ impl Default for SolverOptions {
             nlp_upper_bound_inf: 1e19,
             kappa: 10.0,
             mu_allow_increase: true,
-            least_squares_mult_init: false,
+            least_squares_mult_init: true,
             constr_mult_init_max: 1000.0,
             constraint_slack_barrier: true,
             max_wall_time: 0.0,
