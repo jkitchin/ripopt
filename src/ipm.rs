@@ -1883,6 +1883,8 @@ fn run_line_search_loop<P: NlpProblem>(
     early_timeout: f64,
     trace_meta: &mut TraceMetadata,
     ls_steps: &mut usize,
+    aug_solver: &mut dyn LinearSolver,
+    aug_kkt: &crate::kkt_aug::AugKktSystem,
 ) -> LineSearchOutcome {
     let mut alpha = alpha_primal_max;
     let mut step_accepted = false;
@@ -1975,6 +1977,7 @@ fn run_line_search_loop<P: NlpProblem>(
             let soc_accepted = attempt_soc_aug(
                 state, problem, &g_trial, inertia_params, filter,
                 theta_current, phi_current, grad_phi_step, alpha, options,
+                aug_solver, aug_kkt,
             );
             if let Some((x_soc, obj_soc, g_soc, alpha_soc)) = soc_accepted {
                 state.diagnostics.soc_corrections += 1;
@@ -6053,68 +6056,68 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             StallDecision::Proceed => {}
         }
 
-        {
-            // A7: primary Newton step via the 4-block augmented system
-            // [x; s; y_c; y_d]. A7.5 ports the Ipopt Probing μ oracle
-            // (`IpProbingMuOracle::CalculateMu`) and gates it on
-            // `options.mehrotra_pc`. When the oracle runs, it returns the
-            // chosen μ alongside the step; we install the new μ into
-            // `state.mu` so downstream line-search/convergence sees it.
-            let t_dir = Instant::now();
-            let mut aug_solver: Box<dyn LinearSolver> = Box::new(DenseLdl::new());
-            let probing = options.mehrotra_pc;
-            let (step, _dc, mu_new_opt) = if probing {
-                let avg_compl = compute_avg_complementarity(&state);
-                let mu_max = mu_state.mu_max_cap(options, avg_compl);
-                match crate::kkt_aug::aug_step_from_state_mehrotra(
-                    n, &state.grad_f,
-                    &state.hess_rows, &state.hess_cols, &state.hess_vals,
-                    &state.jac_rows, &state.jac_cols, &state.jac_vals,
-                    &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u,
-                    &state.s, &state.g, &state.g_l, &state.g_u, &state.y,
-                    &state.v_l, &state.v_u,
-                    state.mu, options.kappa_d,
-                    crate::kkt_aug::PROBING_SIGMA_MAX_DEFAULT,
-                    options.mu_min, mu_max,
-                    false,
-                    aug_solver.as_mut(),
-                    &mut inertia_params,
-                ) {
-                    Ok((step, mu_new, _dw, dc)) => (step, dc, Some(mu_new)),
-                    Err(_e) => {
-                        timings.direction_solve += t_dir.elapsed();
-                        return make_result(&state, SolveStatus::NumericalError);
-                    }
+        // A7: primary Newton step via the 4-block augmented system
+        // [x; s; y_c; y_d]. A7.5 ports the Ipopt Probing μ oracle
+        // (`IpProbingMuOracle::CalculateMu`) and gates it on
+        // `options.mehrotra_pc`. When the oracle runs, it returns the
+        // chosen μ alongside the step; we install the new μ into
+        // `state.mu` so downstream line-search/convergence sees it.
+        // A7.7: keep `aug_solver` and the returned `aug_kkt` alive across
+        // the line search so SOC can reuse the factorization.
+        let t_dir = Instant::now();
+        let mut aug_solver: Box<dyn LinearSolver> = Box::new(DenseLdl::new());
+        let probing = options.mehrotra_pc;
+        let (step, _dc, mu_new_opt, aug_kkt) = if probing {
+            let avg_compl = compute_avg_complementarity(&state);
+            let mu_max = mu_state.mu_max_cap(options, avg_compl);
+            match crate::kkt_aug::aug_step_from_state_mehrotra(
+                n, &state.grad_f,
+                &state.hess_rows, &state.hess_cols, &state.hess_vals,
+                &state.jac_rows, &state.jac_cols, &state.jac_vals,
+                &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u,
+                &state.s, &state.g, &state.g_l, &state.g_u, &state.y,
+                &state.v_l, &state.v_u,
+                state.mu, options.kappa_d,
+                crate::kkt_aug::PROBING_SIGMA_MAX_DEFAULT,
+                options.mu_min, mu_max,
+                false,
+                aug_solver.as_mut(),
+                &mut inertia_params,
+            ) {
+                Ok((step, mu_new, _dw, dc, aug)) => (step, dc, Some(mu_new), aug),
+                Err(_e) => {
+                    timings.direction_solve += t_dir.elapsed();
+                    return make_result(&state, SolveStatus::NumericalError);
                 }
-            } else {
-                match crate::kkt_aug::aug_step_from_state(
-                    n, &state.grad_f,
-                    &state.hess_rows, &state.hess_cols, &state.hess_vals,
-                    &state.jac_rows, &state.jac_cols, &state.jac_vals,
-                    &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u,
-                    &state.s, &state.g, &state.g_l, &state.g_u, &state.y,
-                    &state.v_l, &state.v_u,
-                    state.mu, options.kappa_d,
-                    false,
-                    aug_solver.as_mut(),
-                    &mut inertia_params,
-                ) {
-                    Ok((step, _dw, dc)) => (step, dc, None),
-                    Err(_e) => {
-                        timings.direction_solve += t_dir.elapsed();
-                        return make_result(&state, SolveStatus::NumericalError);
-                    }
-                }
-            };
-            timings.direction_solve += t_dir.elapsed();
-            if let Some(mu_new) = mu_new_opt {
-                state.mu = mu_new;
             }
-            install_step_directions(
-                &mut state, step.dx, step.dy_m, step.ds,
-                step.dz_l, step.dz_u, step.dv_l, step.dv_u,
-            );
+        } else {
+            match crate::kkt_aug::aug_step_from_state(
+                n, &state.grad_f,
+                &state.hess_rows, &state.hess_cols, &state.hess_vals,
+                &state.jac_rows, &state.jac_cols, &state.jac_vals,
+                &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u,
+                &state.s, &state.g, &state.g_l, &state.g_u, &state.y,
+                &state.v_l, &state.v_u,
+                state.mu, options.kappa_d,
+                false,
+                aug_solver.as_mut(),
+                &mut inertia_params,
+            ) {
+                Ok((step, _dw, dc, aug)) => (step, dc, None, aug),
+                Err(_e) => {
+                    timings.direction_solve += t_dir.elapsed();
+                    return make_result(&state, SolveStatus::NumericalError);
+                }
+            }
+        };
+        timings.direction_solve += t_dir.elapsed();
+        if let Some(mu_new) = mu_new_opt {
+            state.mu = mu_new;
         }
+        install_step_directions(
+            &mut state, step.dx, step.dy_m, step.ds,
+            step.dz_l, step.dz_u, step.dv_l, step.dv_u,
+        );
 
         let (tau, alpha_primal_max, alpha_dual_max) = compute_alpha_max(
             &state, options, &mu_state, primal_inf, dual_inf, compl_inf,
@@ -6173,6 +6176,8 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             early_timeout,
             &mut trace_meta,
             &mut ls_steps,
+            aug_solver.as_mut(),
+            &aug_kkt,
         ) {
             LineSearchOutcome::StepAccepted => {
                 step_accepted = true;
@@ -6563,13 +6568,15 @@ fn attempt_soc_aug<P: NlpProblem>(
     state: &SolverState,
     problem: &P,
     g_trial: &[f64],
-    inertia_params: &mut InertiaCorrectionParams,
+    _inertia_params: &mut InertiaCorrectionParams,
     filter: &mut Filter,
     theta_current: f64,
     phi_current: f64,
     grad_phi_step: f64,
     alpha: f64,
     options: &SolverOptions,
+    aug_solver: &mut dyn LinearSolver,
+    aug_kkt: &crate::kkt_aug::AugKktSystem,
 ) -> Option<(Vec<f64>, f64, Vec<f64>, f64)> {
     let n = state.n;
     let m = state.m;
@@ -6611,8 +6618,6 @@ fn attempt_soc_aug<P: NlpProblem>(
     let mut alpha_primal_soc = alpha;
     let mut theta_prev_soc = theta_for_g(state, g_trial);
 
-    let mut aug_solver: Box<dyn LinearSolver> = Box::new(DenseLdl::new());
-
     for _soc_iter in 0..options.max_soc {
         for k in 0..n_c {
             c_soc[k] += alpha_primal_soc * latest_trial_c[k];
@@ -6621,17 +6626,19 @@ fn attempt_soc_aug<P: NlpProblem>(
             dms_soc[k] += alpha_primal_soc * latest_trial_dms[k];
         }
 
-        let (dx_soc, ds_d_soc) = match crate::kkt_aug::aug_soc_solve_dx(
+        // A7.7: SOC reuses the upstream Newton step's factorization. The
+        // aug matrix (W + Σ + perturbation) is identical to the one
+        // factored at the top of the IPM iteration; only the y_c/y_d RHS
+        // slots change.
+        let (dx_soc, ds_d_soc) = match crate::kkt_aug::aug_soc_solve_dx_factored(
             n, &state.grad_f,
-            &state.hess_rows, &state.hess_cols, &state.hess_vals,
             &state.jac_rows, &state.jac_cols, &state.jac_vals,
             &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u,
             &state.s, &state.g, &state.g_l, &state.g_u, &state.y,
             &state.v_l, &state.v_u,
             state.mu, options.kappa_d,
-            false,
-            aug_solver.as_mut(),
-            inertia_params,
+            aug_solver,
+            aug_kkt,
             &c_soc, &dms_soc,
         ) {
             Some(p) => p,

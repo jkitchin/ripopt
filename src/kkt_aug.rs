@@ -1007,7 +1007,7 @@ pub fn aug_step_from_state(
     use_sparse: bool,
     solver: &mut dyn LinearSolver,
     perturbation: &mut crate::kkt::InertiaCorrectionParams,
-) -> Result<(AugStep, f64, f64), SolverError> {
+) -> Result<(AugStep, f64, f64, AugKktSystem), SolverError> {
     let m = g.len();
     let partition = ConstraintPartition::new(g_l, g_u);
 
@@ -1078,7 +1078,10 @@ pub fn aug_step_from_state(
         x, x_l, x_u, z_l, z_u,
         s, g_l, g_u, v_l, v_u, mu,
     );
-    Ok((step, dw, dc))
+    // A7.7: return the perturbed `AugKktSystem` so callers (line search → SOC)
+    // can reuse the just-installed factorization without reassembling and
+    // re-factoring the same matrix.
+    Ok((step, dw, dc, aug))
 }
 
 /// Probing-oracle defaults from Ipopt 3.14:
@@ -1276,7 +1279,7 @@ pub fn aug_step_from_state_mehrotra(
     use_sparse: bool,
     solver: &mut dyn LinearSolver,
     perturbation: &mut crate::kkt::InertiaCorrectionParams,
-) -> Result<(AugStep, f64, f64, f64), SolverError> {
+) -> Result<(AugStep, f64, f64, f64, AugKktSystem), SolverError> {
     let m = g.len();
     let partition = ConstraintPartition::new(g_l, g_u);
 
@@ -1376,7 +1379,7 @@ pub fn aug_step_from_state_mehrotra(
         s, g_l, g_u, v_l, v_u, mu_new,
     );
 
-    Ok((step, mu_new, dw, dc))
+    Ok((step, mu_new, dw, dc, aug))
 }
 
 /// Second-order correction (SOC) step for the augmented system.
@@ -1388,9 +1391,9 @@ pub fn aug_step_from_state_mehrotra(
 /// form (Ipopt's `curr_relaxed_compl_*` differs from `curr_compl_*` only by
 /// κ_σ damping; we use the standard form for v0.8).
 ///
-/// Re-factors the matrix per call. A7.7 (factor caching) will eliminate the
-/// redundant factor by sharing the cached factorization with the upstream
-/// Newton step (matrix is identical — W + Σ does not depend on the SOC RHS).
+/// Re-factors the matrix per call. A7.7 (factor caching) — see
+/// `aug_soc_solve_dx_factored` for the cached entry that reuses the upstream
+/// Newton step's factorization.
 ///
 /// Returns `Some((dx_soc, ds_d_soc))` on success — `dx_soc` length `n`,
 /// `ds_d_soc` length `n_d` (inequality-only slack step indexed by
@@ -1486,6 +1489,89 @@ pub fn aug_soc_solve_dx(
     }
     let result = match solve_aug_with_ir(
         solver, &aug, &aug_rhs,
+        IR_MIN_STEPS_DEFAULT, IR_MAX_STEPS_DEFAULT,
+        IR_RATIO_MAX_DEFAULT, IR_IMPROVEMENT_FACTOR_DEFAULT,
+    ) {
+        Ok(r) => r,
+        Err(_) => return None,
+    };
+    if result.sol.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let dx_soc = result.sol[..n].to_vec();
+    let ds_d_soc = result.sol[n..n + n_d].to_vec();
+    Some((dx_soc, ds_d_soc))
+}
+
+/// Factor-cached SOC solve (A7.7). Reuses the `solver`'s existing
+/// factorization of `aug` (installed by the upstream Newton step's
+/// `factor_aug_with_inertia_correction`). Only rebuilds the RHS with the
+/// SOC-overwritten y_c / y_d slots and runs IR.
+///
+/// Preconditions:
+/// - `aug` is the perturbed `AugKktSystem` returned by `aug_step_from_state`
+///   or `aug_step_from_state_mehrotra` for the same iterate.
+/// - `solver` still holds the LDLᵀ factorization of `aug.matrix` (no other
+///   `factor` call between the upstream step and this call).
+///
+/// All Σ-, Hessian-, and Jacobian-derived inputs are inputs only because
+/// the RHS construction needs them (`build_outer_rhs` → J^T·y, gradient,
+/// kappa_d damping); they MUST be identical to the values used to assemble
+/// `aug` upstream — otherwise the factorization is stale.
+#[allow(clippy::too_many_arguments)]
+pub fn aug_soc_solve_dx_factored(
+    n: usize,
+    grad_f: &[f64],
+    jac_rows: &[usize],
+    jac_cols: &[usize],
+    jac_vals: &[f64],
+    x: &[f64],
+    x_l: &[f64],
+    x_u: &[f64],
+    z_l: &[f64],
+    z_u: &[f64],
+    s: &[f64],
+    g: &[f64],
+    g_l: &[f64],
+    g_u: &[f64],
+    y: &[f64],
+    v_l: &[f64],
+    v_u: &[f64],
+    mu: f64,
+    kappa_d: f64,
+    solver: &mut dyn LinearSolver,
+    aug: &AugKktSystem,
+    c_soc: &[f64],
+    dms_soc: &[f64],
+) -> Option<(Vec<f64>, Vec<f64>)> {
+    let m = g.len();
+    let partition = ConstraintPartition::new(g_l, g_u);
+    if c_soc.len() != partition.n_c || dms_soc.len() != partition.n_d {
+        return None;
+    }
+    let n_d = partition.n_d;
+
+    let mut j_t_y = vec![0.0; n];
+    for (idx, &row) in jac_rows.iter().enumerate() {
+        let col = jac_cols[idx];
+        let v = jac_vals[idx];
+        if row < m && col < n {
+            j_t_y[col] += v * y[row];
+        }
+    }
+
+    let mut outer = build_outer_rhs(
+        n, &partition, grad_f, &j_t_y,
+        x, x_l, x_u, z_l, z_u,
+        s, g, g_l, g_u, y, v_l, v_u,
+        mu, kappa_d,
+    );
+    outer.rhs_y_c.copy_from_slice(c_soc);
+    outer.rhs_y_d.copy_from_slice(dms_soc);
+    let aug_rhs = fold_aug_rhs(n, &partition, &outer, x, x_l, x_u, s, g_l, g_u);
+
+    let result = match solve_aug_with_ir(
+        solver, aug, &aug_rhs,
         IR_MIN_STEPS_DEFAULT, IR_MAX_STEPS_DEFAULT,
         IR_RATIO_MAX_DEFAULT, IR_IMPROVEMENT_FACTOR_DEFAULT,
     ) {
@@ -1831,7 +1917,7 @@ mod tests {
         let mu = 1e-3;
         let mut solver: Box<dyn LinearSolver> = Box::new(DenseLdl::new());
         let mut params = crate::kkt::InertiaCorrectionParams::default();
-        let (step, _dw, _dc) = aug_step_from_state(
+        let (step, _dw, _dc, _aug) = aug_step_from_state(
             n, &grad_f,
             &hess_rows, &hess_cols, &hess_vals,
             &jac_rows, &jac_cols, &jac_vals,
