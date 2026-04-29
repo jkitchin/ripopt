@@ -246,12 +246,18 @@ fn lbfgs_ipm_unit_bk_formation() {
 }
 
 // ===========================================================================
-// L-BFGS Hessian FALLBACK tests
+// L-BFGS Hessian failure-path smoke tests
+//
+// The auto-retry "L-BFGS Hessian fallback" was retired during the v0.8
+// Ipopt alignment work (A7) — Ipopt 3.14 has no equivalent. The remaining
+// tests in this section verify behaviour on a deliberately-bad Hessian
+// problem under the *current* solver: inertia correction must rescue
+// what it can, and `hessian_approximation_lbfgs` must be settable
+// manually to force the L-BFGS path.
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
-// Problem with a deliberately bad Hessian that causes IPM failure.
-// The fallback should retry with L-BFGS Hessian and succeed.
+// Problem with a deliberately bad Hessian.
 // ---------------------------------------------------------------------------
 
 struct BadHessianQuadratic;
@@ -296,36 +302,15 @@ impl NlpProblem for BadHessianQuadratic {
     }
 }
 
-/// Test that the L-BFGS Hessian fallback activates and solves a problem
-/// where the user-provided Hessian is wrong.
-///
-/// A7.6 regression (2026-04-28): the L-BFGS Hessian fallback is wired
-/// only into the condensed direction-solve path. Under the augmented-KKT
-/// default (use_augmented_kkt=true), this fallback is bypassed. Re-enable
-/// once the fallback is ported into the aug branch.
-#[ignore]
+/// Default options on a deliberately-bad Hessian: the IPM either fails or
+/// is rescued by inertia correction (which can dominate the wrong
+/// curvature). This test pins the contract that ripopt no longer
+/// auto-retries with L-BFGS — Ipopt 3.14 has no such retry, so neither
+/// does ripopt v0.8+. If the user wants L-BFGS, they set
+/// `hessian_approximation_lbfgs = true` (see the "manual switch" test
+/// `lbfgs_mode_solves_bad_hessian` below).
 #[test]
-fn lbfgs_hessian_fallback_recovers_bad_hessian() {
-    let problem = BadHessianQuadratic;
-    let options = SolverOptions {
-        print_level: 0,
-        // Keep other fallbacks disabled so only L-BFGS Hessian fallback can help
-        max_iter: 100,
-        ..SolverOptions::default()
-    };
-    let result = ripopt::solve(&problem, &options);
-    assert!(
-        result.status == SolveStatus::Optimal,
-        "L-BFGS Hessian fallback should recover from bad Hessian, got {:?}",
-        result.status
-    );
-    assert!(result.x[0].abs() < 1e-2, "x[0]={}, expected ~0", result.x[0]);
-    assert!(result.x[1].abs() < 1e-2, "x[1]={}, expected ~0", result.x[1]);
-}
-
-/// Test that the fallback is skipped when disabled.
-#[test]
-fn lbfgs_hessian_fallback_disabled() {
+fn bad_hessian_default_options_inertia_or_fail() {
     let problem = BadHessianQuadratic;
     let options = SolverOptions {
         print_level: 0,
