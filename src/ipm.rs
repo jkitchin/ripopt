@@ -6065,7 +6065,10 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         // A7.7: keep `aug_solver` and the returned `aug_kkt` alive across
         // the line search so SOC can reuse the factorization.
         let t_dir = Instant::now();
-        let mut aug_solver: Box<dyn LinearSolver> = Box::new(DenseLdl::new());
+        // A7.8: pick the linear solver per the (n+m, sparse_threshold)
+        // sizing cutoff already used by the rest of the IPM. Aug matrix is
+        // assembled in matching layout (sparse vs dense) below.
+        let mut aug_solver: Box<dyn LinearSolver> = new_fallback_solver(use_sparse);
         let probing = options.mehrotra_pc;
         let (step, _dc, mu_new_opt, aug_kkt) = if probing {
             let avg_compl = compute_avg_complementarity(&state);
@@ -6080,7 +6083,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 state.mu, options.kappa_d,
                 crate::kkt_aug::PROBING_SIGMA_MAX_DEFAULT,
                 options.mu_min, mu_max,
-                false,
+                use_sparse,
                 aug_solver.as_mut(),
                 &mut inertia_params,
             ) {
@@ -6099,7 +6102,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 &state.s, &state.g, &state.g_l, &state.g_u, &state.y,
                 &state.v_l, &state.v_u,
                 state.mu, options.kappa_d,
-                false,
+                use_sparse,
                 aug_solver.as_mut(),
                 &mut inertia_params,
             ) {
