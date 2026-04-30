@@ -2473,9 +2473,19 @@ fn process_watchdog_trial<P: NlpProblem>(
     let saved = wd.saved.as_ref()?;
     let theta_now = state.constraint_violation();
     let phi_now = state.barrier_objective(options);
+    // Ipopt-aligned watchdog progress check: the trial iterate must be
+    // acceptable to the saved filter and provide sufficient decrease
+    // against the saved (theta, phi) snapshot using the same
+    // gamma_theta / gamma_phi margins the filter line search uses.
+    // Reference: Ipopt's IpBacktrackingLineSearch only retains the
+    // watchdog while DoBacktrackingLineSearch accepts; that acceptance
+    // is the filter sufficient-progress test relative to the watchdog
+    // reference iterate.
+    let gamma_theta = filter.gamma_theta();
+    let gamma_phi = filter.gamma_phi();
     let made_progress = filter.is_acceptable(theta_now, phi_now)
-        && (theta_now < (1.0 - 1e-5) * saved.theta
-            || phi_now < saved.phi - 1e-5 * saved.theta);
+        && (theta_now <= (1.0 - gamma_theta) * saved.theta
+            || phi_now <= saved.phi - gamma_phi * saved.theta);
 
     if made_progress {
         log::debug!(
