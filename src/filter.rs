@@ -67,6 +67,12 @@ pub struct Filter {
     /// disables the heuristic). Mirrors `IpFilterLSAcceptor.cpp:142,
     /// 230, 407-414`.
     max_filter_resets: u32,
+    /// DEV-36: `theta_min_fact` (Ipopt default 1e-4). Used by
+    /// `set_theta_min_from_initial` to seed `theta_min` once.
+    theta_min_fact: f64,
+    /// DEV-36: `theta_max_fact` (Ipopt default 1e4). Used by
+    /// `set_theta_min_from_initial` to seed `theta_max` once.
+    theta_max_fact: f64,
 }
 
 impl Filter {
@@ -90,7 +96,16 @@ impl Filter {
             n_filter_resets: 0,
             filter_reset_trigger: 5,
             max_filter_resets: 5,
+            theta_min_fact: 1e-4,
+            theta_max_fact: 1e4,
         }
+    }
+
+    /// DEV-36: plumb the Ipopt `theta_min_fact` / `theta_max_fact`
+    /// options. Called before `set_theta_min_from_initial`.
+    pub fn set_theta_factors(&mut self, theta_min_fact: f64, theta_max_fact: f64) {
+        self.theta_min_fact = theta_min_fact;
+        self.theta_max_fact = theta_max_fact;
     }
 
     /// Initialize `theta_min` and `theta_max` from the initial constraint
@@ -112,8 +127,8 @@ impl Filter {
             return;
         }
         let floor = theta_init.max(1.0);
-        self.theta_min = 1e-4 * floor;
-        self.theta_max = 1e4 * floor;
+        self.theta_min = self.theta_min_fact * floor;
+        self.theta_max = self.theta_max_fact * floor;
         self.theta_init_set = true;
     }
 

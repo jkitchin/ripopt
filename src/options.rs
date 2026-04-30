@@ -168,6 +168,16 @@ pub struct SolverOptions {
     /// the solve. Mirrors Ipopt 3.14 `max_filter_resets` (default 5;
     /// 0 disables the heuristic, `IpFilterLSAcceptor.cpp:152`).
     pub max_filter_resets: u32,
+    /// DEV-36: scaling factor for the filter `theta_min` initialization
+    /// from the initial constraint violation. Mirrors Ipopt 3.14
+    /// `theta_min_fact` (default `1e-4`, `IpFilterLSAcceptor.cpp:118`).
+    /// `theta_min = theta_min_fact * max(1, theta_init)`.
+    pub theta_min_fact: f64,
+    /// DEV-36: scaling factor for the filter `theta_max` initialization
+    /// from the initial constraint violation. Mirrors Ipopt 3.14
+    /// `theta_max_fact` (default `1e4`, `IpFilterLSAcceptor.cpp:120`).
+    /// `theta_max = theta_max_fact * max(1, theta_init)`.
+    pub theta_max_fact: f64,
     /// Fraction-to-boundary parameter minimum.
     pub tau_min: f64,
     /// Barrier parameter reduction factor (monotone mode).
@@ -654,6 +664,8 @@ impl Default for SolverOptions {
             alpha_min_frac: 0.05,
             filter_reset_trigger: 5,
             max_filter_resets: 5,
+            theta_min_fact: 1e-4,
+            theta_max_fact: 1e4,
             tau_min: 0.99,
             mu_linear_decrease_factor: 0.2,
             mu_superlinear_decrease_power: 1.5,

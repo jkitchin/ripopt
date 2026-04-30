@@ -5708,6 +5708,8 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
     filter.set_obj_max_inc(options.obj_max_inc);
     filter.set_alpha_min_frac(options.alpha_min_frac);
     filter.set_filter_reset_options(options.filter_reset_trigger, options.max_filter_resets);
+    // DEV-36: plumb Ipopt `theta_min_fact` / `theta_max_fact` options.
+    filter.set_theta_factors(options.theta_min_fact, options.theta_max_fact);
 
     // Mehrotra centering parameter from the last iteration's predictor step.
     // Used in the Free-mode mu update: when sigma is available, mu = sigma * mu_current
