@@ -6396,11 +6396,40 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 MuMode::Free => "Free",
                 MuMode::Fixed => "Fixed",
             };
+            // Step magnitude ranges: dx/dy/dz_l/dz_u L∞.
+            let dx_inf = linf_norm(&state.dx);
+            let dy_inf = linf_norm(&state.dy);
+            let dzl_inf = linf_norm(&state.dz_l);
+            let dzu_inf = linf_norm(&state.dz_u);
+            // Worst (z·s)/μ ratio: should be bounded by κ_Σ (default 1e10)
+            // per Ipopt's reset_slack_multipliers / IpIpoptCalculatedQuantities.
+            // Ratios >> 1 indicate the κ_Σ clamp is not enforcing.
+            let mut worst_zs_ratio = 0.0_f64;
+            let mut worst_zs_idx = usize::MAX;
+            let mut worst_zs_side = "";
+            for i in 0..state.n {
+                if state.x_l[i].is_finite() {
+                    let s = state.x[i] - state.x_l[i];
+                    if s > 0.0 {
+                        let r = (state.z_l[i] * s).abs() / state.mu.max(1e-300);
+                        if r > worst_zs_ratio { worst_zs_ratio = r; worst_zs_idx = i; worst_zs_side = "L"; }
+                    }
+                }
+                if state.x_u[i].is_finite() {
+                    let s = state.x_u[i] - state.x[i];
+                    if s > 0.0 {
+                        let r = (state.z_u[i] * s).abs() / state.mu.max(1e-300);
+                        if r > worst_zs_ratio { worst_zs_ratio = r; worst_zs_idx = i; worst_zs_side = "U"; }
+                    }
+                }
+            }
             eprintln!(
-                "[dual] it={:4} ‖y‖∞={:.3e}@{} α_p={:.3e} α_d={:.3e} μ={:.3e} mode={} resto={}",
+                "[dual] it={:4} ‖y‖∞={:.3e}@{} α_p={:.3e} α_d={:.3e} μ={:.3e} mode={} resto={} ‖dx‖={:.2e} ‖dy‖={:.2e} ‖dz_l‖={:.2e} ‖dz_u‖={:.2e} max(zs)/μ={:.2e}@{}{}",
                 iteration, y_inf, y_idx,
                 state.alpha_primal, state.alpha_dual, state.mu, mode_str,
                 state.diagnostics.restoration_count,
+                dx_inf, dy_inf, dzl_inf, dzu_inf,
+                worst_zs_ratio, worst_zs_idx, worst_zs_side,
             );
         }
     }

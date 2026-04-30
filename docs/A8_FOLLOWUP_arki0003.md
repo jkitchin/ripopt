@@ -624,3 +624,78 @@ verifying the exact criterion via ipopt-expert.
 
 **Verified**: A8.7 hoist is numerically equivalent (iters 0-19
 bit-identical with/without). Re-applied; commit 8f6a129 stands.
+
+## A8.8 result and diagnosis of dual-stagnation root cause (2026-04-30)
+
+A8.8 commit 45dcf45 fixed the iter-1 mu-mode misswitch. ripopt
+now reaches the right primal basin on arki0003: obj=3.7956e3 vs
+Ipopt 3.7952e3, inf_pr=3.4e-5 vs Ipopt 5.4e-9.
+
+Remaining symptom: from iter ~800 the iterate is bit-identical
+each iter. inf_du=6.3e6 frozen, compl=0.286, μ=6.3e-4.
+Per-iter ‖dy‖_∞ in the 1e6–1e8 range, all concentrated on
+equality row 1904. ‖dx‖ in 700–30000 range, but α_pr in
+1e-5–1e-1 keeps effective dx small.
+
+Ipopt-expert review (`af596942e65477b75`) identified five
+ripopt-vs-Ipopt discrepancies. Plan to bring ripopt to parity:
+
+### Discrepancies vs Ipopt (cited from `ref/Ipopt/src/Algorithm/`)
+
+1. **`apply_damped_y_update` heuristic (src/ipm.rs:2249)** — ripopt
+   halves `dy` when the same component flips sign 3+ iters in a row
+   (`near_convergence && sign_change_count >= 3`). Not in Ipopt.
+   Ipopt's `BacktrackingLineSearch::PerformDualStep`
+   (`IpBacktrackingLineSearch.cpp:919-1006`) updates y with the
+   raw `α_y · dy` from the KKT solve. → **A8.9**
+
+2. **kappa_d damping in `dual_infeasibility` (src/convergence.rs:319)**
+   — ripopt's printed inf_du adds `+kappa_d·μ` for one-sided
+   bound vars. Per ipopt-expert: `curr_dual_infeasibility`
+   (`IpIpoptCalculatedQuantities.cpp:2682-2691`) calls the **plain**
+   `curr_grad_lag_x()` without damping. The damping lives only in
+   the augmented-RHS `curr_grad_lag_with_damping_x` (lines 2131-2227,
+   used in `curr_grad_barrier_obj_x`). ripopt's T3.9 cites lines
+   888-899 which are the wrong CQ. The error is small numerically
+   (1e-9) but is a convergence-test misalignment. → **A8.10**
+
+3. **`barrier_subproblem_solved` gate in Free-mode μ update
+   (src/ipm.rs:4044, called at 4249)** — ripopt's Free-mode μ
+   update only fires when `barrier_err <= barrier_tol_factor·μ`.
+   This is Fixed-mode logic copied into Free
+   (`IpMonotoneMuUpdate.cpp:135-194`). Ipopt's Free-mode `NewMu`
+   (`IpAdaptiveMuUpdate.cpp:343-389`) updates μ from the oracle
+   whenever `CheckSufficientProgress()` returns true; there's no
+   barrier-solved gate. → **A8.11**
+
+4. **DetectTinyStep terminator missing/misaligned**
+   — Ipopt's `BacktrackingLineSearch::DetectTinyStep`
+   (`IpBacktrackingLineSearch.cpp:1219-1279`): if `‖Δx‖∞/(1+|x|) ≤
+   10ε` AND `cviol ≤ 1e-4` for two consecutive iters AND barrier
+   subproblem solved, throws `TINY_STEP_DETECTED` →
+   `STOP_AT_TINY_STEP` exit (`IpIpoptAlg.cpp:461-466`). Defaults:
+   `tiny_step_tol=10ε≈2.22e-15`, `tiny_step_y_tol=1e-2`. ripopt's
+   tiny-step path uses different thresholds and doesn't terminate
+   at 2 consecutive. → **A8.12**
+
+5. **κ_Σ multiplier reset (`correct_bound_multiplier`,
+   `IpIpoptAlg.cpp:1055-1133`)** — Ipopt clamps `z_i ←
+   max(min(z_i, κ_Σ·μ/s_i), μ/(κ_Σ·s_i))` after every dual step
+   in `AcceptTrialPoint`. Default `κ_Σ=1e10` is essentially inert
+   so this is a tertiary concern; verify ripopt's analogue
+   (`reset_slack_multipliers`) runs every iter. → **A8.13** (low
+   priority unless 1-4 don't suffice)
+
+### Root-cause hypothesis for arki0003 freeze
+
+The dy explosion (1e6-1e8) at row 1904 with correct inertia
+suggests the augmented system has a small but non-zero
+singular value at the equality row. Ipopt's
+`PDPerturbationHandler` only escalates δ_c on detected
+singularity (`zero > 0`). If inertia counts are exact but the
+factorization is just ill-conditioned, neither Ipopt nor
+ripopt would escalate δ_c — but Ipopt's iterates would never
+reach this regime because the cumulative effect of 1-4 above
+keeps Ipopt on a different trajectory. So the most
+profitable fix order is the alignment fixes (1-4), then
+re-test. Track whether dy magnitudes shrink.
