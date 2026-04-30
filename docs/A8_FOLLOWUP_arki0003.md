@@ -1033,3 +1033,139 @@ at iter 110 (both solvers compute essentially the same Δx that
 respects the bound buffers giving α_max = O(1e-3 to 1e-5)). The
 divergence is in the *line search filter test*, not the linear
 solve. This shifts focus from KKT/inertia to filter-test alignment.
+
+## A8.19 — filter θ uses box-violation, not slack-coupling (2026-04-30, Task #43)
+
+**Finding**: ripopt's filter line search computes `theta` as the
+1-norm of `g(x)`'s box violation against `[g_l, g_u]`, but Ipopt's
+`IpCq().curr_constraint_violation()` returns
+`||c(x)||_1 + ||d(x) − s||_1` where `s` is the explicit inequality
+slack iterate (`IpIpoptCalculatedQuantities.cpp:1468-1473,
+2570-2610`). These are different quantities once the IPM iterate
+has `s ≠ projection(g(x))`.
+
+Concretely:
+
+- ripopt at `src/ipm.rs:7508` defines
+  `theta_for_g(state, g) = primal_infeasibility(g, g_l, g_u)`,
+  which is `Σ max(g_l[i]−g[i], 0) + max(g[i]−g_u[i], 0)` —
+  the box-violation of `g(x)` alone, **slack-free**.
+  This is the function used at every line-search trial site:
+  `evaluate_trial_point` (line 1831), `attempt_soft_restoration`
+  (line 3269), and the SOC `theta_prev_soc` initialiser
+  (line 6240).
+- ripopt's `state.constraint_violation()` (`ipm.rs:1263`) calls
+  the same `convergence::primal_infeasibility` — slack-free —
+  and is used as `theta_current` at the top of each iteration
+  (`ipm.rs:5720`) and as the iter-log `inf_pr` column.
+- Ipopt's filter test instead reads `IpCq().curr_constraint_violation()`,
+  which sums `|g[i] − g_l[i]|` for equality rows and `|g[i] − s[i]|`
+  for inequality rows (`IpIpoptCalculatedQuantities.cpp:2596-2602`,
+  `Norm1` overload). Slack-coupled.
+- ripopt's own helper `convergence::primal_infeasibility_internal`
+  (and its `_max` variant) computes the slack-coupled form. This
+  helper *is* used in the barrier-level convergence test
+  (`compute_primal_inf_internal_max_at_state`, `ipm.rs:7789`) and
+  in the SOC RHS (`ipm.rs:6219-6220`), but not in the filter trial
+  path nor in `state.constraint_violation()`.
+
+**Evidence**: at iter 111 of arki0003 ripopt's first trial accepts
+α=1.94e-5 with `ls_steps=0` because the filter h-type test passes
+on `theta_trial ≈ theta_current`. Under box-violation flavour the
+trial slack `s_trial = s + α·ds` does not appear in `theta`; the
+quantity that *does* move under the slack-Newton step (`d(x) − s`)
+is invisible. Ipopt's slack-coupled `theta` is generally larger
+than ripopt's box-violation `theta` because for an inequality row
+with `g[i] outside [g_l, g_u]`, `|g[i] − s[i]| ≥ |box_violation|`
+(s ∈ (g_l, g_u) is strictly inside the box). The acceptance
+threshold `gamma_phi · theta_current` is therefore artificially
+small in ripopt, making the h-type phi-only test laxer than
+Ipopt's.
+
+**Plan to align (Task #43)**:
+
+1. Add `theta_for_g_s(state, g, s)` helper using
+   `primal_infeasibility_internal(g, s, g_l, g_u)`.
+2. Update `evaluate_trial_point` to compute
+   `s_trial = s + α·ds` and pass it to the helper. Frac-to-bound
+   on `s` is enforced upstream by `compute_alpha_max`, so
+   `s_trial` is feasible for all `α ≤ alpha_primal_max`.
+3. Update SOC `theta_prev_soc` (`ipm.rs:6240`) and soft-restoration
+   `theta_trial` (`ipm.rs:3269`) to use the slack-coupled form
+   with the appropriate trial slack.
+4. Switch `state.constraint_violation()` to slack-coupled form so
+   the iter-level `theta_current` (and the `inf_pr` column) match
+   Ipopt's `curr_constraint_violation`.
+
+Step (4) is the higher blast-radius change — it affects the
+restoration cascade entry, the post-cascade convergence check, and
+the diagnostic output. Steps (1)-(3) are surgical and limited to
+the filter line-search trial path. The fix is in scope for Task #43.
+
+### A8.19 implementation result (2026-04-30, Task #43 closure)
+
+Implemented steps (1)-(3) of the alignment plan: surgical scope
+limited to the filter line-search trial path. Step (4)
+(`state.constraint_violation()` flip) deferred — higher
+blast-radius and the iter-level `theta_current` was localized via
+`theta_for_g_s(&state, &state.g, &state.s)` so the filter pipeline
+sees slack-coupled θ end-to-end without disturbing the diagnostic
+column or restoration entry.
+
+Code changes (src/ipm.rs):
+
+- Replaced `theta_for_g` with `theta_for_g_s(state, g, s)` and
+  added `compute_trial_slack(state, alpha) → Vec<f64>` helper
+  (line ~7508, ~7563).
+- `evaluate_trial_point` (line ~1831): computes `s_trial = s+α·ds`
+  and uses slack-coupled θ.
+- SOC pipeline (line ~6219-6307): `s_soc` built per inequality row
+  from the SOC d-step `ds_d_soc`; `theta_prev_soc` and
+  `theta_soc` use slack-coupled θ.
+- Soft restoration trial (line ~3269): uses
+  `theta_for_g_s(state, &state.g, &state.s)` (no step taken;
+  current slack is the trial slack).
+- `theta_init` (line ~5416) and per-iter `theta_current`
+  (line ~5735): slack-coupled.
+- Restoration recovery sites: `theta_for_g_s(state, &g_new,
+  &state.s)` since IPM s is preserved across the recovery.
+
+Verification:
+
+- All 294 lib tests pass; `hs_tp044` integration test now passes
+  (was MaxIter on baseline) — incidental improvement.
+- arki0003 with `max_iter=200`: still terminates at iter 199 with
+  `obj=1.22e7`, `inf_pr=7.46e3`. Iter 110-115 still shows the
+  microscopic-α acceptance pattern (α=1.94e-5, ls_steps=0, θ
+  unchanged at 3.12e5). `filter_rejects=0`, no restoration.
+
+Why arki0003 wasn't fixed: the IPM Newton step is a local descent
+direction for θ, so even at α=1.94e-5 the trial yields
+`theta_trial ≈ (1−α)·theta_current` ≈ 3.12e5·(1−1.94e-5),
+which still satisfies `theta_trial ≤ (1−γ_θ)·theta_ref` because
+γ_θ=1e-5 is the *same* small constant. Slack-coupling shifts the
+absolute magnitude of θ but does not change the algebraic
+relationship `θ_trial/θ_ref = 1−Θ(α)`. So the h-type test passes
+identically before and after the fix at this iterate.
+
+The real arki0003 root cause must therefore be elsewhere — likely
+in either:
+- the α_max (frac-to-bound) computation pinning the first trial
+  to such a small value at iter 110→111, or
+- the α_min computation: γ_α·γ_θ (≈ 5e-7 with γ_α=0.05) leaves
+  α=1.94e-5 well above α_min, so even an exhaustive backtracking
+  line search would accept the same trial. Compare to Ipopt's
+  α_min — if Ipopt computes a larger α_min at iter 110, the
+  microscopic α would be rejected outright and restoration
+  triggered.
+
+A8.20 follow-up: trace α_max and α_min at iter 110 in both
+solvers. Hypothesis: ripopt's α_max is correct (it's just
+frac-to-bound on x and s) but α_min may be missing the
+`gamma_phi*theta/(-grad_phi*d)` clause or the `delta*theta^s_theta`
+term, which would make it too generous in this regime.
+
+The slack-coupling fix is committed regardless because it is
+correct against the Ipopt reference (`IpCq::curr_constraint_violation`)
+and resolves the apples-to-oranges issue between the filter test
+and the IPM convergence test, and unrelatedly enables `hs_tp044`.

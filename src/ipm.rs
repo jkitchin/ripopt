@@ -1828,7 +1828,11 @@ fn evaluate_trial_point<P: NlpProblem>(
         return None;
     }
 
-    let theta_trial = theta_for_g(state, &g_trial);
+    // Slack-coupled trial theta — A8.19. Trial slack `s + α·ds` is
+    // feasible because `compute_alpha_max` already applied frac-to-bound
+    // to the primal slack step.
+    let s_trial = compute_trial_slack(state, alpha);
+    let theta_trial = theta_for_g_s(state, &g_trial, &s_trial);
     Some((x_trial, obj_trial, g_trial, theta_trial))
 }
 
@@ -3266,7 +3270,10 @@ fn attempt_soft_restoration<P: NlpProblem>(
         return false;
     }
 
-    let theta_trial = theta_for_g(state, &state.g);
+    // Soft restoration steps x and the duals but not the slack `s`,
+    // so theta is measured against the unchanged `state.s` (A8.19
+    // slack-coupled form).
+    let theta_trial = theta_for_g_s(state, &state.g, &state.s);
     let phi_trial = compute_barrier_phi(
         state.obj, &state.x, &state.g, state, n, m, options.constraint_slack_barrier,
         options.kappa_d,
@@ -5402,8 +5409,11 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
     initialize_slack_iterate(&mut state, m, options);
     initialize_constraint_slack_multipliers(&mut state, m, options);
 
-    // Set filter parameters based on initial constraint violation
-    let theta_init = state.constraint_violation();
+    // Set filter parameters based on initial constraint violation.
+    // A8.19: use slack-coupled `||c||_1 + ||d − s||_1` so theta_min /
+    // theta_max are on the same scale as the trial-point theta computed
+    // during the line search (which now uses `theta_for_g_s`).
+    let theta_init = theta_for_g_s(&state, &state.g, &state.s);
     filter.set_theta_min_from_initial(theta_init);
 
     // B10: Ipopt-style problem statistics block (print_level >= 4
@@ -5717,7 +5727,12 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
 
         // Line search
         let t_ls = Instant::now();
-        let theta_current = primal_inf;
+        // A8.19: filter theta is slack-coupled (`||c||_1 + ||d − s||_1`)
+        // matching Ipopt's `IpCq::curr_constraint_violation`. The
+        // box-violation `primal_inf` is preserved separately as a
+        // diagnostic and as the input to other consumers (compute_tau,
+        // detect_tiny_step, almost_feasible_guard, feasibility history).
+        let theta_current = theta_for_g_s(&state, &state.g, &state.s);
         let phi_current = state.barrier_objective(options);
         let grad_phi_step = state.barrier_directional_derivative(options);
 
@@ -6121,6 +6136,7 @@ fn evaluate_soc_trial_and_check<P: NlpProblem>(
     options: &SolverOptions,
     filter: &mut Filter,
     x_soc: Vec<f64>,
+    s_soc: &[f64],
     n: usize,
     m: usize,
     theta_current: f64,
@@ -6142,7 +6158,8 @@ fn evaluate_soc_trial_and_check<P: NlpProblem>(
         return SocTrialOutcome::Abort;
     }
 
-    let theta_soc = theta_for_g(state, &g_soc);
+    // A8.19 slack-coupled SOC theta: s_soc = state.s + α_p_soc · ds_d_soc.
+    let theta_soc = theta_for_g_s(state, &g_soc, s_soc);
     if theta_soc >= kappa_soc * *theta_prev_soc {
         return SocTrialOutcome::Abort;
     }
@@ -6237,7 +6254,11 @@ fn attempt_soc_aug<P: NlpProblem>(
     let tau = (1.0 - state.mu).max(options.tau_min);
 
     let mut alpha_primal_soc = alpha;
-    let mut theta_prev_soc = theta_for_g(state, g_trial);
+    // A8.19 slack-coupled theta: the SOC seed reuses the upstream
+    // line-search trial slack `s + α·ds`, matching `latest_trial_dms`
+    // initialised above.
+    let s_trial_seed = compute_trial_slack(state, alpha);
+    let mut theta_prev_soc = theta_for_g_s(state, g_trial, &s_trial_seed);
 
     for _soc_iter in 0..options.max_soc {
         for k in 0..n_c {
@@ -6270,8 +6291,19 @@ fn attempt_soc_aug<P: NlpProblem>(
             compute_soc_alpha_and_trial_x(state, &dx_soc, tau);
         alpha_primal_soc = alpha_primal_soc_new;
 
+        // A8.19: build s_soc = state.s + α_p_soc · ds_d_soc (inequality
+        // rows only; equality rows keep the sentinel state.s[i]=g_l[i])
+        // so the SOC trial theta uses the slack-coupled form
+        // `||c||_1 + ||d − s||_1` matching Ipopt.
+        let mut s_soc = state.s.clone();
+        for i in 0..m {
+            if let Some(k) = partition.ineq_pos[i] {
+                s_soc[i] = state.s[i] + alpha_primal_soc * ds_d_soc[k];
+            }
+        }
+
         match evaluate_soc_trial_and_check(
-            state, problem, options, filter, x_soc, n, m,
+            state, problem, options, filter, x_soc, &s_soc, n, m,
             theta_current, phi_current, grad_phi_step, alpha,
             kappa_soc, &mut theta_prev_soc,
         ) {
@@ -6605,7 +6637,11 @@ fn apply_restoration_success<P: NlpProblem>(
         if !g_ok || !phi_ok {
             return false;
         }
-        let theta_check = if m == 0 { 0.0 } else { theta_for_g(state, &g_check) };
+        // A8.19 slack-coupled. After restoration, state.s has not yet
+        // been updated to match x_new; using state.s here is consistent
+        // with the filter's `is_acceptable` envelope built from prior
+        // (theta, phi) pairs that all use the slack-coupled formula.
+        let theta_check = if m == 0 { 0.0 } else { theta_for_g_s(state, &g_check, &state.s) };
         let feasible = theta_check < options.constr_viol_tol;
         if !feasible && !filter.is_acceptable(theta_check, phi_check) {
             return false;
@@ -6775,7 +6811,10 @@ fn attempt_nlp_restoration<P: NlpProblem>(
     {
         return (x_nlp, resto_z, RestorationOutcome::Failed);
     }
-    let theta_new = theta_for_g(state, &g_new);
+    // A8.19 slack-coupled (state.s carries the pre-restoration slack;
+    // the post-restoration logic re-syncs s to match x_nlp shortly
+    // after this point).
+    let theta_new = theta_for_g_s(state, &g_new, &state.s);
 
     // Evaluate original objective at the restored point
     let mut phi_new = f64::INFINITY;
@@ -7499,14 +7538,43 @@ fn compute_s_d_at_state(state: &SolverState) -> f64 {
     compute_residual_scaling(compute_multiplier_sum(state), compute_multiplier_count(state))
 }
 
-/// Constraint violation theta evaluated at an arbitrary `g` against
-/// the current state's `g_l`/`g_u` bounds. Centralises the four
-/// trial-point theta sites (regular line search, soft restoration,
-/// second-order correction, and the IIE search-direction probe) that
-/// otherwise each repeat `convergence::primal_infeasibility(g,
-/// &state.g_l, &state.g_u)`.
-fn theta_for_g(state: &SolverState, g: &[f64]) -> f64 {
-    convergence::primal_infeasibility(g, &state.g_l, &state.g_u)
+/// Slack-coupled constraint violation θ evaluated at trial `(g, s)`
+/// against the current state's `g_l`/`g_u` bounds.
+///
+/// Mirrors Ipopt's `IpCq::curr_constraint_violation` =
+/// `||c||_1 + ||d − s||_1`
+/// (`IpIpoptCalculatedQuantities.cpp:1468-1473, 2570-2610`):
+/// - equality row (`g_l == g_u`): contributes `|g[i] − g_l[i]|`
+/// - inequality row: contributes `|g[i] − s[i]|`
+///
+/// **Why slack-coupled and not box-violation**: the IPM iterates an
+/// explicit slack `s` for inequality rows, and the Newton system
+/// drives the residual `d(x) − s` to zero (not `g(x)` to `[g_l,
+/// g_u]`). The filter line search must measure the same residual
+/// the step is solving — see `docs/A8_FOLLOWUP_arki0003.md` §A8.19
+/// for why the prior box-violation flavour made the h-type filter
+/// test artificially permissive at high theta.
+///
+/// Equality rows remain consistent because `state.s[i] = g_l[i]`
+/// is the sentinel for equality rows (`ipm.rs:578`) and `state.ds[i]
+/// = 0` for equalities, so trial `s_trial = s + α·ds` preserves
+/// `s[i] = g_l[i]` and the formula collapses to `|g[i] − g_l[i]|`.
+fn theta_for_g_s(state: &SolverState, g: &[f64], s: &[f64]) -> f64 {
+    convergence::primal_infeasibility_internal(g, s, &state.g_l, &state.g_u)
+}
+
+/// Compute the trial slack `s + α·ds` for the line-search trial.
+/// Frac-to-bound on `s` is enforced upstream by `compute_alpha_max`
+/// (`ipm.rs:3303-3414`), so `s_trial` stays in `(g_l, g_u)` for any
+/// `α ≤ alpha_primal_max`. For equality rows `state.ds[i] = 0`, so
+/// `s_trial[i] = state.s[i] = g_l[i]` (sentinel preserved).
+fn compute_trial_slack(state: &SolverState, alpha: f64) -> Vec<f64> {
+    let m = state.m;
+    let mut s_trial = Vec::with_capacity(m);
+    for i in 0..m {
+        s_trial.push(state.s[i] + alpha * state.ds[i]);
+    }
+    s_trial
 }
 
 /// Accumulate `J^T * y` (constraint Jacobian transpose times the
