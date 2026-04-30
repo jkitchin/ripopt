@@ -150,8 +150,14 @@ impl Filter {
         // Ipopt switching condition: alpha makes this depend on step length,
         // so as alpha shrinks during backtracking, we properly fall back to
         // h-type (constraint reduction) acceptance.
+        //
+        // DEV-24: `<= theta_min` (non-strict) matches Ipopt's
+        // IpFilterLSAcceptor.cpp:362 (`reference_theta_ <= theta_min_`)
+        // and :460 (`curr_theta <= theta_min_`). Strict `<` could
+        // diverge on synthetic boundary cases where theta exactly equals
+        // theta_min.
         grad_phi_step < 0.0
-            && theta_current < self.theta_min
+            && theta_current <= self.theta_min
             && alpha * (-grad_phi_step).powf(self.s_phi)
                 > self.delta * theta_current.powf(self.s_theta)
     }
