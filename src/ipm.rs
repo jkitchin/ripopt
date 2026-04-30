@@ -1711,7 +1711,6 @@ fn evaluate_and_refresh_lbfgs<P: NlpProblem>(
 enum LineSearchOutcome {
     StepAccepted,
     Rejected,
-    Return(SolveResult),
 }
 
 /// Run the Ipopt-style backtracking line search on the current direction.
@@ -1870,11 +1869,9 @@ fn run_line_search_loop<P: NlpProblem>(
     grad_phi_step: f64,
     min_alpha: f64,
     watchdog_active: bool,
-    iteration: usize,
+    _iteration: usize,
     n: usize,
     m: usize,
-    start_time: Instant,
-    early_timeout: f64,
     trace_meta: &mut TraceMetadata,
     ls_steps: &mut usize,
     aug_solver: &mut dyn LinearSolver,
@@ -1893,17 +1890,6 @@ fn run_line_search_loop<P: NlpProblem>(
     // ripopt-specific and could prematurely abandon a step that was
     // still on track to either accept or fall through to alpha_min.
     loop {
-        // Intra-iteration early stall check (scaled by problem size).
-        // Square problems can have legitimately slow first iterations
-        // (mirrors IpBacktrackingLineSearch.cpp:276-280), so we never
-        // declare infeasibility on time alone in that branch.
-        if !state.is_square
-            && iteration < 3
-            && options.early_stall_timeout > 0.0
-            && start_time.elapsed().as_secs_f64() > early_timeout
-        {
-            return LineSearchOutcome::Return(make_result(state, SolveStatus::NumericalError));
-        }
         if alpha < min_alpha {
             break;
         }
@@ -2619,8 +2605,7 @@ enum RestorationCascadeDecision {
 }
 
 /// Attempt full NLP restoration on `fail_count ∈ {2, 4}` (skipped if
-/// disabled, KKT dim > 50000, or the early-stall timeout has nearly
-/// elapsed within the first 3 iterations). Returns true when restoration
+/// disabled or KKT dim > 50000). Returns true when restoration
 /// succeeded and the cascade should short-circuit with `Continue`; false
 /// when the caller should fall through to the recovery / max-attempts
 /// classification.
@@ -2634,23 +2619,17 @@ fn try_nlp_restoration_phase<P: NlpProblem>(
     lbfgs_state: &mut Option<LbfgsIpmState>,
     lbfgs_mode: bool,
     linear_constraints: Option<&[bool]>,
-    iteration: usize,
+    _iteration: usize,
     fail_count: usize,
     n: usize,
     m: usize,
     start_time: Instant,
-    early_timeout: f64,
     theta_current: f64,
 ) -> bool {
     let kkt_dim = n + m;
-    let skip_nlp_restoration = !state.is_square
-        && iteration < 3
-        && options.early_stall_timeout > 0.0
-        && start_time.elapsed().as_secs_f64() > early_timeout * 0.5;
     if !((fail_count == 2 || fail_count == 4)
         && !options.disable_nlp_restoration
-        && kkt_dim <= 50000
-        && !skip_nlp_restoration)
+        && kkt_dim <= 50000)
     {
         return false;
     }
@@ -2880,7 +2859,6 @@ fn run_post_ls_restoration_cascade<P: NlpProblem>(
     m: usize,
     start_time: Instant,
     deadline: Option<Instant>,
-    early_timeout: f64,
     feas: &FeasibilityTracker,
     theta_current: f64,
 ) -> RestorationCascadeDecision {
@@ -2921,7 +2899,7 @@ fn run_post_ls_restoration_cascade<P: NlpProblem>(
     if try_nlp_restoration_phase(
         state, problem, options, filter, mu_state, lbfgs_state, lbfgs_mode,
         linear_constraints, iteration, fail_count, n, m, start_time,
-        early_timeout, theta_current,
+        theta_current,
     ) {
         return RestorationCascadeDecision::Continue;
     }
@@ -4331,46 +4309,20 @@ fn check_convergence_and_handle_promotions(
     }
 }
 
-/// Check wall-clock and early-stall time limits at the top of each iteration.
+/// Check wall-clock time limit at the top of each iteration.
 ///
-/// Returns `Some(SolveResult)` to terminate the loop if either:
-/// - `max_wall_time` has been exceeded → `MaxIterations`
-/// - `early_stall_timeout` was hit during the first 5 iterations
-///   (scaled by problem size) → `NumericalError`
-///
+/// Returns `Some(MaxIterations)` if `max_wall_time` has been exceeded.
 /// Wall-clock is polled every iteration during the first 10, then every 10
 /// thereafter to keep overhead negligible on long runs.
-///
-/// Extracted from `solve_ipm` as part of the v0.8 main-loop decomposition
-/// (pre-work step 2). Pure guard function.
 fn check_time_limits(
     state: &SolverState,
     iteration: usize,
     start_time: Instant,
-    early_timeout: f64,
     options: &SolverOptions,
 ) -> Option<SolveResult> {
-    // Check wall-clock time limit (every iteration in early phase, every 10 after)
     if (iteration < 10 || iteration % 10 == 0) && options.max_wall_time > 0.0 {
         if start_time.elapsed().as_secs_f64() >= options.max_wall_time {
             return Some(make_result(state, SolveStatus::MaxIterations));
-        }
-    }
-
-    // Early stall detection: bail out if stuck in early iterations.
-    // `early_timeout` is pre-scaled by problem size in the caller (see
-    // scaling formula in solve_ipm). Square problems are exempt — they
-    // can have legitimately slow first iterations (mirrors Ipopt
-    // IpBacktrackingLineSearch.cpp:276-280).
-    if !state.is_square && iteration < 5 && options.early_stall_timeout > 0.0 {
-        if start_time.elapsed().as_secs_f64() > early_timeout {
-            if options.print_level >= 3 {
-                rip_log!(
-                    "ripopt: Early stall at iteration {} ({:.1}s elapsed), terminating",
-                    iteration, start_time.elapsed().as_secs_f64()
-                );
-            }
-            return Some(make_result(state, SolveStatus::NumericalError));
         }
     }
     None
@@ -4389,46 +4341,6 @@ fn check_time_limits(
 /// solver-init seeding; the call is omitted for clarity.
 fn reset_filter_with_current_theta(_state: &SolverState, filter: &mut Filter) {
     filter.reset();
-}
-
-/// Overall-progress stall tracker: best primal/dual infeasibility seen
-/// so far and the consecutive-no-progress counter. Threaded through
-/// the stall-detection helpers (`detect_and_handle_progress_stall` and
-/// the μ-boost recovery paths) instead of three parallel locals.
-struct ProgressStallTracker {
-    best_pr: f64,
-    best_du: f64,
-    no_progress_count: usize,
-}
-
-impl ProgressStallTracker {
-    fn new() -> Self {
-        Self {
-            best_pr: f64::INFINITY,
-            best_du: f64::INFINITY,
-            no_progress_count: 0,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.best_pr = f64::INFINITY;
-        self.best_du = f64::INFINITY;
-        self.no_progress_count = 0;
-    }
-}
-
-/// Stall-recovery cleanup: re-seed the filter from the current θ and
-/// clear the no-progress window so the next iteration starts fresh.
-/// Used by every branch in `handle_near_tolerance_stall` /
-/// `try_boost_mu_for_stall` that mutates μ to escape a stall — the
-/// metric history before the μ change is meaningless once μ jumps.
-fn reset_stall_counters_and_filter(
-    state: &SolverState,
-    filter: &mut Filter,
-    stall: &mut ProgressStallTracker,
-) {
-    reset_filter_with_current_theta(state, filter);
-    stall.reset();
 }
 
 /// Per-iteration KKT residuals used by the log row, filter, and
@@ -4481,8 +4393,8 @@ fn compute_optimality_measures(state: &SolverState) -> OptimalityMeasures {
 }
 
 /// Compute the multiplier-based scaling factor `s_d` used by the
-/// Ipopt acceptable-tolerance gate and the overall-progress stall
-/// detector, then update `state.consecutive_acceptable`.
+/// Ipopt acceptable-tolerance gate, then update
+/// `state.consecutive_acceptable`.
 ///
 /// Scaling matches `IpIpoptCalculatedQuantities::ComputeOptimalityErrorScaling`
 /// with `s_max=100` and the 1e4 cap preserved for compatibility with
@@ -4490,9 +4402,6 @@ fn compute_optimality_measures(state: &SolverState) -> OptimalityMeasures {
 /// match `IpOptErrorConvCheck.cpp:70-121` defaults
 /// (acceptable_tol=1e-6, acceptable_constr_viol_tol=1e-2,
 /// acceptable_dual_inf_tol=1e10, acceptable_compl_inf_tol=1e-2).
-///
-/// Returns `s_d_for_acc` because it is consumed downstream by
-/// `detect_and_handle_progress_stall`.
 fn track_consecutive_acceptable(
     state: &mut SolverState,
     options: &SolverOptions,
@@ -4676,299 +4585,37 @@ impl FeasibilityTracker {
     }
 }
 
-/// Outcome of the overall-progress stall detector.
-enum StallDecision {
-    /// No stall (or not yet activated) — fall through to normal step.
-    Proceed,
-    /// Stall detected and recovered by bumping μ / resetting the filter —
-    /// caller must `continue` the main loop immediately (no Newton step
-    /// this iteration).
-    Continue,
-    /// Stall detected and no recovery possible — caller must return this
-    /// result immediately.
-    Return(SolveResult),
-}
+// T3.13–T3.22 (2026-04-30): retired the entire ripopt-specific stall machinery
+// (`ProgressStallTracker`, `StallDecision`, `detect_and_handle_progress_stall`,
+// `handle_near_tolerance_stall`, `classify_near_tolerance_stall_outcome`,
+// `try_boost_mu_for_stall`, `try_force_mu_decrease_in_fixed_mode`,
+// `update_stall_counters_and_check_limit`,
+// `boost_mu_and_switch_to_fixed_with_stall_reset`,
+// `reset_stall_counters_and_filter`, and the `stall_iter_limit` /
+// `early_stall_timeout` options that gated them). No Ipopt analog.
+// Stall handling in Ipopt 3.14 is owned by the filter line search, the
+// watchdog reversal (`IpBacktrackingLineSearch.cpp:773`), the AcceptableLevel
+// termination (`IpOptErrorConvCheck.cpp:328-330`), and the restoration phase
+// — collectively those already cover the cases the retired machinery was
+// catching, without ripopt-specific μ-boost flips that violated the monotone
+// invariant.
 
-// T3.21 (2026-04-27): retired `check_stall_near_tolerance_via_optimal_duals`.
-// It recomputed "optimal" bound multipliers from ∇L, ran a two-gate
-// near-tolerance check, and exited with NumericalError when both gates
-// passed. The handler was unreachable under defaults (gated behind
-// `options.stall_iter_limit > 0`, default 0 since T2.27) and has no
-// Ipopt analog — Ipopt has no near-tolerance escape hatch on stall.
-// Removed alongside its callsite in `detect_and_handle_progress_stall`.
-
-/// In Fixed (monotone) μ mode, when stall recovery hasn't already kicked
-/// in via a μ boost and μ is still above mu_min, force a μ decrease at
-/// the min(linear, superlinear) rate. Resets stall counters and the
-/// filter. Returns true when the decrease was applied (caller should
-/// `continue` the loop), false when the gate didn't fire.
-#[allow(clippy::too_many_arguments)]
-fn try_force_mu_decrease_in_fixed_mode(
-    state: &mut SolverState,
-    options: &SolverOptions,
-    primal_inf: f64,
-    dual_inf: f64,
-    compl_inf: f64,
-    filter: &mut Filter,
-    stall: &mut ProgressStallTracker,
-) -> bool {
-    if !(!options.mu_strategy_adaptive && state.mu > options.mu_min) {
-        return false;
-    }
-    let new_mu = (options.mu_linear_decrease_factor * state.mu)
-        .min(state.mu.powf(options.mu_superlinear_decrease_power))
-        .max(options.mu_min);
-    if options.print_level >= 3 {
-        rip_log!(
-            "ripopt: Fixed mode stall near tolerance (pr={:.2e}, du={:.2e}, co={:.2e}), forcing mu {:.2e} -> {:.2e}",
-            primal_inf, dual_inf, compl_inf, state.mu, new_mu
-        );
-    }
-    state.mu = new_mu;
-    reset_stall_counters_and_filter(state, filter, stall);
-    true
-}
-
-/// Handle a stall whose current iterate is near-tolerance (1000x tol on
-/// each metric). Three sub-decisions in priority order:
-/// 1. mu has outrun feasibility (mu < 0.01*pr_max while pr_max above
-///    constr_viol_tol): boost mu to 0.1*pr_max, switch to Fixed mode,
-///    return Continue.
-/// 2. Fixed (monotone) mode + mu still above mu_min: force a mu decrease
-///    by min(linear, superlinear) rate (the barrier subproblem is
-///    effectively solved at the current mu), return Continue.
-/// 3. Otherwise, classify as Acceptable when both unscaled (1e-2) and
-///    scaled (1e-6 * s_d) tolerances pass; else return NumericalError.
-#[allow(clippy::too_many_arguments)]
-fn handle_near_tolerance_stall(
-    state: &mut SolverState,
-    options: &SolverOptions,
-    primal_inf: f64,
-    primal_inf_max: f64,
-    dual_inf: f64,
-    compl_inf: f64,
-    s_d_for_acc: f64,
-    filter: &mut Filter,
-    mu_state: &mut MuState,
-    stall: &mut ProgressStallTracker,
-) -> StallDecision {
-    // A8.13: μ-boost on stall is a ripopt-specific recovery with no
-    // analogue in Ipopt's `IpMonotoneMuUpdate.cpp`, where μ decreases
-    // monotonically and stall handling is left to the filter line
-    // search + AcceptableLevel termination. Restrict to adaptive
-    // strategy only — under monotone (the Ipopt default) a μ-boost
-    // violates the monotone invariant and produced an iter-685 spike
-    // on arki0003 (μ jumped 1e-3 → 2.21e2). See A8 follow-up doc.
-    if options.mu_strategy_adaptive
-        && state.mu < primal_inf_max * 0.01
-        && primal_inf_max > options.constr_viol_tol
-    {
-        let new_mu = (primal_inf_max * 0.1).max(1e-6);
-        if options.print_level >= 3 {
-            rip_log!(
-                "ripopt: Near-tolerance stall: boosting mu {:.2e} -> {:.2e} (pr_max={:.2e})",
-                state.mu, new_mu, primal_inf_max
-            );
-        }
-        boost_mu_and_switch_to_fixed_with_stall_reset(
-            state, new_mu, mu_state, filter, stall,
-        );
-        return StallDecision::Continue;
-    }
-    if try_force_mu_decrease_in_fixed_mode(
-        state, options, primal_inf, dual_inf, compl_inf, filter, stall,
-    ) {
-        return StallDecision::Continue;
-    }
-    classify_near_tolerance_stall_outcome(
-        state, options, primal_inf, primal_inf_max, dual_inf, compl_inf, s_d_for_acc,
-    )
-}
-
-/// Final classification used after the μ-boost and forced-Fixed-decrease
-/// branches of handle_near_tolerance_stall did not fire. Returns
-/// `Acceptable` when both unscaled (1e-2) and scaled (1e-6 · s_d) gates
-/// pass on all three metrics; otherwise `NumericalError`.
-#[allow(clippy::too_many_arguments)]
-fn classify_near_tolerance_stall_outcome(
-    state: &SolverState,
-    options: &SolverOptions,
-    primal_inf: f64,
-    primal_inf_max: f64,
-    dual_inf: f64,
-    compl_inf: f64,
-    s_d_for_acc: f64,
-) -> StallDecision {
-    let acc_pr_ok = primal_inf_max <= 1e-2;
-    let acc_du_ok = dual_inf <= 1e10;
-    let acc_co_ok = compl_inf <= 1e-2;
-    let acc_scaled_ok = primal_inf_max <= 1e-6
-        && dual_inf <= 1e-6 * s_d_for_acc
-        && compl_inf <= 1e-6 * s_d_for_acc;
-    if acc_pr_ok && acc_du_ok && acc_co_ok && acc_scaled_ok {
-        if options.print_level >= 3 {
-            rip_log!(
-                "ripopt: Stalled at acceptable tolerance (pr={:.2e}, du={:.2e}, co={:.2e}), returning Acceptable",
-                primal_inf, dual_inf, compl_inf
-            );
-        }
-        return StallDecision::Return(make_result(state, SolveStatus::Acceptable));
-    }
-    if options.print_level >= 3 {
-        rip_log!(
-            "ripopt: Stalled but near-tolerance (pr={:.2e}, du={:.2e}, co={:.2e}), returning NumericalError",
-            primal_inf, dual_inf, compl_inf
-        );
-    }
-    StallDecision::Return(make_result(state, SolveStatus::NumericalError))
-}
-
-/// Last-chance stall recovery: when primal feasibility is reasonable
-/// (< 0.1) but μ has outrun it (μ < pr_max·0.01), bump μ back to
-/// pr_max·0.1 (floor 1e-6), reset the filter, clear stall counters,
-/// and switch to Fixed mode. Returns Some(Continue) on recovery, None
-/// if the trigger isn't met.
-fn try_boost_mu_for_stall(
-    state: &mut SolverState,
-    options: &SolverOptions,
-    filter: &mut Filter,
-    mu_state: &mut MuState,
-    primal_inf_max: f64,
-    stall: &mut ProgressStallTracker,
-) -> Option<StallDecision> {
-    // A8.13: same gate as `handle_near_tolerance_stall` — μ-boost has
-    // no analogue in Ipopt's monotone path; restrict to adaptive.
-    if !(options.mu_strategy_adaptive
-        && primal_inf_max < 0.1
-        && state.mu < primal_inf_max * 0.01)
-    {
-        return None;
-    }
-    let new_mu = (primal_inf_max * 0.1).max(1e-6);
-    if options.print_level >= 3 {
-        rip_log!(
-            "ripopt: Stall recovery: boosting mu {:.2e} -> {:.2e} (pr_max={:.2e})",
-            state.mu, new_mu, primal_inf_max
-        );
-    }
-    boost_mu_and_switch_to_fixed_with_stall_reset(
-        state, new_mu, mu_state, filter, stall,
-    );
-    Some(StallDecision::Continue)
-}
-
-/// Update best-so-far primal/dual metrics and the no-progress counter,
-/// and return `true` when the stall limit has been reached.
+/// Track constraint-violation history. Pushes `primal_inf` into the
+/// θ-history ring, updates the sticky `ever_feasible` flag, and clears
+/// the auxiliary stall counter when the iterate has been feasible.
 ///
-/// Counts an iteration as "improving" when either `primal_inf_max` or
-/// `dual_inf` shrinks by at least 1% of the previous best. Improving
-/// resets the no-progress counter; non-improving increments it. The
-/// effective stall limit is halved when both step lengths are
-/// negligible (`alpha_primal < 1e-8 && alpha_dual < 1e-4`) so truly
-/// stuck iterations terminate sooner.
-fn update_stall_counters_and_check_limit(
-    stall: &mut ProgressStallTracker,
-    state: &SolverState,
-    options: &SolverOptions,
-    primal_inf_max: f64,
-    dual_inf: f64,
-) -> bool {
-    let pr_improved = primal_inf_max < 0.99 * stall.best_pr;
-    let du_improved = dual_inf < 0.99 * stall.best_du;
-    if pr_improved {
-        stall.best_pr = primal_inf_max;
-    }
-    if du_improved {
-        stall.best_du = dual_inf;
-    }
-    if pr_improved || du_improved {
-        stall.no_progress_count = 0;
-        return false;
-    }
-    stall.no_progress_count += 1;
-    let tiny_alpha = state.alpha_primal < 1e-8 && state.alpha_dual < 1e-4;
-    let stall_limit = if tiny_alpha { options.stall_iter_limit / 2 } else { options.stall_iter_limit };
-    stall.no_progress_count >= stall_limit
-}
-
-fn detect_and_handle_progress_stall<P: NlpProblem>(
-    state: &mut SolverState,
-    _problem: &P,
-    options: &SolverOptions,
-    iteration: usize,
-    primal_inf: f64,
-    primal_inf_max: f64,
-    dual_inf: f64,
-    compl_inf: f64,
-    s_d_for_acc: f64,
-    filter: &mut Filter,
-    mu_state: &mut MuState,
-    stall: &mut ProgressStallTracker,
-    _linear_constraints: Option<&[bool]>,
-    _lbfgs_mode: bool,
-) -> StallDecision {
-    if iteration <= 50 || options.stall_iter_limit == 0 {
-        return StallDecision::Proceed;
-    }
-
-    if !update_stall_counters_and_check_limit(
-        stall, state, options, primal_inf_max, dual_inf,
-    ) {
-        return StallDecision::Proceed;
-    }
-
-    // Before declaring NumericalError, check if the current point is
-    // near-tolerance (1000x tol).
-    let stall_near_tol = options.tol * 1000.0;
-    let stall_pr_ok = primal_inf_max <= stall_near_tol.max(10.0 * options.constr_viol_tol);
-    let stall_du_ok = dual_inf <= (stall_near_tol * s_d_for_acc).max(1e-2);
-    let stall_co_ok = compl_inf <= (stall_near_tol * s_d_for_acc).max(1e-2);
-    if stall_pr_ok && stall_du_ok && stall_co_ok {
-        return handle_near_tolerance_stall(
-            state, options, primal_inf, primal_inf_max, dual_inf, compl_inf,
-            s_d_for_acc, filter, mu_state, stall,
-        );
-    }
-    if let Some(decision) = try_boost_mu_for_stall(
-        state, options, filter, mu_state, primal_inf_max, stall,
-    ) {
-        return decision;
-    }
-    if options.print_level >= 3 {
-        rip_log!(
-            "ripopt: Stalled for {} iterations without progress (alpha_p={:.2e}, pr={:.2e}, du={:.2e}), terminating",
-            stall.no_progress_count, state.alpha_primal, primal_inf, dual_inf
-        );
-    }
-    StallDecision::Return(make_result(state, SolveStatus::NumericalError))
-}
-
-/// Track constraint-violation history and optionally short-circuit
-/// with `LocalInfeasibility`.
-///
-/// Pushes the current `primal_inf` into `theta_history`, updates the
-/// "ever feasible" flag, and (when proactive infeasibility detection
-/// is enabled) looks for a stagnated θ with a near-stationary ∇θ
-/// over a 100-iteration window. Returns `Some(SolveResult)` when
-/// infeasibility is declared.
-///
-/// Ipopt uses its `RestoFilterConvCheck` for a broadly analogous
-/// purpose; this path is ripopt-specific and fires before the main
-/// IPM would otherwise burn iterations waiting for restoration to
-/// reach the same conclusion.
-///
-/// Extracted from `solve_ipm` as part of the v0.8 main-loop
-/// decomposition.
-#[allow(clippy::too_many_arguments)]
+/// T3.17: the proactive_infeasibility_detection branch was retired
+/// (no Ipopt analog). LocalInfeasibility detection now flows only
+/// through the restoration cascade (`classify_exhausted_restoration_attempt`)
+/// and the MaxIter exit (`try_classify_max_iter_infeasibility`), both of
+/// which test the same "stationary infeasible point" criterion.
 fn track_feasibility_and_detect_infeasibility(
-    state: &SolverState,
+    _state: &SolverState,
     options: &SolverOptions,
-    iteration: usize,
+    _iteration: usize,
     primal_inf: f64,
     feas: &mut FeasibilityTracker,
 ) -> Option<SolveResult> {
-    let m = state.m;
-
     if feas.history.len() >= feas.history_len {
         feas.history.remove(0);
     }
@@ -4976,39 +4623,6 @@ fn track_feasibility_and_detect_infeasibility(
 
     if primal_inf < options.constr_viol_tol {
         feas.ever_feasible = true;
-    }
-
-    // Proactive infeasibility detection: if θ has stagnated over the history
-    // window AND ‖∇θ‖_∞ is near zero, declare infeasibility instead of
-    // waiting for restoration to reach the same conclusion.
-    if options.proactive_infeasibility_detection
-        && !feas.ever_feasible
-        && m > 0
-        && iteration >= 50
-        && primal_inf > options.constr_viol_tol
-        && feas.history.len() >= feas.history_len
-    {
-        let theta_min_h = slice_min(&feas.history);
-        let theta_max_h = feas.history.iter().cloned().fold(0.0f64, f64::max);
-        if theta_max_h > 0.0 && (theta_max_h - theta_min_h) < 0.01 * primal_inf {
-            feas.stall_count += 1;
-        } else {
-            feas.stall_count = 0;
-        }
-        if feas.stall_count >= 10 {
-            let grad_theta_norm = compute_grad_theta_norm(state);
-            let stationarity_tol = 1e-3 * primal_inf.max(1.0);
-            if grad_theta_norm < stationarity_tol {
-                log::info!(
-                    "Proactive infeasibility at iter {}: θ stagnated at {:.2e}, ‖∇θ‖={:.2e}",
-                    iteration, primal_inf, grad_theta_norm
-                );
-                return Some(make_result(state, SolveStatus::LocalInfeasibility));
-            }
-            // Stationarity not met — reset counter to check again next window.
-            feas.stall_count = 0;
-        }
-    } else if feas.ever_feasible {
         feas.stall_count = 0;
     }
     None
@@ -5755,10 +5369,6 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
     // so KKT-clean tiny-step iterates exit Optimal first.
     let mut pending_tiny_step_exit: bool = false;
 
-    // Overall progress stall detection: if neither primal nor dual infeasibility
-    // improves by at least 1% over many consecutive iterations, terminate early.
-    let mut stall = ProgressStallTracker::new();
-
     // Line-search backtrack count for the previous iteration (printed in table).
     let mut ls_steps: usize = 0;
     // Hessian regularization delta from previous iteration (for intermediate callback).
@@ -5829,11 +5439,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         // for normal NLPs (IpRestoIpoptNLP.cpp:759).
         problem.notify_mu(state.mu);
 
-        // Early-stall timeout scaled by problem size: medium-scale problems
-        // (n+m > 1000) can legitimately spend 30-60s on restoration or line
-        // search during early iterations.
-        let early_timeout = options.early_stall_timeout * ((n + m) as f64 / 200.0).max(1.0);
-        if let Some(result) = check_time_limits(&state, iteration, start_time, early_timeout, options) {
+        if let Some(result) = check_time_limits(&state, iteration, start_time, options) {
             return result;
         }
 
@@ -5964,7 +5570,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             return make_result(&state, SolveStatus::StopAtTinyStep);
         }
 
-        let s_d_for_acc = track_consecutive_acceptable(
+        let _s_d_for_acc = track_consecutive_acceptable(
             &mut state,
             options,
             primal_inf,
@@ -6002,28 +5608,6 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             &mut feas,
         ) {
             return result;
-        }
-
-        // Overall-progress stall detection — see helper doc comment.
-        match detect_and_handle_progress_stall(
-            &mut state,
-            problem,
-            options,
-            iteration,
-            primal_inf,
-            primal_inf_max,
-            dual_inf,
-            compl_inf,
-            s_d_for_acc,
-            &mut filter,
-            &mut mu_state,
-            &mut stall,
-            linear_constraints.as_deref(),
-            lbfgs_mode,
-        ) {
-            StallDecision::Return(r) => return r,
-            StallDecision::Continue => continue,
-            StallDecision::Proceed => {}
         }
 
         // A7: primary Newton step via the 4-block augmented system
@@ -6146,8 +5730,6 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             iteration,
             n,
             m,
-            start_time,
-            early_timeout,
             &mut trace_meta,
             &mut ls_steps,
             aug_solver.as_mut(),
@@ -6159,7 +5741,6 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             LineSearchOutcome::Rejected => {
                 step_accepted = false;
             }
-            LineSearchOutcome::Return(result) => return result,
         }
 
         let mut accepted_by_soft_resto = false;
@@ -6215,7 +5796,6 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 m,
                 start_time,
                 deadline,
-                early_timeout,
                 &feas,
                 theta_current,
             ) {
@@ -7086,17 +6666,14 @@ enum RestorationOutcome {
 /// the same IPM engine (with `disable_nlp_restoration=true` to prevent recursion).
 /// Configure the inner SolverOptions for the restoration NLP solve. Caps
 /// max_iter at restoration_max_iter (>=500), disables nested restoration to
-/// prevent recursion, sets mu_init to resto_mu, disables stall detection
-/// (restoration makes slow steady progress that would trip the 30-iter
-/// stall limit), and relaxes tol to 1e-7 (we want feasibility, not
-/// optimality). Propagates the remaining wall-time budget so the inner
-/// solve can't outlive the outer fallback cascade; returns None when the
-/// remaining budget is < 0.5s. Scales early_stall_timeout by restoration
-/// NLP size so large restorations get the full default timeout.
+/// prevent recursion, sets mu_init to resto_mu, and relaxes tol to 1e-7
+/// (we want feasibility, not optimality). Propagates the remaining
+/// wall-time budget so the inner solve can't outlive the outer fallback
+/// cascade; returns None when the remaining budget is < 0.5s.
 fn configure_restoration_inner_options(
     options: &SolverOptions,
     resto_mu: f64,
-    resto_dim: usize,
+    _resto_dim: usize,
     start_time: Instant,
 ) -> Option<SolverOptions> {
     let mut inner_opts = options.clone();
@@ -7104,7 +6681,6 @@ fn configure_restoration_inner_options(
     inner_opts.disable_nlp_restoration = true;
     inner_opts.print_level = if options.print_level >= 5 { 3 } else { 0 };
     inner_opts.mu_init = resto_mu;
-    inner_opts.stall_iter_limit = 0;
     inner_opts.tol = 1e-7;
 
     if options.max_wall_time > 0.0 {
@@ -7114,15 +6690,6 @@ fn configure_restoration_inner_options(
         }
         inner_opts.max_wall_time = remaining;
     }
-    inner_opts.early_stall_timeout = if options.early_stall_timeout > 0.0 {
-        if resto_dim > 500 {
-            options.early_stall_timeout
-        } else {
-            options.early_stall_timeout.min(3.0)
-        }
-    } else {
-        3.0
-    };
     Some(inner_opts)
 }
 
@@ -8348,27 +7915,6 @@ fn reseed_bound_multipliers_from_mu(state: &mut SolverState, mu: f64) {
             state.z_u[i] = mu / slack_xu(state, i);
         }
     }
-}
-
-/// Boost μ to `new_mu`, reset the filter and overall-progress stall
-/// counters, and pin the strategy in Fixed mode. Used by the two
-/// stall-recovery branches (`handle_near_tolerance_stall` near-tol
-/// boost and `try_boost_mu_for_stall`) — both first decide a target
-/// μ from `primal_inf_max`, log it, then run this exact mutation.
-/// Does NOT increment `diagnostics.mu_mode_switches` (these
-/// stall-driven flips are tracked separately from the Free↔Fixed
-/// transitions in `switch_mu_mode`).
-fn boost_mu_and_switch_to_fixed_with_stall_reset(
-    state: &mut SolverState,
-    new_mu: f64,
-    mu_state: &mut MuState,
-    filter: &mut Filter,
-    stall: &mut ProgressStallTracker,
-) {
-    state.mu = new_mu;
-    reset_stall_counters_and_filter(state, filter, stall);
-    mu_state.mode = MuMode::Fixed;
-    mu_state.first_iter_in_mode = true;
 }
 
 /// Clamp `arr[i]` strictly inside the open variable box at index `i`,

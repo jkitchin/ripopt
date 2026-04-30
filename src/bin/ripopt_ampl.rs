@@ -161,7 +161,6 @@ fn print_help() {
     println!("    tol=<float>                          Optimality convergence tolerance [1e-8]");
     println!("    max_iter=<int>                       Maximum iterations [3000]");
     println!("    max_wall_time=<float>                Max wall-clock time in seconds (0=no limit) [0.0]");
-    println!("    stall_iter_limit=<int>               Iters without 1% improvement before stall (0=off) [30]");
     println!();
     println!("  Constraint & Dual Tolerances");
     println!("    constr_viol_tol=<float>              Constraint violation tolerance [1e-4]");
@@ -219,9 +218,7 @@ fn print_help() {
     println!();
     println!("  Preprocessing & Diagnostics");
     println!("    enable_preprocessing=<bool>          Eliminate fixed vars & redundant constraints [yes]");
-    println!("    proactive_infeasibility_detection=<bool> Early infeasibility detection [no]");
     println!("    print_level=<int>                    Verbosity: 0=silent, 5=verbose [5]");
-    println!("    early_stall_timeout=<float>          Max seconds for first 3 iters (0=off) [120.0]");
     println!("    mu_oracle_quality_function=<bool>    Use quality function for mu selection [no]");
     println!();
     println!("  Boolean values accept: yes, true, 1 (anything else is false).");
@@ -412,9 +409,6 @@ fn apply_option(opts: &mut SolverOptions, key: &str, value: &str) {
                 opts.gondzio_mcc_max = v;
             }
         }
-        "proactive_infeasibility_detection" => {
-            opts.proactive_infeasibility_detection = value == "yes" || value == "true" || value == "1";
-        }
         "hessian_approximation" => {
             match value {
                 "limited-memory" => opts.hessian_approximation_lbfgs = true,
@@ -428,16 +422,6 @@ fn apply_option(opts: &mut SolverOptions, key: &str, value: &str) {
                 "iterative" | "minres" => opts.linear_solver = ripopt::LinearSolverChoice::Iterative,
                 "hybrid" | "auto" => opts.linear_solver = ripopt::LinearSolverChoice::Hybrid,
                 _ => eprintln!("Warning: unknown linear_solver '{}' (use 'direct', 'iterative', or 'hybrid')", value),
-            }
-        }
-        "stall_iter_limit" => {
-            if let Ok(v) = value.parse() {
-                opts.stall_iter_limit = v;
-            }
-        }
-        "early_stall_timeout" => {
-            if let Ok(v) = value.parse() {
-                opts.early_stall_timeout = v;
             }
         }
         "mu_oracle_quality_function" => {

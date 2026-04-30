@@ -363,28 +363,8 @@ pub struct SolverOptions {
     /// Set to 0 to disable. Typical value: 3.
     /// Default: 3.
     pub gondzio_mcc_max: usize,
-    /// Enable proactive infeasibility detection.
-    ///
-    /// Monitors constraint violation (θ) in the main loop. If θ has stagnated
-    /// (< 1% relative change over the history window) and the gradient of θ is
-    /// stationary, declares LocalInfeasibility earlier instead of wasting iterations
-    /// before restoration eventually fires.
-    ///
-    /// Default: true.
-    pub proactive_infeasibility_detection: bool,
     /// Choice of sparse linear solver. Default: Direct.
     pub linear_solver: LinearSolverChoice,
-    /// Maximum consecutive iterations without 1% improvement in primal or dual
-    /// infeasibility before declaring stall (NumericalError). 0 = disable stall detection.
-    /// Default: 0 (disabled — Ipopt 3.14 has no equivalent stall_iter path; see
-    /// docs/IPOPT_ALGORITHM_SPEC.md §14.x). Retained as an opt-in escape hatch.
-    pub stall_iter_limit: usize,
-    /// Maximum wall-clock seconds allowed for the first few iterations.
-    /// If the solver has completed fewer than 3 iterations after this many seconds,
-    /// it returns NumericalError to trigger fallback strategies.
-    /// 0.0 disables early stall detection (default; T3.15 retired).
-    /// Mirrors no Ipopt option — wall-clock kill belongs to `max_cpu_time`.
-    pub early_stall_timeout: f64,
     /// Recompute equality multipliers `y` via the augmented least-squares
     /// system after each accepted step once the iterate is sufficiently
     /// feasible (`||c||_∞ < recalc_y_feas_tol`). Mirrors Ipopt 3.14
@@ -714,10 +694,7 @@ impl Default for SolverOptions {
             hessian_approximation_lbfgs: false,
             mehrotra_pc: false,
             gondzio_mcc_max: 3,
-            proactive_infeasibility_detection: false,
             linear_solver: LinearSolverChoice::default(),
-            stall_iter_limit: 0,
-            early_stall_timeout: 0.0,
             recalc_y: false,
             recalc_y_feas_tol: 1e-6,
             alpha_for_y: AlphaForY::default(),

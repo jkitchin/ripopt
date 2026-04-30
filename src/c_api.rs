@@ -574,9 +574,6 @@ pub unsafe extern "C" fn ripopt_add_str_option(
         "mehrotra_pc" => {
             p.options.mehrotra_pc = value == "yes";
         }
-        "proactive_infeasibility_detection" => {
-            p.options.proactive_infeasibility_detection = value == "yes";
-        }
         "mu_oracle_quality_function" => {
             p.options.mu_oracle_quality_function = value == "yes";
         }
