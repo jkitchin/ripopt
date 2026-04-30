@@ -857,3 +857,64 @@ and did not fix". Open work items 1-3 in §A8.15 remain the right
 direction (step-computation comparison vs Ipopt at iter ~100, dual
 update size limits, filter sufficient-progress at large theta).
 
+## A8.17 — DEV-34 and DEV-37 verified as audit false-positives (2026-04-30)
+
+Independent ipopt-expert read of `IpBacktrackingLineSearch.cpp` and
+`IpFilterLSAcceptor.cpp` against ripopt's `src/ipm.rs` and
+`src/filter.rs` confirms that DEV-34 and DEV-37 are NOT real
+misalignments and would be incorrect changes against Ipopt 3.14.
+
+### DEV-34 — "watchdog progress drop missing is_acceptable clause"
+
+**Verdict: ripopt already matches Ipopt.**
+
+Ipopt watchdog acceptance: the forward iterate goes through the
+*same* `acceptor_->CheckAcceptabilityOfTrialPoint(...)` call as a
+normal step (`IpBacktrackingLineSearch.cpp:773`), with only the
+reference iterate swapped from current to saved
+(`IpFilterLSAcceptor.cpp:251-268, :510-512`). That single check
+includes (a) `theta_max` guard, (b) F-type Armijo on phi or
+sufficient reduction vs reference (`:361-374`), and (c)
+`IsAcceptableToCurrentFilter` against the *live* filter (`:392`).
+
+ripopt's `process_watchdog_trial` at `src/ipm.rs:2505-2507`:
+```rust
+let made_progress = filter.is_acceptable(theta_now, phi_now)
+    && (theta_now <= (1.0 - gamma_theta) * saved.theta
+        || phi_now <= saved.phi - gamma_phi * saved.theta);
+```
+already requires *both* current-filter acceptability AND sufficient
+reduction vs the saved reference — matching Ipopt. Adding another
+`is_acceptable` clause would just duplicate the existing filter
+check.
+
+### DEV-37 — "theta_max early-rejection should skip SOC/watchdog"
+
+**Verdict: ripopt already matches Ipopt.**
+
+Ipopt's `theta_max` early-reject at `IpFilterLSAcceptor.cpp:341-348`
+sits inside `CheckAcceptabilityOfTrialPoint`, and *all* trial-point
+contexts go through that single function:
+- normal backtracking (`IpBacktrackingLineSearch.cpp:773`),
+- SOC trial (`IpFilterLSAcceptor.cpp:629`),
+- MPC/PD corrector (`IpFilterLSAcceptor.cpp:848`),
+- watchdog forward step (same `:773`, only reference values
+  change),
+- soft-resto sanity probe (`IpBacktrackingLineSearch.cpp:1172`).
+
+There is no flag to skip `theta_max` for SOC or watchdog. The audit
+claim that Ipopt skips this guard in those contexts is incorrect.
+
+ripopt's `Filter::check_acceptability` at `src/filter.rs:235` fires
+the `theta_trial > self.theta_max` reject regardless of caller —
+matching Ipopt. Skipping it would be a regression against the
+reference.
+
+### Status
+
+DEV-34 and DEV-37 marked complete (no-op, verified against Ipopt
+3.14). The DEV audit batch from §A8.15-§A8.16 lands at: 12 real
+fixes (DEV-1, DEV-2, DEV-3, DEV-4, DEV-7, DEV-9, DEV-11, DEV-13,
+DEV-23, DEV-24, DEV-30+31, DEV-32, DEV-33, DEV-35, DEV-36) plus 2
+verified-not-misalignments (DEV-34, DEV-37).
+
