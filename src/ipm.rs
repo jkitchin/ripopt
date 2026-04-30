@@ -8161,10 +8161,18 @@ fn compute_grad_theta_norm(state: &SolverState) -> f64 {
 /// `IpIpoptCalculatedQuantities::curr_dual_infeasibility` over both
 /// x and s blocks).
 fn compute_dual_inf_at_state(state: &SolverState) -> f64 {
+    // A8.10: Ipopt's `curr_dual_infeasibility`
+    // (`IpIpoptCalculatedQuantities.cpp:2682-2691`) calls the *plain*
+    // `curr_grad_lag_x()` / `curr_grad_lag_s()` (lines 2016-2024,
+    // 2088-2122) — no κ_d damping. The damped variants
+    // (`curr_grad_lag_with_damping_x/s`, lines 2131-2227) are used
+    // *only* in the augmented-system RHS (`curr_grad_barrier_obj_x`).
+    // Pass `kappa_d=0.0` so the printed inf_du and the convergence
+    // test match Ipopt's metric exactly.
     let x_part = convergence::dual_infeasibility(
         &state.grad_f, &state.jac_rows, &state.jac_cols, &state.jac_vals,
         &state.y, &state.z_l, &state.z_u, state.n,
-        state.kappa_d, state.mu, &state.x_l, &state.x_u,
+        0.0, state.mu, &state.x_l, &state.x_u,
     );
     x_part.max(slack_dual_inf_max(state))
 }
@@ -8175,27 +8183,18 @@ fn compute_dual_inf_at_state(state: &SolverState) -> f64 {
 /// slots are zero on rows with infinite g_l/g_u so the sum is implicitly
 /// projected onto active inequality bounds.
 ///
-/// B-cross2: applies the same `kappa_d * mu` damping for one-sided
-/// inequality rows that `dual_infeasibility` applies on the x side
-/// (Ipopt's `IpIpoptCalculatedQuantities::curr_grad_lag_s` —
-/// `IpIpoptCalculatedQuantities.cpp:888-899` mirror).
+/// A8.10: Ipopt's `curr_dual_infeasibility`
+/// (`IpIpoptCalculatedQuantities.cpp:2682-2691`) uses the *plain*
+/// `curr_grad_lag_s()` — no κ_d damping. The damped variant
+/// `curr_grad_lag_with_damping_s` is used only for the augmented-system
+/// RHS, not the printed inf_du or convergence test. Pass no damping here.
 fn slack_dual_inf_max(state: &SolverState) -> f64 {
     let mut m = 0.0_f64;
-    let damping = state.kappa_d * state.mu;
     for i in 0..state.m {
         if constraint_is_equality(state, i) {
             continue;
         }
-        let l_fin = state.g_l[i].is_finite();
-        let u_fin = state.g_u[i].is_finite();
-        let mut r = -state.y[i] - state.v_l[i] + state.v_u[i];
-        if damping > 0.0 {
-            if l_fin && !u_fin {
-                r += damping;
-            } else if !l_fin && u_fin {
-                r -= damping;
-            }
-        }
+        let r = -state.y[i] - state.v_l[i] + state.v_u[i];
         let a = r.abs();
         if a > m {
             m = a;
@@ -8209,10 +8208,12 @@ fn slack_dual_inf_max(state: &SolverState) -> f64 {
 /// by [`recover_active_set_z`] for an optimistic optimality probe)
 /// instead of `state.z_l`/`state.z_u`.
 fn dual_inf_with_z(state: &SolverState, z_l: &[f64], z_u: &[f64]) -> f64 {
+    // A8.10: plain `curr_dual_infeasibility` — no κ_d damping
+    // (`IpIpoptCalculatedQuantities.cpp:2682-2691`).
     convergence::dual_infeasibility(
         &state.grad_f, &state.jac_rows, &state.jac_cols, &state.jac_vals,
         &state.y, z_l, z_u, state.n,
-        state.kappa_d, state.mu, &state.x_l, &state.x_u,
+        0.0, state.mu, &state.x_l, &state.x_u,
     )
 }
 
@@ -8242,10 +8243,12 @@ fn compute_primal_inf_internal_max_at_state(state: &SolverState) -> f64 {
 /// B7: also folds in `slack_dual_inf_max` so the unscaled view of dual
 /// feasibility sees the slack-side residual too.
 fn compute_dual_inf_unscaled_at_state(state: &SolverState) -> f64 {
+    // A8.10: plain `curr_dual_infeasibility` — no κ_d damping
+    // (`IpIpoptCalculatedQuantities.cpp:2682-2691`).
     let x_part = convergence::dual_infeasibility_scaled(
         &state.grad_f, &state.jac_rows, &state.jac_cols, &state.jac_vals,
         &state.y, &state.z_l, &state.z_u, state.n,
-        state.kappa_d, state.mu, &state.x_l, &state.x_u,
+        0.0, state.mu, &state.x_l, &state.x_u,
     );
     x_part.max(slack_dual_inf_max(state))
 }
