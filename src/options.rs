@@ -327,10 +327,9 @@ pub struct SolverOptions {
     /// `IpRestoFilterConvCheck.cpp:53-60` which reads `IpData().curr_mu()`
     /// of the parent algorithm.
     ///
-    /// Default: `false` (behaviour matches the pre-T3.12 GN restoration
-    /// — only the post-loop filter check uses the raw objective). The
-    /// flag is wired but kept off by default so the change can land
-    /// behind a single switch and be enabled / benchmarked in isolation.
+    /// Default: `true` (Ipopt-aligned). Set to `false` to fall back to
+    /// the pre-T3.12 ripopt behaviour where only the post-loop filter
+    /// check uses the raw objective.
     pub restore_early_exit_outer_filter: bool,
     /// Enable preprocessing to eliminate fixed variables and redundant constraints.
     /// Default: true.
@@ -709,7 +708,7 @@ impl Default for SolverOptions {
             restoration_max_iter: 200,
             disable_nlp_restoration: false,
             kappa_resto: 0.9,
-            restore_early_exit_outer_filter: false,
+            restore_early_exit_outer_filter: true,
             enable_preprocessing: true,
             detect_linear_constraints: true,
             hessian_approximation_lbfgs: false,

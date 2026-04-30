@@ -952,7 +952,7 @@ mod tests {
     }
 
     #[test]
-    fn test_restoration_outer_filter_early_exit_disabled_by_default() {
+    fn test_restoration_outer_filter_early_exit_disabled() {
         // With the option off, behaviour is identical to the no-context
         // restore: the GN loop runs to feasibility and the post-loop
         // check uses raw f. We exercise this by running an infeasible
@@ -965,7 +965,8 @@ mod tests {
         let g_u = vec![1.0];
         let jac_rows = vec![0, 0];
         let jac_cols = vec![0, 1];
-        let opts = default_opts(); // restore_early_exit_outer_filter = false
+        let mut opts = default_opts();
+        opts.restore_early_exit_outer_filter = false;
         let outer_ctx = OuterBarrierContext {
             mu_outer: 0.1,
             x_l: &x_l,
