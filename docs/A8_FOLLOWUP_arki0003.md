@@ -973,3 +973,63 @@ moves in dy). A8.12 is a *correctness* alignment for problems that
 naturally enter the machine-precision-step regime, not a fix for
 arki0003 specifically. The next focus is the iter-100 KKT-solve
 comparison (Task #42) per §A8.15.
+
+## A8.18 — divergence point identified (2026-04-30, Task #42)
+
+**Iter-110 trajectory comparison** between ripopt (post-DEV-audit) and
+Ipopt 3.14 on arki0003 reveals an essentially identical iterate state
+at iter 110, with bit-different next-iteration behavior:
+
+| iter | obj            | inf_pr  | inf_du  | mu     | α_pr     | α_du     | flag |
+|------|----------------|---------|---------|--------|----------|----------|------|
+| ripopt 110 | 1.166e7 | 3.12e5 | 5.40e6 | 1e-1 | 1.85e-3 | 1.24e-1 | (regular) |
+| ipopt  110 | 1.195e7 | 3.12e5 | 3.57e6 | 1e-1 | 2.21e-4 | 5.30e-3 | (regular) |
+| ripopt 111 | 1.166e7 | 3.12e5 | 5.40e6 | 1e-1 | 1.94e-5 | 9.93e-6 | (regular, accepted!) |
+| ipopt  111r| 1.195e7 | 3.12e5 | 1.00e3 | 5.5  | 0       | 3.14e-7 | **R** restoration |
+| ipopt  112r| 6.075e6 | 3.02e5 | 1.01e3 | 5.5  | 2.00e+11 | 2.94e-5 | R |
+| ipopt  113r| 5.016e6 | 2.87e3 | 1.02e3 | 3.4  | 1.02e+09 | 1.04e-3 | R |
+| ipopt  114 | 5.016e6 | 2.87e3 | 1.02   | -1.0 | 4.16e+5 | 7.27e-5 | (regular) |
+
+**Diagnosis**: at iter 110→111 Ipopt's regular filter line search
+exhausts down to `alpha < alpha_min` without finding an acceptable
+trial point, triggering the restoration phase
+(`IpBacktrackingLineSearch.cpp:516-602`). Restoration delivers a
+massive feasibility improvement (inf_pr 3.12e5 → 2.87e3, two orders
+of magnitude) and the regular IPM resumes at a vastly better point.
+
+ripopt at the *same* iterate **accepts** a microscopic primal step
+(α_pr=1.94e-5, ls_steps=0 — accepted on first try without any
+backtracking). The next iter has α_pr=1.94e-5, then 2.06e-7, then
+6.17e-8 — the iterate is bit-identical for at least 5 iters with
+no restoration trigger. This means ripopt's filter is accepting
+a "no-op" step where Ipopt's filter rejects.
+
+**Hypothesis (to verify next)**: ripopt's `filter.check_acceptability`
+or its Armijo/switching decision tree differs from Ipopt's
+`IpFilterLSAcceptor::IsAcceptableToCurrentIterate` such that a step
+with `theta_trial ≈ theta_current` AND `phi_trial ≈ phi_current`
+passes ripopt's test but fails Ipopt's. With theta_current=3.12e5
+and γ_theta·theta=3.12 and γ_phi·theta=3.12e-3, both
+"sufficient decrease" tests should fail at α=1.94e-5 → trial should
+be unacceptable. The fact that ripopt accepts means the test logic
+itself is misaligned.
+
+**Next investigation (Task #43)**: instrument ripopt at iter 110-115
+on arki0003 with `RIPOPT_TRACE_FILTER=1` (or print_level=7) to log
+(theta_trial, phi_trial, theta_current, phi_current, gamma_theta,
+gamma_phi, switching_holds, armijo_holds) for the first ls_steps=0
+trial. Compare against Ipopt with `print_level=12` filter trace at
+the same iter. Identify the exact rule whose result differs.
+
+**Why this was missed by prior DEV audit**: DEV-23/24/30/31/32
+all touched filter mechanics but stayed in the abstract test logic
+(switching condition, augmentation gate, IsFtype split). None
+exercised a regression test where `theta_current ≈ theta_trial` at
+machine-relative precision — exactly the scenario at iter 111.
+
+**Status**: §A8.15's "iter-100 KKT-solve comparison" deliverable
+collapsed to a much simpler finding — the KKT *solution* is fine
+at iter 110 (both solvers compute essentially the same Δx that
+respects the bound buffers giving α_max = O(1e-3 to 1e-5)). The
+divergence is in the *line search filter test*, not the linear
+solve. This shifts focus from KKT/inertia to filter-test alignment.
