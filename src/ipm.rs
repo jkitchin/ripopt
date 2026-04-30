@@ -5649,7 +5649,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         // A8.7: `aug_solver` is hoisted above the loop so its symbolic
         // cache persists across iterations.
         let probing = options.mehrotra_pc;
-        let (step, _dc, mu_new_opt, aug_kkt) = if probing {
+        let (step, _dc, mu_new_opt, aug_kkt, _iter_dw, _iter_dc) = if probing {
             let avg_compl = compute_avg_complementarity(&state);
             let mu_max = mu_state.mu_max_cap(options, avg_compl);
             match crate::kkt_aug::aug_step_from_state_mehrotra(
@@ -5666,7 +5666,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 aug_solver.as_mut(),
                 &mut inertia_params,
             ) {
-                Ok((step, mu_new, _dw, dc, aug)) => (step, dc, Some(mu_new), aug),
+                Ok((step, mu_new, dw, dc, aug)) => (step, dc, Some(mu_new), aug, dw, dc),
                 Err(_e) => {
                     timings.direction_solve += t_dir.elapsed();
                     return make_result(&state, SolveStatus::NumericalError);
@@ -5685,7 +5685,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 aug_solver.as_mut(),
                 &mut inertia_params,
             ) {
-                Ok((step, _dw, dc, aug)) => (step, dc, None, aug),
+                Ok((step, dw, dc, aug)) => (step, dc, None, aug, dw, dc),
                 Err(_e) => {
                     timings.direction_solve += t_dir.elapsed();
                     return make_result(&state, SolveStatus::NumericalError);
@@ -5700,6 +5700,74 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             &mut state, step.dx, step.dy_m, step.ds,
             step.dz_l, step.dz_u, step.dv_l, step.dv_u,
         );
+
+        // A8.21: iter-0 step-direction probe. Dumps ||·||_inf and the
+        // five largest-magnitude (signed value, index) pairs for each of
+        // dx, ds, dy, dz_l, dz_u so we can compare element-by-element
+        // against Ipopt's `print_level=12` iter-0 trace.
+        if iteration == 0 && options.print_level >= 6 {
+            fn top5_signed(v: &[f64]) -> Vec<(usize, f64)> {
+                let mut idx: Vec<usize> = (0..v.len()).collect();
+                idx.sort_by(|&a, &b| v[b].abs().partial_cmp(&v[a].abs()).unwrap());
+                idx.iter().take(5).map(|&i| (i, v[i])).collect()
+            }
+            let dx_inf = state.dx.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+            let ds_inf = state.ds.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+            let dy_inf = state.dy.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+            let dzl_inf = state.dz_l.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+            let dzu_inf = state.dz_u.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+            rip_log!(
+                "ripopt: iter0-step: ||dx||_inf={:.16e} ||ds||_inf={:.16e} ||dy||_inf={:.16e} ||dz_l||_inf={:.16e} ||dz_u||_inf={:.16e}",
+                dx_inf, ds_inf, dy_inf, dzl_inf, dzu_inf
+            );
+            // A8.21: emit the perturbation δ_w/δ_c that landed for iter 0.
+            // Ipopt's print_level=12 trace shows `delta_x=0.000000e+00
+            // delta_s=0.000000e+00` at iter 0; if ripopt non-zero here,
+            // that's a candidate root-cause for the dx gap.
+            rip_log!(
+                "ripopt: iter0-pert: delta_w_used={:.6e} delta_c_used={:.6e} delta_w_last={:.6e} delta_c_last={:.6e}",
+                _iter_dw, _iter_dc,
+                inertia_params.delta_w_last, inertia_params.delta_c_last
+            );
+            for (name, vec) in [
+                ("dx", &state.dx[..]),
+                ("ds", &state.ds[..]),
+                ("dy", &state.dy[..]),
+                ("dz_l", &state.dz_l[..]),
+                ("dz_u", &state.dz_u[..]),
+            ] {
+                let top = top5_signed(vec);
+                let mut s = format!("ripopt: iter0-step: top5 {}:", name);
+                for (i, v) in top {
+                    s.push_str(&format!(" [{}]={:.16e}", i, v));
+                }
+                rip_log!("{}", s);
+            }
+            // A8.21: targeted dump of (x, x_l, z_l, dx, dz_l, x-x_l) at the
+            // variable Ipopt reports as its delta_z_L max (absolute var
+            // 1753, 0-indexed; AMPL name x1754). ripopt's max dz_l is at
+            // 1753 too, so values at this index will reveal whether the
+            // discrepancy comes from dx (linear solve precision) or from
+            // the back-sub formula (x-x_l, z_l, μ inputs).
+            for &probe_i in &[1753usize, 1801usize, 1871usize] {
+                if probe_i < state.n {
+                    let xi = state.x[probe_i];
+                    let xli = state.x_l[probe_i];
+                    let xui = state.x_u[probe_i];
+                    let zli = state.z_l[probe_i];
+                    let zui = state.z_u[probe_i];
+                    let dxi = state.dx[probe_i];
+                    let dzli = state.dz_l[probe_i];
+                    let dzui = state.dz_u[probe_i];
+                    let slack_l = xi - xli;
+                    let slack_u = xui - xi;
+                    rip_log!(
+                        "ripopt: iter0-probe[{}]: x={:.16e} x_l={:.16e} x_u={:.16e} (x-x_l)={:.16e} (x_u-x)={:.16e} z_l={:.16e} z_u={:.16e} dx={:.16e} dz_l={:.16e} dz_u={:.16e}",
+                        probe_i, xi, xli, xui, slack_l, slack_u, zli, zui, dxi, dzli, dzui
+                    );
+                }
+            }
+        }
 
         let (tau, alpha_primal_max, alpha_dual_max) = compute_alpha_max(
             &state, options, &mu_state, primal_inf, dual_inf, compl_inf,

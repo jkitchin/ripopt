@@ -1246,3 +1246,73 @@ A8.21 (if pursued): pick a smaller problem from the failure set and run
 the same iter-by-iter comparison. Alternatively, accept arki0003 as a
 "hard problem" that requires Ipopt-level numerical robustness across
 the full IPM stack and refocus the alignment effort on cleaner cases.
+
+## A8.21 — element-level iter-0 dx diff vs Ipopt (2026-04-30, Task #45)
+
+**Trigger**: user pushback on A8.20 — "This doesn't make sense. It implies
+inaccuracy somewhere in the ripopt/feral stack." Element-level diff to
+localize.
+
+**Method**: instrument `src/ipm.rs` post-`install_step_directions` with an
+iter-0 probe (`||·||_inf`, top-5 signed/index, per-bound dump at three
+canonical slots). Mirror the data in Ipopt 3.14.19 print_level=12 trace
+on `arki0003.nl`.
+
+**Findings (per-variable)** — slot index uses ripopt 0-indexed (n=1872);
+AMPL annotation is the user-facing variable name from Ipopt's trace:
+
+| slot | AMPL    | ripopt dx                         | Ipopt dx                          | gap     |
+|------|---------|-----------------------------------|-----------------------------------|---------|
+| 1801 | x1850   | +9.8235739400465982e-2            | +9.8235739400465982e-2            | bit-exact (17 digits) |
+| 1871 | x2283   | -4.9989773495065801e+7            | -4.9988622038987763e+7            | 0.0023% |
+| 1753 | x1802   | +1.2807967345267247e+1            | +1.2065061724475607e+1            | 6.16%   |
+
+`||dx||_inf = 4.999e7` in both, dominated by the unbounded slot 1871 — the
+infinity-norm hides the structural gap. The 6.16% gap at slot 1753
+manifests downstream as a 6.2% `dz_L` gap at the same variable.
+
+**Where the gap is *not***:
+
+1. **Perturbation handler** — `delta_w_used = 0`, `delta_c_used = 0`,
+   `delta_w_last = 0`, `delta_c_last = 0` at iter 0. Matches Ipopt's
+   trace verbatim ("Solving system with delta_x=0.000000e+00
+   delta_s=0.000000e+00").
+
+2. **Linear-solver accuracy (feral)** — IR `final_ratio = 1.03e-15` after
+   `ir_iters = 1`. The augmented matrix `A` satisfies `A·sol ≈ rhs` to
+   ~15 decimals. **feral is not the source.** This rules out the original
+   "feral inaccuracy" framing.
+
+3. **Variable scaling** — `nlp_scaling_method = gradient-based` (default
+   in both) scales objective and constraints, not variables. Both solvers
+   use identity x-scaling unless `user_x_scaling` is supplied.
+
+4. **Initial point** — ripopt: `x[1753] = 9.99999e-3` (i.e. `x_l + bound_push`
+   with `bound_push=1e-2`, `x_l = -1e-8`). Both solvers default
+   `bound_push = 1e-2`; a 6% x_0 difference would require divergent
+   bound-push semantics, which the bit-exact match at slot 1801 rules
+   out (same bound layout: `x_l = -1e-8`, `x = 9.99999e-3`).
+
+**Conclusion**: at this seed, the assembled augmented KKT system itself
+(matrix `A` or rhs `b`) differs from Ipopt's at the rows touching variable
+`x1802`, even though the bound-coupled inputs (`x`, `x_l`, `z_l`) appear
+identical. Remaining candidates:
+
+- **Hessian entry** `H[1753, *]` — different sparsity or values from
+  Ipopt's `IpEvalHessian`. The objective Hessian on arki0003 is dense in
+  certain rows; numerical evaluation differences in AMPL .nl interpretation
+  (or one-sided vs structural Hessian sparsity) could leak in.
+- **Jacobian column 1753** — at iter 0 with `y_0 = 0`, `J^T·y = 0`, so
+  this only matters via the Σ structure folded into the augmented system.
+- **Σ_s contributions through slack rows coupled to constraint rows that
+  reference variable 1753** — ripopt's slot 1801 (also `x_l = -1e-8`,
+  `(x-x_l) = 0.01`) matching bit-exactly while 1753 differs 6% means the
+  delta is not in the bound geometry; it's in the constraint coupling.
+
+**Status**: instrumentation shipped; root-cause to (Hessian eval | Jacobian
+eval | constraint-row coupling) deferred. The probe is gated on
+`print_level >= 6` and `RIPOPT_IR_PROBE=1` — silent in normal runs.
+
+**Refs**: `src/ipm.rs:5703-5775` (iter-0 probe), `src/kkt_aug.rs:1086-1106`
+(IR-probe, env-var gated). Closes Task #45.
+

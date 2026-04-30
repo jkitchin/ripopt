@@ -1084,6 +1084,27 @@ pub fn aug_step_from_state(
         IR_IMPROVEMENT_FACTOR_DEFAULT,
     )?;
 
+    // A8.21: env-var-gated probe — dump the IR diagnostics (final residual
+    // ratio, refinement count) and the inf-norm of the recovered solution
+    // alongside per-block inf-norms. Lets the caller see whether a 6%-level
+    // dx gap vs Ipopt at iter 0 is upstream of the IR loop (factorization
+    // accuracy) or downstream (post-solve back-sub).
+    if std::env::var("RIPOPT_IR_PROBE").is_ok() {
+        let nx = n;
+        let nd = partition.n_d;
+        let nc = partition.n_c;
+        let dx_block = &result.sol[0..nx];
+        let ds_block = &result.sol[nx..nx+nd];
+        let dyc_block = &result.sol[nx+nd..nx+nd+nc];
+        let dyd_block = &result.sol[nx+nd+nc..nx+nd+nc+nd];
+        let inf = |v: &[f64]| v.iter().fold(0.0f64, |a,&b| a.max(b.abs()));
+        eprintln!(
+            "ripopt-IR-probe: ir_iters={} final_ratio={:?} ||sol||={:.6e} ||rhs||={:.6e} ||dx_block||={:.16e} ||ds_block||={:.16e} ||dy_c||={:.16e} ||dy_d||={:.16e} dw_used={:.6e} dc_used={:.6e}",
+            result.ir_iters, result.final_ratio, inf(&result.sol), inf(&aug_rhs),
+            inf(dx_block), inf(ds_block), inf(dyc_block), inf(dyd_block), dw, dc,
+        );
+    }
+
     // Recover the eight-block step.
     let step = recover_step(
         n, &partition, &result.sol,
