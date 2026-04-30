@@ -546,11 +546,6 @@ impl WatchdogSavedState {
 
 /// Central state struct for the IPM solver.
 pub(crate) struct SolverState {
-    /// kappa_d damping coefficient (T3.9). Read from
-    /// `options.kappa_d` at construction; used by convergence helpers
-    /// to add the one-sided-bound damping term to grad_lag_x without
-    /// threading `options` through every call site.
-    pub kappa_d: f64,
     /// Current primal variables.
     pub x: Vec<f64>,
     /// Current constraint multipliers (lambda/y).
@@ -1143,7 +1138,6 @@ impl SolverState {
         let is_square = m == n || m_eq == n;
 
         Self {
-            kappa_d: options.kappa_d,
             x,
             y,
             z_l,
@@ -8607,7 +8601,6 @@ fn commit_trial_point(
     // that the linear solver still reports as nonsingular.
     if std::env::var("RIPOPT_TRACE_STEP").is_ok() {
         let dx_inf = linf_norm(&state.dx);
-        let alpha_dx_inf = alpha * dx_inf;
         let mut x_inf = 0.0_f64;
         let mut diff_inf = 0.0_f64;
         for i in 0..state.n {
@@ -8987,7 +8980,6 @@ mod tests {
     // The caller supplies only fields the test exercises; everything else is zeroed.
     fn minimal_state(n: usize, m: usize) -> SolverState {
         SolverState {
-            kappa_d: 0.0,
             x: vec![0.0; n],
             y: vec![0.0; m],
             z_l: vec![0.0; n],
