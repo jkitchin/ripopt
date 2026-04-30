@@ -49,21 +49,10 @@ nalgebra = { version = "0.34", optional = true }
 default = ["feral", "faer"]
 ipopt-native = []
 cutest = []
-hs = []
 rmumps = ["dep:rmumps"]
 faer = ["dep:faer"]
 feral = ["dep:feral"]
 num-dual = ["dep:num-dual", "dep:nalgebra"]
-
-[[bin]]
-name = "hs_suite"
-path = "benchmarks/hs/run_ripopt.rs"
-required-features = ["hs"]
-
-[[bin]]
-name = "ipopt_native"
-path = "benchmarks/hs/run_ipopt_native.rs"
-required-features = ["ipopt-native"]
 
 [[bin]]
 name = "ripopt"
