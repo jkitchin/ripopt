@@ -1316,3 +1316,86 @@ eval | constraint-row coupling) deferred. The probe is gated on
 **Refs**: `src/ipm.rs:5703-5775` (iter-0 probe), `src/kkt_aug.rs:1086-1106`
 (IR-probe, env-var gated). Closes Task #45.
 
+## A8.22 — scaling-propagation hypothesis ruled out (2026-04-30)
+
+**Trigger**: A8.21 conclusion narrowed the iter-0 dx[1753] gap to "data
+assembly". A working hypothesis was that ripopt computes `g_scaling`
+correctly but the IPM core operates on raw values (i.e. the
+`ScaledProblem` wrapper bypassed somewhere), which would systematically
+inflate dx/dy by `1/g_scaling[row]` for affected rows.
+
+**Method**: extended the iter-0 probe to dump per-constraint-row data
+(`g`, `g_l`, `g_u`, slack `s`, `dy`, plus full `J[r,*]`) for every row
+that touches `x1802`. Re-read the wrapper chain and `SolverState::new`
+in full.
+
+**Findings (row 1962 = AMPL e2372, `g_scaling[1962] = 0.0909`)**:
+
+```
+g=4.5453545455545456e4  g_l=-inf  g_u=1.0000000000000000e-8
+s=-9.9999900000000003e-3  dy=2.1689770521236824e1
+J[1962,*]: (1723, 9.090909e-2) (1753, -1.000000e2)
+```
+
+Re-interpreted with `ScaledProblem` (`src/ipm.rs:180-248`) applied:
+
+- `g_u = 1e-8`: raw .nl r-segment value is `0` (line "1 0"). Scaled:
+  `0 × 0.0909 = 0`. `apply_bound_relax_factor` then pads to `1e-8`.
+  **Consistent with scaling applied.**
+- `g[1962] = 4.5453e4`: scaled value, raw inner = `5e5` (back-solved
+  via `g_scaling[1962] = 0.0909`). Matches Ipopt's `print_level=12`
+  internal print (Ipopt prints scaled values).
+- `J[1962, 1723] = 9.09e-2`: scaled, raw = `1.0` (clean coefficient).
+  `J[1962, 1753] = -100`: scaled, raw = `-1100` (constraint coefficient
+  of the relevant magnitude). **Consistent with scaling applied.**
+
+**Code path verified**:
+
+- `solve_ipm` (`src/ipm.rs:5273`) wraps `problem` →
+  `ScaledProblem` (5295) → `FiniteCheckedProblem` (5307) → shadow
+  `problem` (5308).
+- `SolverState::new(problem, options)` (5310) calls
+  `problem.constraint_bounds(...)` (1078) and `problem.constraints(...)`
+  (1228) through this wrapper chain. State is populated with **scaled**
+  values throughout.
+- `ScaledProblem::constraint_bounds` (190-200) multiplies `g_l`, `g_u`
+  by `g_scaling[i]` when finite. `ScaledProblem::constraints` (216-222)
+  multiplies `g[i]` by `g_scaling[i]`. `ScaledProblem::jacobian_values`
+  (226-232) multiplies `vals[idx]` by `g_scaling[row]`.
+
+**Conclusion**: scaling propagation is correct. The 6.16% iter-0 dx gap
+at slot 1753 is **not** caused by ripopt operating on the unscaled
+problem.
+
+Combined with A8.21's elimination of feral, perturbation handler, and
+initial point, every locally-verifiable hypothesis at iter 0 is now
+ruled out. The remaining candidates require global-system comparison
+against Ipopt:
+
+- **Hessian assembly globally** — H[1753, *] is empty at iter 0 (x1802
+  is linear in objective, and y_0=0 zeros out constraint Hessians), so
+  this can't explain dx[1753] *locally*, but Hessian differences at
+  *other* rows propagate through the augmented solve to dx[1753].
+- **Jacobian column 1753 raw values** — verified clean above for J row
+  1962; J row 1904 entries are `1, -1, 1`. Cross-check against Ipopt's
+  print_level=12 Jacobian dump for these rows would be definitive.
+- **Σ_s coupling for slack rows touching variable 1753** — ripopt's
+  d-block formulation may differ structurally from Ipopt at the slack
+  initialization (`s = -9.99e-3` for row 1962, on the upper-side of an
+  `x ≤ 0` constraint relaxed to `x ≤ 1e-8`).
+- **Floating-point accumulation across the global augmented solve** —
+  the system has Σ_x range ~650:1 within row 1753 alone (100 vs 0.154
+  from x near vs far from bound), and the IR final_ratio is 1e-15. A
+  6% gap from FP differences alone would require systematic ordering
+  differences in the elimination tree — feral vs MUMPS is a candidate
+  but A8.16 already showed feral and rmumps produce identical results.
+
+**Status**: arki0003 deprioritized per A8.20. The remaining hypothesis
+list cannot be discriminated without a global Jacobian/Hessian dump from
+Ipopt's print_level=12 trace at iter 0, which is a substantial parsing
+exercise. Recommend pivoting to a smaller-scale problem with cleaner
+divergence signature before further deep-dive on arki0003.
+
+**Refs**: `src/ipm.rs:5743-5832` (extended conrow probe);
+`src/ipm.rs:180-248` (ScaledProblem wrapper).
+

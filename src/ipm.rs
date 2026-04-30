@@ -5743,6 +5743,95 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 }
                 rip_log!("{}", s);
             }
+            // A8.21 deep-dive: dump the assembled-system inputs that feed
+            // x-block row 1753 of the augmented system. This separates a
+            // tape-evaluation discrepancy (grad_f, J, H) from a Σ-assembly
+            // bug from a downstream issue.
+            let probe_var: usize = 1753;
+            if probe_var < state.n {
+                // grad_f at probe_var
+                let grad_f_pv = state.grad_f[probe_var];
+                // Σ_x at probe_var (matches kkt_aug::aug_step_from_state formula)
+                let xi = state.x[probe_var];
+                let xli = state.x_l[probe_var];
+                let xui = state.x_u[probe_var];
+                let mut sigma_x_pv = 0.0_f64;
+                if xli.is_finite() {
+                    sigma_x_pv += state.z_l[probe_var] / (xi - xli).max(1e-20);
+                }
+                if xui.is_finite() {
+                    sigma_x_pv += state.z_u[probe_var] / (xui - xi).max(1e-20);
+                }
+                // Hessian row probe_var (lower-triangle entries (probe_var, *)
+                // and upper via (*, probe_var)).
+                let mut h_row: Vec<(usize, f64)> = Vec::new();
+                for k in 0..state.hess_rows.len() {
+                    let r = state.hess_rows[k];
+                    let c = state.hess_cols[k];
+                    let v = state.hess_vals[k];
+                    if v == 0.0 { continue; }
+                    if r == probe_var { h_row.push((c, v)); }
+                    else if c == probe_var { h_row.push((r, v)); }
+                }
+                // Jacobian column probe_var: rows of constraints that have a
+                // structural entry at column probe_var.
+                let mut j_col: Vec<(usize, f64)> = Vec::new();
+                for k in 0..state.jac_rows.len() {
+                    if state.jac_cols[k] == probe_var {
+                        j_col.push((state.jac_rows[k], state.jac_vals[k]));
+                    }
+                }
+                rip_log!(
+                    "ripopt: iter0-row[{}]: grad_f={:.16e} sigma_x={:.16e} H_row_nnz={} J_col_nnz={}",
+                    probe_var, grad_f_pv, sigma_x_pv, h_row.len(), j_col.len()
+                );
+                {
+                    let mut s = format!("ripopt: iter0-row[{}]: H[{},*] (col,val):", probe_var, probe_var);
+                    for (c, v) in h_row.iter().take(20) {
+                        s.push_str(&format!(" ({},{:.6e})", c, v));
+                    }
+                    if h_row.len() > 20 { s.push_str(&format!(" ... [{}]", h_row.len())); }
+                    rip_log!("{}", s);
+                }
+                {
+                    let mut s = format!("ripopt: iter0-row[{}]: J[*,{}] (row,val):", probe_var, probe_var);
+                    for (r, v) in j_col.iter().take(20) {
+                        s.push_str(&format!(" ({},{:.6e})", r, v));
+                    }
+                    if j_col.len() > 20 { s.push_str(&format!(" ... [{}]", j_col.len())); }
+                    rip_log!("{}", s);
+                }
+                // For each constraint row that touches probe_var, dump:
+                //  g(x_0)[r], g_l[r], g_u[r], slack s[r], dy[r], plus the
+                //  full row of J at row r (other variables coupled).
+                for (r, _coeff) in j_col.iter().take(8) {
+                    let r = *r;
+                    let g_r = state.g[r];
+                    let gl_r = state.g_l[r];
+                    let gu_r = state.g_u[r];
+                    let dy_r = state.dy[r];
+                    let s_r = if r < state.s.len() { state.s[r] } else { f64::NAN };
+                    // collect J row r (cols, vals)
+                    let mut j_row: Vec<(usize, f64)> = Vec::new();
+                    for k in 0..state.jac_rows.len() {
+                        if state.jac_rows[k] == r {
+                            j_row.push((state.jac_cols[k], state.jac_vals[k]));
+                        }
+                    }
+                    let scale_r = if r < state.g_scaling.len() { state.g_scaling[r] } else { 1.0 };
+                    rip_log!(
+                        "ripopt: iter0-conrow[{}]: g={:.16e} g_l={:.16e} g_u={:.16e} s={:.16e} dy={:.16e} g_scale={:.16e} nnz={}",
+                        r, g_r, gl_r, gu_r, s_r, dy_r, scale_r, j_row.len()
+                    );
+                    let mut s = format!("ripopt: iter0-conrow[{}]: J[{},*]:", r, r);
+                    for (c, v) in j_row.iter().take(10) {
+                        s.push_str(&format!(" ({},{:.6e})", c, v));
+                    }
+                    if j_row.len() > 10 { s.push_str(&format!(" ... [{}]", j_row.len())); }
+                    rip_log!("{}", s);
+                }
+            }
+
             // A8.21: targeted dump of (x, x_l, z_l, dx, dz_l, x-x_l) at the
             // variable Ipopt reports as its delta_z_L max (absolute var
             // 1753, 0-indexed; AMPL name x1754). ripopt's max dz_l is at
