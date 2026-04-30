@@ -3034,15 +3034,6 @@ fn reevaluate_after_step<P: NlpProblem>(
     PostStepEvalDecision::Return(make_result(state, SolveStatus::NumericalError))
 }
 
-/// No-op stub: v_L, v_U are now advanced via the proper Newton step in
-/// `advance_z_to_trial` (with FTB on `dv` in `compute_alpha_max`) and
-/// κ_σ-clamped post-step in `apply_kappa_sigma_bound_multiplier_reset`,
-/// matching Ipopt's `IpIpoptAlg.cpp:652-770` flow. The previous μ/s
-/// reset was a ripopt-specific simplification that overwrote the Newton
-/// dv update each iteration, freezing v near μ/s independently of the
-/// linearised slack-stationarity equation.
-fn reset_slack_multipliers(_state: &mut SolverState, _mu_ks: f64) {}
-
 /// Compute the per-component "magic step" delta for an explicit slack
 /// vector `s` against constraint values `d` and finite slack bounds
 /// `[d_L, d_U]`. Mirrors Ipopt 3.14
@@ -6246,7 +6237,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
 
         timings.line_search += t_ls.elapsed();
 
-        let mu_ks = update_dual_variables(
+        let _ = update_dual_variables(
             &mut state,
             &mu_state,
             alpha_dual_max,
@@ -6282,7 +6273,6 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         // the call is retained for spec-compliance and as the hook
         // for any future explicit-slack solve path.
         let _ = apply_magic_step(&mut state, options);
-        reset_slack_multipliers(&mut state, mu_ks);
         maybe_recalc_y_post_step(&mut state, options, n, m, lbfgs_mode);
 
         // --- Barrier parameter update (free/fixed mode) ---
