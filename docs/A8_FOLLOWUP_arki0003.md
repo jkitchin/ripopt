@@ -1169,3 +1169,80 @@ The slack-coupling fix is committed regardless because it is
 correct against the Ipopt reference (`IpCq::curr_constraint_violation`)
 and resolves the apples-to-oranges issue between the filter test
 and the IPM convergence test, and unrelatedly enables `hs_tp044`.
+
+## A8.20 — iter-110 "convergence" was illusory (2026-04-30, Task #44)
+
+**Method**: ran Ipopt 3.14.19 with `print_level=12 max_iter=115` on the
+same `arki0003.nl` and compared filter-trace internals against the
+post-A8.19 ripopt log.
+
+**Finding**: ripopt and Ipopt had *not* converged to the same iterate by
+iter 110. The A8.18 finding that "both reach an essentially identical
+iterate at iter 110 (obj~1.17e7, inf_pr=3.12e5)" was misleading because
+only the `inf_pr` column matched at machine-printed precision; objectives
+and inf_du differed substantially.
+
+Side-by-side iter 100-110 (objective):
+
+| iter | Ipopt obj    | ripopt obj   | Ipopt inf_du | ripopt inf_du |
+|------|--------------|--------------|--------------|---------------|
+| 100  | 1.1799421e7  | 1.1389183e7  | 1.23e8       | 2.74e6        |
+| 105  | 1.1874710e7  | 1.1508713e7  | 2.55e7       | 4.04e6        |
+| 109  | 1.1945968e7  | 1.1655002e7  | 3.51e6       | 4.90e6        |
+| 110  | 1.1945981e7  | 1.1655116e7  | 3.57e6       | 5.40e6        |
+
+Δobj ≈ 2.5% by iter 100, persisting through iter 110. ripopt's inf_du
+profile is qualitatively different from Ipopt's: Ipopt suffers a one-iter
+spike to 1.23e8 at iter 100 (and a 7.99e6 spike at iter 106) while
+ripopt's inf_du grows monotonically from 2.74e6 → 5.40e6 over the same
+range.
+
+**At Ipopt iter 110**: `reference_theta=3.921e5` (iter-109→110 line search
+seed) and `reference_gradBarrTDelta=1.252e7 > 0` — no barrier descent, so
+Ipopt's only acceptance test is h-type. `ALPHA_MIN = 5.000e-7` matches
+ripopt's `α_min = α_min_frac · γ_θ = 0.05 · 1e-5 = 5e-7` exactly.
+
+**Verified `compute_alpha_min` is correctly aligned** (`src/filter.rs:370-393`
+vs `IpFilterLSAcceptor.cpp:450-469`). All four clauses present and the
+α_min_frac=0.05 multiplier matches.
+
+**The iter-111 microscopic-α acceptance is algebraically inevitable in
+both solvers** at the iterates each one is at:
+
+- Newton step satisfies `J·d = -c(x)` so `c(x+αd) ≈ (1−α)c(x)` at first
+  order. With α=1.94e-5 > γ_θ=1e-5, the h-type test
+  `θ_trial ≤ (1−γ_θ)·θ_ref` passes by an algebraically-required margin.
+- Ipopt's iter 110 `Step Calculated` trace shows three "Checking
+  sufficient reduction" entries with `reference_theta=3.921e5` and `gBD>0`
+  before accepting at `α=2.21e-4` (h-step). Ipopt's iter 111 line search
+  presumably also accepts on first try given the same algebra.
+
+**Real divergence point**: ripopt and Ipopt take materially different
+α-paths starting from iter 3-9. By iter 9 ripopt is at obj=2.74e5 vs
+Ipopt 2.85e5 (4% gap). The gap widens through iter 90-100 where ripopt's
+inf_du diverges from Ipopt's spike pattern. This is consistent with a
+*step-direction* difference (different KKT solve, scaling, or
+perturbation), not a *line-search-acceptance* difference.
+
+**Closes Task #44**: `compute_alpha_min` and `compute_alpha_max`
+(frac-to-bound) are correctly aligned. Iter-111 acceptance is correct
+behaviour — both solvers do this. The reason ripopt converges differently
+on arki0003 is upstream of the line search: the *direction* differs,
+likely in early iterations (iter 3-9 already show 4% obj gap) and again
+at iter 95-100 where the inf_du profiles diverge qualitatively.
+
+**Implication for the v0.8 alignment effort**: arki0003 is no longer
+useful as a single-bug diagnostic. The 2.5% obj gap by iter 100 means
+this problem exposes *cumulative drift* across many iterations rather
+than one alignable heuristic. Better candidates for further
+filter/line-search alignment audit:
+- Problems where ripopt and Ipopt agree to <0.1% on objective until a
+  specific iter, then diverge sharply (one-shot heuristic mismatch).
+- Problems where ripopt's iter-by-iter `α_pr` differs systematically
+  from Ipopt's by a constant factor (e.g. 0.5x or 2x), pointing to a
+  specific α_init or τ_min difference.
+
+A8.21 (if pursued): pick a smaller problem from the failure set and run
+the same iter-by-iter comparison. Alternatively, accept arki0003 as a
+"hard problem" that requires Ipopt-level numerical robustness across
+the full IPM stack and refocus the alignment effort on cleaner cases.
