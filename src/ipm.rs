@@ -4125,8 +4125,14 @@ fn switch_to_fixed_mode_with_adaptive_init(
     }
     let avg_compl = compute_avg_complementarity(state);
     if avg_compl > 0.0 {
+        // A8.6: align switch-to-Fixed cap with Ipopt
+        // (`IpAdaptiveMuUpdate.cpp:267-273`): cap by `mu_max_fact *
+        // initial_avg_compl` rather than the hard `1e5` previously used.
+        // Matches the cap already used by the four other Free-mode μ
+        // update sites that all funnel through `mu_state.mu_max_cap`.
+        let mu_cap = mu_state.mu_max_cap(options, avg_compl);
         state.mu = (options.adaptive_mu_monotone_init_factor * avg_compl)
-            .clamp(options.mu_min, 1e5);
+            .clamp(options.mu_min, mu_cap);
     } else {
         state.mu = (options.mu_linear_decrease_factor * state.mu)
             .max(options.mu_min);
