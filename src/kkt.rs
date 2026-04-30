@@ -1354,7 +1354,18 @@ pub fn solve_for_direction_with_ir_ctx(
         ));
     }
 
+    // DEV-33: one-shot `increase_quality` retry around the solve+IR
+    // pass. Mirrors Ipopt `IpPDFullSpaceSolver.cpp:283-309` (the
+    // `augsys_improved_`/`resolve_with_better_quality` interplay):
+    // if IR fails (would otherwise raise PretendSingular) and quality
+    // hasn't been raised yet on this linear system, ask the solver to
+    // increase quality, re-factor, and retry. The retry is at most
+    // once per call. `pretend_singular_or_retry` below encapsulates
+    // the decision.
+    let mut tried_increase_quality = false;
     let mut solution = vec![0.0; dim];
+
+    'retry: loop {
     solver.solve(&kkt.rhs, &mut solution)?;
 
     // NaN guard on solution — factorization may produce NaN for ill-conditioned systems
@@ -1511,6 +1522,14 @@ pub fn solve_for_direction_with_ir_ctx(
     // perturbation.
     {
         if residual_ratio > ir.residual_ratio_singular {
+            // DEV-33: before declaring PretendSingular, try one
+            // `increase_quality` + re-factor pass. Matches Ipopt's
+            // `IpPDFullSpaceSolver.cpp:289-301` (`augsys_improved_`).
+            if !tried_increase_quality && solver.increase_quality() {
+                tried_increase_quality = true;
+                solver.factor(&kkt.matrix)?;
+                continue 'retry;
+            }
             log::debug!(
                 "KKT residual ratio {:.2e} > singular {:.2e} — pretend singular",
                 residual_ratio,
@@ -1538,6 +1557,13 @@ pub fn solve_for_direction_with_ir_ctx(
         let nrm_rhs = nrm_rhs.max(rhs_bound_max);
         let magnitude_ratio = nrm_res / nrm_rhs.max(1.0);
         if magnitude_ratio > 1e10 {
+            // DEV-33: same one-shot quality escalation for the
+            // rank-deficiency guard.
+            if !tried_increase_quality && solver.increase_quality() {
+                tried_increase_quality = true;
+                solver.factor(&kkt.matrix)?;
+                continue 'retry;
+            }
             log::debug!(
                 "KKT ||sol||={:.2e} vs ||rhs||={:.2e} (ratio {:.2e}) — pretend singular (rank-def guard)",
                 nrm_res, nrm_rhs, magnitude_ratio,
@@ -1545,6 +1571,8 @@ pub fn solve_for_direction_with_ir_ctx(
             return Err(SolverError::PretendSingular);
         }
     }
+    break 'retry;
+    } // end 'retry loop
 
     // Unscale solution when Ruiz equilibration was applied.
     // The scaled system solves (D*A*D)*(D^{-1}*x) = D*b, so x_scaled = D^{-1}*x_original.
