@@ -829,3 +829,31 @@ touch the mechanism that determines this.
 This is the open work for A8.15+ sessions; do not re-implement
 the failed A8.5 IR-residual feedback (see §A8.5 above).
 
+## A8.16 — re-measurement after cumulative DEV-30..DEV-36 (2026-04-30)
+
+After landing six more Ipopt-alignment fixes
+(`cdd3aab` DEV-30/31 split IsFtype + augmentation logic,
+`ae61169` DEV-33 IR loop tries `increase_quality` before pretend-singular,
+`3e9da05` DEV-32 alpha_for_y dxnorm,
+`c1eead8` DEV-35 drop 40-iter LS cap,
+`21c9cb4` DEV-36 wire theta_min_fact / theta_max_fact options),
+arki0003 still walls out at the 5 min mittelmann timeout. Trace at
+`benchmarks/mittelmann/logs/ripopt/arki0003_post_dev_30_36.log`.
+
+Snapshot at the wall (iter 430, max_iter not reached):
+
+```
+iter  obj           inf_pr    inf_du    compl     lg(mu)
+312   1.109e7       1.17e-4   8.35e3    2.32e-1   1.00e-1     ← pre-cascade (same as A8.15)
+313   1.102e7       4.45e-4   6.97e-1   5.15e-1   1.50e-4     ← 3-step cascade fires
+...
+430   1.45e6        1.91e-3   3.69e2    6.02e0    1.50e-4     ← still pinned at mu=1.5e-4
+```
+
+Conclusion: DEV-30..DEV-36 do not touch the per-iteration step
+trajectory in the iter 100-300 regime that drives the pre-cascade
+`‖y‖_∞ → 1e7` blowup. As predicted in §A8.15 "What the DEV audit did
+and did not fix". Open work items 1-3 in §A8.15 remain the right
+direction (step-computation comparison vs Ipopt at iter ~100, dual
+update size limits, filter sufficient-progress at large theta).
+
