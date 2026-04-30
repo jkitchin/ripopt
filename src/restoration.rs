@@ -311,10 +311,12 @@ impl RestorationPhase {
                 for i in 0..n {
                     x_trial[i] = x_rest[i] + alpha * step[i];
                     if x_l[i].is_finite() {
-                        x_trial[i] = x_trial[i].max(x_l[i] + 1e-8);
+                        let push = options.bound_push * x_l[i].abs().max(1.0);
+                        x_trial[i] = x_trial[i].max(x_l[i] + push);
                     }
                     if x_u[i].is_finite() {
-                        x_trial[i] = x_trial[i].min(x_u[i] - 1e-8);
+                        let push = options.bound_push * x_u[i].abs().max(1.0);
+                        x_trial[i] = x_trial[i].min(x_u[i] - push);
                     }
                 }
 
@@ -383,10 +385,12 @@ impl RestorationPhase {
                     for i in 0..n {
                         x_trial[i] = x_rest[i] + gd_alpha * grad_step[i];
                         if x_l[i].is_finite() {
-                            x_trial[i] = x_trial[i].max(x_l[i] + 1e-8);
+                            let push = options.bound_push * x_l[i].abs().max(1.0);
+                            x_trial[i] = x_trial[i].max(x_l[i] + push);
                         }
                         if x_u[i].is_finite() {
-                            x_trial[i] = x_trial[i].min(x_u[i] - 1e-8);
+                            let push = options.bound_push * x_u[i].abs().max(1.0);
+                            x_trial[i] = x_trial[i].min(x_u[i] - push);
                         }
                     }
 
@@ -495,10 +499,12 @@ impl RestorationPhase {
                         for i in 0..n {
                             x_trial_pen[i] = x_rest[i] - pen_alpha * pen_grad[i];
                             if x_l[i].is_finite() {
-                                x_trial_pen[i] = x_trial_pen[i].max(x_l[i] + 1e-8);
+                                let push = options.bound_push * x_l[i].abs().max(1.0);
+                                x_trial_pen[i] = x_trial_pen[i].max(x_l[i] + push);
                             }
                             if x_u[i].is_finite() {
-                                x_trial_pen[i] = x_trial_pen[i].min(x_u[i] - 1e-8);
+                                let push = options.bound_push * x_u[i].abs().max(1.0);
+                                x_trial_pen[i] = x_trial_pen[i].min(x_u[i] - push);
                             }
                         }
                         if !eval_constraints(&x_trial_pen, &mut g_trial_pen) {
