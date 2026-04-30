@@ -667,7 +667,12 @@ impl Default for SolverOptions {
             constr_viol_tol: 1e-4,
             dual_inf_tol: 1.0,
             compl_inf_tol: 1e-4,
-            mu_strategy_adaptive: true,
+            // A8.11.1: Ipopt's default `mu_strategy = "monotone"`
+            // (`IpAlgBuilder.cpp:355-362`). ripopt previously defaulted
+            // to `adaptive` which mismatches Ipopt's iter-0 mu trajectory
+            // on hard problems (arki0003 stayed at lg(mu)=-1.0 with
+            // monotone, oscillated under adaptive). Switch to monotone.
+            mu_strategy_adaptive: false,
             max_soc: 4,
             warm_start: false,
             warm_start_bound_push: 1e-3,
