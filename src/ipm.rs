@@ -4123,11 +4123,14 @@ fn apply_free_mode_sufficient_progress_update(
         state.mu = qf_mu
             .unwrap_or_else(|| compute_loqo_mu(state, options, mu_state, avg_compl));
     } else if avg_compl > 0.0 {
-        // T2.3: dropped the ripopt-specific `μ/5` floor that fired when
-        // barrier_err > κ_eps·μ; Ipopt's monotone-mode update uses only
-        // `mu_min` as the lower clamp.
-        let mu_cap = mu_state.mu_max_cap(options, avg_compl);
-        state.mu = (avg_compl / options.kappa).clamp(options.mu_min, mu_cap);
+        // DEV-2: replace the ripopt-specific `avg_compl / options.kappa`
+        // fallback with the Loqo oracle. Ipopt's `IpAdaptiveMuUpdate::DoUpdate`
+        // (`IpAdaptiveMuUpdate.cpp:391-436`) always runs the configured
+        // mu-oracle (loqo, quality-function, or probing) when sufficient
+        // progress holds; it never uses an `avg_compl / kappa` formula.
+        // Falling back to Loqo when the QF oracle is disabled gives the
+        // closest Ipopt analog (`mu_oracle = loqo`).
+        state.mu = compute_loqo_mu(state, options, mu_state, avg_compl);
     } else {
         state.mu = (options.mu_linear_decrease_factor * state.mu)
             .max(options.mu_min);
