@@ -3994,23 +3994,18 @@ fn update_barrier_parameter(
         mu_state.dual_inf_window.push(du_now);
     }
 
-    // Ipopt-style barrier-subproblem stop test (IpMonotoneMuUpdate.cpp:135-194).
-    // Decrease mu only when the current barrier subproblem is approximately
-    // solved: barrier_err <= kappa_eps * mu (kappa_eps = barrier_tol_factor,
-    // default 10). Without this gate, mu collapses every iteration regardless
-    // of whether the line search is actually making progress on the current
-    // subproblem — observed on cho parmest where mu went 1e-1 -> 1e-9 in 9
-    // iters while inf_pr stayed pinned at 19. The check_sufficient_progress
-    // gate below is a relative-history check; this is the absolute gate.
-    let barrier_err_for_gate = compute_barrier_error(state);
-    let barrier_subproblem_solved =
-        barrier_err_for_gate <= options.barrier_tol_factor * state.mu;
-
+    // A8.11: Ipopt's Free mode (IpAdaptiveMuUpdate.cpp:343-389) has no
+    // barrier-subproblem-solved gate — that absolute test exists only in
+    // Fixed mode (IpMonotoneMuUpdate.cpp). Free mode is a strict 2-way
+    // split on `CheckSufficientProgress()` after the skipped-LS / tiny-step
+    // override: sufficient → run oracle unconditionally (line 391-436),
+    // not sufficient → switch to Fixed. Fixed mode does its own
+    // barrier_err computation inside the decrement loop.
     match mu_state.mode {
         MuMode::Free => {
             update_barrier_parameter_free_mode(
                 state, mu_state, filter, last_mehrotra_sigma, options,
-                sufficient, kkt_error, barrier_subproblem_solved, use_sparse,
+                sufficient, kkt_error, use_sparse,
             );
         }
         MuMode::Fixed => {
@@ -4149,36 +4144,21 @@ fn apply_free_mode_sufficient_progress_update(
     reset_filter_with_current_theta(state, filter);
 }
 
-/// Conservative μ decrease for the "stay in Free, neither sufficient
-/// nor switch-to-Fixed" branch. Only fires when the barrier
-/// subproblem is approximately solved — without that gate μ would
-/// collapse unconditionally even when the line search is making no
-/// progress (observed on cho parmest: μ 0.1 → 0.02 at iter 1
-/// despite barrier_err=1.4e4). Uses `avg_compl/kappa` clamped to
-/// `[μ_min, 1e5]` when active complementarity products exist;
-/// otherwise falls back to `mu_linear_decrease_factor·μ`.
-fn apply_free_mode_conservative_decrease(state: &mut SolverState, options: &SolverOptions) {
-    let avg_compl = compute_avg_complementarity(state);
-    if avg_compl > 0.0 {
-        let mu_floor = options.mu_min;
-        state.mu = (avg_compl / options.kappa).clamp(mu_floor, 1e5);
-    } else {
-        state.mu = (options.mu_linear_decrease_factor * state.mu)
-            .max(options.mu_min);
-    }
-}
-
-/// Free-mode (adaptive) barrier-parameter update. Three branches:
-/// 1) Sufficient progress + barrier subproblem solved: pick a new mu via
-///    the Loqo oracle (when quality_function is on) or rate-limited Loqo
-///    fallback `avg_compl/kappa`, then reset the filter.
-/// 2) Insufficient progress (>=2 consecutive) or dual-infeasibility
-///    stagnation: switch to Fixed mode with mu = adaptive_mu_monotone_init
-///    * avg_compl, reset the filter.
-/// 3) Stay in Free with conservative mu decrease only when the barrier
-///    subproblem is approximately solved; otherwise mu stays put waiting
-///    for the line search to make progress on the current subproblem.
-#[allow(clippy::too_many_arguments)]
+/// Free-mode (adaptive) barrier-parameter update. Strict 2-way split
+/// matching Ipopt's `IpAdaptiveMuUpdate::DoUpdate` (lines 343-389) and
+/// the unconditional oracle call at lines 391-436:
+/// 1) `sufficient && !tiny_step` → run the mu-oracle to pick a new μ,
+///    remember the accepted point, and reset the filter.
+/// 2) Otherwise → switch to Fixed mode with `μ = adaptive_mu_monotone_init *
+///    avg_compl` and reset the filter.
+///
+/// A8.11: removed the previous `barrier_subproblem_solved` gate and
+/// the `apply_free_mode_conservative_decrease` middle branch. Neither
+/// has an analogue in Ipopt 3.14 — Free mode never tests
+/// `barrier_err <= kappa_eps * mu`; that gate exists only in Fixed
+/// mode (`IpMonotoneMuUpdate.cpp:135-194`). The "stay in Free with μ
+/// unchanged" fall-through that the gate created is also non-Ipopt:
+/// Free mode either runs the oracle or switches to Fixed.
 fn update_barrier_parameter_free_mode(
     state: &mut SolverState,
     mu_state: &mut MuState,
@@ -4187,12 +4167,11 @@ fn update_barrier_parameter_free_mode(
     options: &SolverOptions,
     sufficient: bool,
     kkt_error: f64,
-    barrier_subproblem_solved: bool,
     use_sparse: bool,
 ) {
     // Consume Mehrotra sigma for use as quality function candidate
     let _sigma_mu = last_mehrotra_sigma.take();
-    if sufficient && !mu_state.tiny_step && barrier_subproblem_solved {
+    if sufficient && !mu_state.tiny_step {
         apply_free_mode_sufficient_progress_update(
             state, mu_state, filter, options, kkt_error, use_sparse,
         );
@@ -4205,26 +4184,8 @@ fn update_barrier_parameter_free_mode(
         // KKT-error reference window has fewer than `num_refs_max`
         // (default 4) entries (`IpAdaptiveMuUpdate.cpp:446-490`), so
         // the earliest possible switch is iter 4, not iter 1.
-        //
-        // Previous ripopt logic added two spurious extra triggers:
-        // `consecutive_insufficient >= 2` (no analogue in Ipopt) and
-        // a 3-iter `du_stagnant` window (no analogue in Ipopt). On
-        // arki0003 this fired the switch at iter 1, jumping μ from
-        // 0.1 → 7.9e4 (`adaptive_mu_monotone_init_factor *
-        // avg_compl`) while Ipopt held μ=0.1 in Free mode for all
-        // 318 iters. The dual variable then chased the inflated μ to
-        // ‖y‖_∞ = 1.5e7 by iter 54 — see
-        // `docs/A8_FOLLOWUP_arki0003.md`.
         mu_state.consecutive_insufficient += 1;
-        let switch_to_fixed = !sufficient || mu_state.tiny_step;
-        if switch_to_fixed {
-            switch_to_fixed_mode_with_adaptive_init(state, mu_state, filter, options);
-        } else if barrier_subproblem_solved {
-            apply_free_mode_conservative_decrease(state, options);
-        }
-        // When !barrier_subproblem_solved, mu stays put and we
-        // wait for the line search to make progress on the current
-        // subproblem.
+        switch_to_fixed_mode_with_adaptive_init(state, mu_state, filter, options);
     }
 }
 
