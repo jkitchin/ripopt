@@ -4060,21 +4060,6 @@ fn update_barrier_parameter(
     }
 }
 
-/// Detect dual-infeasibility stagnation over the 3-element du window.
-/// Returns true when the most recent du is at least 90% of the oldest
-/// (i.e. has not improved meaningfully) AND du is still large
-/// relative to tol. Used by the Free-mode mu update to force a
-/// switch to Fixed mode even when consecutive_insufficient < 2.
-fn compute_du_stagnant_in_free_mode(mu_state: &MuState, options: &SolverOptions) -> bool {
-    if mu_state.dual_inf_window.len() < 3 {
-        return false;
-    }
-    let w = &mu_state.dual_inf_window;
-    let recent = w[w.len() - 1];
-    let oldest = w[w.len() - 3];
-    recent >= 0.9 * oldest && recent > options.tol * 100.0
-}
-
 /// Record a mu-strategy mode change: bump the diagnostics counter,
 /// flip `mu_state.mode`, and re-seed `first_iter_in_mode = true` so
 /// the next iteration re-initialises the new mode's tracking state.
@@ -4251,9 +4236,27 @@ fn update_barrier_parameter_free_mode(
             state, mu_state, filter, options, kkt_error, use_sparse,
         );
     } else {
-        let du_stagnant = compute_du_stagnant_in_free_mode(mu_state, options);
+        // A8.8: align Free→Fixed switch with Ipopt
+        // (`IpAdaptiveMuUpdate.cpp:343-389`). Ipopt's only Free→Fixed
+        // triggers are `!CheckSufficientProgress()`, `tiny_step_flag`,
+        // and `CheckSkippedLineSearch()`. Critically,
+        // `CheckSufficientProgress()` returns *true* whenever the
+        // KKT-error reference window has fewer than `num_refs_max`
+        // (default 4) entries (`IpAdaptiveMuUpdate.cpp:446-490`), so
+        // the earliest possible switch is iter 4, not iter 1.
+        //
+        // Previous ripopt logic added two spurious extra triggers:
+        // `consecutive_insufficient >= 2` (no analogue in Ipopt) and
+        // a 3-iter `du_stagnant` window (no analogue in Ipopt). On
+        // arki0003 this fired the switch at iter 1, jumping μ from
+        // 0.1 → 7.9e4 (`adaptive_mu_monotone_init_factor *
+        // avg_compl`) while Ipopt held μ=0.1 in Free mode for all
+        // 318 iters. The dual variable then chased the inflated μ to
+        // ‖y‖_∞ = 1.5e7 by iter 54 — see
+        // `docs/A8_FOLLOWUP_arki0003.md`.
         mu_state.consecutive_insufficient += 1;
-        if mu_state.consecutive_insufficient >= 2 || du_stagnant {
+        let switch_to_fixed = !sufficient || mu_state.tiny_step;
+        if switch_to_fixed {
             switch_to_fixed_mode_with_adaptive_init(state, mu_state, filter, options);
         } else if barrier_subproblem_solved {
             apply_free_mode_conservative_decrease(state, options);
@@ -6374,6 +6377,32 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         }
 
         track_post_step_acceptable(&mut state, options);
+
+        // A8.6+ dual-divergence trace: env-gated per-iter snapshot of
+        // the dual state. Set RIPOPT_TRACE_DUAL=1 to log ‖y‖_∞,
+        // worst-y_i index, α_pr/α_du, μ, and μ-mode at the end of
+        // every accepted iteration. Used to identify the iter where a
+        // diverging trajectory first deviates from the Ipopt log.
+        if std::env::var("RIPOPT_TRACE_DUAL").is_ok() {
+            let mut y_inf = 0.0_f64;
+            let mut y_idx = usize::MAX;
+            for (i, &yi) in state.y.iter().enumerate() {
+                if yi.abs() > y_inf {
+                    y_inf = yi.abs();
+                    y_idx = i;
+                }
+            }
+            let mode_str = match mu_state.mode {
+                MuMode::Free => "Free",
+                MuMode::Fixed => "Fixed",
+            };
+            eprintln!(
+                "[dual] it={:4} ‖y‖∞={:.3e}@{} α_p={:.3e} α_d={:.3e} μ={:.3e} mode={} resto={}",
+                iteration, y_inf, y_idx,
+                state.alpha_primal, state.alpha_dual, state.mu, mode_str,
+                state.diagnostics.restoration_count,
+            );
+        }
     }
 
     finalize_after_max_iter(

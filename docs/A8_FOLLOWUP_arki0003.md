@@ -578,3 +578,49 @@ src/kkt_aug.rs`. 295 lib tests pass on the revert.
 - Always run the head-to-head with a disable env var
   (`RIPOPT_DISABLE_A85=1` here) before committing — same
   binary, two runs, one switch.
+
+## A8.6+ findings — μ-mode mis-switch at iter 1 (2026-04-29)
+
+Added `RIPOPT_TRACE_DUAL=1` per-iter dump (||y||_∞, worst-y_i,
+α_pr, α_du, μ, mode, resto) at end of IPM loop. Ran arki0003 to
+max_iter=200 and compared against `/tmp/arki0003_ipopt5.txt`
+(`print_level=5` Ipopt 3.14 reference).
+
+**Smoking gun at iter 1**:
+
+|         | obj      | inf_pr  | inf_du | μ       | mode  | α_pr     |
+|---------|----------|---------|--------|---------|-------|----------|
+| Ipopt 1 | 1.13e4   | 1.16e8  | 1.49e0 | 1.0e-1  | Free  | 2.26e-4  |
+| ripopt 1| 1.14e4   | 1.16e8  | 1.08e0 | 7.92e4  | Fixed | 2.28e-4  |
+
+Identical primal trajectory (same obj, inf_pr, α_pr to 3 sig figs),
+but μ explodes 6 orders of magnitude. From there ripopt's dual
+chases the inflated μ: ||y||_∞ goes 0.99 → 2.2 → 28 → 5e4 → 1.5e7
+in iters 0..54, all concentrated on row 1904 (an equality
+constraint). Ipopt stays in Free mode for all 318 iters and
+solves cleanly to obj=3.795e3.
+
+Mode oscillation: 51 Free↔Fixed switches across 200 ripopt iters
+(~25% of iters). Each switch back to Fixed re-runs
+`switch_to_fixed_mode_with_adaptive_init`, re-seeding μ from
+avg_compl × `adaptive_mu_monotone_init_factor`.
+
+**Triggering call site** (src/ipm.rs:4253-4257):
+```rust
+let du_stagnant = compute_du_stagnant_in_free_mode(mu_state, options);
+mu_state.consecutive_insufficient += 1;
+if mu_state.consecutive_insufficient >= 2 || du_stagnant {
+    switch_to_fixed_mode_with_adaptive_init(state, mu_state, filter, options);
+}
+```
+
+`du_stagnant` requires window length ≥ 3 and so cannot fire by
+iter 1. The trigger is `consecutive_insufficient >= 2`. The
+counter is incremented every Free-mode iter that takes the `else`
+branch (i.e., is not "sufficient + barrier_subproblem_solved").
+On arki0003 this fires at iter 0 (counter=1) and iter 1
+(counter=2 → switch). Ipopt does not switch this aggressively;
+verifying the exact criterion via ipopt-expert.
+
+**Verified**: A8.7 hoist is numerically equivalent (iters 0-19
+bit-identical with/without). Re-applied; commit 8f6a129 stands.
