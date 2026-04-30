@@ -2221,57 +2221,19 @@ fn apply_slack_move(state: &mut SolverState, options: &SolverOptions) -> usize {
     adjusted
 }
 
-/// Per-component sign-flip damping state for the y multiplier update.
-/// `prev_dy` holds the previous iterate's dy (for sign comparison) and
-/// `sign_change_count[i]` accumulates consecutive sign flips on row i;
-/// when a count hits 3 the corresponding dy[i] is halved.
-struct DyOscillationTracker {
-    prev_dy: Option<Vec<f64>>,
-    sign_change_count: Vec<u8>,
-}
-
-impl DyOscillationTracker {
-    fn new(m: usize) -> Self {
-        Self {
-            prev_dy: None,
-            sign_change_count: vec![0u8; m],
-        }
+/// A8.9: Plain Ipopt y-update — `state.y[i] += alpha_y * dy_i`.
+/// Mirrors `BacktrackingLineSearch::PerformDualStep`
+/// (`IpBacktrackingLineSearch.cpp:919-1006`); Ipopt updates y_c,y_d
+/// with the raw `α_y · dy` from the KKT solve and has no sign-flip
+/// or oscillation damping. The previous ripopt-specific
+/// `DyOscillationTracker` heuristic — halving dy when the same
+/// component flipped sign 3 times near convergence — was a load-
+/// bearing benchmark crutch with no analogue in Ipopt and is
+/// removed here.
+fn apply_y_update(state: &mut SolverState, alpha_y: f64) {
+    for i in 0..state.m {
+        state.y[i] += alpha_y * state.dy[i];
     }
-}
-
-/// Apply the y multiplier update with sign-flip damping. Once the
-/// solver is near convergence (`consecutive_acceptable >= 1`),
-/// components of `dy` whose sign has flipped relative to the previous
-/// iterate accumulate a counter; when the count hits 3, the step is
-/// halved (0.5·dy). Components without a flip reset their counter.
-/// `state.y[i] += alpha_y * dy_i` for each row, then `tracker.prev_dy`
-/// is rotated to hold the current `dy`.
-fn apply_damped_y_update(
-    state: &mut SolverState,
-    alpha_y: f64,
-    tracker: &mut DyOscillationTracker,
-) {
-    let m = state.m;
-    let near_convergence = state.consecutive_acceptable >= 1;
-    for i in 0..m {
-        let sign_change = if let Some(ref pdy) = tracker.prev_dy {
-            pdy[i] * state.dy[i] < 0.0
-        } else {
-            false
-        };
-        if near_convergence && sign_change {
-            tracker.sign_change_count[i] = tracker.sign_change_count[i].saturating_add(1);
-        } else if !sign_change {
-            tracker.sign_change_count[i] = 0;
-        }
-        let dy_i = if near_convergence && tracker.sign_change_count[i] >= 3 {
-            0.5 * state.dy[i]
-        } else {
-            state.dy[i]
-        };
-        state.y[i] += alpha_y * dy_i;
-    }
-    tracker.prev_dy = Some(state.dy.clone());
 }
 
 /// T3.32: closed-form 1D minimizer of the dual-infeasibility quadratic
@@ -2377,7 +2339,6 @@ fn update_dual_variables<P: NlpProblem>(
     state: &mut SolverState,
     mu_state: &MuState,
     alpha_dual_max: f64,
-    tracker: &mut DyOscillationTracker,
     options: &SolverOptions,
     problem: &P,
 ) -> f64 {
@@ -2403,7 +2364,7 @@ fn update_dual_variables<P: NlpProblem>(
         }
     };
 
-    apply_damped_y_update(state, alpha_y, tracker);
+    apply_y_update(state, alpha_y);
 
     // Ipopt post-step order (IpIpoptAlg.cpp:652-770):
     //   1. Advance z to trial step.
@@ -5816,9 +5777,6 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
     // Consecutive iterations with obj < -1e20 for robust unbounded detection
     let mut consecutive_unbounded: usize = 0;
 
-    // Damped multiplier updates when oscillation detected
-    let mut dy_tracker = DyOscillationTracker::new(m);
-
     // Initial evaluation with NaN/Inf recovery by bound-push perturbation.
     if let Err(result) = initial_evaluate_with_recovery(
         &mut state, problem, &mut lbfgs_state, linear_constraints.as_deref(), lbfgs_mode, n, options,
@@ -6316,7 +6274,6 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             &mut state,
             &mu_state,
             alpha_dual_max,
-            &mut dy_tracker,
             options,
             problem,
         );
