@@ -699,3 +699,46 @@ reach this regime because the cumulative effect of 1-4 above
 keeps Ipopt on a different trajectory. So the most
 profitable fix order is the alignment fixes (1-4), then
 re-test. Track whether dy magnitudes shrink.
+
+
+## A8.11 attempt: drop barrier_subproblem_solved gate from Free mode
+
+**Status: reverted.** The change was structurally correct against
+Ipopt 3.14 (`IpAdaptiveMuUpdate.cpp:343-389` strict 2-way split,
+oracle invoked unconditionally at line 391-436 — verified by
+ipopt-expert), but on arki0003 it exposed an *upstream* bug in
+ripopt's mu-oracle implementation: at iter 1 with `compl ≈ 1e7`
+(non-feasible starting iterate), ripopt's `compute_loqo_mu`
+fallback `avg_compl/kappa = 1e6` and the quality-function oracle
+both return values clamped only by `mu_max_fact * initial_avg_compl
+= 1e5 * 1e7 = 1e12`. So mu jumped from `1e-1` (mu_init) to `8.55e4`
+on iter 1, then oscillated between `6.13e1` and `2.18e-1` for the
+next 75 iters chasing the unstable oracle. Final state at iter 415:
+obj=3.7956e3, inf_du=6.06e6, frozen.
+
+**Comparison:**
+- A8.10 (gate kept): mu held in Free mode at 0.1, reaches obj=3.805e3,
+  inf_pr=9.5e-5, inf_du=0.17 by iter 562 (close to Ipopt's 3.7952e3).
+- A8.11 (gate removed): mu oscillates 1e-1 ↔ 1e5, dual infeasibility
+  never drops below 6e6.
+
+**Root cause:** ripopt's Free-mode oracle is not safe to invoke at
+infeasible early iterates. Ipopt's oracle apparently *is* safe
+(arki0003 solves cleanly there), so the divergence is in the oracle
+itself — likely the LOQO sigma or quality-function safeguards.
+
+**Follow-up needed before re-attempting A8.11:**
+- Compare ripopt's `compute_quality_function_mu` output at iter 1
+  against Ipopt's `IpQualityFunctionMuOracle::CalculateMu` for the
+  same iterate (arki0003 starting point).
+- Verify `mu_max_fact` cap is being respected. Default `mu_max_fact
+  = 1e5` in Ipopt, but the cap is multiplicative on
+  `initial_avg_compl` which for a problem with compl~1e7 is
+  effectively no cap.
+- Check whether Ipopt's first oracle call at iter 1 is conditional
+  on something other than CheckSufficientProgress (e.g., via
+  `start_with_resto` or `mu_init_constant_phase`).
+
+Until those discrepancies are resolved, the `barrier_subproblem_solved`
+gate is acting as a *de facto* mu-oracle safety net. Removing it is
+correct-against-Ipopt but unsafe-against-ripopt.
