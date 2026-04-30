@@ -363,12 +363,15 @@ impl Filter {
     }
 
     /// Augment the filter at restoration entry (Ipopt's PrepareRestoPhaseStart,
-    /// IpFilterLSAcceptor.cpp:898-901). Adds an entry at
-    /// (phi - gamma_phi*theta, (1 - gamma_theta)*theta) so the restored iterate
-    /// cannot hand back a point "as bad or worse" than the pre-restoration one.
-    /// Also bumps theta_max.
+    /// IpFilterLSAcceptor.cpp:898-901 → AugmentFilter() at :297-308). Adds an
+    /// entry at (phi - gamma_phi*theta, (1 - gamma_theta)*theta) so the
+    /// restored iterate cannot hand back a point "as bad or worse" than the
+    /// pre-restoration one.
+    ///
+    /// Note: does NOT bump `theta_max` — Ipopt's `theta_max_` is initialized
+    /// lazily once from the first reference theta and is never re-inflated
+    /// at restoration entry.
     pub fn augment_for_restoration(&mut self, theta_current: f64, phi_current: f64) {
-        self.theta_max = self.theta_max.max(1e4 * theta_current.max(1e-4));
         let guard_theta = (1.0 - self.gamma_theta) * theta_current;
         let guard_phi = phi_current - self.gamma_phi * theta_current;
         self.add(guard_theta, guard_phi);
@@ -702,16 +705,15 @@ mod tests {
     fn test_augment_for_restoration_adds_entry() {
         let mut filter = Filter::new(100.0);
         let initial_theta_max = filter.theta_max();
-        let theta = 50.0; // Large enough to bump theta_max
+        let theta = 50.0;
         let phi = 10.0;
         filter.augment_for_restoration(theta, phi);
         // Should have added an entry at ((1-gamma_theta)*theta, phi - gamma_phi*theta)
         assert_eq!(filter.len(), 1);
-        // theta_max should be bumped to at least 1e4 * theta
-        assert!(filter.theta_max() >= 1e4 * theta,
-            "theta_max not bumped: {} < {}", filter.theta_max(), 1e4 * theta);
-        assert!(filter.theta_max() >= initial_theta_max,
-            "augmentation should not shrink theta_max");
+        // Ipopt's PrepareRestoPhaseStart only adds the margin entry; theta_max
+        // is initialized lazily once and is not re-inflated at restoration entry.
+        assert_eq!(filter.theta_max(), initial_theta_max,
+            "augment_for_restoration must not mutate theta_max");
         // A point worse than the guard should be rejected
         assert!(!filter.is_acceptable(theta, phi));
     }
