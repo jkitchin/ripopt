@@ -1884,7 +1884,15 @@ fn run_line_search_loop<P: NlpProblem>(
     let mut step_accepted = false;
     *ls_steps = 0;
 
-    for _ls_iter in 0..40 {
+    // DEV-35: no hard-coded line-search step cap. Ipopt
+    // (IpFilterLSAcceptor.cpp::ComputeAlphaMin and the backtracking
+    // loop in IpBacktrackingLineSearch::DoBacktrackingLineSearch)
+    // terminates the line search on `alpha < alpha_min`, where
+    // alpha_min is itself derived from filter parameters and the
+    // current iterate. The previous `for _ls_iter in 0..40` cap was
+    // ripopt-specific and could prematurely abandon a step that was
+    // still on track to either accept or fall through to alpha_min.
+    loop {
         // Intra-iteration early stall check (scaled by problem size).
         // Square problems can have legitimately slow first iterations
         // (mirrors IpBacktrackingLineSearch.cpp:276-280), so we never
