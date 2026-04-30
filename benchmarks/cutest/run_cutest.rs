@@ -348,7 +348,7 @@ fn ripopt_status_to_string(status: SolveStatus) -> String {
         SolveStatus::Infeasible => "Infeasible".to_string(),
         SolveStatus::MaxIterations => "MaxIterations".to_string(),
         SolveStatus::NumericalError => "NumericalError".to_string(),
-        SolveStatus::Unbounded => "Unbounded".to_string(),
+        SolveStatus::DivergingIterates => "DivergingIterates".to_string(),
         SolveStatus::RestorationFailed => "RestorationFailed".to_string(),
         SolveStatus::InternalError => "InternalError".to_string(),
         SolveStatus::LocalInfeasibility => "LocalInfeasibility".to_string(),
