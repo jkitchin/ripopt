@@ -136,30 +136,37 @@ impl Filter {
         true
     }
 
-    /// Check the switching condition: whether we should use the objective (phi)
-    /// criterion instead of the filter.
+    /// Pure Ipopt `IsFtype` (`IpFilterLSAcceptor.cpp:273-295`):
+    /// `gradBarrTDelta < 0  &&  alpha * (-gradBarrTDelta)^s_phi > delta * theta^s_theta`.
     ///
-    /// Returns true if the current constraint violation is small enough and the
-    /// directional derivative indicates sufficient objective decrease.
+    /// DEV-30: this **does not** include the `theta <= theta_min` gate.
+    /// In Ipopt that gate is applied at the call sites in
+    /// `CheckAcceptabilityOfTrialPoint` (line 361-362), but the
+    /// augmentation logic in `UpdateForNextIteration` (line 881-895)
+    /// uses pure `IsFtype` *without* the theta_min gate. Bundling the
+    /// two over-augments the filter on h-type accepts that came from
+    /// theta>theta_min trials with a still-good Armijo decrease.
+    pub fn is_ftype(&self, theta_current: f64, grad_phi_step: f64, alpha: f64) -> bool {
+        grad_phi_step < 0.0
+            && alpha * (-grad_phi_step).powf(self.s_phi)
+                > self.delta * theta_current.powf(self.s_theta)
+    }
+
+    /// Combined Ipopt switching gate: `IsFtype(alpha) && theta <= theta_min`.
+    /// This is the gate at `IpFilterLSAcceptor.cpp:361-362` that selects
+    /// the Armijo branch in `CheckAcceptabilityOfTrialPoint`.
+    ///
+    /// DEV-30: factored as `is_ftype(...) && theta_current <= theta_min`.
     pub fn switching_condition(
         &self,
         theta_current: f64,
         grad_phi_step: f64,
         alpha: f64,
     ) -> bool {
-        // Ipopt switching condition: alpha makes this depend on step length,
-        // so as alpha shrinks during backtracking, we properly fall back to
-        // h-type (constraint reduction) acceptance.
-        //
-        // DEV-24: `<= theta_min` (non-strict) matches Ipopt's
-        // IpFilterLSAcceptor.cpp:362 (`reference_theta_ <= theta_min_`)
-        // and :460 (`curr_theta <= theta_min_`). Strict `<` could
-        // diverge on synthetic boundary cases where theta exactly equals
-        // theta_min.
-        grad_phi_step < 0.0
+        // DEV-24: `<= theta_min` (non-strict) matches Ipopt
+        // IpFilterLSAcceptor.cpp:362.
+        self.is_ftype(theta_current, grad_phi_step, alpha)
             && theta_current <= self.theta_min
-            && alpha * (-grad_phi_step).powf(self.s_phi)
-                > self.delta * theta_current.powf(self.s_theta)
     }
 
     /// Check the Armijo sufficient decrease condition.
@@ -186,14 +193,20 @@ impl Filter {
     /// Check if a trial point is acceptable via either the filter or the
     /// sufficient decrease conditions (Armijo or constraint reduction).
     ///
-    /// Returns (acceptable, use_switching) where:
+    /// Returns (acceptable, augment_required) where:
     /// - acceptable: whether the step should be accepted
-    /// - use_switching: whether the switching condition was used (affects filter update)
+    /// - augment_required: per Ipopt `UpdateForNextIteration`
+    ///   (`IpFilterLSAcceptor.cpp:881-895`), the filter must be
+    ///   augmented iff `!IsFtype(alpha) || !ArmijoHolds(alpha)`.
+    ///   DEV-31: the augmentation gate uses pure `IsFtype` *without*
+    ///   the `theta <= theta_min` clause; bundling them over-augments
+    ///   when a step was accepted via h-type but happened to satisfy
+    ///   IsFtype + Armijo at the accepted alpha.
     ///
     /// Follows Ipopt's structure (IpFilterLSAcceptor.cpp:311-437):
-    /// 1. Determine step type (f-type via switching/Armijo, or h-type via reduction)
+    /// 1. Determine step type (Armijo branch when `IsFtype && theta<=theta_min`,
+    ///    sufficient-reduction otherwise)
     /// 2. Check filter acceptability
-    /// When the switching condition holds, the step is purely f-type — no h-type fallback.
     pub fn check_acceptability(
         &mut self,
         theta_current: f64,
@@ -219,15 +232,20 @@ impl Filter {
             return (false, false);
         }
 
-        // Determine step type and check type-specific condition
-        let (type_ok, is_switching) = if self.switching_condition(theta_current, grad_phi_step, alpha) {
-            // f-type: Armijo on barrier objective. No h-type fallback.
-            (self.armijo_condition(phi_current, phi_trial, grad_phi_step, alpha), true)
+        // DEV-30: split IsFtype (pure) from the call-site theta_min gate
+        // that selects the acceptance branch.
+        let is_ft = self.is_ftype(theta_current, grad_phi_step, alpha);
+        let armijo_holds = self.armijo_condition(phi_current, phi_trial, grad_phi_step, alpha);
+
+        // Acceptance branch (IpFilterLSAcceptor.cpp:361-374):
+        //   if (IsFtype && theta <= theta_min)  Armijo
+        //   else                                 IsAcceptableToCurrentIterate
+        let type_ok = if is_ft && theta_current <= self.theta_min {
+            armijo_holds
         } else {
-            // h-type: sufficient decrease in theta or phi
-            let ok = self.sufficient_infeasibility_reduction(theta_current, theta_trial)
-                || phi_trial <= phi_current - self.gamma_phi * theta_current;
-            (ok, false)
+            // Sufficient reduction in theta or phi.
+            self.sufficient_infeasibility_reduction(theta_current, theta_trial)
+                || phi_trial <= phi_current - self.gamma_phi * theta_current
         };
 
         if !type_ok {
@@ -241,7 +259,10 @@ impl Filter {
             return (false, false);
         }
 
-        (true, is_switching)
+        // DEV-31: augmentation gate is pure `!IsFtype || !ArmijoHolds`
+        // (IpFilterLSAcceptor.cpp:885-886). No theta_min clause.
+        let augment_required = !is_ft || !armijo_holds;
+        (true, augment_required)
     }
 
     /// T3.10: handle the post-acceptance bookkeeping of the
@@ -550,11 +571,12 @@ mod tests {
         let grad_phi_step = -100.0; // Strong descent
         let alpha = 1.0;
 
-        let (accept, switching) = filter.check_acceptability(
+        let (accept, augment_required) = filter.check_acceptability(
             theta_current, phi_current, theta_trial, phi_trial, grad_phi_step, alpha,
         );
         assert!(accept, "Should be accepted via Armijo");
-        assert!(switching, "Should use switching condition");
+        // DEV-31: f-type accept (IsFtype && ArmijoHolds) → no filter augmentation.
+        assert!(!augment_required, "f-type accept must not augment filter");
     }
 
     #[test]
@@ -569,11 +591,12 @@ mod tests {
         let grad_phi_step = -0.01; // Weak descent
         let alpha = 1.0;
 
-        let (accept, switching) = filter.check_acceptability(
+        let (accept, augment_required) = filter.check_acceptability(
             theta_current, phi_current, theta_trial, phi_trial, grad_phi_step, alpha,
         );
         assert!(accept, "Should be accepted via filter mode");
-        assert!(!switching, "Should NOT use switching");
+        // DEV-31: h-type accept where IsFtype is false → must augment filter.
+        assert!(augment_required, "h-type accept must augment filter");
     }
 
     #[test]
@@ -733,11 +756,12 @@ mod tests {
         let phi_trial = 50.0;
         let grad = -0.01; // weak descent, theta_current > theta_min -> h-type
         let alpha = 1.0;
-        let (accept, switching) = filter.check_acceptability(
+        let (accept, augment_required) = filter.check_acceptability(
             theta_current, phi_current, theta_trial, phi_trial, grad, alpha,
         );
         assert!(accept, "h-type phi-only reduction must be accepted");
-        assert!(!switching);
+        // DEV-31: h-type accept (IsFtype false) → augmentation required.
+        assert!(augment_required);
     }
 
     #[test]

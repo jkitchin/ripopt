@@ -1916,7 +1916,12 @@ fn run_line_search_loop<P: NlpProblem>(
             options.kappa_d,
         );
 
-        let (acceptable, used_switching) = filter.check_acceptability(
+        // DEV-30/31: `augment_required` is the Ipopt
+        // `UpdateForNextIteration` augmentation gate (`!IsFtype || !ArmijoHolds`,
+        // IpFilterLSAcceptor.cpp:881-895). Pure IsFtype, *without* the
+        // theta_min clause, so h-type accepts that happened to satisfy
+        // IsFtype+Armijo at the accepted alpha do not over-augment.
+        let (acceptable, augment_required) = filter.check_acceptability(
             theta_current,
             phi_current,
             theta_trial,
@@ -1949,7 +1954,7 @@ fn run_line_search_loop<P: NlpProblem>(
         if acceptable {
             commit_trial_point(state, x_trial, obj_trial, g_trial, alpha);
             step_accepted = true;
-            if !used_switching {
+            if augment_required {
                 filter.add(theta_current, phi_current);
             }
             // T3.10: post-acceptance filter-reset trigger
