@@ -701,44 +701,46 @@ profitable fix order is the alignment fixes (1-4), then
 re-test. Track whether dy magnitudes shrink.
 
 
-## A8.11 attempt: drop barrier_subproblem_solved gate from Free mode
+## A8.11: drop barrier_subproblem_solved gate from Free mode (kept)
 
-**Status: reverted.** The change was structurally correct against
-Ipopt 3.14 (`IpAdaptiveMuUpdate.cpp:343-389` strict 2-way split,
-oracle invoked unconditionally at line 391-436 — verified by
-ipopt-expert), but on arki0003 it exposed an *upstream* bug in
-ripopt's mu-oracle implementation: at iter 1 with `compl ≈ 1e7`
-(non-feasible starting iterate), ripopt's `compute_loqo_mu`
-fallback `avg_compl/kappa = 1e6` and the quality-function oracle
-both return values clamped only by `mu_max_fact * initial_avg_compl
-= 1e5 * 1e7 = 1e12`. So mu jumped from `1e-1` (mu_init) to `8.55e4`
-on iter 1, then oscillated between `6.13e1` and `2.18e-1` for the
-next 75 iters chasing the unstable oracle. Final state at iter 415:
-obj=3.7956e3, inf_du=6.06e6, frozen.
+**Status: kept.** Verified by ipopt-expert against
+`IpAdaptiveMuUpdate.cpp:343-389` (strict 2-way split) and lines 391-436
+(unconditional oracle call). Free mode has *no*
+`barrier_err <= kappa_eps * mu` test in Ipopt; that gate exists only in
+Fixed mode (`IpMonotoneMuUpdate.cpp:135-194`). The previous ripopt
+implementation added a third "stay in Free with conservative mu
+decrease" branch and a "mu unchanged fall-through" — neither has an
+analogue in Ipopt. Both were removed in commit `3f4c82d`.
 
-**Comparison:**
-- A8.10 (gate kept): mu held in Free mode at 0.1, reaches obj=3.805e3,
-  inf_pr=9.5e-5, inf_du=0.17 by iter 562 (close to Ipopt's 3.7952e3).
-- A8.11 (gate removed): mu oscillates 1e-1 ↔ 1e5, dual infeasibility
-  never drops below 6e6.
+**First attempt symptom (arki0003):** removing the gate exposed a
+*downstream* mismatch: ripopt was running adaptive (Free) by default,
+which invoked the QF mu-oracle at iter 1 with `compl ≈ 1e7` from the
+infeasible starting iterate. The oracle returned mu=8.55e4 (capped only
+by `mu_max_fact * initial_avg_compl = 1e12`), and mu oscillated wildly
+through 415 iters.
 
-**Root cause:** ripopt's Free-mode oracle is not safe to invoke at
-infeasible early iterates. Ipopt's oracle apparently *is* safe
-(arki0003 solves cleanly there), so the divergence is in the oracle
-itself — likely the LOQO sigma or quality-function safeguards.
+**Root cause (A8.11.1):** ripopt's default `mu_strategy_adaptive: true`
+mismatched Ipopt 3.14's default `mu_strategy = "monotone"`
+(`IpAlgBuilder.cpp:355-362`). With the correct monotone default, the
+Free-mode path doesn't run on arki0003 at all — Fixed mode holds
+`mu = mu_init = 0.1` and decreases monotonically, matching Ipopt's
+printed log iter-by-iter. Fixed in commit `fe111d4`
+(`mu_strategy_adaptive: false` default in `src/options.rs`).
 
-**Follow-up needed before re-attempting A8.11:**
-- Compare ripopt's `compute_quality_function_mu` output at iter 1
-  against Ipopt's `IpQualityFunctionMuOracle::CalculateMu` for the
-  same iterate (arki0003 starting point).
-- Verify `mu_max_fact` cap is being respected. Default `mu_max_fact
-  = 1e5` in Ipopt, but the cap is multiplicative on
-  `initial_avg_compl` which for a problem with compl~1e7 is
-  effectively no cap.
-- Check whether Ipopt's first oracle call at iter 1 is conditional
-  on something other than CheckSufficientProgress (e.g., via
-  `start_with_resto` or `mu_init_constant_phase`).
+**Lesson per CLAUDE.md alignment-work principle:** when a
+correct-against-Ipopt change regresses, do not revert; find the
+upstream mismatch that the heuristic was masking. Here the masking
+heuristic (`barrier_subproblem_solved` gate) was hiding a deeper
+default-mismatch (`mu_strategy_adaptive`); fixing the deeper issue
+makes the surface change benign.
 
-Until those discrepancies are resolved, the `barrier_subproblem_solved`
-gate is acting as a *de facto* mu-oracle safety net. Removing it is
-correct-against-Ipopt but unsafe-against-ripopt.
+**Follow-ups (open):**
+- Long-run on arki0003 with monotone default still shows a mu spike at
+  iter ~685 (mu jumped from ~1e-3 to 2.21e2). Suspect the
+  ripopt-specific stall-recovery paths (`try_boost_mu_for_stall`,
+  `handle_near_tolerance_stall` in `src/ipm.rs:4731,4809`) which
+  unconditionally boost mu and switch to Fixed. These have no Ipopt
+  analogue and should be either gated on adaptive strategy or removed.
+- Audit ripopt's mu-oracle (`compute_quality_function_mu`,
+  `compute_loqo_mu`) for safety at infeasible iterates so that adaptive
+  strategy itself can be re-enabled per-problem without diverging.
