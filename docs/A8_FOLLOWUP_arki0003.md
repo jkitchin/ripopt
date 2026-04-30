@@ -676,7 +676,7 @@ ripopt-vs-Ipopt discrepancies. Plan to bring ripopt to parity:
    `STOP_AT_TINY_STEP` exit (`IpIpoptAlg.cpp:461-466`). Defaults:
    `tiny_step_tol=10ε≈2.22e-15`, `tiny_step_y_tol=1e-2`. ripopt's
    tiny-step path uses different thresholds and doesn't terminate
-   at 2 consecutive. → **A8.12**
+   at 2 consecutive. → **A8.12** ✅ (2026-04-30)
 
 5. **κ_Σ multiplier reset (`correct_bound_multiplier`,
    `IpIpoptAlg.cpp:1055-1133`)** — Ipopt clamps `z_i ←
@@ -918,3 +918,58 @@ fixes (DEV-1, DEV-2, DEV-3, DEV-4, DEV-7, DEV-9, DEV-11, DEV-13,
 DEV-23, DEV-24, DEV-30+31, DEV-32, DEV-33, DEV-35, DEV-36) plus 2
 verified-not-misalignments (DEV-34, DEV-37).
 
+
+
+## A8.12 result — DetectTinyStep alignment (2026-04-30)
+
+**Status: landed.** Three corrections in `detect_tiny_step`
+(`src/ipm.rs:3417-3500`) to match `IpBacktrackingLineSearch.cpp:1219-1278`
+and the latch flow at lines 363-435:
+
+1. **Slack-step check added.** Ipopt's `DetectTinyStep` requires
+   `max_i |Δs_i|/(1+|s_i|) ≤ tiny_step_tol` in addition to the x-step
+   gate. Without it, an iterate making real progress only on
+   inequality slacks would be wrongly classified as tiny.
+
+2. **Δy moved out of detection.** Ipopt does NOT include the dual
+   step in `DetectTinyStep`. The `tiny_step_y_tol` threshold is the
+   gate for the *latch* `tiny_step_last_iteration_` set at line
+   421-424, used only to determine whether the *next* iter's
+   detection should fire `tiny_step_flag`. ripopt previously gated
+   the entire detection on Δy, which made detection more conservative
+   than Ipopt and prevented `tiny_step_flag` from firing on iterates
+   whose dy was 0.5 (still small but above the 1e-2 threshold).
+
+3. **Two-iter latch via boolean, not counter.** Replaced
+   `consecutive_tiny_steps: usize` with `tiny_step_last_iter: bool`,
+   matching Ipopt's `tiny_step_last_iteration_`.
+   `mu_state.tiny_step` (= Ipopt's `tiny_step_flag`) now fires iff
+   *current iter detection* AND *previous iter latched*. The latch is
+   refreshed each iter as `detection && (dy_amax < tiny_step_y_tol)`.
+
+**Termination unchanged.** `pending_tiny_step_exit` is still set when
+`tiny_step && state.mu == mu_before_update`, mirroring
+`IpMonotoneMuUpdate.cpp:158-160` and `IpAdaptiveMuUpdate.cpp:330-332,377-379`.
+The redundant `consecutive_tiny_steps >= 2` gate was dropped because
+`mu_state.tiny_step` already encodes the two-iter requirement.
+
+**Not done in A8.12 (deferred).** Ipopt also takes a frac-to-bound
+primal step *bypassing the line search* when `DetectTinyStep` returns
+true (`IpBacktrackingLineSearch.cpp:383-431`). ripopt currently routes
+tiny-step detection iterates through the normal line search. This is
+a larger surface-area change and is left as a follow-up; it may
+matter on problems where the line search keeps shrinking α toward 0
+at machine-precision noise.
+
+**Tests.** Five unit tests cover: detection no-op on mu/filter,
+prior-latch requirement, step-grows reset, dy-only-gates-latch
+(the key correction — detection fires even with large dy if prior
+latched), and cviol-blocks-detection. All 294 lib tests pass.
+
+**Effect on arki0003.** No expected delta — the dual-stagnation
+trajectory described in §A8.15 doesn't trip the tiny-step gate
+(Δx is not at machine-precision noise; the iterate is making "real"
+moves in dy). A8.12 is a *correctness* alignment for problems that
+naturally enter the machine-precision-step regime, not a fix for
+arki0003 specifically. The next focus is the iter-100 KKT-solve
+comparison (Task #42) per §A8.15.
