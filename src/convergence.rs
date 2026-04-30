@@ -274,18 +274,21 @@ pub fn primal_infeasibility_internal_max(
     m
 }
 
-/// Compute dual infeasibility: ||grad_f + J^T * lambda - z_l + z_u + kappa_d damping||_inf.
+/// Compute dual infeasibility: ||grad_f + J^T * lambda - z_l + z_u||_inf.
+///
+/// Mirrors Ipopt's `IpoptCalculatedQuantities::curr_grad_lag_x()`
+/// (`IpIpoptCalculatedQuantities.cpp:1993-2030`) — the *plain*
+/// Lagrangian gradient with NO `kappa_d` damping. The damped variant
+/// `curr_grad_lag_with_damping_x` (`IpIpoptCalculatedQuantities.cpp:2131+`)
+/// is used only for the barrier-objective gradient and Newton RHS,
+/// never for the convergence test (`IpOptErrorConvCheck::CheckConvergence`
+/// → `unscaled_curr_dual_infeasibility(NORM_MAX)` → `curr_grad_lag_x`).
 ///
 /// `grad_f`: gradient of objective
 /// `jac_rows`, `jac_cols`, `jac_vals`: Jacobian in COO format
 /// `lambda`: constraint multipliers
 /// `z_l`, `z_u`: bound multipliers
 /// `n`: number of variables
-/// `kappa_d`, `mu`, `x_l`, `x_u`: T3.9 — Ipopt's `curr_grad_lag_x` adds
-///   `+ kappa_d * mu` for one-sided lower-bound vars and
-///   `- kappa_d * mu` for one-sided upper-bound vars
-///   (`IpIpoptCalculatedQuantities.cpp:888-899`, default `kappa_d = 1e-5`).
-#[allow(clippy::too_many_arguments)]
 pub fn dual_infeasibility(
     grad_f: &[f64],
     jac_rows: &[usize],
@@ -295,10 +298,6 @@ pub fn dual_infeasibility(
     z_l: &[f64],
     z_u: &[f64],
     n: usize,
-    kappa_d: f64,
-    mu: f64,
-    x_l: &[f64],
-    x_u: &[f64],
 ) -> f64 {
     let mut residual = vec![0.0; n];
 
@@ -316,30 +315,21 @@ pub fn dual_infeasibility(
         residual[i] += z_u[i];
     }
 
-    // T3.9: kappa_d damping for one-sided-bound vars (matches Ipopt's
-    // curr_grad_lag_x).
-    if kappa_d > 0.0 {
-        for i in 0..n {
-            let l_fin = x_l[i].is_finite();
-            let u_fin = x_u[i].is_finite();
-            if l_fin && !u_fin {
-                residual[i] += kappa_d * mu;
-            } else if !l_fin && u_fin {
-                residual[i] -= kappa_d * mu;
-            }
-        }
-    }
-
     residual.iter().map(|r| r.abs()).fold(0.0f64, f64::max)
 }
 
-/// Compute component-wise scaled dual infeasibility.
+/// Compute the unscaled dual infeasibility max-norm.
 ///
-/// Uses `|r_i| / (1 + |grad_f_i|)` per component, which makes the metric
-/// insensitive to gradient magnitude across variables. This prevents
-/// poorly-scaled problems from having artificially large unscaled dual
-/// infeasibility even when the scaled version is small.
-#[allow(clippy::too_many_arguments)]
+/// T3.1: dropped the ripopt-specific per-component `(1 + |grad_f_i|)`
+/// divisor. Ipopt's `IpIpoptCalculatedQuantities::curr_dual_infeasibility`
+/// computes the raw max-norm of `grad_f + J^T y - z_L + z_U` and only
+/// applies the global `s_d` scaling at the convergence-test boundary
+/// (`IpOptErrorConvCheck.cpp:208`). The per-component normalisation
+/// could declare false-Optimal on problems with one large gradient
+/// component shadowing uniformly small residuals.
+///
+/// As in `dual_infeasibility`, no `kappa_d` damping: the convergence
+/// test uses `curr_grad_lag_x` (plain), not `curr_grad_lag_with_damping_x`.
 pub fn dual_infeasibility_scaled(
     grad_f: &[f64],
     jac_rows: &[usize],
@@ -349,21 +339,7 @@ pub fn dual_infeasibility_scaled(
     z_l: &[f64],
     z_u: &[f64],
     n: usize,
-    kappa_d: f64,
-    mu: f64,
-    x_l: &[f64],
-    x_u: &[f64],
 ) -> f64 {
-    // T3.1: dropped the ripopt-specific per-component `(1 + |grad_f_i|)`
-    // divisor. Ipopt's `IpIpoptCalculatedQuantities::curr_dual_infeasibility`
-    // computes the raw max-norm of `grad_f + J^T y - z_L + z_U` and only
-    // applies the global `s_d` scaling at the convergence-test boundary
-    // (`IpOptErrorConvCheck.cpp:208`). The per-component normalisation
-    // could declare false-Optimal on problems with one large gradient
-    // component shadowing uniformly small residuals.
-    //
-    // T3.9: kappa_d damping for one-sided-bound vars
-    // (IpIpoptCalculatedQuantities.cpp:888-899).
     let mut residual = vec![0.0; n];
     residual[..n].copy_from_slice(&grad_f[..n]);
     for (idx, (&row, &col)) in jac_rows.iter().zip(jac_cols.iter()).enumerate() {
@@ -372,17 +348,6 @@ pub fn dual_infeasibility_scaled(
     for i in 0..n {
         residual[i] -= z_l[i];
         residual[i] += z_u[i];
-    }
-    if kappa_d > 0.0 {
-        for i in 0..n {
-            let l_fin = x_l[i].is_finite();
-            let u_fin = x_u[i].is_finite();
-            if l_fin && !u_fin {
-                residual[i] += kappa_d * mu;
-            } else if !l_fin && u_fin {
-                residual[i] -= kappa_d * mu;
-            }
-        }
     }
     residual.iter().map(|r| r.abs()).fold(0.0f64, f64::max)
 }
@@ -805,14 +770,12 @@ mod tests {
         // Need z_l, z_u such that residual = 0
         let z_l = vec![0.5, 1.5];
         let z_u = vec![0.0, 0.0];
-        let x_l = vec![f64::NEG_INFINITY, f64::NEG_INFINITY];
-        let x_u = vec![f64::INFINITY, f64::INFINITY];
-        let di = dual_infeasibility(&grad_f, &jac_rows, &jac_cols, &jac_vals, &lambda, &z_l, &z_u, n, 0.0, 0.0, &x_l, &x_u);
+        let di = dual_infeasibility(&grad_f, &jac_rows, &jac_cols, &jac_vals, &lambda, &z_l, &z_u, n);
         assert!(di < 1e-12, "Exact stationarity should give 0, got {}", di);
 
         // Nonzero case
         let z_l2 = vec![0.0, 0.0];
-        let di2 = dual_infeasibility(&grad_f, &jac_rows, &jac_cols, &jac_vals, &lambda, &z_l2, &z_u, n, 0.0, 0.0, &x_l, &x_u);
+        let di2 = dual_infeasibility(&grad_f, &jac_rows, &jac_cols, &jac_vals, &lambda, &z_l2, &z_u, n);
         assert!(di2 > 0.1, "Non-stationary should give positive dual_inf");
     }
 
@@ -835,19 +798,22 @@ mod tests {
         let lambda = vec![-0.5];
         let z_l = vec![0.5, 1.5];
         let z_u = vec![0.0, 0.0];
-        let x_l = vec![f64::NEG_INFINITY, f64::NEG_INFINITY];
-        let x_u = vec![f64::INFINITY, f64::INFINITY];
         // At stationarity, both scaled and unscaled should be ~0
-        let di_s = dual_infeasibility_scaled(&grad_f, &jac_rows, &jac_cols, &jac_vals, &lambda, &z_l, &z_u, n, 0.0, 0.0, &x_l, &x_u);
+        let di_s = dual_infeasibility_scaled(&grad_f, &jac_rows, &jac_cols, &jac_vals, &lambda, &z_l, &z_u, n);
         assert!(di_s < 1e-12, "Scaled stationarity should give 0, got {}", di_s);
     }
 
-    /// T3.9: For a one-sided lower-bounded variable, the kappa_d damping
-    /// should add `+ kappa_d * mu` to grad_lag, exactly canceling a small
-    /// negative raw residual driven by an over-estimated z_l.
-    /// Mirrors `IpIpoptCalculatedQuantities.cpp:888-899`.
+    /// DEV-1: The convergence-test `dual_infeasibility` MUST mirror
+    /// Ipopt's plain `curr_grad_lag_x` (no κ_d damping). For a
+    /// one-sided lower-bounded variable with a small negative raw
+    /// residual, the function must report the residual verbatim — the
+    /// damping that would otherwise mask it lives in
+    /// `curr_grad_lag_with_damping_x` and is used only by the barrier
+    /// objective and Newton RHS, not the convergence test
+    /// (`IpOptErrorConvCheck.cpp:208` → `curr_dual_infeasibility` →
+    /// `curr_grad_lag_x`).
     #[test]
-    fn test_dual_infeasibility_kappa_d_one_sided_lower_cancels() {
+    fn test_dual_infeasibility_no_kappa_d_damping_at_convergence_test() {
         let n = 1;
         let grad_f = vec![1.0];
         let jac_rows: Vec<usize> = vec![];
@@ -857,103 +823,12 @@ mod tests {
         // raw grad_lag = grad_f - z_l = 1.0 - (1.0 + 1e-6) = -1e-6
         let z_l = vec![1.0 + 1e-6];
         let z_u = vec![0.0];
-        let x_l = vec![0.0];
-        let x_u = vec![f64::INFINITY];
-        let kappa_d = 1e-5;
-        let mu = 0.1;
-        // damped = -1e-6 + kappa_d*mu = -1e-6 + 1e-6 = 0
         let di = dual_infeasibility(
             &grad_f, &jac_rows, &jac_cols, &jac_vals, &lambda, &z_l, &z_u, n,
-            kappa_d, mu, &x_l, &x_u,
-        );
-        assert!(di < 1e-15, "damped one-sided-lower should be ~0, got {}", di);
-
-        // Without damping, the residual should be visible at 1e-6.
-        let di_undamped = dual_infeasibility(
-            &grad_f, &jac_rows, &jac_cols, &jac_vals, &lambda, &z_l, &z_u, n,
-            0.0, 0.0, &x_l, &x_u,
         );
         assert!(
-            (di_undamped - 1e-6).abs() < 1e-15,
-            "undamped should expose 1e-6 residual, got {}",
-            di_undamped,
-        );
-    }
-
-    /// T3.9: For a one-sided upper-bounded variable, the kappa_d damping
-    /// should subtract `kappa_d * mu` from grad_lag, canceling a small
-    /// positive raw residual.
-    #[test]
-    fn test_dual_infeasibility_kappa_d_one_sided_upper_cancels() {
-        let n = 1;
-        let grad_f = vec![-1.0];
-        let jac_rows: Vec<usize> = vec![];
-        let jac_cols: Vec<usize> = vec![];
-        let jac_vals: Vec<f64> = vec![];
-        let lambda: Vec<f64> = vec![];
-        // raw grad_lag = grad_f + z_u = -1.0 + (1.0 + 1e-6) = +1e-6
-        let z_l = vec![0.0];
-        let z_u = vec![1.0 + 1e-6];
-        let x_l = vec![f64::NEG_INFINITY];
-        let x_u = vec![0.0];
-        let kappa_d = 1e-5;
-        let mu = 0.1;
-        // damped = +1e-6 - kappa_d*mu = +1e-6 - 1e-6 = 0
-        let di = dual_infeasibility(
-            &grad_f, &jac_rows, &jac_cols, &jac_vals, &lambda, &z_l, &z_u, n,
-            kappa_d, mu, &x_l, &x_u,
-        );
-        assert!(di < 1e-15, "damped one-sided-upper should be ~0, got {}", di);
-    }
-
-    /// T3.9: A free (no-bounds) variable receives no damping; the
-    /// residual is exactly |grad_f|.
-    #[test]
-    fn test_dual_infeasibility_kappa_d_free_var_undamped() {
-        let n = 1;
-        let grad_f = vec![0.5];
-        let jac_rows: Vec<usize> = vec![];
-        let jac_cols: Vec<usize> = vec![];
-        let jac_vals: Vec<f64> = vec![];
-        let lambda: Vec<f64> = vec![];
-        let z_l = vec![0.0];
-        let z_u = vec![0.0];
-        let x_l = vec![f64::NEG_INFINITY];
-        let x_u = vec![f64::INFINITY];
-        let di = dual_infeasibility(
-            &grad_f, &jac_rows, &jac_cols, &jac_vals, &lambda, &z_l, &z_u, n,
-            1e-5, 0.1, &x_l, &x_u,
-        );
-        assert!(
-            (di - 0.5).abs() < 1e-15,
-            "free var must not be damped, got {}",
-            di,
-        );
-    }
-
-    /// T3.9: A two-sided-bounded variable should see the +kappa_d*mu
-    /// and -kappa_d*mu terms cancel, leaving the raw residual unchanged.
-    /// Mirrors Ipopt's `Px_L*1 - Px_U*1` projection algebra.
-    #[test]
-    fn test_dual_infeasibility_kappa_d_two_sided_no_net_damping() {
-        let n = 1;
-        let grad_f = vec![0.25];
-        let jac_rows: Vec<usize> = vec![];
-        let jac_cols: Vec<usize> = vec![];
-        let jac_vals: Vec<f64> = vec![];
-        let lambda: Vec<f64> = vec![];
-        let z_l = vec![0.0];
-        let z_u = vec![0.0];
-        // Two-sided: both bounds finite — net damping must be zero.
-        let x_l = vec![-1.0];
-        let x_u = vec![1.0];
-        let di = dual_infeasibility(
-            &grad_f, &jac_rows, &jac_cols, &jac_vals, &lambda, &z_l, &z_u, n,
-            1e-5, 0.1, &x_l, &x_u,
-        );
-        assert!(
-            (di - 0.25).abs() < 1e-15,
-            "two-sided var must see no net damping, got {}",
+            (di - 1e-6).abs() < 1e-15,
+            "convergence-test dual_inf must expose raw residual, got {}",
             di,
         );
     }

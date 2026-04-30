@@ -8127,18 +8127,15 @@ fn compute_grad_theta_norm(state: &SolverState) -> f64 {
 /// `IpIpoptCalculatedQuantities::curr_dual_infeasibility` over both
 /// x and s blocks).
 fn compute_dual_inf_at_state(state: &SolverState) -> f64 {
-    // A8.10: Ipopt's `curr_dual_infeasibility`
+    // A8.10 / DEV-1: Ipopt's `curr_dual_infeasibility`
     // (`IpIpoptCalculatedQuantities.cpp:2682-2691`) calls the *plain*
-    // `curr_grad_lag_x()` / `curr_grad_lag_s()` (lines 2016-2024,
-    // 2088-2122) — no κ_d damping. The damped variants
+    // `curr_grad_lag_x()` / `curr_grad_lag_s()` (lines 1993-2030,
+    // 2069-2098) — no κ_d damping. The damped variants
     // (`curr_grad_lag_with_damping_x/s`, lines 2131-2227) are used
     // *only* in the augmented-system RHS (`curr_grad_barrier_obj_x`).
-    // Pass `kappa_d=0.0` so the printed inf_du and the convergence
-    // test match Ipopt's metric exactly.
     let x_part = convergence::dual_infeasibility(
         &state.grad_f, &state.jac_rows, &state.jac_cols, &state.jac_vals,
         &state.y, &state.z_l, &state.z_u, state.n,
-        0.0, state.mu, &state.x_l, &state.x_u,
     );
     x_part.max(slack_dual_inf_max(state))
 }
@@ -8174,12 +8171,11 @@ fn slack_dual_inf_max(state: &SolverState) -> f64 {
 /// by [`recover_active_set_z`] for an optimistic optimality probe)
 /// instead of `state.z_l`/`state.z_u`.
 fn dual_inf_with_z(state: &SolverState, z_l: &[f64], z_u: &[f64]) -> f64 {
-    // A8.10: plain `curr_dual_infeasibility` — no κ_d damping
+    // A8.10 / DEV-1: plain `curr_dual_infeasibility` — no κ_d damping
     // (`IpIpoptCalculatedQuantities.cpp:2682-2691`).
     convergence::dual_infeasibility(
         &state.grad_f, &state.jac_rows, &state.jac_cols, &state.jac_vals,
         &state.y, z_l, z_u, state.n,
-        0.0, state.mu, &state.x_l, &state.x_u,
     )
 }
 
@@ -8209,12 +8205,11 @@ fn compute_primal_inf_internal_max_at_state(state: &SolverState) -> f64 {
 /// B7: also folds in `slack_dual_inf_max` so the unscaled view of dual
 /// feasibility sees the slack-side residual too.
 fn compute_dual_inf_unscaled_at_state(state: &SolverState) -> f64 {
-    // A8.10: plain `curr_dual_infeasibility` — no κ_d damping
+    // A8.10 / DEV-1: plain `curr_dual_infeasibility` — no κ_d damping
     // (`IpIpoptCalculatedQuantities.cpp:2682-2691`).
     let x_part = convergence::dual_infeasibility_scaled(
         &state.grad_f, &state.jac_rows, &state.jac_cols, &state.jac_vals,
         &state.y, &state.z_l, &state.z_u, state.n,
-        0.0, state.mu, &state.x_l, &state.x_u,
     );
     x_part.max(slack_dual_inf_max(state))
 }
