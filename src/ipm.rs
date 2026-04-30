@@ -4206,8 +4206,20 @@ fn update_barrier_parameter_fixed_mode(
         // subproblem is solved at the current μ (or a tiny step was taken),
         // decrease μ. With `mu_allow_fast_monotone_decrease`, allow several
         // consecutive decreases per outer iteration; otherwise stop after one.
-        // Cap at 4 to bound work.
-        const MAX_FAST_DECREASES: usize = 4;
+        //
+        // DEV-3: floor mu at `min(tol, compl_inf_tol) / (barrier_tol_factor + 1)`
+        // per IpMonotoneMuUpdate.cpp:215 — Ipopt won't drive mu below the
+        // level the convergence test cannot benefit from, preventing the
+        // algorithm from latching into pathological super-tight subproblems.
+        // ripopt's `mu_min` (default 1e-11) is preserved as an absolute
+        // hard-floor below the Ipopt formula.
+        //
+        // DEV-4: removed the `MAX_FAST_DECREASES = 4` cap; Ipopt loops
+        // while-solved without bound (IpMonotoneMuUpdate.cpp:130-200).
+        let mu_floor = options
+            .tol
+            .min(options.compl_inf_tol)
+            / (options.barrier_tol_factor + 1.0);
         let mut decreases = 0usize;
         let mut tiny_step = mu_state.tiny_step;
         loop {
@@ -4216,6 +4228,7 @@ fn update_barrier_parameter_fixed_mode(
             if !(solved || tiny_step) { break; }
             let new_mu = (options.mu_linear_decrease_factor * state.mu)
                 .min(state.mu.powf(options.mu_superlinear_decrease_power))
+                .max(mu_floor)
                 .max(options.mu_min);
             let mu_changed = (new_mu - state.mu).abs() > 1e-20;
             if !mu_changed { break; }
@@ -4224,7 +4237,6 @@ fn update_barrier_parameter_fixed_mode(
             tiny_step = false;
             log::debug!("Fixed mode: mu decreased to {:.2e}", state.mu);
             if !options.mu_allow_fast_monotone_decrease { break; }
-            if decreases >= MAX_FAST_DECREASES { break; }
         }
         if decreases > 0 {
             reset_filter_with_current_theta(state, filter);
