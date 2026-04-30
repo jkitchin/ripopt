@@ -5850,6 +5850,17 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         rip_log!("ripopt: Starting main loop (n={}, m={})", n, m);
     }
 
+    // A8.7: hoist `aug_solver` above the IPM loop so its symbolic
+    // factorization / CSC pattern caches persist across iterations.
+    // The augmented-KKT sparsity pattern is fixed by the Hessian and
+    // Jacobian patterns (Σ values + δ perturbations only change the
+    // numeric diagonal, not the structure), so feral's first-call
+    // symbolic analysis only needs to run once per solve. Without
+    // hoisting, every iter constructed a fresh `FeralLdl` and re-ran
+    // METIS-style ordering — measured at ~1.5s/iter on Mittelmann
+    // ex8_2_3 (90% of total wall time before this fix).
+    let mut aug_solver: Box<dyn LinearSolver> = new_fallback_solver(use_sparse);
+
     // Main IPM loop
     for iteration in 0..options.max_iter {
         state.iter = iteration;
@@ -6084,7 +6095,8 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         // A7.8: pick the linear solver per the (n+m, sparse_threshold)
         // sizing cutoff already used by the rest of the IPM. Aug matrix is
         // assembled in matching layout (sparse vs dense) below.
-        let mut aug_solver: Box<dyn LinearSolver> = new_fallback_solver(use_sparse);
+        // A8.7: `aug_solver` is hoisted above the loop so its symbolic
+        // cache persists across iterations.
         let probing = options.mehrotra_pc;
         let (step, _dc, mu_new_opt, aug_kkt) = if probing {
             let avg_compl = compute_avg_complementarity(&state);

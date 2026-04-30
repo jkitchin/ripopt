@@ -815,8 +815,20 @@ pub fn factor_aug_with_inertia_correction(
     let mut tried_increase_quality = false;
     for _attempt in 0..params.max_attempts {
         // δ_x = δ_s, δ_c = δ_d.
+        let trace_factor = std::env::var("RIPOPT_TRACE_FACTOR").is_ok();
+        let t_assemble = if trace_factor { Some(std::time::Instant::now()) } else { None };
         let perturbed = apply_aug_perturbation(&aug.matrix, n, n_c, n_d, dx, dx, dc, dc);
+        let dt_assemble = t_assemble.map(|t| t.elapsed());
+        let t_factor = if trace_factor { Some(std::time::Instant::now()) } else { None };
         let inertia = solver.factor(&perturbed)?;
+        if trace_factor {
+            let diag = solver.last_factor_diagnostics();
+            eprintln!(
+                "factor-trace: assemble={:?} factor={:?} factor_nnz={:?} n={}",
+                dt_assemble.unwrap(), t_factor.unwrap().elapsed(),
+                diag.factor_nnz, aug.dim
+            );
+        }
 
         let (positive, negative, zero) = match inertia {
             Some(i) => (i.positive, i.negative, i.zero),
