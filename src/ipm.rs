@@ -2346,6 +2346,18 @@ fn update_dual_variables<P: NlpProblem>(
     // :969-998 (closed-form 1D minimizer for MinDualInfeas variants).
     let alpha_p = state.alpha_primal;
     let alpha_d = alpha_dual_max;
+    // DEV-32: PRIMAL_AND_FULL / DUAL_AND_FULL switch to the full step
+    // when the *primal step infinity norm* is small, not when the
+    // primal/dual step length is large. Per Ipopt
+    // IpBacktrackingLineSearch.cpp:937-958 and the option
+    // documentation at line 95-96/103-104:
+    //   dxnorm = max(|delta_x|_inf, |delta_s|_inf)
+    //   if dxnorm <= alpha_for_y_tol → alpha_y = 1
+    let dxnorm = || -> f64 {
+        let dx_inf = state.dx.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+        let ds_inf = state.ds.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+        dx_inf.max(ds_inf)
+    };
     let alpha_y = match options.alpha_for_y {
         AlphaForY::Primal => alpha_p,
         AlphaForY::BoundMult => alpha_d,
@@ -2353,10 +2365,10 @@ fn update_dual_variables<P: NlpProblem>(
         AlphaForY::Max => alpha_p.max(alpha_d),
         AlphaForY::Full => 1.0,
         AlphaForY::PrimalAndFull => {
-            if alpha_p >= options.alpha_for_y_tol { 1.0 } else { alpha_p }
+            if dxnorm() <= options.alpha_for_y_tol { 1.0 } else { alpha_p }
         }
         AlphaForY::DualAndFull => {
-            if alpha_d >= options.alpha_for_y_tol { 1.0 } else { alpha_d }
+            if dxnorm() <= options.alpha_for_y_tol { 1.0 } else { alpha_d }
         }
         AlphaForY::MinDualInfeas | AlphaForY::SaferMinDualInfeas => {
             compute_min_dual_infeas_alpha(state, problem, options.alpha_for_y, alpha_p, alpha_d)
