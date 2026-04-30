@@ -1485,7 +1485,7 @@ fn print_final_summary(result: &SolveResult) {
         SolveStatus::LocalInfeasibility => "Converged to a point of local infeasibility.",
         SolveStatus::MaxIterations => "Maximum Number of Iterations Exceeded.",
         SolveStatus::NumericalError => "Numerical Difficulties Encountered.",
-        SolveStatus::Unbounded => "Diverging Iterates -- Problem May Be Unbounded.",
+        SolveStatus::DivergingIterates => "Diverging Iterates -- Problem May Be Unbounded.",
         SolveStatus::RestorationFailed => "Restoration Failed.",
         SolveStatus::EvaluationError => "Evaluation Error.",
         SolveStatus::UserRequestedStop => "User Requested Stop.",
@@ -4296,7 +4296,7 @@ fn check_convergence_and_handle_promotions(
             Some(make_result(state, SolveStatus::Acceptable))
         }
         ConvergenceStatus::Diverging => {
-            Some(make_result(state, SolveStatus::Unbounded))
+            Some(make_result(state, SolveStatus::DivergingIterates))
         }
         ConvergenceStatus::NotConverged => None,
     }
@@ -4601,36 +4601,13 @@ fn check_almost_feasible_guard(
     Some(make_result(state, SolveStatus::NumericalError))
 }
 
-/// Detect unboundedness by requiring 10 consecutive iterations of
-/// `obj < -1e20` at a feasible iterate. The counter prevents false
-/// positives from transient dips.
-///
-/// **ripopt-specific (T3.22, no Ipopt analog).** Ipopt 3.14 has no
-/// `Unbounded` exit status: it relies on the user to set
-/// `nlp_lower_bound_inf` (default −1e19) and to bound objectives that
-/// could legitimately diverge; an unbounded NLP typically manifests as
-/// `Diverging_Iterates` (`x` magnitude exceeding the
-/// `diverging_iterates_tol` threshold, default 1e20) rather than as an
-/// objective-value test. This routine is a defensive ripopt convenience
-/// for callers that pass an objective with no lower bound — kept until
-/// T3.21 ports Ipopt's diverging-iterates check, after which
-/// `SolveStatus::Unbounded` itself is also up for review.
-fn detect_unbounded(
-    state: &SolverState,
-    options: &SolverOptions,
-    primal_inf: f64,
-    consecutive_unbounded: &mut usize,
-) -> Option<SolveResult> {
-    if state.obj < -1e20 && primal_inf < options.constr_viol_tol {
-        *consecutive_unbounded += 1;
-        if *consecutive_unbounded >= 10 {
-            return Some(make_result(state, SolveStatus::Unbounded));
-        }
-    } else {
-        *consecutive_unbounded = 0;
-    }
-    None
-}
+// DEV-7: removed `detect_unbounded`. The objective-magnitude heuristic
+// (10 consecutive iters with `obj < -1e20` at feasibility) had no Ipopt
+// analog and could mis-fire on legitimate large-objective problems.
+// Ipopt 3.14's actual divergence detector is `‖x‖_∞ >
+// diverging_iterates_tol` in IpOptErrorConvCheck (`IpOptErrorConvCheck.cpp:255`),
+// already wired through `convergence::check_convergence` →
+// `ConvergenceStatus::Diverging` → `SolveStatus::DivergingIterates`.
 
 /// Primal-infeasibility divergence detector.
 ///
@@ -5756,8 +5733,9 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
     // Hessian regularization delta from previous iteration (for intermediate callback).
     let prev_ic_delta_w: f64 = 0.0;
 
-    // Consecutive iterations with obj < -1e20 for robust unbounded detection
-    let mut consecutive_unbounded: usize = 0;
+    // DEV-7: removed `consecutive_unbounded` counter; Ipopt-aligned
+    // divergence is checked via `ConvergenceStatus::Diverging` driven by
+    // `info.x_max_abs > options.diverging_iterates_tol` in convergence.rs.
 
     // Initial evaluation with NaN/Inf recovery by bound-push perturbation.
     if let Err(result) = initial_evaluate_with_recovery(
@@ -5991,15 +5969,6 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             iteration,
             primal_inf,
             &mut feas,
-        ) {
-            return result;
-        }
-
-        if let Some(result) = detect_unbounded(
-            &state,
-            options,
-            primal_inf,
-            &mut consecutive_unbounded,
         ) {
             return result;
         }

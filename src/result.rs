@@ -22,8 +22,11 @@ pub enum SolveStatus {
     MaxIterations,
     /// Numerical difficulties (e.g., singular KKT system).
     NumericalError,
-    /// Problem appears unbounded below.
-    Unbounded,
+    /// Iterates diverged: ‖x‖_∞ exceeded `diverging_iterates_tol`
+    /// (default 1e20). Mirrors Ipopt 3.14's
+    /// `Diverging_Iterates` (`IpReturnCodes_inc.h`); the legitimate
+    /// signature of an unbounded NLP after the bound-relaxation push.
+    DivergingIterates,
     /// Restoration phase failed.
     RestorationFailed,
     /// User callback returned `false`, indicating evaluation failure at the

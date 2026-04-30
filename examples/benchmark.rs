@@ -392,7 +392,7 @@ fn status_string(s: SolveStatus) -> &'static str {
         SolveStatus::NumericalError => "NumericalError",
         SolveStatus::EvaluationError => "EvaluationError",
         SolveStatus::UserRequestedStop => "UserRequestedStop",
-        SolveStatus::Unbounded => "Unbounded",
+        SolveStatus::DivergingIterates => "DivergingIterates",
         SolveStatus::RestorationFailed => "RestorationFailed",
         SolveStatus::InternalError => "InternalError",
         SolveStatus::LocalInfeasibility => "LocalInfeasibility",

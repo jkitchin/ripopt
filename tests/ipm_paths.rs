@@ -306,10 +306,10 @@ fn ipm_unbounded_detection() {
     // Without bounds, the solver may detect unboundedness, hit numerical issues,
     // reach max iterations, or declare acceptable at a large negative objective.
     assert!(
-        result.status == SolveStatus::Unbounded
+        result.status == SolveStatus::DivergingIterates
             || result.status == SolveStatus::NumericalError
             || result.status == SolveStatus::MaxIterations,
-        "Expected Unbounded/NumericalError/MaxIterations, got {:?}",
+        "Expected DivergingIterates/NumericalError/MaxIterations, got {:?}",
         result.status
     );
 }

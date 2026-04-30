@@ -343,7 +343,7 @@ fn map_status(s: SolveStatus) -> RipoptReturnStatus {
         SolveStatus::UserRequestedStop => RipoptReturnStatus::UserRequestedStop,
         // Ipopt maps STOP_AT_TINY_STEP to Search_Direction_Becomes_Too_Small.
         SolveStatus::StopAtTinyStep => RipoptReturnStatus::SearchDirectionTooSmall,
-        SolveStatus::Unbounded => RipoptReturnStatus::DivergingIterates,
+        SolveStatus::DivergingIterates => RipoptReturnStatus::DivergingIterates,
         SolveStatus::InternalError => RipoptReturnStatus::InternalError,
     }
 }

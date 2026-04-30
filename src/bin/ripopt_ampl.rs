@@ -108,7 +108,7 @@ fn main() {
             ripopt::SolveStatus::LocalInfeasibility => "LocalInfeasibility",
             ripopt::SolveStatus::MaxIterations => "MaxIterations",
             ripopt::SolveStatus::NumericalError => "NumericalError",
-            ripopt::SolveStatus::Unbounded => "Unbounded",
+            ripopt::SolveStatus::DivergingIterates => "DivergingIterates",
             ripopt::SolveStatus::RestorationFailed => "RestorationFailed",
             ripopt::SolveStatus::InternalError => "InternalError",
             ripopt::SolveStatus::EvaluationError => "EvaluationError",
