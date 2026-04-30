@@ -744,3 +744,88 @@ makes the surface change benign.
 - Audit ripopt's mu-oracle (`compute_quality_function_mu`,
   `compute_loqo_mu`) for safety at infeasible iterates so that adaptive
   strategy itself can be re-enabled per-problem without diverging.
+
+## A8.15 — re-measurement after DEV-1..DEV-24 audit fixes (2026-04-30)
+
+After landing 10 systematic Ipopt-alignment fixes from the v0.8 DEV
+audit (commits `0f426d7` DEV-1 → `ace902a` DEV-23: kappa_d removal,
+Loqo Free-mode fallback, monotone mu floor + uncapped cascade,
+`Diverging_Iterates` rename, restoration success gate alignment,
+restoration bound-push proximity, watchdog filter-gamma margins,
+filter `theta_max` non-bump, switching-condition non-strict), the
+arki0003 dual-stagnation pattern is **still present**. Trace at
+`benchmarks/mittelmann/logs/ripopt/arki0003_post_dev_audit.log`.
+
+### Current trajectory (max_iter=1500, hits 5min wall-time)
+
+Cumulative DEV fixes change *when* the cascade fires but not the
+underlying behavior:
+
+```
+iter  obj           inf_pr    inf_du    compl     lg(mu)
+312   1.109e7       1.17e-4   8.35e3    2.32e-1   1.00e-1
+313   1.102e7       4.45e-4   6.97e-1   5.15e-1   1.50e-4   ← 3-step cascade
+314   1.087e7       2.18e-4   2.84e1    1.37e-1   1.50e-4   ← inf_du blows back
+315-450  obj decreasing 1.1e7 → 2.8e6 with inf_du oscillating 100-700, mu pinned at 1.50e-4
+```
+
+The cascade math: from `mu=1e-1` Ipopt's `min(linear*mu, mu^super)`
+gives 0.1 → 0.02 → 2.83e-3 → 1.50e-4 (three promotions). With
+`mu_allow_fast_monotone_decrease=true` (Ipopt's default), Ipopt
+loops `while sub_problem_error <= barrier_tol_factor*mu` and so
+ripopt's three-step cascade in one iteration is **Ipopt-aligned** —
+verified against `IpMonotoneMuUpdate.cpp:130-200`. Not the bug.
+
+The post-cascade blow-up is also expected post-cascade behavior: at
+the new `mu=1.5e-4`, the dual residual at the previous iterate is
+naturally large because multipliers were tuned for `mu=1e-1`.
+
+The actual fault: **mu stays pinned at 1.5e-4 forever** because
+`barrier_subproblem_solved` (`barrier_err <= 10*mu = 1.5e-3`) is
+never met again — `inf_du` stays in the hundreds.
+
+### Comparison vs Ipopt (same problem, default options)
+
+```
+                    iter   obj         lg(mu)   inf_du
+ripopt iter 312     312    1.11e7      -1.0     8.35e3
+ipopt iter 302      302    3.7952e3    -8.6     5.50e1
+```
+
+Ipopt is at the **optimum's basin** (obj=3795, mu=2.5e-9) at iter
+302. ripopt is still in the **far field** (obj=1.1e7, mu=1e-1) at
+the same iter count. The cascade is not the problem — the *primal
+trajectory* is wrong from much earlier than the cascade fires.
+
+### What the DEV audit did and did not fix
+
+The DEV audit corrected 10 misalignments in convergence test, mu
+update, restoration gates, and filter math. None of these are on
+the per-iteration step / line-search hot path. arki0003's symptom
+is in the iter 1-300 trajectory: ripopt drives `‖y‖_∞ → 1e7` at
+row 1904 while Ipopt holds `‖y‖_∞ = O(10)`. The DEV-fixes do not
+touch the mechanism that determines this.
+
+### Where to look next
+
+1. **Step computation at the iter 100-300 regime.** The step at
+   iter 312 has α_pr=1.37e-3 — typical of late-phase fixed-mu
+   stagnation. Compare ripopt's iter-100 KKT solve with Ipopt's
+   on the same iterate (need to dump x, y, z values at a specific
+   iter and run both solvers from there).
+
+2. **Dual update size limits.** At iter 1, ripopt's ‖y‖_∞ went
+   0.99 → 2.2 → 28 → 5e4 → 1.5e7 over 54 iters with growth
+   concentrated on row 1904 (an equality). Ipopt's bound on dual
+   update size during the centering phase isn't currently
+   enforced/matched.
+
+3. **Filter sufficient-progress for h-type vs f-type at large
+   theta**. arki0003 spends 70+ iters at `theta ≈ 1e8` (i.e.
+   theta >> theta_min). Filter sufficient-progress in this regime
+   permits weak θ-decrease only — verify alpha_min computation
+   doesn't discard reasonable steps prematurely.
+
+This is the open work for A8.15+ sessions; do not re-implement
+the failed A8.5 IR-residual feedback (see §A8.5 above).
+
