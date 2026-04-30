@@ -4740,7 +4740,17 @@ fn handle_near_tolerance_stall(
     mu_state: &mut MuState,
     stall: &mut ProgressStallTracker,
 ) -> StallDecision {
-    if state.mu < primal_inf_max * 0.01 && primal_inf_max > options.constr_viol_tol {
+    // A8.13: μ-boost on stall is a ripopt-specific recovery with no
+    // analogue in Ipopt's `IpMonotoneMuUpdate.cpp`, where μ decreases
+    // monotonically and stall handling is left to the filter line
+    // search + AcceptableLevel termination. Restrict to adaptive
+    // strategy only — under monotone (the Ipopt default) a μ-boost
+    // violates the monotone invariant and produced an iter-685 spike
+    // on arki0003 (μ jumped 1e-3 → 2.21e2). See A8 follow-up doc.
+    if options.mu_strategy_adaptive
+        && state.mu < primal_inf_max * 0.01
+        && primal_inf_max > options.constr_viol_tol
+    {
         let new_mu = (primal_inf_max * 0.1).max(1e-6);
         if options.print_level >= 3 {
             rip_log!(
@@ -4814,7 +4824,12 @@ fn try_boost_mu_for_stall(
     primal_inf_max: f64,
     stall: &mut ProgressStallTracker,
 ) -> Option<StallDecision> {
-    if !(primal_inf_max < 0.1 && state.mu < primal_inf_max * 0.01) {
+    // A8.13: same gate as `handle_near_tolerance_stall` — μ-boost has
+    // no analogue in Ipopt's monotone path; restrict to adaptive.
+    if !(options.mu_strategy_adaptive
+        && primal_inf_max < 0.1
+        && state.mu < primal_inf_max * 0.01)
+    {
         return None;
     }
     let new_mu = (primal_inf_max * 0.1).max(1e-6);
