@@ -7222,15 +7222,18 @@ fn filter_accepts_restored_iterate(
 /// spec §7.7). Decision tree:
 /// 1. theta_new < min(tol, constr_viol_tol) → Success (achieved feasibility,
 ///    matches Ipopt's "small_threshold" gate).
-/// 2. theta_new ≤ 0.5*theta_current → Success (50% reduction, ripopt-specific
-///    lenient path that helps NLP restoration recover when θ_current is small;
-///    subsumed by gate 3 when `kappa_resto >= 0.5`).
-/// 3. theta_new ≤ kappa_resto * theta_current AND filter-acceptable → Success
+/// 2. theta_new ≤ kappa_resto * theta_current AND filter-acceptable → Success
 ///    (Ipopt's primary `required_infeasibility_reduction` gate, default 0.9).
-/// 4. inner_converged but no feasibility improvement → LocalInfeasibility
+/// 3. inner_converged but no feasibility improvement → LocalInfeasibility
 ///    (the restoration NLP itself reached a stationary point of the
 ///    L1-feasibility objective with positive residual).
-/// 5. Otherwise → Failed.
+/// 4. Otherwise → Failed.
+///
+/// DEV-9: removed the lenient `theta_new ≤ 0.5 * theta_current` gate.
+/// Ipopt's primary success criterion is the `kappa_resto` reduction
+/// AND filter acceptance — never one without the other. The 50% gate
+/// could accept restoration exits that the filter would reject, biasing
+/// the next iterate.
 fn classify_restoration_outcome(
     filter: &Filter,
     options: &SolverOptions,
@@ -7241,9 +7244,6 @@ fn classify_restoration_outcome(
 ) -> RestorationOutcome {
     let small_threshold = options.tol.min(options.constr_viol_tol);
     if theta_new < small_threshold {
-        return RestorationOutcome::Success;
-    }
-    if theta_new <= 0.5 * theta_current {
         return RestorationOutcome::Success;
     }
     if theta_new <= options.kappa_resto * theta_current
