@@ -8856,13 +8856,33 @@ fn compute_avg_complementarity(state: &SolverState) -> f64 {
     }
 }
 
-/// Compute barrier error for fixed-mode subproblem convergence check.
-/// This is the optimality error of the current barrier subproblem (for fixed mu).
+/// Barrier-subproblem optimality error E_μ(x, λ, z), the gate that
+/// `update_barrier_parameter_fixed_mode` checks against
+/// `barrier_tol_factor * mu` to decide whether the current subproblem
+/// is "solved" enough to decrement μ. Mirrors Ipopt's
+/// `IpoptCalculatedQuantities::curr_barrier_error()`
+/// (`IpIpoptCalculatedQuantities.cpp:3148-3196`):
+///
+///   E_μ = max( ‖∇L‖_∞ / s_d,
+///              ‖c‖_∞,
+///              max_i |slack_i · z_i − μ| / s_c )
+///
+/// where `s_d`, `s_c` are the L1-mean multiplier scalings from
+/// `ComputeOptimalityErrorScaling` (`IpIpoptCalculatedQuantities.cpp:3663-3700`,
+/// `s_max = 100`). All three components use the L∞ norm; only s_d/s_c
+/// internally average over multiplier counts.
+///
+/// The previous ripopt implementation used L1/n on the dual term and
+/// the L1 mean on complementarity (instead of L∞), and added a
+/// `du_floor = 0.1 * unscaled_du` heuristic that had no Ipopt analogue
+/// and prevented μ from decreasing whenever NLP-level dual_inf was
+/// large — exactly the dual-stagnation symptom seen on arki0003 where
+/// μ froze at lg(μ)=2.83e-3 for 500+ iterations.
 fn compute_barrier_error(state: &SolverState) -> f64 {
     let n = state.n;
 
-    // Dual infeasibility of barrier problem:
-    // grad_f + J^T y - z_l + z_u
+    // ∇L = ∇f + J^T y − z_l + z_u (un-damped; matches
+    // `curr_grad_lag_x` at IpIpoptCalculatedQuantities.cpp:1993-2030)
     let mut grad_lag = state.grad_f.clone();
     accumulate_jt_y(state, &mut grad_lag);
     for i in 0..n {
@@ -8873,39 +8893,39 @@ fn compute_barrier_error(state: &SolverState) -> f64 {
             grad_lag[i] += state.z_u[i];
         }
     }
+    let s_d = compute_s_d_at_state(state);
+    let dual_err = linf_norm(&grad_lag) / s_d;
 
-    let sd = n.max(1) as f64;
-    let dual_err = l1_norm(&grad_lag) / sd;
-
-    // Complementarity error (relative to mu)
-    let mut compl_err = 0.0;
-    let mut count = 0;
+    // L∞ of the perturbed complementarity (`X·z − μ·e` per
+    // IpIpoptCalculatedQuantities.cpp:2799-2871, scaled by s_c).
+    let s_c = compute_residual_scaling(
+        compute_bound_multiplier_sum(state),
+        compute_bound_multiplier_count(state),
+    );
+    let mut compl_max: f64 = 0.0;
     for i in 0..n {
         if state.x_l[i].is_finite() {
-            let slack = slack_xl(state, i);
-            compl_err += (slack * state.z_l[i] - state.mu).abs();
-            count += 1;
+            let r = (slack_xl(state, i) * state.z_l[i] - state.mu).abs();
+            if r > compl_max {
+                compl_max = r;
+            }
         }
         if state.x_u[i].is_finite() {
-            let slack = slack_xu(state, i);
-            compl_err += (slack * state.z_u[i] - state.mu).abs();
-            count += 1;
+            let r = (slack_xu(state, i) * state.z_u[i] - state.mu).abs();
+            if r > compl_max {
+                compl_max = r;
+            }
         }
     }
-    if count > 0 {
-        compl_err /= count as f64;
-    }
+    let compl_err = compl_max / s_c;
 
-    // Primal infeasibility
-    let primal_err = state.constraint_violation();
+    // Primal infeasibility ‖c‖_∞ (no s-divisor in Ipopt;
+    // `curr_primal_infeasibility(NORM_MAX)` at line 2570-2610).
+    // `state.constraint_violation()` returns the L1 sum used by the
+    // filter; the barrier-error gate needs the L∞ version.
+    let primal_err = convergence::primal_infeasibility_max(&state.g, &state.g_l, &state.g_u);
 
-    // Dual infeasibility safeguard: prevent the barrier subproblem from being
-    // declared "solved" when the NLP dual infeasibility is still large.
-    // This prevents mu from collapsing to 1e-11 while du remains huge (issue #8 Class 2).
-    let unscaled_du = compute_dual_inf_at_state(state);
-    let du_floor = unscaled_du * 0.1; // 10% of unscaled du as floor on barrier error
-
-    dual_err.max(compl_err).max(primal_err).max(du_floor)
+    dual_err.max(compl_err).max(primal_err)
 }
 
 
