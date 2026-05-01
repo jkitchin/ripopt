@@ -665,8 +665,15 @@ pub(crate) struct SolverState {
     pub consecutive_acceptable: usize,
     /// Objective scaling factor (for NLP scaling / result unscaling).
     pub obj_scaling: f64,
-    /// Constraint scaling factors (for NLP scaling / result unscaling).
-    pub g_scaling: Vec<f64>,
+    /// Equality-block constraint scaling factors `dc` (size n_c). Mirrors
+    /// Ipopt's `c_scaling` produced by `IpGradientScaling.cpp:144-185`.
+    /// Phase 3 of the data-layout refactor: replaces the combined
+    /// `g_scaling: Vec<f64>` (size m). User-facing combined scaling is
+    /// reconstructed in `unscale_solution_vectors` via the layout.
+    pub c_scaling: Vec<f64>,
+    /// Inequality-block constraint scaling factors `dd` (size n_d). Mirrors
+    /// Ipopt's `d_scaling` produced by `IpGradientScaling.cpp:191-232`.
+    pub d_scaling: Vec<f64>,
     /// Equality / inequality constraint layout. Built once from `g_l`/`g_u`
     /// at construction; stable for the problem lifetime. Single source of
     /// truth for the c-block / d-block split (replaces per-assemble
@@ -1230,7 +1237,8 @@ impl SolverState {
             hess_vals: vec![0.0; hess_nnz],
             consecutive_acceptable: 0,
             obj_scaling: 1.0,
-            g_scaling: vec![1.0; m],
+            c_scaling: vec![1.0; layout.n_c],
+            d_scaling: vec![1.0; layout.n_d],
             layout,
             diagnostics: SolverDiagnostics::default(),
             x_last_eval: vec![f64::NAN; n],
@@ -1317,15 +1325,18 @@ impl SolverState {
     }
 
     /// Equality-block constraint scaling `dc` (size n_c). Mirrors Ipopt's
-    /// `c_scaling` produced by `IpGradientScaling.cpp:144-185`.
+    /// `c_scaling` produced by `IpGradientScaling.cpp:144-185`. Phase 3
+    /// flipped the backing storage: this is now a direct read of
+    /// `self.c_scaling` (no projection allocation).
     pub fn c_scaling(&self) -> Vec<f64> {
-        self.layout.project_c(&self.g_scaling)
+        self.c_scaling.clone()
     }
 
     /// Inequality-block constraint scaling `dd` (size n_d). Mirrors Ipopt's
-    /// `d_scaling` produced by `IpGradientScaling.cpp:191-232`.
+    /// `d_scaling` produced by `IpGradientScaling.cpp:191-232`. Phase 3
+    /// flipped the backing storage: direct read of `self.d_scaling`.
     pub fn d_scaling(&self) -> Vec<f64> {
-        self.layout.project_d(&self.g_scaling)
+        self.d_scaling.clone()
     }
 
     /// Inequality-block slack-bound multipliers `v_L` (size n_d, zero on
@@ -5483,7 +5494,12 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
 
     let mut state = SolverState::new(problem, options);
     state.obj_scaling = obj_scaling;
-    state.g_scaling = g_scaling;
+    // Project the combined per-row scaling onto the c-block / d-block
+    // (Phase 3 split storage). The user's NlpProblem trait stays
+    // combined-indexed, so g_scaling is still a length-m Vec at this
+    // boundary; SolverState owns the split form.
+    state.c_scaling = state.layout.project_c(&g_scaling);
+    state.d_scaling = state.layout.project_d(&g_scaling);
     let n = state.n;
     let m = state.m;
 
@@ -5992,7 +6008,15 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                             j_row.push((state.jac_cols[k], state.jac_vals[k]));
                         }
                     }
-                    let scale_r = if r < state.g_scaling.len() { state.g_scaling[r] } else { 1.0 };
+                    // Look up the per-row scaling via the layout (Phase 3
+                    // split storage; user-facing index r is combined).
+                    let scale_r = if let Some(k) = state.layout.eq_pos[r] {
+                        state.c_scaling.get(k).copied().unwrap_or(1.0)
+                    } else if let Some(k) = state.layout.ineq_pos[r] {
+                        state.d_scaling.get(k).copied().unwrap_or(1.0)
+                    } else {
+                        1.0
+                    };
                     rip_log!(
                         "ripopt: iter0-conrow[{}]: g={:.16e} g_l={:.16e} g_u={:.16e} s={:.16e} dy={:.16e} g_scale={:.16e} nnz={}",
                         r, g_r, gl_r, gu_r, s_r, dy_r, scale_r, j_row.len()
@@ -8963,13 +8987,21 @@ fn unscale_solution_vectors(state: &SolverState) -> (Vec<f64>, Vec<f64>, Vec<f64
         z_l_out[i] = state.z_l[i] / state.obj_scaling;
         z_u_out[i] = state.z_u[i] / state.obj_scaling;
     }
+    // Reconstruct combined-indexed y_out / g_out from the split storage
+    // (Phase 3): per-row scaling lives in c_scaling[k] for equalities,
+    // d_scaling[k] for inequalities.
     let mut y_out = state.y.clone();
-    for i in 0..m {
-        y_out[i] = state.y[i] * state.g_scaling[i] / state.obj_scaling;
-    }
     let mut g_out = state.g.clone();
     for i in 0..m {
-        g_out[i] /= state.g_scaling[i];
+        let scale_i = if let Some(k) = state.layout.eq_pos[i] {
+            state.c_scaling.get(k).copied().unwrap_or(1.0)
+        } else if let Some(k) = state.layout.ineq_pos[i] {
+            state.d_scaling.get(k).copied().unwrap_or(1.0)
+        } else {
+            1.0
+        };
+        y_out[i] = state.y[i] * scale_i / state.obj_scaling;
+        g_out[i] /= scale_i;
     }
     (z_l_out, z_u_out, y_out, g_out)
 }
@@ -9034,7 +9066,10 @@ mod tests {
             hess_vals: Vec::new(),
             consecutive_acceptable: 0,
             obj_scaling: 1.0,
-            g_scaling: vec![1.0; m],
+            // Test-only constructor uses an all-inequality layout (no
+            // equalities) — n_c=0, n_d=m. c_scaling is empty.
+            c_scaling: Vec::new(),
+            d_scaling: vec![1.0; m],
             layout: crate::constraint_layout::ConstraintLayout::new(
                 &vec![f64::NEG_INFINITY; m],
                 &vec![f64::INFINITY; m],
