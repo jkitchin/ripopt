@@ -27,50 +27,8 @@
 //! iterative refinement (A4), inertia target (A5), perturbation ladder (A6),
 //! and IPM wiring (A7) live in separate modules / tasks.
 
-use crate::convergence::is_equality_constraint;
+pub use crate::constraint_layout::ConstraintLayout;
 use crate::linear_solver::{KktMatrix, LinearSolver, SolverError};
-
-/// Splits a flat `m`-constraint vector into equality and inequality subsets,
-/// matching Ipopt's internal split between `J_c` (equalities, dim `n_c`) and
-/// `J_d` (inequalities with slacks, dim `n_d`).
-///
-/// `eq_pos[i]` is `Some(k)` iff constraint `i` is an equality and is the
-/// `k`-th entry of the equality subset. `ineq_pos[i]` is `Some(k)` for
-/// inequalities. Exactly one of the two is `Some` for each `i`.
-#[derive(Debug, Clone)]
-pub struct ConstraintPartition {
-    pub n_c: usize,
-    pub n_d: usize,
-    pub eq_pos: Vec<Option<usize>>,
-    pub ineq_pos: Vec<Option<usize>>,
-    /// Inverse of `ineq_pos`: `ineq_to_constraint[k]` is the global constraint
-    /// index `i` of the `k`-th inequality. Useful when the slack vector `s`
-    /// is indexed in `[0, n_d)`-space.
-    pub ineq_to_constraint: Vec<usize>,
-}
-
-impl ConstraintPartition {
-    pub fn new(g_l: &[f64], g_u: &[f64]) -> Self {
-        let m = g_l.len();
-        debug_assert_eq!(g_u.len(), m);
-        let mut eq_pos = vec![None; m];
-        let mut ineq_pos = vec![None; m];
-        let mut ineq_to_constraint = Vec::new();
-        let mut n_c = 0usize;
-        let mut n_d = 0usize;
-        for i in 0..m {
-            if is_equality_constraint(g_l[i], g_u[i]) {
-                eq_pos[i] = Some(n_c);
-                n_c += 1;
-            } else {
-                ineq_pos[i] = Some(n_d);
-                ineq_to_constraint.push(i);
-                n_d += 1;
-            }
-        }
-        Self { n_c, n_d, eq_pos, ineq_pos, ineq_to_constraint }
-    }
-}
 
 /// Σ_s = Pd_L · diag(v_L / s_L) + Pd_U · diag(v_U / s_U), one entry per
 /// inequality constraint (length `n_d`). The projection matrices `Pd_L` /
@@ -80,7 +38,7 @@ impl ConstraintPartition {
 /// bounds, length `m`), `v_l` / `v_u` (slack-bound multipliers, length `m`),
 /// and the partition (which selects the `n_d` inequality rows).
 pub fn compute_sigma_s(
-    partition: &ConstraintPartition,
+    partition: &ConstraintLayout,
     s: &[f64],
     g_l: &[f64],
     g_u: &[f64],
@@ -88,7 +46,7 @@ pub fn compute_sigma_s(
     v_u: &[f64],
 ) -> Vec<f64> {
     let mut sigma_s = vec![0.0; partition.n_d];
-    for (k, &i) in partition.ineq_to_constraint.iter().enumerate() {
+    for (k, &i) in partition.d_to_combined.iter().enumerate() {
         if g_l[i].is_finite() {
             let slack = (s[i] - g_l[i]).max(1e-20);
             sigma_s[k] += v_l[i] / slack;
@@ -137,7 +95,7 @@ pub struct AugKktSystem {
 /// `AddMSinvZ` zeros out unbounded slots before the assembler is called.
 ///
 /// `partition` carries the eq/ineq split derived from the constraint bounds
-/// (`ConstraintPartition::new`).
+/// (`ConstraintLayout::new`).
 ///
 /// Jacobian triplets `(jac_rows, jac_cols, jac_vals)` are in flat
 /// `m × n` triplet form; each entry is routed to either the `(2,0)` block
@@ -149,7 +107,7 @@ pub struct AugKktSystem {
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_aug_kkt(
     n: usize,
-    partition: &ConstraintPartition,
+    partition: &ConstraintLayout,
     hess_rows: &[usize],
     hess_cols: &[usize],
     hess_vals: &[f64],
@@ -295,7 +253,7 @@ pub struct OuterRhs {
 #[allow(clippy::too_many_arguments)]
 pub fn build_outer_rhs(
     n: usize,
-    partition: &ConstraintPartition,
+    partition: &ConstraintLayout,
     grad_f: &[f64],
     j_t_y: &[f64],
     x: &[f64],
@@ -344,7 +302,7 @@ pub fn build_outer_rhs(
     // rhs_s (n_d entries) = −y_d − Pd_L·v_L + Pd_U·v_U + κ_d damping per
     // `IpIpoptCalculatedQuantities.cpp:2182-2227`. Iterate in n_d-space.
     let mut rhs_s = vec![0.0; n_d];
-    for (k, &i) in partition.ineq_to_constraint.iter().enumerate() {
+    for (k, &i) in partition.d_to_combined.iter().enumerate() {
         let mut r = -y[i];
         let l_fin = g_l[i].is_finite();
         let u_fin = g_u[i].is_finite();
@@ -375,7 +333,7 @@ pub fn build_outer_rhs(
 
     // rhs_y_d = d(x) − s for inequality rows.
     let mut rhs_y_d = vec![0.0; n_d];
-    for (k, &i) in partition.ineq_to_constraint.iter().enumerate() {
+    for (k, &i) in partition.d_to_combined.iter().enumerate() {
         rhs_y_d[k] = g[i] - s[i];
     }
 
@@ -399,7 +357,7 @@ pub fn build_outer_rhs(
     let m = g.len();
     let mut rhs_v_l = vec![0.0; m];
     let mut rhs_v_u = vec![0.0; m];
-    for &i in partition.ineq_to_constraint.iter() {
+    for &i in partition.d_to_combined.iter() {
         if g_l[i].is_finite() {
             let s_l = (s[i] - g_l[i]).max(1e-20);
             rhs_v_l[i] = v_l[i] * s_l - mu;
@@ -440,7 +398,7 @@ pub fn build_outer_rhs(
 /// the same order as `assemble_aug_kkt`: `[x; s; y_c; y_d]`.
 pub fn fold_aug_rhs(
     n: usize,
-    partition: &ConstraintPartition,
+    partition: &ConstraintLayout,
     rhs: &OuterRhs,
     x: &[f64],
     x_l: &[f64],
@@ -471,7 +429,7 @@ pub fn fold_aug_rhs(
     }
 
     // s-block: same pattern with Pd_L / Pd_U and slack_s_L / slack_s_U.
-    for (k, &i) in partition.ineq_to_constraint.iter().enumerate() {
+    for (k, &i) in partition.d_to_combined.iter().enumerate() {
         let mut r = -rhs.rhs_s[k];
         if g_l[i].is_finite() {
             let s_l = (s[i] - g_l[i]).max(1e-20);
@@ -512,7 +470,7 @@ pub struct AugStep {
     pub dy_d: Vec<f64>,
     /// Combined constraint multiplier step in m-space, formed by writing
     /// `dy_c` into the equality positions and `dy_d` into the inequality
-    /// positions per `ConstraintPartition`. Convenient for IPM-side wiring
+    /// positions per `ConstraintLayout`. Convenient for IPM-side wiring
     /// (the legacy `state.y` is m-indexed and combines both subsets).
     pub dy_m: Vec<f64>,
     /// Per-variable Δz_L (zero for variables without a lower bound).
@@ -547,7 +505,7 @@ pub struct AugStep {
 #[allow(clippy::too_many_arguments)]
 pub fn recover_step(
     n: usize,
-    partition: &ConstraintPartition,
+    partition: &ConstraintLayout,
     aug_sol: &[f64],
     x: &[f64],
     x_l: &[f64],
@@ -589,7 +547,7 @@ pub fn recover_step(
     // Slack-bound recovery: ds is in n_d-space, indexed by inequality position.
     let mut dv_l = vec![0.0; m];
     let mut dv_u = vec![0.0; m];
-    for (k, &i) in partition.ineq_to_constraint.iter().enumerate() {
+    for (k, &i) in partition.d_to_combined.iter().enumerate() {
         let dsk = ds_nd[k];
         if g_l[i].is_finite() {
             let s_l = (s[i] - g_l[i]).max(1e-20);
@@ -604,7 +562,7 @@ pub fn recover_step(
     // Promote ds back to m-space (zero for equalities) so downstream code
     // that uses the IPM's m-indexed `state.s` arrays can stay unchanged.
     let mut ds = vec![0.0; m];
-    for (k, &i) in partition.ineq_to_constraint.iter().enumerate() {
+    for (k, &i) in partition.d_to_combined.iter().enumerate() {
         ds[i] = ds_nd[k];
     }
 
@@ -616,7 +574,7 @@ pub fn recover_step(
             dy_m[i] = dy_c[*k];
         }
     }
-    for (k, &i) in partition.ineq_to_constraint.iter().enumerate() {
+    for (k, &i) in partition.d_to_combined.iter().enumerate() {
         dy_m[i] = dy_d[k];
     }
 
@@ -1021,7 +979,7 @@ pub fn aug_step_from_state(
     perturbation: &mut crate::kkt::InertiaCorrectionParams,
 ) -> Result<(AugStep, f64, f64, AugKktSystem), SolverError> {
     let m = g.len();
-    let partition = ConstraintPartition::new(g_l, g_u);
+    let partition = ConstraintLayout::new(g_l, g_u);
 
     // Σ_x: `IpIpoptCalculatedQuantities.cpp:3501-3540`. Pre-projected — zero
     // for fully unbounded variables.
@@ -1150,7 +1108,7 @@ pub const PROBING_SIGMA_MAX_DEFAULT: f64 = 1e2;
 #[allow(clippy::too_many_arguments)]
 pub fn aug_probing_mu_from_affine(
     n: usize,
-    partition: &ConstraintPartition,
+    partition: &ConstraintLayout,
     step_aff: &AugStep,
     x: &[f64], x_l: &[f64], x_u: &[f64], z_l: &[f64], z_u: &[f64],
     s: &[f64], g_l: &[f64], g_u: &[f64], v_l: &[f64], v_u: &[f64],
@@ -1179,7 +1137,7 @@ pub fn aug_probing_mu_from_affine(
             alpha_p = alpha_p.min(tau * s_u / step_aff.dx[i]);
         }
     }
-    for &i in partition.ineq_to_constraint.iter() {
+    for &i in partition.d_to_combined.iter() {
         let dsi = step_aff.ds[i];
         if g_l[i].is_finite() && dsi < 0.0 {
             let s_l = (s[i] - g_l[i]).max(1e-20);
@@ -1202,7 +1160,7 @@ pub fn aug_probing_mu_from_affine(
             alpha_d = alpha_d.min(tau * z_u[i].max(1e-20) / (-step_aff.dz_u[i]));
         }
     }
-    for &i in partition.ineq_to_constraint.iter() {
+    for &i in partition.d_to_combined.iter() {
         if g_l[i].is_finite() && step_aff.dv_l[i] < 0.0 {
             alpha_d = alpha_d.min(tau * v_l[i].max(1e-20) / (-step_aff.dv_l[i]));
         }
@@ -1234,7 +1192,7 @@ pub fn aug_probing_mu_from_affine(
             ncomp += 1;
         }
     }
-    for &i in partition.ineq_to_constraint.iter() {
+    for &i in partition.d_to_combined.iter() {
         let dsi = step_aff.ds[i];
         if g_l[i].is_finite() {
             let s_l = (s[i] - g_l[i]).max(1e-20);
@@ -1314,7 +1272,7 @@ pub fn aug_step_from_state_mehrotra(
     perturbation: &mut crate::kkt::InertiaCorrectionParams,
 ) -> Result<(AugStep, f64, f64, f64, AugKktSystem), SolverError> {
     let m = g.len();
-    let partition = ConstraintPartition::new(g_l, g_u);
+    let partition = ConstraintLayout::new(g_l, g_u);
 
     // Σ_x and Σ_s do not depend on μ — they're functions of bound multipliers
     // and slacks at the current iterate. Reused across the affine and Newton
@@ -1430,7 +1388,7 @@ pub fn aug_step_from_state_mehrotra(
 ///
 /// Returns `Some((dx_soc, ds_d_soc))` on success — `dx_soc` length `n`,
 /// `ds_d_soc` length `n_d` (inequality-only slack step indexed by
-/// `partition.ineq_to_constraint[k]`). `None` if the linear solve fails.
+/// `partition.d_to_combined[k]`). `None` if the linear solve fails.
 #[allow(clippy::too_many_arguments)]
 pub fn aug_soc_solve_dx(
     n: usize,
@@ -1463,7 +1421,7 @@ pub fn aug_soc_solve_dx(
     dms_soc: &[f64],
 ) -> Option<(Vec<f64>, Vec<f64>)> {
     let m = g.len();
-    let partition = ConstraintPartition::new(g_l, g_u);
+    let partition = ConstraintLayout::new(g_l, g_u);
     if c_soc.len() != partition.n_c || dms_soc.len() != partition.n_d {
         return None;
     }
@@ -1578,7 +1536,7 @@ pub fn aug_soc_solve_dx_factored(
     dms_soc: &[f64],
 ) -> Option<(Vec<f64>, Vec<f64>)> {
     let m = g.len();
-    let partition = ConstraintPartition::new(g_l, g_u);
+    let partition = ConstraintLayout::new(g_l, g_u);
     if c_soc.len() != partition.n_c || dms_soc.len() != partition.n_d {
         return None;
     }
@@ -1627,24 +1585,24 @@ mod tests {
     fn partition_pure_equality() {
         let g_l = vec![1.0, 2.0, 3.0];
         let g_u = vec![1.0, 2.0, 3.0];
-        let p = ConstraintPartition::new(&g_l, &g_u);
+        let p = ConstraintLayout::new(&g_l, &g_u);
         assert_eq!(p.n_c, 3);
         assert_eq!(p.n_d, 0);
         assert_eq!(p.eq_pos, vec![Some(0), Some(1), Some(2)]);
         assert_eq!(p.ineq_pos, vec![None, None, None]);
-        assert!(p.ineq_to_constraint.is_empty());
+        assert!(p.d_to_combined.is_empty());
     }
 
     #[test]
     fn partition_pure_inequality() {
         let g_l = vec![0.0, f64::NEG_INFINITY];
         let g_u = vec![10.0, 5.0];
-        let p = ConstraintPartition::new(&g_l, &g_u);
+        let p = ConstraintLayout::new(&g_l, &g_u);
         assert_eq!(p.n_c, 0);
         assert_eq!(p.n_d, 2);
         assert_eq!(p.eq_pos, vec![None, None]);
         assert_eq!(p.ineq_pos, vec![Some(0), Some(1)]);
-        assert_eq!(p.ineq_to_constraint, vec![0, 1]);
+        assert_eq!(p.d_to_combined, vec![0, 1]);
     }
 
     #[test]
@@ -1652,12 +1610,12 @@ mod tests {
         // eq, ineq, eq, ineq, ineq -> n_c=2, n_d=3 with positions in order
         let g_l = vec![1.0, 0.0, 5.0, f64::NEG_INFINITY, -1.0];
         let g_u = vec![1.0, 10.0, 5.0, 7.0, 1.0];
-        let p = ConstraintPartition::new(&g_l, &g_u);
+        let p = ConstraintLayout::new(&g_l, &g_u);
         assert_eq!(p.n_c, 2);
         assert_eq!(p.n_d, 3);
         assert_eq!(p.eq_pos, vec![Some(0), None, Some(1), None, None]);
         assert_eq!(p.ineq_pos, vec![None, Some(0), None, Some(1), Some(2)]);
-        assert_eq!(p.ineq_to_constraint, vec![1, 3, 4]);
+        assert_eq!(p.d_to_combined, vec![1, 3, 4]);
     }
 
     #[test]
@@ -1665,7 +1623,7 @@ mod tests {
         // Two ineq rows: row 0 has only lower bound, row 1 fully unbounded.
         let g_l = vec![0.0, f64::NEG_INFINITY];
         let g_u = vec![f64::INFINITY, f64::INFINITY];
-        let p = ConstraintPartition::new(&g_l, &g_u);
+        let p = ConstraintLayout::new(&g_l, &g_u);
         // Row 1 is fully unbounded, so it's not really a "constraint" in
         // the usual sense, but `is_equality_constraint` returns false and
         // it lands in the inequality bucket. sigma_s for it should be 0.
@@ -1682,7 +1640,7 @@ mod tests {
     fn sigma_s_two_sided_sums_both_contributions() {
         let g_l = vec![0.0];
         let g_u = vec![10.0];
-        let p = ConstraintPartition::new(&g_l, &g_u);
+        let p = ConstraintLayout::new(&g_l, &g_u);
         let s = vec![2.0];
         let v_l = vec![3.0];
         let v_u = vec![4.0];
@@ -1697,7 +1655,7 @@ mod tests {
         let n = 2usize;
         let g_l = vec![5.0, 0.0, f64::NEG_INFINITY];
         let g_u = vec![5.0, 10.0, 1.0];
-        let p = ConstraintPartition::new(&g_l, &g_u);
+        let p = ConstraintLayout::new(&g_l, &g_u);
         assert_eq!(p.n_c, 1);
         assert_eq!(p.n_d, 2);
 
@@ -1761,7 +1719,7 @@ mod tests {
         let n = 2usize;
         let g_l = vec![0.0];
         let g_u = vec![0.0];
-        let p = ConstraintPartition::new(&g_l, &g_u);
+        let p = ConstraintLayout::new(&g_l, &g_u);
         let grad_f = vec![1.0, 2.0];
         let j_t_y = vec![0.1, 0.2];
         let x = vec![0.0, 0.0];
@@ -1798,7 +1756,7 @@ mod tests {
         let n = 3usize;
         let g_l: Vec<f64> = vec![];
         let g_u: Vec<f64> = vec![];
-        let p = ConstraintPartition::new(&g_l, &g_u);
+        let p = ConstraintLayout::new(&g_l, &g_u);
         let grad_f = vec![0.0, 0.0, 0.0];
         let j_t_y = vec![0.0, 0.0, 0.0];
         let x = vec![1.0, 1.0, 1.0];
@@ -1838,7 +1796,7 @@ mod tests {
         // 1 ineq with both bounds.
         let g_l = vec![0.0];
         let g_u = vec![10.0];
-        let p = ConstraintPartition::new(&g_l, &g_u);
+        let p = ConstraintLayout::new(&g_l, &g_u);
         // x bounded in [0, ∞), so only z_l contributes.
         let x_l = vec![0.0];
         let x_u = vec![f64::INFINITY];
@@ -2025,7 +1983,7 @@ mod tests {
         let n = 2usize;
         let g_l = vec![0.0, 1.0];
         let g_u = vec![0.0, 1.0];
-        let p = ConstraintPartition::new(&g_l, &g_u);
+        let p = ConstraintLayout::new(&g_l, &g_u);
         assert_eq!(p.n_d, 0);
         let hess_rows = vec![0, 1];
         let hess_cols = vec![0, 1];

@@ -170,11 +170,25 @@ impl<P: NlpProblem> NlpProblem for FiniteCheckedProblem<'_, P> {
 /// Scales objective by `obj_scaling` and each constraint `i` by `g_scaling[i]`
 /// so that the max gradient norm at the initial point is ≤ 100.
 /// This matches Ipopt's `nlp_scaling_method = gradient-based`.
+///
+/// The constraint-bound path also applies `nlp_lower/upper_bound_inf`
+/// sentinel mapping and `bound_relax_factor` IN RAW SPACE before
+/// scaling, mirroring `IpOrigIpoptNLP::InitializeStructures`
+/// (`ref/Ipopt/src/Algorithm/IpOrigIpoptNLP.cpp:343-374`): relax_bounds
+/// runs on raw `d_L`/`d_U`, then `apply_vector_scaling_d_LU` scales the
+/// already-relaxed bounds. Doing the order the other way (scale, then
+/// relax in scaled space) gives `1e-8` padding for any constraint whose
+/// raw bound is `0`, instead of Ipopt's `scale × 1e-8`. For rows with
+/// `|raw_b| < 1/scale` this is an O(1/scale) effective-bound error.
 struct ScaledProblem<'a, P: NlpProblem> {
     inner: &'a P,
     obj_scaling: f64,
     g_scaling: Vec<f64>,
     jac_rows: Vec<usize>,
+    bound_relax_factor: f64,
+    constr_viol_tol: f64,
+    nlp_lower_bound_inf: f64,
+    nlp_upper_bound_inf: f64,
 }
 
 impl<P: NlpProblem> NlpProblem for ScaledProblem<'_, P> {
@@ -188,7 +202,38 @@ impl<P: NlpProblem> NlpProblem for ScaledProblem<'_, P> {
         self.inner.bounds(x_l, x_u);
     }
     fn constraint_bounds(&self, g_l: &mut [f64], g_u: &mut [f64]) {
+        // Order matches Ipopt 3.14 IpOrigIpoptNLP.cpp:343-374:
+        //   raw inner bounds → sentinel-to-infinity → relax_bounds (raw)
+        //   → apply_vector_scaling_d_LU (scale)
+        // The relaxation amount uses |raw_b| (not |scaled_b|), which
+        // matters whenever |raw_b| < 1/scale — most importantly for
+        // raw bounds at exactly 0 (e.g. inequalities `g(x) ≤ 0`).
         self.inner.constraint_bounds(g_l, g_u);
+        for i in 0..g_l.len() {
+            if g_l[i] <= self.nlp_lower_bound_inf {
+                g_l[i] = f64::NEG_INFINITY;
+            }
+            if g_u[i] >= self.nlp_upper_bound_inf {
+                g_u[i] = f64::INFINITY;
+            }
+        }
+        if self.bound_relax_factor > 0.0 {
+            for i in 0..g_l.len() {
+                if g_l[i].is_finite() && g_u[i].is_finite() && g_l[i] == g_u[i] {
+                    continue;
+                }
+                if g_l[i].is_finite() {
+                    let delta = (self.bound_relax_factor * g_l[i].abs().max(1.0))
+                        .min(self.constr_viol_tol);
+                    g_l[i] -= delta;
+                }
+                if g_u[i].is_finite() {
+                    let delta = (self.bound_relax_factor * g_u[i].abs().max(1.0))
+                        .min(self.constr_viol_tol);
+                    g_u[i] += delta;
+                }
+            }
+        }
         for (i, &s) in self.g_scaling.iter().enumerate() {
             if g_l[i].is_finite() {
                 g_l[i] *= s;
@@ -622,6 +667,12 @@ pub(crate) struct SolverState {
     pub obj_scaling: f64,
     /// Constraint scaling factors (for NLP scaling / result unscaling).
     pub g_scaling: Vec<f64>,
+    /// Equality / inequality constraint layout. Built once from `g_l`/`g_u`
+    /// at construction; stable for the problem lifetime. Single source of
+    /// truth for the c-block / d-block split (replaces per-assemble
+    /// `ConstraintLayout::new` calls — Phase 1 of the data-layout refactor,
+    /// see `docs/V0.8_DATA_LAYOUT_REFACTOR_PLAN.md`).
+    pub layout: crate::constraint_layout::ConstraintLayout,
     /// Accumulated solver diagnostics.
     pub diagnostics: SolverDiagnostics,
     /// Last point at which evaluations were performed (for new_x tracking).
@@ -1083,20 +1134,21 @@ impl SolverState {
         // in f64). Without this conversion, z_l ≈ mu/1e30 and slack ≈ 1e30, giving
         // slack * z_l ≈ mu ≠ 0 as a spurious complementarity contribution that blocks
         // convergence detection even when the NLP is solved.
+        //
+        // For x bounds: applied here in the IPM layer (variables are not
+        // scaled by ScaledProblem). For g bounds: ScaledProblem applies
+        // sentinel + bound_relax_factor in raw space inside its
+        // `constraint_bounds`, mirroring Ipopt's relax-then-scale order
+        // (IpOrigIpoptNLP.cpp:343-374). See ScaledProblem doc comment.
         sentinel_bounds_to_infinity(&mut x_l, &mut x_u, options);
-        sentinel_bounds_to_infinity(&mut g_l, &mut g_u, options);
 
-        // Ipopt's bound_relax_factor: widen every finite variable AND
-        // constraint bound outward by min(constr_viol_tol, factor·max(|b|,1)).
-        // Mirrors IpOrigIpoptNLP.cpp:355-358. Must run AFTER infinity
-        // sentinels (so we don't relax 1e30) and BEFORE bound_push /
-        // fixed-variable handling.
+        // Ipopt's bound_relax_factor for variable bounds: widen every finite
+        // bound outward by min(constr_viol_tol, factor·max(|b|,1)). Mirrors
+        // IpOrigIpoptNLP.cpp:355-356. Must run AFTER infinity sentinels
+        // (so we don't relax 1e30) and BEFORE bound_push / fixed-variable
+        // handling. (Constraint-bound counterpart is in ScaledProblem.)
         apply_bound_relax_factor(
             &mut x_l, &mut x_u,
-            options.bound_relax_factor, options.constr_viol_tol,
-        );
-        apply_bound_relax_factor(
-            &mut g_l, &mut g_u,
             options.bound_relax_factor, options.constr_viol_tol,
         );
 
@@ -1136,6 +1188,7 @@ impl SolverState {
 
         let m_eq = (0..m).filter(|&i| g_l[i] == g_u[i]).count();
         let is_square = m == n || m_eq == n;
+        let layout = crate::constraint_layout::ConstraintLayout::new(&g_l, &g_u);
 
         Self {
             x,
@@ -1178,6 +1231,7 @@ impl SolverState {
             consecutive_acceptable: 0,
             obj_scaling: 1.0,
             g_scaling: vec![1.0; m],
+            layout,
             diagnostics: SolverDiagnostics::default(),
             x_last_eval: vec![f64::NAN; n],
             adjusted_slacks_count: 0,
@@ -1196,6 +1250,107 @@ impl SolverState {
             n_jac_evals: 0,
             n_hess_evals: 0,
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 1 split-layout accessors. Backed by combined storage today;
+    // Phase 3 will swap the backing fields and these become trivial
+    // pass-throughs. See docs/V0.8_DATA_LAYOUT_REFACTOR_PLAN.md.
+    //
+    // Naming mirrors Ipopt 3.14:
+    //   c-block  ↔  equality constraints (size n_c)
+    //   d-block  ↔  inequality constraints (size n_d), the only block
+    //              with bounds and slacks
+    // -------------------------------------------------------------------
+
+    /// Equality constraint values `c(x)` (size n_c). Mirrors Ipopt's
+    /// `OrigIpoptNLP::c()` (`IpIpoptNLP.hpp:117`).
+    pub fn g_c(&self) -> Vec<f64> {
+        self.layout.project_c(&self.g)
+    }
+
+    /// Inequality constraint values `d(x)` (size n_d). Mirrors Ipopt's
+    /// `OrigIpoptNLP::d()` (`IpIpoptNLP.hpp:118`).
+    pub fn g_d(&self) -> Vec<f64> {
+        self.layout.project_d(&self.g)
+    }
+
+    /// Inequality lower bounds `d_L` (size n_d, may contain -inf).
+    /// Mirrors Ipopt's `OrigIpoptNLP::d_L()` (`IpIpoptNLP.hpp:153`).
+    pub fn d_l(&self) -> Vec<f64> {
+        self.layout.project_d(&self.g_l)
+    }
+
+    /// Inequality upper bounds `d_U` (size n_d, may contain +inf).
+    /// Mirrors Ipopt's `OrigIpoptNLP::d_U()` (`IpIpoptNLP.hpp:155`).
+    pub fn d_u(&self) -> Vec<f64> {
+        self.layout.project_d(&self.g_u)
+    }
+
+    /// Equality multipliers `y_c` (size n_c). Mirrors Ipopt's
+    /// `IteratesVector::y_c()` (`IpIteratesVector.hpp` slot 2).
+    pub fn y_c(&self) -> Vec<f64> {
+        self.layout.project_c(&self.y)
+    }
+
+    /// Inequality multipliers `y_d` (size n_d). Mirrors Ipopt's
+    /// `IteratesVector::y_d()` (slot 3).
+    pub fn y_d(&self) -> Vec<f64> {
+        self.layout.project_d(&self.y)
+    }
+
+    /// Slack iterate `s` projected onto the d-block (size n_d). Equality-row
+    /// sentinel slacks (`s[i] = g_l[i]` for c-block rows) are dropped.
+    /// In Ipopt `s` has dimension `n_d` natively (`IpIpoptData.cpp:140`).
+    pub fn s_d(&self) -> Vec<f64> {
+        self.layout.project_d(&self.s)
+    }
+
+    /// Equality-block constraint scaling `dc` (size n_c). Mirrors Ipopt's
+    /// `c_scaling` produced by `IpGradientScaling.cpp:144-185`.
+    pub fn c_scaling(&self) -> Vec<f64> {
+        self.layout.project_c(&self.g_scaling)
+    }
+
+    /// Inequality-block constraint scaling `dd` (size n_d). Mirrors Ipopt's
+    /// `d_scaling` produced by `IpGradientScaling.cpp:191-232`.
+    pub fn d_scaling(&self) -> Vec<f64> {
+        self.layout.project_d(&self.g_scaling)
+    }
+
+    /// Inequality-block slack-bound multipliers `v_L` (size n_d, zero on
+    /// rows with infinite `d_L`). Phase 3 will resize this to # finite
+    /// `d_L` via `Pd_L`; today it carries the d-block projection of the
+    /// combined `v_l`.
+    pub fn v_l_d(&self) -> Vec<f64> {
+        self.layout.project_d(&self.v_l)
+    }
+
+    /// Inequality-block slack-bound multipliers `v_U` (size n_d, zero on
+    /// rows with infinite `d_U`).
+    pub fn v_u_d(&self) -> Vec<f64> {
+        self.layout.project_d(&self.v_u)
+    }
+
+    /// Equality-block search direction `Δy_c` (size n_c).
+    pub fn dy_c(&self) -> Vec<f64> {
+        self.layout.project_c(&self.dy)
+    }
+
+    /// Inequality-block search direction `Δy_d` (size n_d).
+    pub fn dy_d(&self) -> Vec<f64> {
+        self.layout.project_d(&self.dy)
+    }
+
+    /// Number of equality constraints (`n_c`). Convenience over
+    /// `state.layout.n_c`.
+    pub fn n_c(&self) -> usize {
+        self.layout.n_c
+    }
+
+    /// Number of inequality constraints (`n_d`).
+    pub fn n_d(&self) -> usize {
+        self.layout.n_d
     }
 
     /// Evaluate all functions, zeroing Hessian lambda for linear constraints.
@@ -5297,6 +5452,10 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         obj_scaling,
         g_scaling: g_scaling.clone(),
         jac_rows: jac_rows_sc,
+        bound_relax_factor: options.bound_relax_factor,
+        constr_viol_tol: options.constr_viol_tol,
+        nlp_lower_bound_inf: options.nlp_lower_bound_inf,
+        nlp_upper_bound_inf: options.nlp_upper_bound_inf,
     };
     // Mirrors Ipopt 3.14's IpOrigIpoptNLP per-call Eval_Error checks:
     // wrap the scaled problem with a NaN/Inf guard so every eval
@@ -6379,7 +6538,7 @@ fn attempt_soc_aug<P: NlpProblem>(
         return None;
     }
 
-    let partition = crate::kkt_aug::ConstraintPartition::new(&state.g_l, &state.g_u);
+    let partition = crate::constraint_layout::ConstraintLayout::new(&state.g_l, &state.g_u);
     let n_c = partition.n_c;
     let n_d = partition.n_d;
 
@@ -8828,6 +8987,10 @@ mod tests {
             consecutive_acceptable: 0,
             obj_scaling: 1.0,
             g_scaling: vec![1.0; m],
+            layout: crate::constraint_layout::ConstraintLayout::new(
+                &vec![f64::NEG_INFINITY; m],
+                &vec![f64::INFINITY; m],
+            ),
             diagnostics: SolverDiagnostics::default(),
             x_last_eval: vec![f64::NAN; n],
             adjusted_slacks_count: 0,
