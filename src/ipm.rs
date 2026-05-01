@@ -476,7 +476,8 @@ impl<P: NlpProblem> NlpProblem for XScaledProblem<'_, P> {
 /// path in `IpIpoptAlgorithm.cpp`.
 struct IterateSnapshot {
     x: Vec<f64>,
-    y: Vec<f64>,
+    y_c: Vec<f64>,
+    y_d: Vec<f64>,
     z_l: Vec<f64>,
     z_u: Vec<f64>,
     v_l: Vec<f64>,
@@ -484,7 +485,8 @@ struct IterateSnapshot {
     s: Vec<f64>,
     mu: f64,
     obj: f64,
-    g: Vec<f64>,
+    c_x: Vec<f64>,
+    d_x: Vec<f64>,
     grad_f: Vec<f64>,
     filter_entries: Vec<FilterEntry>,
     iteration: usize,
@@ -494,15 +496,17 @@ impl IterateSnapshot {
     fn capture(state: &SolverState, filter: &Filter, iteration: usize) -> Self {
         Self {
             x: state.x.clone(),
-            y: state.y_combined(),
+            y_c: state.y_c.clone(),
+            y_d: state.y_d.clone(),
             z_l: state.z_l.clone(),
             z_u: state.z_u.clone(),
-            v_l: state.v_l_combined(),
-            v_u: state.v_u_combined(),
-            s: state.s_combined(),
+            v_l: state.v_l.clone(),
+            v_u: state.v_u.clone(),
+            s: state.s.clone(),
             mu: state.mu,
             obj: state.obj,
-            g: state.g.clone(),
+            c_x: state.c_x.clone(),
+            d_x: state.d_x.clone(),
             grad_f: state.grad_f.clone(),
             filter_entries: filter.save_entries(),
             iteration,
@@ -511,16 +515,17 @@ impl IterateSnapshot {
 
     fn restore(&self, state: &mut SolverState, filter: &mut Filter) {
         state.x = self.x.clone();
-        state.set_y_combined(&self.y);
+        state.y_c = self.y_c.clone();
+        state.y_d = self.y_d.clone();
         state.z_l = self.z_l.clone();
         state.z_u = self.z_u.clone();
-        state.set_v_l_combined(&self.v_l);
-        state.set_v_u_combined(&self.v_u);
-        state.set_s_combined(&self.s);
+        state.v_l = self.v_l.clone();
+        state.v_u = self.v_u.clone();
+        state.s = self.s.clone();
         state.mu = self.mu;
         state.obj = self.obj;
-        state.g = self.g.clone();
-        state.refresh_split_constraints();
+        state.c_x = self.c_x.clone();
+        state.d_x = self.d_x.clone();
         state.grad_f = self.grad_f.clone();
         filter.restore_entries(self.filter_entries.clone());
     }
@@ -529,7 +534,8 @@ impl IterateSnapshot {
 /// Saved state for the watchdog mechanism.
 struct WatchdogSavedState {
     x: Vec<f64>,
-    y: Vec<f64>,
+    y_c: Vec<f64>,
+    y_d: Vec<f64>,
     z_l: Vec<f64>,
     z_u: Vec<f64>,
     v_l: Vec<f64>,
@@ -537,7 +543,8 @@ struct WatchdogSavedState {
     s: Vec<f64>,
     mu: f64,
     obj: f64,
-    g: Vec<f64>,
+    c_x: Vec<f64>,
+    d_x: Vec<f64>,
     grad_f: Vec<f64>,
     filter_entries: Vec<FilterEntry>,
     theta: f64,
@@ -550,15 +557,17 @@ impl WatchdogSavedState {
     fn snapshot(state: &SolverState, filter: &Filter, theta: f64, phi: f64) -> Self {
         Self {
             x: state.x.clone(),
-            y: state.y_combined(),
+            y_c: state.y_c.clone(),
+            y_d: state.y_d.clone(),
             z_l: state.z_l.clone(),
             z_u: state.z_u.clone(),
-            v_l: state.v_l_combined(),
-            v_u: state.v_u_combined(),
-            s: state.s_combined(),
+            v_l: state.v_l.clone(),
+            v_u: state.v_u.clone(),
+            s: state.s.clone(),
             mu: state.mu,
             obj: state.obj,
-            g: state.g.clone(),
+            c_x: state.c_x.clone(),
+            d_x: state.d_x.clone(),
             grad_f: state.grad_f.clone(),
             filter_entries: filter.save_entries(),
             theta,
@@ -571,16 +580,17 @@ impl WatchdogSavedState {
     /// the filter after restore, which the helper would obscure).
     fn restore(&self, state: &mut SolverState) {
         state.x = self.x.clone();
-        state.set_y_combined(&self.y);
+        state.y_c = self.y_c.clone();
+        state.y_d = self.y_d.clone();
         state.z_l = self.z_l.clone();
         state.z_u = self.z_u.clone();
-        state.set_v_l_combined(&self.v_l);
-        state.set_v_u_combined(&self.v_u);
-        state.set_s_combined(&self.s);
+        state.v_l = self.v_l.clone();
+        state.v_u = self.v_u.clone();
+        state.s = self.s.clone();
         state.mu = self.mu;
         state.obj = self.obj;
-        state.g = self.g.clone();
-        state.refresh_split_constraints();
+        state.c_x = self.c_x.clone();
+        state.d_x = self.d_x.clone();
         state.grad_f = self.grad_f.clone();
         // T3.25 follow-up: watchdog revert mutates x/y/z/v outside the
         // line-search choke point that bumps atags. Bump them and drop
@@ -3846,45 +3856,50 @@ const MAX_SOFT_RESTO_ITERS: usize = 10;
 /// off the success path that would otherwise dominate the helper.
 struct SoftRestoSnapshot {
     x: Vec<f64>,
-    y: Vec<f64>,
+    y_c: Vec<f64>,
+    y_d: Vec<f64>,
     z_l: Vec<f64>,
     z_u: Vec<f64>,
     s: Vec<f64>,
     obj: f64,
-    g: Vec<f64>,
+    c_x: Vec<f64>,
+    d_x: Vec<f64>,
     grad_f: Vec<f64>,
-    jac_vals: Vec<f64>,
+    jac_c_vals: Vec<f64>,
+    jac_d_vals: Vec<f64>,
     alpha_primal: f64,
 }
 impl SoftRestoSnapshot {
     fn take(state: &SolverState) -> Self {
         Self {
             x: state.x.clone(),
-            y: state.y_combined(),
+            y_c: state.y_c.clone(),
+            y_d: state.y_d.clone(),
             z_l: state.z_l.clone(),
             z_u: state.z_u.clone(),
-            s: state.s_combined(),
+            s: state.s.clone(),
             obj: state.obj,
-            g: state.g.clone(),
+            c_x: state.c_x.clone(),
+            d_x: state.d_x.clone(),
             grad_f: state.grad_f.clone(),
-            jac_vals: state.jac_vals.clone(),
+            jac_c_vals: state.jac_c_vals.clone(),
+            jac_d_vals: state.jac_d_vals.clone(),
             alpha_primal: state.alpha_primal,
         }
     }
     fn restore(self, state: &mut SolverState) {
         state.x = self.x;
-        state.set_y_combined(&self.y);
+        state.y_c = self.y_c;
+        state.y_d = self.y_d;
         state.z_l = self.z_l;
         state.z_u = self.z_u;
-        state.set_s_combined(&self.s);
+        state.s = self.s;
         state.obj = self.obj;
-        state.g = self.g;
-        state.refresh_split_constraints();
+        state.c_x = self.c_x;
+        state.d_x = self.d_x;
         state.grad_f = self.grad_f;
-        state.jac_vals = self.jac_vals;
-        // Phase 4a: keep the split mirror in sync with the restored
-        // combined values.
-        state.refresh_split_jac_vals();
+        state.jac_c_vals = self.jac_c_vals;
+        state.jac_d_vals = self.jac_d_vals;
         state.alpha_primal = self.alpha_primal;
         // T3.25: snapshot restore touches every tracked input.
         state.bump_all_kkt_atags();
