@@ -175,6 +175,11 @@ impl RestorationPhase {
             return (x.to_vec(), true);
         }
 
+        // Build the c/d layout once for this restoration call. The bounds
+        // never change during restoration, so layout is invariant. Used by
+        // the violation-vector loops below for the row-class dispatch.
+        let layout = crate::constraint_layout::ConstraintLayout::new(g_l, g_u);
+
         let mut x_rest = x.to_vec();
         let mut g = vec![0.0; m];
         let jac_nnz = jac_rows.len();
@@ -220,7 +225,7 @@ impl RestorationPhase {
             let mut violation = vec![0.0; m];
             let mut active = vec![false; m];
             for i in 0..m {
-                if convergence::is_equality_constraint(g_l[i], g_u[i]) {
+                if layout.eq_pos[i].is_some() {
                     violation[i] = g[i] - g_l[i];
                     active[i] = true;
                 } else if g_l[i].is_finite() && g[i] < g_l[i] {
@@ -464,7 +469,7 @@ impl RestorationPhase {
                     let mut violation_pen = vec![0.0; m];
                     let mut any_active = false;
                     for i in 0..m {
-                        if convergence::is_equality_constraint(g_l[i], g_u[i]) {
+                        if layout.eq_pos[i].is_some() {
                             violation_pen[i] = g[i] - g_l[i];
                             any_active = true;
                         } else if g_l[i].is_finite() && g[i] < g_l[i] {
