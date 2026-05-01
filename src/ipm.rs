@@ -499,7 +499,7 @@ impl IterateSnapshot {
             z_u: state.z_u.clone(),
             v_l: state.v_l.clone(),
             v_u: state.v_u.clone(),
-            s: state.s.clone(),
+            s: state.s_combined(),
             mu: state.mu,
             obj: state.obj,
             g: state.g.clone(),
@@ -516,7 +516,7 @@ impl IterateSnapshot {
         state.z_u = self.z_u.clone();
         state.v_l = self.v_l.clone();
         state.v_u = self.v_u.clone();
-        state.s = self.s.clone();
+        state.set_s_combined(&self.s);
         state.mu = self.mu;
         state.obj = self.obj;
         state.g = self.g.clone();
@@ -554,7 +554,7 @@ impl WatchdogSavedState {
             z_u: state.z_u.clone(),
             v_l: state.v_l.clone(),
             v_u: state.v_u.clone(),
-            s: state.s.clone(),
+            s: state.s_combined(),
             mu: state.mu,
             obj: state.obj,
             g: state.g.clone(),
@@ -575,7 +575,7 @@ impl WatchdogSavedState {
         state.z_u = self.z_u.clone();
         state.v_l = self.v_l.clone();
         state.v_u = self.v_u.clone();
-        state.s = self.s.clone();
+        state.set_s_combined(&self.s);
         state.mu = self.mu;
         state.obj = self.obj;
         state.g = self.g.clone();
@@ -629,15 +629,17 @@ pub(crate) struct SolverState {
     pub dv_l: Vec<f64>,
     /// Search direction: slack upper-bound multipliers (Ipopt's dv_U).
     pub dv_u: Vec<f64>,
-    /// Explicit slack iterate (Ipopt's `s`). For inequality rows: pushed to interior
-    /// of `[g_l, g_u]` at init via slack_bound_push/slack_bound_frac, then advanced
-    /// each iteration by `s ← s + α_p · ds`. For equality rows: held at `g_l[i]`
-    /// as a sentinel; consumers MUST skip equality rows (FTB, barrier, Σ_s).
+    /// Explicit slack iterate (Ipopt's `s`, size `n_d`). Pushed to interior of
+    /// `[d_L, d_U]` at init via slack_bound_push/slack_bound_frac, then advanced
+    /// each iteration by `s ← s + α_p · ds`. Phase 3d of the data-layout refactor:
+    /// dropped the equality-row sentinel slots; `s` is now d-block-only natively
+    /// (matches Ipopt 3.14 `IpIpoptData.cpp:140` where `s` has dimension `n_d`).
+    /// User-facing combined-indexed reads route through `state.s_at(i)`.
     /// Source: Ipopt 3.14 IpIteratesVector.hpp slot 1.
     pub s: Vec<f64>,
-    /// Search direction for slack iterate (Ipopt's `delta_s`).
-    /// Computed by `recover_ds`: `ds[i] = (J·dx)[i] + (g[i] - s[i]) - δ_d·dy[i]`
-    /// for inequality rows, 0 for equalities. Source: IpStdAugSystemSolver.cpp:431-465.
+    /// Search direction for slack iterate (Ipopt's `delta_s`, size `n_d`).
+    /// Computed by `recover_ds`: `ds[k] = (J_d·dx)[k] + (d[k] - s[k]) - δ_d·dy_d[k]`.
+    /// Phase 3d: resized from m to n_d. Source: IpStdAugSystemSolver.cpp:431-465.
     pub ds: Vec<f64>,
     /// Barrier parameter.
     pub mu: f64,
@@ -1230,11 +1232,11 @@ impl SolverState {
             dz_u: vec![0.0; n],
             dv_l: vec![0.0; m],
             dv_u: vec![0.0; m],
-            // Slack iterate `s` and step `ds`. At construction `s[i] = g_l[i]` for
-            // equality rows (sentinel) and `s[i] = 0.0` for inequality rows; the
-            // proper push-to-interior init runs in `initialize_slack_iterate` (B1.2).
-            s: vec![0.0; m],
-            ds: vec![0.0; m],
+            // Slack iterate `s` and step `ds` (size n_d). At construction zeroed;
+            // the proper push-to-interior init runs in `initialize_slack_iterate`
+            // (B1.2). Phase 3d: native d-block sizing, no equality-row sentinels.
+            s: vec![0.0; layout.n_d],
+            ds: vec![0.0; layout.n_d],
 
             mu: initial_mu,
             alpha_primal: 0.0,
@@ -1389,11 +1391,89 @@ impl SolverState {
         }
     }
 
-    /// Slack iterate `s` projected onto the d-block (size n_d). Equality-row
-    /// sentinel slacks (`s[i] = g_l[i]` for c-block rows) are dropped.
-    /// In Ipopt `s` has dimension `n_d` natively (`IpIpoptData.cpp:140`).
+    /// Slack iterate `s` (size n_d). Phase 3d flipped storage: this is now
+    /// a direct clone of `self.s`. In Ipopt `s` has dimension `n_d`
+    /// natively (`IpIpoptData.cpp:140`).
     pub fn s_d(&self) -> Vec<f64> {
-        self.layout.project_d(&self.s)
+        self.s.clone()
+    }
+
+    /// Reconstruct an m-length combined-indexed slack view. Equality rows
+    /// get the sentinel `g_l[i]`; inequality rows get the real `s_d[k]`.
+    /// Used by snapshots and diagnostics that still expect combined-indexed
+    /// slack data. Allocates per call.
+    pub fn s_combined(&self) -> Vec<f64> {
+        let mut out = vec![0.0; self.m];
+        for i in 0..self.m {
+            if let Some(k) = self.layout.ineq_pos[i] {
+                out[i] = self.s[k];
+            } else {
+                out[i] = self.g_l[i];
+            }
+        }
+        out
+    }
+
+    /// Combined-indexed slack read: returns `s_d[k]` for inequality rows
+    /// and `g_l[i]` (sentinel) for equality rows.
+    pub fn s_at(&self, i: usize) -> f64 {
+        if let Some(k) = self.layout.ineq_pos[i] {
+            self.s[k]
+        } else {
+            self.g_l[i]
+        }
+    }
+
+    /// Combined-indexed slack write: stores into `s_d[k]` for inequality
+    /// rows; no-op for equality rows (the sentinel is implicit, not stored).
+    pub fn set_s_at(&mut self, i: usize, v: f64) {
+        if let Some(k) = self.layout.ineq_pos[i] {
+            self.s[k] = v;
+        }
+    }
+
+    /// Overwrite slack iterate from a combined m-length slice. Drops the
+    /// equality-row entries and projects onto the d-block via the layout.
+    pub fn set_s_combined(&mut self, s: &[f64]) {
+        debug_assert_eq!(s.len(), self.m);
+        for (k, &i) in self.layout.d_to_combined.iter().enumerate() {
+            self.s[k] = s[i];
+        }
+    }
+
+    /// Reconstruct an m-length combined-indexed `ds` view. Equality rows
+    /// get 0 (no slack step); inequality rows get the real `ds[k]`.
+    pub fn ds_combined(&self) -> Vec<f64> {
+        let mut out = vec![0.0; self.m];
+        for (k, &i) in self.layout.d_to_combined.iter().enumerate() {
+            out[i] = self.ds[k];
+        }
+        out
+    }
+
+    /// Combined-indexed slack-step read: `ds_d[k]` for ineq rows, 0 for eq.
+    pub fn ds_at(&self, i: usize) -> f64 {
+        if let Some(k) = self.layout.ineq_pos[i] {
+            self.ds[k]
+        } else {
+            0.0
+        }
+    }
+
+    /// Combined-indexed slack-step write: stores into `ds_d[k]` for ineq;
+    /// no-op for eq rows.
+    pub fn set_ds_at(&mut self, i: usize, v: f64) {
+        if let Some(k) = self.layout.ineq_pos[i] {
+            self.ds[k] = v;
+        }
+    }
+
+    /// Overwrite slack step from a combined m-length slice. Drops eq rows.
+    pub fn set_ds_combined(&mut self, ds: &[f64]) {
+        debug_assert_eq!(ds.len(), self.m);
+        for (k, &i) in self.layout.d_to_combined.iter().enumerate() {
+            self.ds[k] = ds[i];
+        }
     }
 
     /// Equality-block constraint scaling `dc` (size n_c). Mirrors Ipopt's
@@ -2484,8 +2564,9 @@ fn apply_slack_move(state: &mut SolverState, options: &SolverOptions) -> usize {
         if l_fin && u_fin && (state.g_l[i] - state.g_u[i]).abs() < 1e-14 {
             continue;
         }
+        let s_i = state.s_at(i);
         if l_fin {
-            let s_l = state.s[i] - state.g_l[i];
+            let s_l = s_i - state.g_l[i];
             if s_l < s_min {
                 let v = state.v_l[i];
                 let from_mu = if v > 0.0 { mu / v } else { f64::INFINITY };
@@ -2496,7 +2577,7 @@ fn apply_slack_move(state: &mut SolverState, options: &SolverOptions) -> usize {
             }
         }
         if u_fin {
-            let s_u = state.g_u[i] - state.s[i];
+            let s_u = state.g_u[i] - s_i;
             if s_u < s_min {
                 let v = state.v_u[i];
                 let from_mu = if v > 0.0 { mu / v } else { f64::INFINITY };
@@ -3474,7 +3555,7 @@ impl SoftRestoSnapshot {
             y: state.y_combined(),
             z_l: state.z_l.clone(),
             z_u: state.z_u.clone(),
-            s: state.s.clone(),
+            s: state.s_combined(),
             obj: state.obj,
             g: state.g.clone(),
             grad_f: state.grad_f.clone(),
@@ -3487,7 +3568,7 @@ impl SoftRestoSnapshot {
         state.set_y_combined(&self.y);
         state.z_l = self.z_l;
         state.z_u = self.z_u;
-        state.s = self.s;
+        state.set_s_combined(&self.s);
         state.obj = self.obj;
         state.g = self.g;
         state.grad_f = self.grad_f;
@@ -3667,9 +3748,11 @@ fn compute_alpha_max(
             if l_fin && u_fin && (state.g_l[i] - state.g_u[i]).abs() < 1e-14 {
                 continue;
             }
-            if l_fin && state.ds[i] < 0.0 {
-                let slack = (state.s[i] - state.g_l[i]).max(0.0);
-                let a = -tau * slack / state.ds[i];
+            let ds_i = state.ds_at(i);
+            let s_i = state.s_at(i);
+            if l_fin && ds_i < 0.0 {
+                let slack = (s_i - state.g_l[i]).max(0.0);
+                let a = -tau * slack / ds_i;
                 if a < lim_alpha {
                     lim_alpha = a;
                     lim_idx = i;
@@ -3677,9 +3760,9 @@ fn compute_alpha_max(
                     lim_block = "s";
                 }
             }
-            if u_fin && state.ds[i] > 0.0 {
-                let slack = (state.g_u[i] - state.s[i]).max(0.0);
-                let a = tau * slack / state.ds[i];
+            if u_fin && ds_i > 0.0 {
+                let slack = (state.g_u[i] - s_i).max(0.0);
+                let a = tau * slack / ds_i;
                 if a < lim_alpha {
                     lim_alpha = a;
                     lim_idx = i;
@@ -3698,9 +3781,9 @@ fn compute_alpha_max(
         let dzu_inf = state.dz_u.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
         if lim_idx != usize::MAX {
             let (xv, xb, dxv, slack) = if lim_block == "s" {
-                let xv = state.s[lim_idx];
+                let xv = state.s_at(lim_idx);
                 let xb = if lim_side == "L" { state.g_l[lim_idx] } else { state.g_u[lim_idx] };
-                (xv, xb, state.ds[lim_idx], (xv - xb).abs())
+                (xv, xb, state.ds_at(lim_idx), (xv - xb).abs())
             } else {
                 let xv = state.x[lim_idx];
                 let xb = if lim_side == "L" { state.x_l[lim_idx] } else { state.x_u[lim_idx] };
@@ -3775,8 +3858,9 @@ fn detect_tiny_step(
     let max_rel_ds: f64 = if state.s.is_empty() {
         0.0
     } else {
-        (0..state.s.len())
-            .map(|i| state.ds[i].abs() / (state.s[i].abs() + 1.0))
+        state.s.iter()
+            .zip(state.ds.iter())
+            .map(|(&s_k, &ds_k)| ds_k.abs() / (s_k.abs() + 1.0))
             .fold(0.0f64, f64::max)
     };
 
@@ -4069,8 +4153,9 @@ fn compute_quality_function_mu(
         // Fraction-to-boundary step lengths under τ=1 (Ipopt QF probe uses
         // a full FTB scan on the candidate direction). B-cross6: include
         // s vs [g_l, g_u] and v_L/v_U non-negativity.
+        let ds_d_qf = state.layout.project_d(&ds);
         let alpha_p = fraction_to_boundary_primal_x(state, &dx, 1.0)
-            .min(fraction_to_boundary_primal_s(state, &ds, 1.0))
+            .min(fraction_to_boundary_primal_s(state, &ds_d_qf, 1.0))
             .clamp(0.0, 1.0);
         let alpha_d = fraction_to_boundary_dual_z_min(state, &dz_l, &dz_u, 1.0)
             .min(fraction_to_boundary_dual_v_min(state, &dv_l, &dv_u, 1.0))
@@ -5258,9 +5343,7 @@ fn initialize_slack_iterate(state: &mut SolverState, m: usize, options: &SolverO
     let kappa2 = options.bound_frac;
     for i in 0..m {
         if constraint_is_equality(state, i) {
-            // Equality row sentinel: s = g_l so the slack-derived diagnostics
-            // (which skip equality rows) see a benign value.
-            state.s[i] = state.g_l[i];
+            // Phase 3d: no sentinel write — `s` no longer carries equality slots.
             continue;
         }
         let l_fin = state.g_l[i].is_finite();
@@ -5278,7 +5361,7 @@ fn initialize_slack_iterate(state: &mut SolverState, m: usize, options: &SolverO
             let p_u = kappa1 * state.g_u[i].abs().max(1.0);
             s_i = s_i.min(state.g_u[i] - p_u);
         }
-        state.s[i] = s_i;
+        state.set_s_at(i, s_i);
     }
 }
 
@@ -5352,29 +5435,31 @@ fn apply_warm_start(state: &mut SolverState, options: &SolverOptions) {
     // project s back into a strict interior to keep the barrier well-
     // defined (use the same κ1/κ2 push the cold-start path uses).
     if let Some(ref init_s) = options.warm_start_s {
-        let len = init_s.len().min(state.s.len());
-        state.s[..len].copy_from_slice(&init_s[..len]);
+        // init_s is combined-indexed (size m). Phase 3d: drop equality slots
+        // and project onto the d-block storage.
+        let m_in = init_s.len().min(state.m);
         let kappa1 = options.bound_push;
         let kappa2 = options.bound_frac;
-        for i in 0..len {
+        for i in 0..m_in {
             if constraint_is_equality(state, i) {
-                state.s[i] = state.g_l[i];
                 continue;
             }
+            let mut s_i = init_s[i];
             let l_fin = state.g_l[i].is_finite();
             let u_fin = state.g_u[i].is_finite();
             if l_fin && u_fin {
                 let range = state.g_u[i] - state.g_l[i];
                 let p_l = (kappa1 * state.g_l[i].abs().max(1.0)).min(kappa2 * range);
                 let p_u = (kappa1 * state.g_u[i].abs().max(1.0)).min(kappa2 * range);
-                state.s[i] = state.s[i].max(state.g_l[i] + p_l).min(state.g_u[i] - p_u);
+                s_i = s_i.max(state.g_l[i] + p_l).min(state.g_u[i] - p_u);
             } else if l_fin {
                 let p_l = kappa1 * state.g_l[i].abs().max(1.0);
-                state.s[i] = state.s[i].max(state.g_l[i] + p_l);
+                s_i = s_i.max(state.g_l[i] + p_l);
             } else if u_fin {
                 let p_u = kappa1 * state.g_u[i].abs().max(1.0);
-                state.s[i] = state.s[i].min(state.g_u[i] - p_u);
+                s_i = s_i.min(state.g_u[i] - p_u);
             }
+            state.set_s_at(i, s_i);
         }
     }
     if let Some(ref init_v_l) = options.warm_start_v_l {
@@ -5977,6 +6062,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         // cache persists across iterations.
         let probing = options.mehrotra_pc;
         let y_combined_for_aug = state.y_combined();
+        let s_combined_for_aug = state.s_combined();
         let (step, _dc, mu_new_opt, aug_kkt, _iter_dw, _iter_dc) = if probing {
             let avg_compl = compute_avg_complementarity(&state);
             let mu_max = mu_state.mu_max_cap(options, avg_compl);
@@ -5985,7 +6071,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 &state.hess_rows, &state.hess_cols, &state.hess_vals,
                 &state.jac_rows, &state.jac_cols, &state.jac_vals,
                 &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u,
-                &state.s, &state.g, &state.g_l, &state.g_u, &y_combined_for_aug,
+                &s_combined_for_aug, &state.g, &state.g_l, &state.g_u, &y_combined_for_aug,
                 &state.v_l, &state.v_u,
                 state.mu, options.kappa_d,
                 crate::kkt_aug::PROBING_SIGMA_MAX_DEFAULT,
@@ -6006,7 +6092,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 &state.hess_rows, &state.hess_cols, &state.hess_vals,
                 &state.jac_rows, &state.jac_cols, &state.jac_vals,
                 &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u,
-                &state.s, &state.g, &state.g_l, &state.g_u, &y_combined_for_aug,
+                &s_combined_for_aug, &state.g, &state.g_l, &state.g_u, &y_combined_for_aug,
                 &state.v_l, &state.v_u,
                 state.mu, options.kappa_d,
                 use_sparse,
@@ -6041,6 +6127,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             }
             let dx_inf = state.dx.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
             let ds_inf = state.ds.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+            let ds_combined_iter0 = state.ds_combined();
             let dy_combined_iter0 = state.dy_combined();
             let dy_inf = dy_combined_iter0.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
             let dzl_inf = state.dz_l.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
@@ -6060,7 +6147,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             );
             for (name, vec) in [
                 ("dx", &state.dx[..]),
-                ("ds", &state.ds[..]),
+                ("ds", &ds_combined_iter0[..]),
                 ("dy", &dy_combined_iter0[..]),
                 ("dz_l", &state.dz_l[..]),
                 ("dz_u", &state.dz_u[..]),
@@ -6139,7 +6226,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                     let gl_r = state.g_l[r];
                     let gu_r = state.g_u[r];
                     let dy_r = state.dy_at(r);
-                    let s_r = if r < state.s.len() { state.s[r] } else { f64::NAN };
+                    let s_r = if r < state.m { state.s_at(r) } else { f64::NAN };
                     // collect J row r (cols, vals)
                     let mut j_row: Vec<(usize, f64)> = Vec::new();
                     for k in 0..state.jac_rows.len() {
@@ -6733,7 +6820,8 @@ fn attempt_soc_aug<P: NlpProblem>(
         if let Some(k) = partition.eq_pos[i] {
             c_soc[k] = state.g[i] - state.g_l[i];
         } else if let Some(k) = partition.ineq_pos[i] {
-            dms_soc[k] = state.g[i] - state.s[i];
+            // Phase 3d: state.s is d-block-native, indexed directly by k.
+            dms_soc[k] = state.g[i] - state.s[k];
         }
     }
 
@@ -6744,7 +6832,7 @@ fn attempt_soc_aug<P: NlpProblem>(
         if let Some(k) = partition.eq_pos[i] {
             latest_trial_c[k] = g_trial[i] - state.g_l[i];
         } else if let Some(k) = partition.ineq_pos[i] {
-            let s_trial_i = state.s[i] + alpha * state.ds[i];
+            let s_trial_i = state.s[k] + alpha * state.ds[k];
             latest_trial_dms[k] = g_trial[i] - s_trial_i;
         }
     }
@@ -6772,11 +6860,12 @@ fn attempt_soc_aug<P: NlpProblem>(
         // factored at the top of the IPM iteration; only the y_c/y_d RHS
         // slots change.
         let y_combined_for_soc = state.y_combined();
+        let s_combined_for_soc = state.s_combined();
         let (dx_soc, ds_d_soc) = match crate::kkt_aug::aug_soc_solve_dx_factored(
             n, &state.grad_f,
             &state.jac_rows, &state.jac_cols, &state.jac_vals,
             &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u,
-            &state.s, &state.g, &state.g_l, &state.g_u, &y_combined_for_soc,
+            &s_combined_for_soc, &state.g, &state.g_l, &state.g_u, &y_combined_for_soc,
             &state.v_l, &state.v_u,
             state.mu, options.kappa_d,
             aug_solver,
@@ -6791,15 +6880,11 @@ fn attempt_soc_aug<P: NlpProblem>(
             compute_soc_alpha_and_trial_x(state, &dx_soc, tau);
         alpha_primal_soc = alpha_primal_soc_new;
 
-        // A8.19: build s_soc = state.s + α_p_soc · ds_d_soc (inequality
-        // rows only; equality rows keep the sentinel state.s[i]=g_l[i])
-        // so the SOC trial theta uses the slack-coupled form
-        // `||c||_1 + ||d − s||_1` matching Ipopt.
+        // A8.19: build s_soc = state.s + α_p_soc · ds_d_soc (d-form).
+        // Phase 3d: state.s and ds_d_soc both index by k ∈ [0, n_d).
         let mut s_soc = state.s.clone();
-        for i in 0..m {
-            if let Some(k) = partition.ineq_pos[i] {
-                s_soc[i] = state.s[i] + alpha_primal_soc * ds_d_soc[k];
-            }
+        for k in 0..n_d {
+            s_soc[k] = state.s[k] + alpha_primal_soc * ds_d_soc[k];
         }
 
         match evaluate_soc_trial_and_check(
@@ -6813,12 +6898,12 @@ fn attempt_soc_aug<P: NlpProblem>(
             SocTrialOutcome::Abort => return None,
             SocTrialOutcome::NotAccepted { g_soc } => {
                 // Refresh latest_trial_* using the rejected SOC trial:
-                //   s_soc[i] = state.s[i] + α_p_soc · ds_d_soc[k]   for ineq row i.
+                //   s_soc[k] = state.s[k] + α_p_soc · ds_d_soc[k]   for k ∈ d-block.
                 for i in 0..m {
                     if let Some(k) = partition.eq_pos[i] {
                         latest_trial_c[k] = g_soc[i] - state.g_l[i];
                     } else if let Some(k) = partition.ineq_pos[i] {
-                        let s_soc_i = state.s[i] + alpha_primal_soc * ds_d_soc[k];
+                        let s_soc_i = state.s[k] + alpha_primal_soc * ds_d_soc[k];
                         latest_trial_dms[k] = g_soc[i] - s_soc_i;
                     }
                 }
@@ -8060,13 +8145,12 @@ fn compute_s_d_at_state(state: &SolverState) -> f64 {
 /// for why the prior box-violation flavour made the h-type filter
 /// test artificially permissive at high theta.
 ///
-/// Equality rows remain consistent because `state.s[i] = g_l[i]`
-/// is the sentinel for equality rows (`ipm.rs:578`) and `state.ds[i]
-/// = 0` for equalities, so trial `s_trial = s + α·ds` preserves
-/// `s[i] = g_l[i]` and the formula collapses to `|g[i] − g_l[i]|`.
-fn theta_for_g_s(state: &SolverState, g: &[f64], s: &[f64]) -> f64 {
-    // Project the trial (g, s) through the constraint layout into c-block
-    // residual + d-block (g_d, s_d) before delegating to the split kernel.
+/// Phase 3d: `s` and `ds` are now d-block-native. Equality rows are
+/// elided from the slack storage entirely, so the slack-coupled theta
+/// reduces to `||c||_1 + ||d − s||_1` directly without sentinel
+/// reconstruction.
+fn theta_for_g_s(state: &SolverState, g: &[f64], s_d: &[f64]) -> f64 {
+    debug_assert_eq!(s_d.len(), state.layout.n_d);
     let g_c: Vec<f64> = state
         .layout
         .c_to_combined
@@ -8074,20 +8158,18 @@ fn theta_for_g_s(state: &SolverState, g: &[f64], s: &[f64]) -> f64 {
         .map(|&i| g[i] - state.g_l[i])
         .collect();
     let g_d: Vec<f64> = state.layout.project_d(g);
-    let s_d: Vec<f64> = state.layout.project_d(s);
-    convergence::primal_infeasibility_internal_split(&g_c, &g_d, &s_d)
+    convergence::primal_infeasibility_internal_split(&g_c, &g_d, s_d)
 }
 
-/// Compute the trial slack `s + α·ds` for the line-search trial.
+/// Compute the trial slack `s + α·ds` for the line-search trial (size n_d).
 /// Frac-to-bound on `s` is enforced upstream by `compute_alpha_max`
-/// (`ipm.rs:3303-3414`), so `s_trial` stays in `(g_l, g_u)` for any
-/// `α ≤ alpha_primal_max`. For equality rows `state.ds[i] = 0`, so
-/// `s_trial[i] = state.s[i] = g_l[i]` (sentinel preserved).
+/// (`ipm.rs:3303-3414`), so `s_trial` stays in `(d_L, d_U)` for any
+/// `α ≤ alpha_primal_max`. Phase 3d: returns d-form Vec.
 fn compute_trial_slack(state: &SolverState, alpha: f64) -> Vec<f64> {
-    let m = state.m;
-    let mut s_trial = Vec::with_capacity(m);
-    for i in 0..m {
-        s_trial.push(state.s[i] + alpha * state.ds[i]);
+    let n_d = state.layout.n_d;
+    let mut s_trial = Vec::with_capacity(n_d);
+    for k in 0..n_d {
+        s_trial.push(state.s[k] + alpha * state.ds[k]);
     }
     s_trial
 }
@@ -8228,20 +8310,18 @@ fn fraction_to_boundary_primal_x(state: &SolverState, dx: &[f64], tau: f64) -> f
 /// its variable bounds: the open side of the bound never produces an `α`
 /// limiter even when `ds` points "away" from the finite side.
 fn fraction_to_boundary_primal_s(state: &SolverState, ds: &[f64], tau: f64) -> f64 {
+    debug_assert_eq!(ds.len(), state.layout.n_d);
     let mut alpha = 1.0_f64;
-    for i in 0..state.m {
+    for (k, &i) in state.layout.d_to_combined.iter().enumerate() {
         let l_fin = state.g_l[i].is_finite();
         let u_fin = state.g_u[i].is_finite();
-        if l_fin && u_fin && (state.g_l[i] - state.g_u[i]).abs() < 1e-14 {
-            continue;
+        if l_fin && ds[k] < 0.0 {
+            let slack = (state.s[k] - state.g_l[i]).max(0.0);
+            alpha = alpha.min(-tau * slack / ds[k]);
         }
-        if l_fin && ds[i] < 0.0 {
-            let slack = (state.s[i] - state.g_l[i]).max(0.0);
-            alpha = alpha.min(-tau * slack / ds[i]);
-        }
-        if u_fin && ds[i] > 0.0 {
-            let slack = (state.g_u[i] - state.s[i]).max(0.0);
-            alpha = alpha.min(tau * slack / ds[i]);
+        if u_fin && ds[k] > 0.0 {
+            let slack = (state.g_u[i] - state.s[k]).max(0.0);
+            alpha = alpha.min(tau * slack / ds[k]);
         }
     }
     alpha
@@ -8262,7 +8342,7 @@ fn install_step_directions(
 ) {
     state.dx = dx;
     state.set_dy_combined(&dy);
-    state.ds = ds;
+    state.set_ds_combined(&ds);
     state.dz_l = dz_l;
     state.dz_u = dz_u;
     state.dv_l = dv_l;
@@ -8570,14 +8650,14 @@ fn slack_xu(state: &SolverState, i: usize) -> f64 {
 /// top of every iteration (via `sync_state_s_to_g`); once B6 lands and `s`
 /// is advanced via Newton step, the sync is removed.
 fn slack_gl(state: &SolverState, i: usize) -> f64 {
-    (state.s[i] - state.g_l[i]).max(1e-20)
+    (state.s_at(i) - state.g_l[i]).max(1e-20)
 }
 
 /// Strictly-positive upper-side constraint slack `max(g_u - s, 1e-20)`.
 /// See [`slack_gl`] for the finite-guard contract and the `state.s`
 /// rationale.
 fn slack_gu(state: &SolverState, i: usize) -> f64 {
-    (state.g_u[i] - state.s[i]).max(1e-20)
+    (state.g_u[i] - state.s_at(i)).max(1e-20)
 }
 
 /// Test-only helper: copy `state.g` into `state.s` so the slack iterate
@@ -8590,11 +8670,11 @@ fn slack_gu(state: &SolverState, i: usize) -> f64 {
 /// with the constraint values they just installed.
 #[cfg(test)]
 pub(crate) fn sync_state_s_to_g(state: &mut SolverState) {
-    for i in 0..state.m {
-        let is_eq = state.g_l[i].is_finite()
-            && state.g_u[i].is_finite()
-            && (state.g_l[i] - state.g_u[i]).abs() < 1e-14;
-        state.s[i] = if is_eq { state.g_l[i] } else { state.g[i] };
+    // Phase 3d: `s` is d-block-native. Walk the d-block directly and copy
+    // `g[i]` for the corresponding combined row.
+    for k in 0..state.layout.n_d {
+        let i = state.layout.d_to_combined[k];
+        state.s[k] = state.g[i];
     }
 }
 
@@ -8701,9 +8781,12 @@ fn recover_dz_from_state(state: &SolverState, dx: &[f64], mu: f64) -> (Vec<f64>,
 /// iterate's `state.{g, g_l, g_u, v_l, v_u}` and Jacobian, for a given
 /// primal direction `dx` and centering target `mu`.
 fn recover_dv_from_state(state: &SolverState, ds: &[f64], mu: f64) -> (Vec<f64>, Vec<f64>) {
+    // Phase 3d: kkt::recover_dv still indexes s/ds in m-form; materialize
+    // a combined s view from the d-block storage for the call.
+    let s_combined = state.s_combined();
     kkt::recover_dv(
         state.m,
-        &state.g_l, &state.g_u, &state.s,
+        &state.g_l, &state.g_u, &s_combined,
         &state.v_l, &state.v_u, ds, mu,
     )
 }
@@ -8728,10 +8811,11 @@ fn recover_ds_from_state(
             .map(|i| if constraint_is_equality(state, i) { 0.0 } else { ic_delta_c })
             .collect()
     };
+    let s_combined = state.s_combined();
     kkt::recover_ds(
         state.n, state.m,
         &state.jac_rows, &state.jac_cols, &state.jac_vals,
-        &state.g, &state.g_l, &state.g_u, &state.s,
+        &state.g, &state.g_l, &state.g_u, &s_combined,
         dx, dy, &delta_d_vec,
     )
 }
@@ -8751,12 +8835,13 @@ fn assemble_kkt_from_state(
     kappa_d: f64,
 ) -> kkt::KktSystem {
     let y_combined = state.y_combined();
+    let s_combined = state.s_combined();
     let mut sys = kkt::assemble_kkt(
         n, m,
         &state.hess_rows, &state.hess_cols, &state.hess_vals,
         &state.jac_rows, &state.jac_cols, &state.jac_vals,
         sigma, &state.grad_f, &state.g, &state.g_l, &state.g_u,
-        &state.s, &y_combined, &state.z_l, &state.z_u,
+        &s_combined, &y_combined, &state.z_l, &state.z_u,
         &state.x, &state.x_l, &state.x_u, state.mu, kappa_d,
         use_sparse, &state.v_l, &state.v_u, &state.layout,
     );
@@ -8842,15 +8927,10 @@ fn commit_trial_point(
     // rows the line-searched α_p is the same fraction of the FTB-capped
     // step taken on x, by Ipopt's `alpha_for_y = primal` default
     // (IpFilterLSAcceptor.cpp:617-628, IpIteratesVector.hpp).
-    for i in 0..state.m {
-        let is_eq = state.g_l[i].is_finite()
-            && state.g_u[i].is_finite()
-            && (state.g_l[i] - state.g_u[i]).abs() < 1e-14;
-        if is_eq {
-            state.s[i] = state.g_l[i];
-        } else {
-            state.s[i] += alpha * state.ds[i];
-        }
+    // Phase 3d: state.s and state.ds are d-block-native (size n_d), so
+    // advance directly over the d-block — equality rows are not stored.
+    for k in 0..state.layout.n_d {
+        state.s[k] += alpha * state.ds[k];
     }
     state.alpha_primal = alpha;
     // T3.25: x and g have changed → slacks_x, slacks_s, sigma_x, sigma_s
@@ -9203,6 +9283,7 @@ mod tests {
             dz_u: vec![0.0; n],
             dv_l: vec![0.0; m],
             dv_u: vec![0.0; m],
+            // Phase 3d: test-only constructor (all-inequality layout) → m-length s/ds.
             s: vec![0.0; m],
             ds: vec![0.0; m],
             mu: 0.1,
