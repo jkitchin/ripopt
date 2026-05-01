@@ -30,30 +30,42 @@
 pub use crate::constraint_layout::ConstraintLayout;
 use crate::linear_solver::{KktMatrix, LinearSolver, SolverError};
 
-/// Σ_s = Pd_L · diag(v_L / s_L) + Pd_U · diag(v_U / s_U), one entry per
-/// inequality constraint (length `n_d`). The projection matrices `Pd_L` /
-/// `Pd_U` zero out unbounded sides, matching `IpIpoptCalculatedQuantities.cpp:3540-3543`.
-///
-/// Reads `s` (the slack iterate, length `m`), `g_l` / `g_u` (constraint
-/// bounds, length `m`), `v_l` / `v_u` (slack-bound multipliers, length `m`),
-/// and the partition (which selects the `n_d` inequality rows).
+/// Project an m-indexed array onto the n_d-indexed inequality subset.
+/// Phase 5f bridge helper: callers that still receive m-form bound /
+/// slack vectors funnel through this once before invoking the native
+/// split-form `compute_sigma_s` and friends. Will disappear once the
+/// public `aug_step_from_state` family takes split inputs directly.
+#[inline]
+fn project_d(partition: &ConstraintLayout, v: &[f64]) -> Vec<f64> {
+    partition.d_to_combined.iter().map(|&i| v[i]).collect()
+}
+
+/// Σ_s = diag(v_L / (s − d_L)) + diag(v_U / (d_U − s)), one entry per
+/// inequality constraint (length `n_d`). Phase 5f: native split-form —
+/// all inputs are n_d-indexed (Ipopt's `Pd_L`/`Pd_U` are baked into the
+/// d-block storage, so unbounded sides have non-finite `d_L` / `d_U` and
+/// contribute zero). Matches `IpIpoptCalculatedQuantities.cpp:3540-3543`.
 pub fn compute_sigma_s(
-    partition: &ConstraintLayout,
-    s: &[f64],
-    g_l: &[f64],
-    g_u: &[f64],
-    v_l: &[f64],
-    v_u: &[f64],
+    d_l: &[f64],
+    d_u: &[f64],
+    s_d: &[f64],
+    v_l_d: &[f64],
+    v_u_d: &[f64],
 ) -> Vec<f64> {
-    let mut sigma_s = vec![0.0; partition.n_d];
-    for (k, &i) in partition.d_to_combined.iter().enumerate() {
-        if g_l[i].is_finite() {
-            let slack = (s[i] - g_l[i]).max(1e-20);
-            sigma_s[k] += v_l[i] / slack;
+    let n_d = s_d.len();
+    debug_assert_eq!(d_l.len(), n_d);
+    debug_assert_eq!(d_u.len(), n_d);
+    debug_assert_eq!(v_l_d.len(), n_d);
+    debug_assert_eq!(v_u_d.len(), n_d);
+    let mut sigma_s = vec![0.0; n_d];
+    for k in 0..n_d {
+        if d_l[k].is_finite() {
+            let slack = (s_d[k] - d_l[k]).max(1e-20);
+            sigma_s[k] += v_l_d[k] / slack;
         }
-        if g_u[i].is_finite() {
-            let slack = (g_u[i] - s[i]).max(1e-20);
-            sigma_s[k] += v_u[i] / slack;
+        if d_u[k].is_finite() {
+            let slack = (d_u[k] - s_d[k]).max(1e-20);
+            sigma_s[k] += v_u_d[k] / slack;
         }
     }
     sigma_s
@@ -1032,7 +1044,12 @@ pub fn aug_step_from_state(
             sigma_x[i] += z_u[i] / s_u;
         }
     }
-    let sigma_s = compute_sigma_s(&partition, s, g_l, g_u, v_l, v_u);
+    let s_d = project_d(&partition, s);
+    let d_l = project_d(&partition, g_l);
+    let d_u = project_d(&partition, g_u);
+    let v_l_d = project_d(&partition, v_l);
+    let v_u_d = project_d(&partition, v_u);
+    let sigma_s = compute_sigma_s(&d_l, &d_u, &s_d, &v_l_d, &v_u_d);
 
     // Assemble the unperturbed matrix (δ_* zeroed; perturbation layered on
     // by factor_aug_with_inertia_correction).
@@ -1326,7 +1343,12 @@ pub fn aug_step_from_state_mehrotra(
             sigma_x[i] += z_u[i] / s_u;
         }
     }
-    let sigma_s = compute_sigma_s(&partition, s, g_l, g_u, v_l, v_u);
+    let s_d = project_d(&partition, s);
+    let d_l = project_d(&partition, g_l);
+    let d_u = project_d(&partition, g_u);
+    let v_l_d = project_d(&partition, v_l);
+    let v_u_d = project_d(&partition, v_u);
+    let sigma_s = compute_sigma_s(&d_l, &d_u, &s_d, &v_l_d, &v_u_d);
 
     let mut aug = assemble_aug_kkt(
         n, partition.n_c, partition.n_d,
@@ -1476,7 +1498,12 @@ pub fn aug_soc_solve_dx(
             sigma_x[i] += z_u[i] / s_u;
         }
     }
-    let sigma_s = compute_sigma_s(&partition, s, g_l, g_u, v_l, v_u);
+    let s_d = project_d(&partition, s);
+    let d_l = project_d(&partition, g_l);
+    let d_u = project_d(&partition, g_u);
+    let v_l_d = project_d(&partition, v_l);
+    let v_u_d = project_d(&partition, v_u);
+    let sigma_s = compute_sigma_s(&d_l, &d_u, &s_d, &v_l_d, &v_u_d);
 
     let mut aug = assemble_aug_kkt(
         n, partition.n_c, partition.n_d,
@@ -1665,7 +1692,8 @@ mod tests {
         let s = vec![1.0, 0.0];
         let v_l = vec![2.0, 0.0];
         let v_u = vec![0.0, 0.0];
-        let sigma = compute_sigma_s(&p, &s, &g_l, &g_u, &v_l, &v_u);
+        let _ = p; // partition no longer needed; inputs are already n_d-form.
+        let sigma = compute_sigma_s(&g_l, &g_u, &s, &v_l, &v_u);
         assert_eq!(sigma.len(), 2);
         assert!((sigma[0] - 2.0).abs() < 1e-12); // v_l/(s-g_l) = 2/1 = 2
         assert_eq!(sigma[1], 0.0);
@@ -1679,7 +1707,8 @@ mod tests {
         let s = vec![2.0];
         let v_l = vec![3.0];
         let v_u = vec![4.0];
-        let sigma = compute_sigma_s(&p, &s, &g_l, &g_u, &v_l, &v_u);
+        let _ = p;
+        let sigma = compute_sigma_s(&g_l, &g_u, &s, &v_l, &v_u);
         // 3/(2-0) + 4/(10-2) = 1.5 + 0.5 = 2.0
         assert!((sigma[0] - 2.0).abs() < 1e-12);
     }
@@ -1853,7 +1882,7 @@ mod tests {
         // Σ_x = z_l/(x-x_l) = 0.5/1 = 0.5.
         let sigma_x = vec![0.5];
         // Σ_s = v_l/(s-g_l) + v_u/(g_u-s) = 0.4/3 + 0.6/7
-        let sigma_s = compute_sigma_s(&p, &s, &g_l, &g_u, &v_l, &v_u);
+        let sigma_s = compute_sigma_s(&g_l, &g_u, &s, &v_l, &v_u);
 
         // Hessian H = [[2.0]], Jacobian J row 0 (ineq, kd=0): [3.0].
         let hess_rows = vec![0];
