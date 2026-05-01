@@ -438,6 +438,159 @@ pub fn complementarity_error_full(
     max_err
 }
 
+// =====================================================================
+// Phase 2 — split-input variants (c-block / d-block) of the primal,
+// dual, and complementarity residuals. These take Ipopt-style separated
+// inputs: `g_c` is the equality residual (size n_c, zero at feasibility,
+// computed as `g[c_to_combined[k]] - g_l[c_to_combined[k]]`), `g_d` is
+// the inequality value, `d_l` / `d_u` are the inequality bounds, `s_d`
+// is the slack iterate restricted to the d-block.
+//
+// Behavior is bit-equivalent to the combined-input variants above on
+// problems where every row has been classified consistently (i.e.,
+// `is_equality_constraint(g_l[i], g_u[i])` matches the layout). They
+// exist so call sites can stop branching per row and so the underlying
+// storage can be split entirely in Phase 3.
+// =====================================================================
+
+/// 1-norm primal infeasibility on the split layout. Equality contribution
+/// is `||c(x)||_1` (residual already), inequality contribution is the
+/// per-row bound violation summed over the d-block.
+pub fn primal_infeasibility_split(
+    g_c: &[f64],
+    g_d: &[f64],
+    d_l: &[f64],
+    d_u: &[f64],
+) -> f64 {
+    let mut sum = 0.0f64;
+    for &c in g_c {
+        sum += c.abs();
+    }
+    debug_assert_eq!(g_d.len(), d_l.len());
+    debug_assert_eq!(g_d.len(), d_u.len());
+    for k in 0..g_d.len() {
+        if g_d[k] < d_l[k] {
+            sum += d_l[k] - g_d[k];
+        }
+        if g_d[k] > d_u[k] {
+            sum += g_d[k] - d_u[k];
+        }
+    }
+    sum
+}
+
+/// Max-norm primal infeasibility on the split layout. Used by the
+/// barrier-level convergence test (Ipopt's `E_mu` primal residual).
+pub fn primal_infeasibility_max_split(
+    g_c: &[f64],
+    g_d: &[f64],
+    d_l: &[f64],
+    d_u: &[f64],
+) -> f64 {
+    let mut m = 0.0f64;
+    for &c in g_c {
+        let a = c.abs();
+        if a > m {
+            m = a;
+        }
+    }
+    debug_assert_eq!(g_d.len(), d_l.len());
+    debug_assert_eq!(g_d.len(), d_u.len());
+    for k in 0..g_d.len() {
+        if g_d[k] < d_l[k] {
+            let v = d_l[k] - g_d[k];
+            if v > m {
+                m = v;
+            }
+        }
+        if g_d[k] > d_u[k] {
+            let v = g_d[k] - d_u[k];
+            if v > m {
+                m = v;
+            }
+        }
+    }
+    m
+}
+
+/// Slack-coupling primal infeasibility (Ipopt's `inf_pr` =
+/// `||c(x)||_1 + ||d(x) − s||_1` on the split layout). Equality rows
+/// contribute `|c[k]|`; inequality rows contribute `|d[k] − s_d[k]|`.
+pub fn primal_infeasibility_internal_split(
+    g_c: &[f64],
+    g_d: &[f64],
+    s_d: &[f64],
+) -> f64 {
+    let mut sum = 0.0f64;
+    for &c in g_c {
+        sum += c.abs();
+    }
+    debug_assert_eq!(g_d.len(), s_d.len());
+    for k in 0..g_d.len() {
+        sum += (g_d[k] - s_d[k]).abs();
+    }
+    sum
+}
+
+/// Max-norm variant of [`primal_infeasibility_internal_split`].
+pub fn primal_infeasibility_internal_max_split(
+    g_c: &[f64],
+    g_d: &[f64],
+    s_d: &[f64],
+) -> f64 {
+    let mut m = 0.0f64;
+    for &c in g_c {
+        let a = c.abs();
+        if a > m {
+            m = a;
+        }
+    }
+    debug_assert_eq!(g_d.len(), s_d.len());
+    for k in 0..g_d.len() {
+        let r = (g_d[k] - s_d[k]).abs();
+        if r > m {
+            m = r;
+        }
+    }
+    m
+}
+
+/// Complementarity error on the split layout. Equality multipliers `y_c`
+/// have no complementarity contribution (no slack); only the d-block
+/// pairs (slack ↔ v_l, v_u) contribute, alongside the variable-bound
+/// pairs (z_l, z_u) handled inside [`complementarity_error`].
+#[allow(clippy::too_many_arguments)]
+pub fn complementarity_error_full_split(
+    x: &[f64],
+    x_l: &[f64],
+    x_u: &[f64],
+    z_l: &[f64],
+    z_u: &[f64],
+    g_d: &[f64],
+    d_l: &[f64],
+    d_u: &[f64],
+    v_l_d: &[f64],
+    v_u_d: &[f64],
+    mu: f64,
+) -> f64 {
+    let mut max_err = complementarity_error(x, x_l, x_u, z_l, z_u, mu);
+    debug_assert_eq!(g_d.len(), d_l.len());
+    debug_assert_eq!(g_d.len(), d_u.len());
+    debug_assert_eq!(g_d.len(), v_l_d.len());
+    debug_assert_eq!(g_d.len(), v_u_d.len());
+    for k in 0..g_d.len() {
+        if d_l[k].is_finite() {
+            let slack = (g_d[k] - d_l[k]).max(0.0);
+            max_err = max_err.max((slack * v_l_d[k] - mu).abs());
+        }
+        if d_u[k].is_finite() {
+            let slack = (d_u[k] - g_d[k]).max(0.0);
+            max_err = max_err.max((slack * v_u_d[k] - mu).abs());
+        }
+    }
+    max_err
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -830,6 +983,125 @@ mod tests {
             (di - 1e-6).abs() < 1e-15,
             "convergence-test dual_inf must expose raw residual, got {}",
             di,
+        );
+    }
+
+    // ---- Phase 2 split-variant equivalence tests --------------------
+
+    /// Helper: project combined (g, g_l, g_u) onto split (g_c residual,
+    /// g_d, d_l, d_u) by classifying each row via `is_equality_constraint`.
+    fn project_split(
+        g: &[f64],
+        g_l: &[f64],
+        g_u: &[f64],
+    ) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+        let mut g_c = Vec::new();
+        let mut g_d = Vec::new();
+        let mut d_l = Vec::new();
+        let mut d_u = Vec::new();
+        for i in 0..g.len() {
+            if is_equality_constraint(g_l[i], g_u[i]) {
+                g_c.push(g[i] - g_l[i]);
+            } else {
+                g_d.push(g[i]);
+                d_l.push(g_l[i]);
+                d_u.push(g_u[i]);
+            }
+        }
+        (g_c, g_d, d_l, d_u)
+    }
+
+    #[test]
+    fn split_primal_inf_matches_combined_mixed() {
+        // 4 rows: eq, ineq, eq, ineq. g violates row 1 below d_l, row 3 above d_u.
+        let g = vec![5.0, 0.5, -2.0, 6.0];
+        let g_l = vec![5.0, 1.0, -2.0, 2.0];
+        let g_u = vec![5.0, 4.0, -2.0, 5.0];
+        let (g_c, g_d, d_l, d_u) = project_split(&g, &g_l, &g_u);
+        let combined = primal_infeasibility(&g, &g_l, &g_u);
+        let split = primal_infeasibility_split(&g_c, &g_d, &d_l, &d_u);
+        assert!(
+            (combined - split).abs() < 1e-15,
+            "1-norm: combined={} split={}",
+            combined,
+            split,
+        );
+        let combined_max = primal_infeasibility_max(&g, &g_l, &g_u);
+        let split_max = primal_infeasibility_max_split(&g_c, &g_d, &d_l, &d_u);
+        assert!((combined_max - split_max).abs() < 1e-15);
+    }
+
+    #[test]
+    fn split_primal_inf_matches_combined_eq_violation() {
+        // Equality residual nonzero — exercises the c-block branch.
+        let g = vec![5.5, 3.0];
+        let g_l = vec![5.0, 1.0];
+        let g_u = vec![5.0, 4.0];
+        let (g_c, g_d, d_l, d_u) = project_split(&g, &g_l, &g_u);
+        // |5.5-5.0| + 0 (3.0 in [1,4])
+        assert_eq!(primal_infeasibility_split(&g_c, &g_d, &d_l, &d_u), 0.5);
+        assert!(
+            (primal_infeasibility(&g, &g_l, &g_u)
+                - primal_infeasibility_split(&g_c, &g_d, &d_l, &d_u))
+            .abs()
+                < 1e-15
+        );
+    }
+
+    #[test]
+    fn split_internal_primal_inf_matches_combined() {
+        // Slack-coupled residual: eq |c|, ineq |d - s|.
+        let g = vec![5.5, 3.0, -2.1];
+        let g_l = vec![5.0, 1.0, -2.0];
+        let g_u = vec![5.0, 4.0, -2.0];
+        let s = vec![5.0, 2.5, -2.0]; // s for eq rows is sentinel = g_l
+        let (g_c, g_d, _d_l, _d_u) = project_split(&g, &g_l, &g_u);
+        let s_d: Vec<f64> = (0..g.len())
+            .filter(|&i| !is_equality_constraint(g_l[i], g_u[i]))
+            .map(|i| s[i])
+            .collect();
+        let combined = primal_infeasibility_internal(&g, &s, &g_l, &g_u);
+        let split = primal_infeasibility_internal_split(&g_c, &g_d, &s_d);
+        assert!((combined - split).abs() < 1e-15);
+        let combined_max = primal_infeasibility_internal_max(&g, &s, &g_l, &g_u);
+        let split_max = primal_infeasibility_internal_max_split(&g_c, &g_d, &s_d);
+        assert!((combined_max - split_max).abs() < 1e-15);
+    }
+
+    #[test]
+    fn split_complementarity_matches_combined() {
+        // 2 inequalities + 1 equality (eq has v_l=v_u=0 in combined frame).
+        let x = vec![0.5];
+        let x_l = vec![0.0];
+        let x_u = vec![1.0];
+        let z_l = vec![2.0];
+        let z_u = vec![1.0];
+        let g = vec![3.0, 5.0, 0.0]; // ineq, ineq, eq
+        let g_l = vec![1.0, f64::NEG_INFINITY, 0.0];
+        let g_u = vec![4.0, 6.0, 0.0];
+        let v_l = vec![0.5, 0.0, 0.0];
+        let v_u = vec![0.7, 0.3, 0.0];
+        let mu = 0.1;
+        let combined = complementarity_error_full(
+            &x, &x_l, &x_u, &z_l, &z_u, &g, &g_l, &g_u, &v_l, &v_u, mu,
+        );
+        let (_g_c, g_d, d_l, d_u) = project_split(&g, &g_l, &g_u);
+        let v_l_d: Vec<f64> = (0..g.len())
+            .filter(|&i| !is_equality_constraint(g_l[i], g_u[i]))
+            .map(|i| v_l[i])
+            .collect();
+        let v_u_d: Vec<f64> = (0..g.len())
+            .filter(|&i| !is_equality_constraint(g_l[i], g_u[i]))
+            .map(|i| v_u[i])
+            .collect();
+        let split = complementarity_error_full_split(
+            &x, &x_l, &x_u, &z_l, &z_u, &g_d, &d_l, &d_u, &v_l_d, &v_u_d, mu,
+        );
+        assert!(
+            (combined - split).abs() < 1e-15,
+            "combined={} split={}",
+            combined,
+            split,
         );
     }
 }

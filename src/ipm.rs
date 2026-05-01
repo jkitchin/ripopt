@@ -1263,14 +1263,24 @@ impl SolverState {
     //              with bounds and slacks
     // -------------------------------------------------------------------
 
-    /// Equality constraint values `c(x)` (size n_c). Mirrors Ipopt's
-    /// `OrigIpoptNLP::c()` (`IpIpoptNLP.hpp:117`).
+    /// Equality-constraint residual `c(x) := g[i] - g_l[i]` projected onto
+    /// the c-block (size n_c). At feasibility `c(x) = 0`. Mirrors Ipopt's
+    /// `OrigIpoptNLP::c()` (`IpIpoptNLP.hpp:117`), where the equality
+    /// target is baked into the residual at TNLPAdapter level
+    /// (`IpTNLPAdapter.cpp:567-570`). Note the asymmetry with `g_d()`,
+    /// which returns the raw inequality value (not a residual) because
+    /// inequalities have a band, not a point target.
     pub fn g_c(&self) -> Vec<f64> {
-        self.layout.project_c(&self.g)
+        self.layout
+            .c_to_combined
+            .iter()
+            .map(|&i| self.g[i] - self.g_l[i])
+            .collect()
     }
 
     /// Inequality constraint values `d(x)` (size n_d). Mirrors Ipopt's
-    /// `OrigIpoptNLP::d()` (`IpIpoptNLP.hpp:118`).
+    /// `OrigIpoptNLP::d()` (`IpIpoptNLP.hpp:118`). At feasibility
+    /// `d_L ≤ d(x) ≤ d_U`.
     pub fn g_d(&self) -> Vec<f64> {
         self.layout.project_d(&self.g)
     }
@@ -1416,7 +1426,12 @@ impl SolverState {
 
     /// Compute constraint violation (theta).
     fn constraint_violation(&self) -> f64 {
-        convergence::primal_infeasibility(&self.g, &self.g_l, &self.g_u)
+        convergence::primal_infeasibility_split(
+            &self.g_c(),
+            &self.g_d(),
+            &self.d_l(),
+            &self.d_u(),
+        )
     }
 
     /// Compute the directional derivative of the barrier objective along the search direction.
@@ -6872,7 +6887,12 @@ fn maybe_recalc_y_post_step(
     // variant `state.constraint_violation()` is used for filter decisions
     // and for many-constraint problems is much larger than the max-norm,
     // making the recalc_y_feas_tol gate spuriously tight.
-    let theta_max = convergence::primal_infeasibility_max(&state.g, &state.g_l, &state.g_u);
+    let theta_max = convergence::primal_infeasibility_max_split(
+        &state.g_c(),
+        &state.g_d(),
+        &state.d_l(),
+        &state.d_u(),
+    );
     if theta_max >= options.recalc_y_feas_tol {
         return;
     }
@@ -7876,7 +7896,17 @@ fn compute_s_d_at_state(state: &SolverState) -> f64 {
 /// = 0` for equalities, so trial `s_trial = s + α·ds` preserves
 /// `s[i] = g_l[i]` and the formula collapses to `|g[i] − g_l[i]|`.
 fn theta_for_g_s(state: &SolverState, g: &[f64], s: &[f64]) -> f64 {
-    convergence::primal_infeasibility_internal(g, s, &state.g_l, &state.g_u)
+    // Project the trial (g, s) through the constraint layout into c-block
+    // residual + d-block (g_d, s_d) before delegating to the split kernel.
+    let g_c: Vec<f64> = state
+        .layout
+        .c_to_combined
+        .iter()
+        .map(|&i| g[i] - state.g_l[i])
+        .collect();
+    let g_d: Vec<f64> = state.layout.project_d(g);
+    let s_d: Vec<f64> = state.layout.project_d(s);
+    convergence::primal_infeasibility_internal_split(&g_c, &g_d, &s_d)
 }
 
 /// Compute the trial slack `s + α·ds` for the line-search trial.
@@ -8163,7 +8193,12 @@ fn dual_inf_with_z(state: &SolverState, z_l: &[f64], z_u: &[f64]) -> f64 {
 /// the current state's `g_l`/`g_u` bounds. Centralises the five
 /// state-arg call sites of `convergence::primal_infeasibility_max`.
 fn compute_primal_inf_max_at_state(state: &SolverState) -> f64 {
-    convergence::primal_infeasibility_max(&state.g, &state.g_l, &state.g_u)
+    convergence::primal_infeasibility_max_split(
+        &state.g_c(),
+        &state.g_d(),
+        &state.d_l(),
+        &state.d_u(),
+    )
 }
 
 /// L-infinity slack-coupling residual at the current iterate
@@ -8171,8 +8206,10 @@ fn compute_primal_inf_max_at_state(state: &SolverState) -> f64 {
 /// convergence test. Mirrors Ipopt's
 /// `IpIpoptCalculatedQuantities::curr_primal_infeasibility(NORM_MAX)`.
 fn compute_primal_inf_internal_max_at_state(state: &SolverState) -> f64 {
-    convergence::primal_infeasibility_internal_max(
-        &state.g, &state.s, &state.g_l, &state.g_u,
+    convergence::primal_infeasibility_internal_max_split(
+        &state.g_c(),
+        &state.g_d(),
+        &state.s_d(),
     )
 }
 
@@ -8214,9 +8251,10 @@ fn compl_err_with_z(state: &SolverState, z_l: &[f64], z_u: &[f64]) -> f64 {
 /// terms the convergence test cannot detect a stalled inequality
 /// constraint where `y` and slack are both nonzero.
 fn compute_compl_err_at_state(state: &SolverState) -> f64 {
-    convergence::complementarity_error_full(
+    convergence::complementarity_error_full_split(
         &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u,
-        &state.g, &state.g_l, &state.g_u, &state.v_l, &state.v_u, 0.0,
+        &state.g_d(), &state.d_l(), &state.d_u(),
+        &state.v_l_d(), &state.v_u_d(), 0.0,
     )
 }
 
@@ -8251,7 +8289,12 @@ fn compute_pderror_e_mu(state: &SolverState, mu: f64) -> f64 {
     }
     let dual_l1: f64 = residual.iter().map(|r| r.abs()).sum();
 
-    let primal_l1 = convergence::primal_infeasibility(&state.g, &state.g_l, &state.g_u);
+    let primal_l1 = convergence::primal_infeasibility_split(
+        &state.g_c(),
+        &state.g_d(),
+        &state.d_l(),
+        &state.d_u(),
+    );
 
     // Complementarity 1-norm: |slack·z - μ| over finite bounds, averaged
     // by the count of contributing entries (n_compl). When there are no
@@ -8866,7 +8909,12 @@ fn compute_barrier_error(state: &SolverState) -> f64 {
     // `curr_primal_infeasibility(NORM_MAX)` at line 2570-2610).
     // `state.constraint_violation()` returns the L1 sum used by the
     // filter; the barrier-error gate needs the L∞ version.
-    let primal_err = convergence::primal_infeasibility_max(&state.g, &state.g_l, &state.g_u);
+    let primal_err = convergence::primal_infeasibility_max_split(
+        &state.g_c(),
+        &state.g_d(),
+        &state.d_l(),
+        &state.d_u(),
+    );
 
     dual_err.max(compl_err).max(primal_err)
 }
