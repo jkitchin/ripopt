@@ -520,6 +520,7 @@ impl IterateSnapshot {
         state.mu = self.mu;
         state.obj = self.obj;
         state.g = self.g.clone();
+        state.refresh_split_constraints();
         state.grad_f = self.grad_f.clone();
         filter.restore_entries(self.filter_entries.clone());
     }
@@ -579,6 +580,7 @@ impl WatchdogSavedState {
         state.mu = self.mu;
         state.obj = self.obj;
         state.g = self.g.clone();
+        state.refresh_split_constraints();
         state.grad_f = self.grad_f.clone();
         // T3.25 follow-up: watchdog revert mutates x/y/z/v outside the
         // line-search choke point that bumps atags. Bump them and drop
@@ -678,6 +680,19 @@ pub(crate) struct SolverState {
     pub grad_f: Vec<f64>,
     /// Current constraint values.
     pub g: Vec<f64>,
+    /// Phase 5a split constraint values — equality residual `c(x)` (size
+    /// `n_c`). Mirrors Ipopt's `OrigIpoptNLP::c()` (`IpIpoptNLP.hpp:117`),
+    /// where the equality target is baked into the residual so `c(x) = 0`
+    /// at feasibility. Computed as `g[c_to_combined[k]] - c_rhs[k]` once
+    /// per evaluate via [`refresh_split_constraints`]. Phase 5a is
+    /// additive — readers still consume `g` + the `g_c()` accessor;
+    /// Phase 5b–5e migrate consumers and Phase 5f drops `g`.
+    pub c_x: Vec<f64>,
+    /// Phase 5a split constraint values — inequality value `d(x)` (size
+    /// `n_d`). Mirrors Ipopt's `OrigIpoptNLP::d()` (`IpIpoptNLP.hpp:118`).
+    /// Computed as `g[d_to_combined[k]]` once per evaluate via
+    /// [`refresh_split_constraints`].
+    pub d_x: Vec<f64>,
     /// Jacobian structure and values (combined m-row form). The
     /// user-facing `NlpProblem` trait still emits a single combined
     /// triplet; the split blocks below are derived projections.
@@ -1323,6 +1338,8 @@ impl SolverState {
             obj: 0.0,
             grad_f: vec![0.0; n],
             g: vec![0.0; m],
+            c_x: vec![0.0; layout.n_c],
+            d_x: vec![0.0; layout.n_d],
             jac_rows,
             jac_cols,
             jac_vals: vec![0.0; jac_nnz],
@@ -1822,6 +1839,21 @@ impl SolverState {
         }
     }
 
+    /// Phase 5a: refresh the split constraint storage from the combined
+    /// `g`. `c_x[k] = g[c_to_combined[k]] - c_rhs[k]` (Ipopt's `c(x)`,
+    /// equality residual baked at TNLPAdapter level — `IpTNLPAdapter.cpp:567-570`)
+    /// and `d_x[k] = g[d_to_combined[k]]` (Ipopt's raw `d(x)` value).
+    /// Call after every site that updates `state.g` so the split mirror
+    /// stays consistent until Phase 5f drops `g` entirely.
+    pub fn refresh_split_constraints(&mut self) {
+        for (k, &i) in self.layout.c_to_combined.iter().enumerate() {
+            self.c_x[k] = self.g[i] - self.c_rhs[k];
+        }
+        for (k, &i) in self.layout.d_to_combined.iter().enumerate() {
+            self.d_x[k] = self.g[i];
+        }
+    }
+
     /// Evaluate all functions, zeroing Hessian lambda for linear constraints.
     /// When `skip_hessian` is true (L-BFGS mode), the Hessian evaluation is skipped.
     fn evaluate_with_linear<P: NlpProblem>(
@@ -1850,6 +1882,7 @@ impl SolverState {
         if self.m > 0 {
             self.n_constr_evals += 1;
             if !problem.constraints(&self.x, false, &mut self.g) { return false; }
+            self.refresh_split_constraints();
             self.n_jac_evals += 1;
             if !problem.jacobian_values(&self.x, false, &mut self.jac_vals) { return false; }
             self.refresh_split_jac_vals();
@@ -3830,6 +3863,7 @@ impl SoftRestoSnapshot {
         state.set_s_combined(&self.s);
         state.obj = self.obj;
         state.g = self.g;
+        state.refresh_split_constraints();
         state.grad_f = self.grad_f;
         state.jac_vals = self.jac_vals;
         // Phase 4a: keep the split mirror in sync with the restored
@@ -9221,6 +9255,7 @@ fn commit_trial_point(
     state.x = x_trial;
     state.obj = obj_trial;
     state.g = g_trial;
+    state.refresh_split_constraints();
     // Advance the slack iterate with the same primal step length.
     // Equality rows (`g_l == g_u`) have `ds = 0` (forced by `recover_ds`)
     // and `s` stays at the equality value as a sentinel. For inequality
@@ -9603,6 +9638,11 @@ mod tests {
             obj: 0.0,
             grad_f: vec![0.0; n],
             g: vec![0.0; m],
+            // Phase 5a: native split constraint storage. Test-only
+            // constructor uses an all-inequality layout (n_c=0, n_d=m),
+            // so c_x is empty and d_x mirrors g.
+            c_x: Vec::new(),
+            d_x: vec![0.0; m],
             jac_rows: Vec::new(),
             jac_cols: Vec::new(),
             jac_vals: Vec::new(),
@@ -9680,6 +9720,8 @@ mod tests {
         state.ds.resize(n_d, 0.0);
         state.c_scaling.resize(n_c, 1.0);
         state.d_scaling.resize(n_d, 1.0);
+        state.c_x.resize(n_c, 0.0);
+        state.d_x.resize(n_d, 0.0);
     }
 
     /// Phase 4a: rebuild the split Jacobian structure from a combined
@@ -9706,6 +9748,42 @@ mod tests {
         }
         state.jac_c_vals = vec![0.0; state.jac_c_rows.len()];
         state.jac_d_vals = vec![0.0; state.jac_d_rows.len()];
+    }
+
+    #[test]
+    fn test_phase5a_split_constraints_mirror_combined() {
+        // 3 constraints, 1 var: row 0 ineq lo, row 1 equality (g_l=g_u=2.5),
+        // row 2 ineq hi. Native split:
+        //   layout.eq_pos  = [None, Some(0), None]
+        //   layout.ineq_pos= [Some(0), None,    Some(1)]
+        //   c_to_combined  = [1]
+        //   d_to_combined  = [0, 2]
+        // c_rhs = [g_l[1]] = [2.5]; for g = [10.0, 7.5, 30.0]:
+        //   c_x = [g[1] - 2.5] = [5.0]
+        //   d_x = [g[0], g[2]] = [10.0, 30.0]
+        let mut state = minimal_state(1, 3);
+        set_constraint_bounds(
+            &mut state,
+            vec![1.0, 2.5, 5.0],
+            vec![f64::INFINITY, 2.5, f64::INFINITY],
+        );
+        assert_eq!(state.layout.n_c, 1);
+        assert_eq!(state.layout.n_d, 2);
+        assert_eq!(state.c_rhs, vec![2.5]);
+        assert_eq!(state.c_x.len(), 1);
+        assert_eq!(state.d_x.len(), 2);
+
+        state.g = vec![10.0, 7.5, 30.0];
+        state.refresh_split_constraints();
+        assert_eq!(state.c_x, vec![5.0]);
+        assert_eq!(state.d_x, vec![10.0, 30.0]);
+
+        // Reactivity: mutating combined and refreshing must propagate.
+        state.g[1] = 4.5;
+        state.g[0] = 11.0;
+        state.refresh_split_constraints();
+        assert_eq!(state.c_x, vec![2.0]);
+        assert_eq!(state.d_x, vec![11.0, 30.0]);
     }
 
     #[test]
