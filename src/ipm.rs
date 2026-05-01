@@ -614,8 +614,13 @@ pub(crate) struct SolverState {
     pub v_u: Vec<f64>,
     /// Search direction: primal.
     pub dx: Vec<f64>,
-    /// Search direction: constraint multipliers.
-    pub dy: Vec<f64>,
+    /// Search direction: equality multipliers `dy_c` (size n_c). Phase 3c
+    /// of the data-layout refactor: replaces the combined
+    /// `dy: Vec<f64>` (size m). Mirrors Ipopt's IteratesVector
+    /// search-direction slot for y_c.
+    pub dy_c: Vec<f64>,
+    /// Search direction: inequality multipliers `dy_d` (size n_d).
+    pub dy_d: Vec<f64>,
     /// Search direction: lower bound multipliers.
     pub dz_l: Vec<f64>,
     /// Search direction: upper bound multipliers.
@@ -1219,7 +1224,8 @@ impl SolverState {
             v_l: vec![0.0; m],
             v_u: vec![0.0; m],
             dx: vec![0.0; n],
-            dy: vec![0.0; m],
+            dy_c: vec![0.0; layout.n_c],
+            dy_d: vec![0.0; layout.n_d],
             dz_l: vec![0.0; n],
             dz_u: vec![0.0; n],
             dv_l: vec![0.0; m],
@@ -1419,14 +1425,52 @@ impl SolverState {
         self.layout.project_d(&self.v_u)
     }
 
-    /// Equality-block search direction `Δy_c` (size n_c).
+    /// Equality-block search direction `Δy_c` (size n_c). Phase 3c:
+    /// clones from the new split storage.
     pub fn dy_c(&self) -> Vec<f64> {
-        self.layout.project_c(&self.dy)
+        self.dy_c.clone()
     }
 
-    /// Inequality-block search direction `Δy_d` (size n_d).
+    /// Inequality-block search direction `Δy_d` (size n_d). Phase 3c:
+    /// clones from the new split storage.
     pub fn dy_d(&self) -> Vec<f64> {
-        self.layout.project_d(&self.dy)
+        self.dy_d.clone()
+    }
+
+    /// Reconstruct the combined m-length step vector from the split
+    /// storage. Allocates per call.
+    pub fn dy_combined(&self) -> Vec<f64> {
+        let mut out = vec![0.0; self.m];
+        for (k, &i) in self.layout.c_to_combined.iter().enumerate() {
+            out[i] = self.dy_c[k];
+        }
+        for (k, &i) in self.layout.d_to_combined.iter().enumerate() {
+            out[i] = self.dy_d[k];
+        }
+        out
+    }
+
+    /// Read the combined-indexed step `dy[i]` by routing through the layout.
+    pub fn dy_at(&self, i: usize) -> f64 {
+        if let Some(k) = self.layout.eq_pos[i] {
+            self.dy_c[k]
+        } else {
+            let k = self.layout.ineq_pos[i].expect("row is c or d");
+            self.dy_d[k]
+        }
+    }
+
+    /// Overwrite the search direction from a combined m-length slice.
+    /// Splits across `dy_c` / `dy_d` via the layout. Used by the KKT
+    /// solver, gradient-descent fallback, and Gondzio correctors.
+    pub fn set_dy_combined(&mut self, dy: &[f64]) {
+        debug_assert_eq!(dy.len(), self.m);
+        for (k, &i) in self.layout.c_to_combined.iter().enumerate() {
+            self.dy_c[k] = dy[i];
+        }
+        for (k, &i) in self.layout.d_to_combined.iter().enumerate() {
+            self.dy_d[k] = dy[i];
+        }
     }
 
     /// Number of equality constraints (`n_c`). Convenience over
@@ -2477,9 +2521,11 @@ fn apply_slack_move(state: &mut SolverState, options: &SolverOptions) -> usize {
 /// bearing benchmark crutch with no analogue in Ipopt and is
 /// removed here.
 fn apply_y_update(state: &mut SolverState, alpha_y: f64) {
-    for i in 0..state.m {
-        let v = state.y_at(i) + alpha_y * state.dy[i];
-        state.set_y_at(i, v);
+    for k in 0..state.layout.n_c {
+        state.y_c[k] += alpha_y * state.dy_c[k];
+    }
+    for k in 0..state.layout.n_d {
+        state.y_d[k] += alpha_y * state.dy_d[k];
     }
 }
 
@@ -2544,7 +2590,7 @@ fn compute_min_dual_infeas_alpha<P: NlpProblem>(
     for i in 0..m {
         if !constraint_is_equality(state, i) {
             r_s[i] = -state.y_at(i) - state.v_l[i] + state.v_u[i];
-            dy_d[i] = state.dy[i];
+            dy_d[i] = state.dy_at(i);
         }
     }
 
@@ -2552,7 +2598,7 @@ fn compute_min_dual_infeas_alpha<P: NlpProblem>(
     // automatically participates in the y_c half of the formula).
     let mut jt_dy = vec![0.0_f64; n];
     for (idx, (&row, &col)) in state.jac_rows.iter().zip(state.jac_cols.iter()).enumerate() {
-        jt_dy[col] += jac_trial[idx] * state.dy[row];
+        jt_dy[col] += jac_trial[idx] * state.dy_at(row);
     }
 
     // a = ||Jt_dy||² + ||dy_d||²
@@ -3499,7 +3545,7 @@ fn attempt_soft_restoration<P: NlpProblem>(
     let x_trial = compute_clamped_trial_x(state, &state.dx, alpha_p);
     state.x = x_trial;
     for i in 0..m {
-        let v = state.y_at(i) + alpha_d * state.dy[i];
+        let v = state.y_at(i) + alpha_d * state.dy_at(i);
         state.set_y_at(i, v);
     }
     for i in 0..n {
@@ -3643,7 +3689,11 @@ fn compute_alpha_max(
             }
         }
         let dx_inf = state.dx.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
-        let dy_inf = state.dy.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+        let dy_inf = state
+            .dy_c
+            .iter()
+            .chain(state.dy_d.iter())
+            .fold(0.0f64, |a, &b| a.max(b.abs()));
         let dzl_inf = state.dz_l.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
         let dzu_inf = state.dz_u.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
         if lim_idx != usize::MAX {
@@ -3739,7 +3789,12 @@ fn detect_tiny_step(
     let dy_amax: f64 = if m == 0 {
         0.0
     } else {
-        state.dy.iter().map(|v| v.abs()).fold(0.0f64, f64::max)
+        state
+            .dy_c
+            .iter()
+            .chain(state.dy_d.iter())
+            .map(|v| v.abs())
+            .fold(0.0f64, f64::max)
     };
 
     // tiny_step_flag (= mu-update exit signal): current iter detection
@@ -5986,7 +6041,8 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             }
             let dx_inf = state.dx.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
             let ds_inf = state.ds.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
-            let dy_inf = state.dy.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+            let dy_combined_iter0 = state.dy_combined();
+            let dy_inf = dy_combined_iter0.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
             let dzl_inf = state.dz_l.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
             let dzu_inf = state.dz_u.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
             rip_log!(
@@ -6005,7 +6061,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             for (name, vec) in [
                 ("dx", &state.dx[..]),
                 ("ds", &state.ds[..]),
-                ("dy", &state.dy[..]),
+                ("dy", &dy_combined_iter0[..]),
                 ("dz_l", &state.dz_l[..]),
                 ("dz_u", &state.dz_u[..]),
             ] {
@@ -6082,7 +6138,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                     let g_r = state.g[r];
                     let gl_r = state.g_l[r];
                     let gu_r = state.g_u[r];
-                    let dy_r = state.dy[r];
+                    let dy_r = state.dy_at(r);
                     let s_r = if r < state.s.len() { state.s[r] } else { f64::NAN };
                     // collect J row r (cols, vals)
                     let mut j_row: Vec<(usize, f64)> = Vec::new();
@@ -6384,7 +6440,11 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             };
             // Step magnitude ranges: dx/dy/dz_l/dz_u L∞.
             let dx_inf = linf_norm(&state.dx);
-            let dy_inf = linf_norm(&state.dy);
+            let dy_inf = state
+                .dy_c
+                .iter()
+                .chain(state.dy_d.iter())
+                .fold(0.0f64, |a, &b| a.max(b.abs()));
             let dzl_inf = linf_norm(&state.dz_l);
             let dzu_inf = linf_norm(&state.dz_u);
             // Worst (z·s)/μ ratio: should be bounded by κ_Σ (default 1e10)
@@ -8201,7 +8261,7 @@ fn install_step_directions(
     dv_u: Vec<f64>,
 ) {
     state.dx = dx;
-    state.dy = dy;
+    state.set_dy_combined(&dy);
     state.ds = ds;
     state.dz_l = dz_l;
     state.dz_u = dz_u;
@@ -8736,7 +8796,11 @@ fn commit_trial_point(
             let d = (x_trial[i] - state.x[i]).abs();
             if d > diff_inf { diff_inf = d; }
         }
-        let dy_inf = linf_norm(&state.dy);
+        let dy_inf = state
+            .dy_c
+            .iter()
+            .chain(state.dy_d.iter())
+            .fold(0.0f64, |a, &b| a.max(b.abs()));
         let rel = if x_inf > 0.0 { diff_inf / x_inf } else { diff_inf };
         // Σ-pin diagnostic: smallest x-slack and largest z give the worst
         // diagonal entry of W + Σ. If min_slack · max_z >> κ_σ·μ the κ_σ
@@ -9131,7 +9195,10 @@ mod tests {
             v_l: vec![0.0; m],
             v_u: vec![0.0; m],
             dx: vec![0.0; n],
-            dy: vec![0.0; m],
+            // Phase 3c: test-only constructor (all-inequality layout) →
+            // empty dy_c, m-length dy_d.
+            dy_c: Vec::new(),
+            dy_d: vec![0.0; m],
             dz_l: vec![0.0; n],
             dz_u: vec![0.0; n],
             dv_l: vec![0.0; m],
@@ -10006,7 +10073,7 @@ mod tests {
         state.g_l = vec![0.0];
         state.g_u = vec![0.0];
         state.set_y_combined(&[0.5]);
-        state.dy = vec![-3.0];
+        state.set_dy_combined(&[-3.0]);
         state.jac_rows = vec![0];
         state.jac_cols = vec![0];
         state.jac_vals = vec![1.0];
@@ -10048,7 +10115,7 @@ mod tests {
         state.g_l = vec![0.0];
         state.g_u = vec![0.0];
         state.set_y_combined(&[0.5]);
-        state.dy = vec![-3.0];
+        state.set_dy_combined(&[-3.0]);
         state.jac_rows = vec![0];
         state.jac_cols = vec![0];
         state.jac_vals = vec![1.0];
@@ -10506,7 +10573,7 @@ mod tests {
         state.x = vec![1.0];
         state.dx = vec![1e-20];
         state.set_y_combined(&[0.0]);
-        state.dy = vec![1.0]; // dy_amax = 1.0, well above default 1e-2
+        state.set_dy_combined(&[1.0]); // dy_amax = 1.0, well above default 1e-2
 
         let opts = SolverOptions::default();
         let mut mu_state = MuState::new();
