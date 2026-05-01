@@ -2933,9 +2933,21 @@ fn compute_min_dual_infeas_alpha<P: NlpProblem>(
     if !problem.gradient(&state.x, true, &mut grad_f_trial) {
         return alpha_p; // graceful fallback
     }
-    let mut jac_trial = vec![0.0_f64; state.jac_vals.len()];
+    // Phase 5e: evaluate trial Jacobian into a scratch combined buffer,
+    // then project into split-form trial blocks via the same combined-idx
+    // map used by `refresh_split_jac_vals`.
+    let nnz_combined = state.jac_c_combined_idx.len() + state.jac_d_combined_idx.len();
+    let mut jac_trial = vec![0.0_f64; nnz_combined];
     if !problem.jacobian_values(&state.x, false, &mut jac_trial) {
         return alpha_p;
+    }
+    let mut jac_c_trial = vec![0.0_f64; state.jac_c_vals.len()];
+    let mut jac_d_trial = vec![0.0_f64; state.jac_d_vals.len()];
+    for (k, &idx) in state.jac_c_combined_idx.iter().enumerate() {
+        jac_c_trial[k] = jac_trial[idx];
+    }
+    for (k, &idx) in state.jac_d_combined_idx.iter().enumerate() {
+        jac_d_trial[k] = jac_trial[idx];
     }
 
     // r_x = grad_lag_x(trial) = grad_f_trial + J(trial)^T · y_curr − z_L + z_U.
@@ -2944,38 +2956,42 @@ fn compute_min_dual_infeas_alpha<P: NlpProblem>(
     // term — Ipopt resets y_c/y_d to current via `BackupCurrent` at
     // 975-980 then queries `curr_grad_lag_x_amax_func()`.)
     let mut r_x = grad_f_trial.clone();
-    for (idx, (&row, &col)) in state.jac_rows.iter().zip(state.jac_cols.iter()).enumerate() {
-        r_x[col] += jac_trial[idx] * state.y_at(row);
+    for (k, (&kc, &col)) in state.jac_c_rows.iter().zip(state.jac_c_cols.iter()).enumerate() {
+        r_x[col] += jac_c_trial[k] * state.y_c[kc];
+    }
+    for (k, (&kd, &col)) in state.jac_d_rows.iter().zip(state.jac_d_cols.iter()).enumerate() {
+        r_x[col] += jac_d_trial[k] * state.y_d[kd];
     }
     for i in 0..n {
         r_x[i] -= state.z_l[i];
         r_x[i] += state.z_u[i];
     }
 
-    // r_s and dy_d are zero on equality rows; on inequality rows
-    // r_s_i = -y_i - v_l_i + v_u_i and dy_d_i = state.dy[i].
-    let mut r_s = vec![0.0_f64; m];
-    let mut dy_d = vec![0.0_f64; m];
-    for i in 0..m {
-        if !constraint_is_equality(state, i) {
-            r_s[i] = -state.y_at(i) - state.v_l_at(i) + state.v_u_at(i);
-            dy_d[i] = state.dy_at(i);
-        }
+    // r_s and dy_d are d-block-only (Ipopt's slack rows don't exist on
+    // equality constraints). Phase 5e: read directly from split storage.
+    let n_d = state.layout.n_d;
+    let mut r_s = vec![0.0_f64; n_d];
+    for k in 0..n_d {
+        r_s[k] = -state.y_d[k] - state.v_l[k] + state.v_u[k];
     }
+    let _ = m;
 
-    // Jt_dy = J(trial)^T · dy (for all rows; equality contribution
-    // automatically participates in the y_c half of the formula).
+    // Jt_dy = J(trial)^T · dy (split-form; equality contribution from
+    // jac_c_trial · dy_c, inequality from jac_d_trial · dy_d).
     let mut jt_dy = vec![0.0_f64; n];
-    for (idx, (&row, &col)) in state.jac_rows.iter().zip(state.jac_cols.iter()).enumerate() {
-        jt_dy[col] += jac_trial[idx] * state.dy_at(row);
+    for (k, (&kc, &col)) in state.jac_c_rows.iter().zip(state.jac_c_cols.iter()).enumerate() {
+        jt_dy[col] += jac_c_trial[k] * state.dy_c[kc];
+    }
+    for (k, (&kd, &col)) in state.jac_d_rows.iter().zip(state.jac_d_cols.iter()).enumerate() {
+        jt_dy[col] += jac_d_trial[k] * state.dy_d[kd];
     }
 
     // a = ||Jt_dy||² + ||dy_d||²
     let a: f64 = jt_dy.iter().map(|v| v * v).sum::<f64>()
-        + dy_d.iter().map(|v| v * v).sum::<f64>();
+        + state.dy_d.iter().map(|v| v * v).sum::<f64>();
     // b = r_x · Jt_dy − r_s · dy_d
     let b: f64 = r_x.iter().zip(jt_dy.iter()).map(|(rx, jd)| rx * jd).sum::<f64>()
-        - r_s.iter().zip(dy_d.iter()).map(|(rs, dd)| rs * dd).sum::<f64>();
+        - r_s.iter().zip(state.dy_d.iter()).map(|(rs, dd)| rs * dd).sum::<f64>();
 
     // Closed-form minimum α* = -b/a. Guard a==0 (Δy entirely zero) by
     // falling back to alpha_p (matches Ipopt's behavior — α_y is
@@ -8693,21 +8709,31 @@ fn install_step_directions(
 /// θ > 0 the iterate is a stationary point of the feasibility merit
 /// function, so the problem is locally infeasible.
 fn compute_grad_theta_norm(state: &SolverState) -> f64 {
+    // Phase 5e: split-form theta gradient.
+    // For c-block: violation[k_c] = c_x[k_c] (= g[i] - c_rhs[k] for
+    // equality row i, since c_rhs = g_l = g_u for equalities).
+    // For d-block: violation[k_d] = clipped d_x against d_l/d_u.
     let n = state.n;
-    let m = state.m;
-    let mut violation = vec![0.0; m];
-    for i in 0..m {
-        if constraint_is_equality(state, i) {
-            violation[i] = state.g[i] - state.g_l_at(i);
-        } else if state.g_l_at(i).is_finite() && state.g[i] < state.g_l_at(i) {
-            violation[i] = state.g[i] - state.g_l_at(i);
-        } else if state.g_u_at(i).is_finite() && state.g[i] > state.g_u_at(i) {
-            violation[i] = state.g[i] - state.g_u_at(i);
-        }
-    }
+    let n_c = state.layout.n_c;
+    let n_d = state.layout.n_d;
     let mut grad_theta = vec![0.0; n];
-    for (idx, (&row, &col)) in state.jac_rows.iter().zip(state.jac_cols.iter()).enumerate() {
-        grad_theta[col] += state.jac_vals[idx] * violation[row];
+    for (idx, (&kc, &col)) in state.jac_c_rows.iter().zip(state.jac_c_cols.iter()).enumerate() {
+        let _ = n_c;
+        grad_theta[col] += state.jac_c_vals[idx] * state.c_x[kc];
+    }
+    for (idx, (&kd, &col)) in state.jac_d_rows.iter().zip(state.jac_d_cols.iter()).enumerate() {
+        let _ = n_d;
+        let dl = state.d_l[kd];
+        let du = state.d_u[kd];
+        let dx = state.d_x[kd];
+        let v = if dl.is_finite() && dx < dl {
+            dx - dl
+        } else if du.is_finite() && dx > du {
+            dx - du
+        } else {
+            0.0
+        };
+        grad_theta[col] += state.jac_d_vals[idx] * v;
     }
     linf_norm(&grad_theta)
 }
@@ -8873,10 +8899,14 @@ fn compute_pderror_e_mu(state: &SolverState, mu: f64) -> f64 {
     let n_pri = m.max(1) as f64;
 
     // Dual residual r_i = grad_f_i + (J^T y)_i - z_l_i + z_u_i, 1-norm.
+    // Phase 5e: split-form J^T·y, no combined materialisation.
     let mut residual = vec![0.0; n];
     residual[..n].copy_from_slice(&state.grad_f[..n]);
-    for (idx, (&row, &col)) in state.jac_rows.iter().zip(state.jac_cols.iter()).enumerate() {
-        residual[col] += state.jac_vals[idx] * state.y_at(row);
+    for (idx, (&kc, &col)) in state.jac_c_rows.iter().zip(state.jac_c_cols.iter()).enumerate() {
+        residual[col] += state.jac_c_vals[idx] * state.y_c[kc];
+    }
+    for (idx, (&kd, &col)) in state.jac_d_rows.iter().zip(state.jac_d_cols.iter()).enumerate() {
+        residual[col] += state.jac_d_vals[idx] * state.y_d[kd];
     }
     for i in 0..n {
         residual[i] -= state.z_l[i];
@@ -10650,6 +10680,8 @@ mod tests {
         state.jac_rows = vec![0];
         state.jac_cols = vec![0];
         state.jac_vals = vec![1.0];
+        rebuild_split_jac_structure(&mut state);
+        state.refresh_split_jac_vals();
 
         let alpha = compute_min_dual_infeas_alpha(
             &state, &ConstantProblem, AlphaForY::MinDualInfeas, 0.5, 0.5,
@@ -10691,6 +10723,8 @@ mod tests {
         state.jac_rows = vec![0];
         state.jac_cols = vec![0];
         state.jac_vals = vec![1.0];
+        rebuild_split_jac_structure(&mut state);
+        state.refresh_split_jac_vals();
 
         let alpha = compute_min_dual_infeas_alpha(
             &state, &ConstantProblem, AlphaForY::SaferMinDualInfeas, 0.2, 0.5,
