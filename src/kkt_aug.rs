@@ -40,6 +40,13 @@ fn project_d(partition: &ConstraintLayout, v: &[f64]) -> Vec<f64> {
     partition.d_to_combined.iter().map(|&i| v[i]).collect()
 }
 
+/// Project an m-indexed array onto the n_c-indexed equality subset.
+/// Phase 5f bridge helper (mirror of `project_d`).
+#[inline]
+fn project_c(partition: &ConstraintLayout, v: &[f64]) -> Vec<f64> {
+    partition.c_to_combined.iter().map(|&i| v[i]).collect()
+}
+
 /// Σ_s = diag(v_L / (s − d_L)) + diag(v_U / (d_U − s)), one entry per
 /// inequality constraint (length `n_d`). Phase 5f: native split-form —
 /// all inputs are n_d-indexed (Ipopt's `Pd_L`/`Pd_U` are baked into the
@@ -81,8 +88,8 @@ pub fn compute_sigma_s(
 /// `partition.eq_pos[row]` / `ineq_pos[row]`.
 pub fn compute_j_t_y_split(
     n: usize,
-    partition: &ConstraintLayout,
-    y: &[f64],
+    y_c: &[f64],
+    y_d: &[f64],
     jac_c_rows: &[usize],
     jac_c_cols: &[usize],
     jac_c_vals: &[f64],
@@ -90,19 +97,19 @@ pub fn compute_j_t_y_split(
     jac_d_cols: &[usize],
     jac_d_vals: &[f64],
 ) -> Vec<f64> {
+    let n_c = y_c.len();
+    let n_d = y_d.len();
     let mut j_t_y = vec![0.0; n];
-    // Equality rows: y_c[kc] = y[c_to_combined[kc]].
+    // Equality rows: y_c is already n_c-indexed.
     for (idx, (&kc, &col)) in jac_c_rows.iter().zip(jac_c_cols.iter()).enumerate() {
-        if col < n && kc < partition.n_c {
-            let i = partition.c_to_combined[kc];
-            j_t_y[col] += jac_c_vals[idx] * y[i];
+        if col < n && kc < n_c {
+            j_t_y[col] += jac_c_vals[idx] * y_c[kc];
         }
     }
-    // Inequality rows: y_d[kd] = y[d_to_combined[kd]].
+    // Inequality rows: y_d is already n_d-indexed.
     for (idx, (&kd, &col)) in jac_d_rows.iter().zip(jac_d_cols.iter()).enumerate() {
-        if col < n && kd < partition.n_d {
-            let i = partition.d_to_combined[kd];
-            j_t_y[col] += jac_d_vals[idx] * y[i];
+        if col < n && kd < n_d {
+            j_t_y[col] += jac_d_vals[idx] * y_d[kd];
         }
     }
     j_t_y
@@ -1065,8 +1072,10 @@ pub fn aug_step_from_state(
 
     // Compute J^T·y once (used both by RHS construction and the unperturbed-matvec
     // sanity check that the IR loop performs internally). Phase 4b: split form.
+    let y_c = project_c(&partition, y);
+    let y_d = project_d(&partition, y);
     let j_t_y = compute_j_t_y_split(
-        n, &partition, y,
+        n, &y_c, &y_d,
         jac_c_rows, jac_c_cols, jac_c_vals,
         jac_d_rows, jac_d_cols, jac_d_vals,
     );
@@ -1360,8 +1369,10 @@ pub fn aug_step_from_state_mehrotra(
         use_sparse,
     );
 
+    let y_c = project_c(&partition, y);
+    let y_d = project_d(&partition, y);
     let j_t_y = compute_j_t_y_split(
-        n, &partition, y,
+        n, &y_c, &y_d,
         jac_c_rows, jac_c_cols, jac_c_vals,
         jac_d_rows, jac_d_cols, jac_d_vals,
     );
@@ -1515,8 +1526,10 @@ pub fn aug_soc_solve_dx(
         use_sparse,
     );
 
+    let y_c = project_c(&partition, y);
+    let y_d = project_d(&partition, y);
     let j_t_y = compute_j_t_y_split(
-        n, &partition, y,
+        n, &y_c, &y_d,
         jac_c_rows, jac_c_cols, jac_c_vals,
         jac_d_rows, jac_d_cols, jac_d_vals,
     );
@@ -1607,8 +1620,10 @@ pub fn aug_soc_solve_dx_factored(
     }
     let n_d = partition.n_d;
 
+    let y_c = project_c(&partition, y);
+    let y_d = project_d(&partition, y);
     let j_t_y = compute_j_t_y_split(
-        n, &partition, y,
+        n, &y_c, &y_d,
         jac_c_rows, jac_c_cols, jac_c_vals,
         jac_d_rows, jac_d_cols, jac_d_vals,
     );
