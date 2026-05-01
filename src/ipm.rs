@@ -656,15 +656,11 @@ pub(crate) struct SolverState {
     pub x_l: Vec<f64>,
     /// Variable upper bounds.
     pub x_u: Vec<f64>,
-    /// Constraint lower bounds (combined m-form, kept as the boundary
-    /// representation that ScaledProblem and the user trait pass through).
-    pub g_l: Vec<f64>,
-    /// Constraint upper bounds (combined m-form). See `g_l` doc.
-    pub g_u: Vec<f64>,
     /// Equality-row target value (Ipopt's `c_rhs`, size `layout.n_c`):
-    /// `g_l[i] == g_u[i]` for each equality row. Phase 3f: split-form
-    /// projection of `g_l`/`g_u` populated once at construction; never
-    /// changes during solve.
+    /// stores the equality-row target. Phase 3f-final: native split
+    /// storage; the legacy combined `g_l`/`g_u` fields are gone.
+    /// Materialise via `state.g_l_combined()` / `state.g_u_combined()`
+    /// when an m-length slice is required.
     pub c_rhs: Vec<f64>,
     /// Inequality-row lower bounds (Ipopt's `d_L`, size `layout.n_d`).
     /// Phase 3f: split-form projection of `g_l`.
@@ -1266,8 +1262,6 @@ impl SolverState {
             iter: 0,
             x_l,
             x_u,
-            g_l,
-            g_u,
             c_rhs,
             d_l,
             d_u,
@@ -1329,7 +1323,8 @@ impl SolverState {
         self.layout
             .c_to_combined
             .iter()
-            .map(|&i| self.g[i] - self.g_l[i])
+            .enumerate()
+            .map(|(k, &i)| self.g[i] - self.c_rhs[k])
             .collect()
     }
 
@@ -1342,22 +1337,76 @@ impl SolverState {
 
     /// Inequality lower bounds `d_L` (size n_d, may contain -inf).
     /// Mirrors Ipopt's `OrigIpoptNLP::d_L()` (`IpIpoptNLP.hpp:153`).
-    /// Phase 3f: still projects from combined `g_l` so test fixtures that
-    /// write `state.g_l` directly continue to work; the native `d_l`
-    /// field is populated at construction and matches `project_d(&g_l)`
-    /// for any state initialized through `SolverState::new`. Phase 4
-    /// will migrate readers to the native field once test fixtures use
-    /// a layout-aware bound setter.
+    /// Phase 3f: native split storage.
     pub fn d_l(&self) -> Vec<f64> {
-        self.layout.project_d(&self.g_l)
+        self.d_l.clone()
     }
 
     /// Inequality upper bounds `d_U` (size n_d, may contain +inf).
     /// Mirrors Ipopt's `OrigIpoptNLP::d_U()` (`IpIpoptNLP.hpp:155`).
-    /// Phase 3f: see `d_l()` — still projects from combined `g_u` for
-    /// test-fixture compatibility.
+    /// Phase 3f: native split storage.
     pub fn d_u(&self) -> Vec<f64> {
-        self.layout.project_d(&self.g_u)
+        self.d_u.clone()
+    }
+
+    /// Combined-indexed read of the constraint lower bound. For eq rows
+    /// returns `c_rhs[k]`; for ineq rows returns `d_l[k]`. Phase 3f
+    /// replacement for direct `state.g_l_at(i)` access.
+    pub fn g_l_at(&self, i: usize) -> f64 {
+        if let Some(k) = self.layout.eq_pos[i] {
+            self.c_rhs[k]
+        } else if let Some(k) = self.layout.ineq_pos[i] {
+            self.d_l[k]
+        } else {
+            unreachable!("constraint row {} is neither eq nor ineq", i)
+        }
+    }
+
+    /// Combined-indexed read of the constraint upper bound. For eq rows
+    /// returns `c_rhs[k]`; for ineq rows returns `d_u[k]`.
+    pub fn g_u_at(&self, i: usize) -> f64 {
+        if let Some(k) = self.layout.eq_pos[i] {
+            self.c_rhs[k]
+        } else if let Some(k) = self.layout.ineq_pos[i] {
+            self.d_u[k]
+        } else {
+            unreachable!("constraint row {} is neither eq nor ineq", i)
+        }
+    }
+
+    /// Materialise the m-form combined `g_l` for callers (kkt assembly,
+    /// convergence helpers) that still take an m-length slice.
+    pub fn g_l_combined(&self) -> Vec<f64> {
+        (0..self.m).map(|i| self.g_l_at(i)).collect()
+    }
+
+    /// Materialise the m-form combined `g_u`.
+    pub fn g_u_combined(&self) -> Vec<f64> {
+        (0..self.m).map(|i| self.g_u_at(i)).collect()
+    }
+
+    /// Combined-indexed write of the constraint lower bound. Routes to
+    /// `c_rhs` for eq rows or `d_l` for ineq rows. Phase 3f replacement
+    /// for direct `state.g_l_at(i) = v` writes.
+    pub fn set_g_l_at(&mut self, i: usize, v: f64) {
+        if let Some(k) = self.layout.eq_pos[i] {
+            self.c_rhs[k] = v;
+        } else if let Some(k) = self.layout.ineq_pos[i] {
+            self.d_l[k] = v;
+        } else {
+            unreachable!("constraint row {} is neither eq nor ineq", i);
+        }
+    }
+
+    /// Combined-indexed write of the constraint upper bound.
+    pub fn set_g_u_at(&mut self, i: usize, v: f64) {
+        if let Some(k) = self.layout.eq_pos[i] {
+            self.c_rhs[k] = v;
+        } else if let Some(k) = self.layout.ineq_pos[i] {
+            self.d_u[k] = v;
+        } else {
+            unreachable!("constraint row {} is neither eq nor ineq", i);
+        }
     }
 
     /// Equality multipliers `y_c` (size n_c). Phase 3b: clones from the
@@ -1440,20 +1489,22 @@ impl SolverState {
         for i in 0..self.m {
             if let Some(k) = self.layout.ineq_pos[i] {
                 out[i] = self.s[k];
-            } else {
-                out[i] = self.g_l[i];
+            } else if let Some(k) = self.layout.eq_pos[i] {
+                out[i] = self.c_rhs[k];
             }
         }
         out
     }
 
     /// Combined-indexed slack read: returns `s_d[k]` for inequality rows
-    /// and `g_l[i]` (sentinel) for equality rows.
+    /// and `c_rhs[k]` (equality target sentinel) for equality rows.
     pub fn s_at(&self, i: usize) -> f64 {
         if let Some(k) = self.layout.ineq_pos[i] {
             self.s[k]
+        } else if let Some(k) = self.layout.eq_pos[i] {
+            self.c_rhs[k]
         } else {
-            self.g_l[i]
+            unreachable!("constraint row {} is neither eq nor ineq", i)
         }
     }
 
@@ -1809,14 +1860,16 @@ impl SolverState {
                 if constraint_is_equality(self, i) {
                     continue;
                 }
-                if self.g_l[i].is_finite() {
-                    let slack = self.g[i] - self.g_l[i];
+                let g_l_i = self.g_l_at(i);
+                let g_u_i = self.g_u_at(i);
+                if g_l_i.is_finite() {
+                    let slack = self.g[i] - g_l_i;
                     if slack > self.mu * 1e-2 {
                         grad_phi_dx -= self.mu * jdx[i] / slack;
                     }
                 }
-                if self.g_u[i].is_finite() {
-                    let slack = self.g_u[i] - self.g[i];
+                if g_u_i.is_finite() {
+                    let slack = g_u_i - self.g[i];
                     if slack > self.mu * 1e-2 {
                         grad_phi_dx += self.mu * jdx[i] / slack;
                     }
@@ -2124,9 +2177,9 @@ fn print_problem_header(state: &SolverState) {
     let mut n_ineq_only_upper = 0usize;
     let mut row_is_eq = vec![false; m];
     for i in 0..m {
-        let l_fin = state.g_l[i].is_finite();
-        let u_fin = state.g_u[i].is_finite();
-        let is_eq = l_fin && u_fin && (state.g_l[i] - state.g_u[i]).abs() < 1e-14;
+        let l_fin = state.g_l_at(i).is_finite();
+        let u_fin = state.g_u_at(i).is_finite();
+        let is_eq = l_fin && u_fin && (state.g_l_at(i) - state.g_u_at(i)).abs() < 1e-14;
         if is_eq {
             n_eq += 1;
             row_is_eq[i] = true;
@@ -2284,14 +2337,14 @@ fn compute_barrier_phi(
             if constraint_is_equality(state, i) {
                 continue;
             }
-            if state.g_l[i].is_finite() {
-                let slack = g[i] - state.g_l[i];
+            if state.g_l_at(i).is_finite() {
+                let slack = g[i] - state.g_l_at(i);
                 if slack > state.mu * 1e-2 {
                     phi -= state.mu * slack.ln();
                 }
             }
-            if state.g_u[i].is_finite() {
-                let slack = state.g_u[i] - g[i];
+            if state.g_u_at(i).is_finite() {
+                let slack = state.g_u_at(i) - g[i];
                 if slack > state.mu * 1e-2 {
                     phi -= state.mu * slack.ln();
                 }
@@ -2550,10 +2603,10 @@ fn advance_z_to_trial(state: &mut SolverState, alpha_d: f64) {
     // shared α_dual). Skip equality constraints (v stays at 0 there).
     // Phase 3e: walk d-block storage directly (eq rows are not stored).
     for (k, &i) in state.layout.d_to_combined.clone().iter().enumerate() {
-        if state.g_l[i].is_finite() {
+        if state.g_l_at(i).is_finite() {
             state.v_l[k] = (state.v_l[k] + alpha_d * state.dv_l[k]).max(1e-20);
         }
-        if state.g_u[i].is_finite() {
+        if state.g_u_at(i).is_finite() {
             state.v_u[k] = (state.v_u[k] + alpha_d * state.dv_u[k]).max(1e-20);
         }
     }
@@ -2602,13 +2655,13 @@ fn apply_kappa_sigma_bound_multiplier_reset(
     // `IpIpoptAlg.cpp:721-758`). Skip equality constraints.
     // Phase 3e: walk d-block storage directly.
     for (k, &i) in state.layout.d_to_combined.clone().iter().enumerate() {
-        if state.g_l[i].is_finite() {
+        if state.g_l_at(i).is_finite() {
             let s_l = slack_gl(state, i);
             let v_lo = mu_ks / (kappa_sigma * s_l);
             let v_hi = kappa_sigma * mu_ks / s_l;
             state.v_l[k] = state.v_l[k].clamp(v_lo, v_hi);
         }
-        if state.g_u[i].is_finite() {
+        if state.g_u_at(i).is_finite() {
             let s_u = slack_gu(state, i);
             let v_lo = mu_ks / (kappa_sigma * s_u);
             let v_hi = kappa_sigma * mu_ks / s_u;
@@ -2683,31 +2736,33 @@ fn apply_slack_move(state: &mut SolverState, options: &SolverOptions) -> usize {
     // IpIpoptCalculatedQuantities.cpp:455-537). Skip equality rows
     // (their s is held at the equality value as a sentinel).
     for i in 0..m {
-        let l_fin = state.g_l[i].is_finite();
-        let u_fin = state.g_u[i].is_finite();
-        if l_fin && u_fin && (state.g_l[i] - state.g_u[i]).abs() < 1e-14 {
+        let l_fin = state.g_l_at(i).is_finite();
+        let u_fin = state.g_u_at(i).is_finite();
+        if l_fin && u_fin && (state.g_l_at(i) - state.g_u_at(i)).abs() < 1e-14 {
             continue;
         }
         let s_i = state.s_at(i);
         if l_fin {
-            let s_l = s_i - state.g_l[i];
+            let g_l_i = state.g_l_at(i);
+            let s_l = s_i - g_l_i;
             if s_l < s_min {
                 let v = state.v_l_at(i);
                 let from_mu = if v > 0.0 { mu / v } else { f64::INFINITY };
-                let cap = slack_move * state.g_l[i].abs().max(1.0) + s_l;
+                let cap = slack_move * g_l_i.abs().max(1.0) + s_l;
                 let new_s = from_mu.max(s_min).min(cap);
-                state.g_l[i] -= new_s - s_l;
+                state.set_g_l_at(i, g_l_i - (new_s - s_l));
                 adjusted += 1;
             }
         }
         if u_fin {
-            let s_u = state.g_u[i] - s_i;
+            let g_u_i = state.g_u_at(i);
+            let s_u = g_u_i - s_i;
             if s_u < s_min {
                 let v = state.v_u_at(i);
                 let from_mu = if v > 0.0 { mu / v } else { f64::INFINITY };
-                let cap = slack_move * state.g_u[i].abs().max(1.0) + s_u;
+                let cap = slack_move * g_u_i.abs().max(1.0) + s_u;
                 let new_s = from_mu.max(s_min).min(cap);
-                state.g_u[i] += new_s - s_u;
+                state.set_g_u_at(i, g_u_i + (new_s - s_u));
                 adjusted += 1;
             }
         }
@@ -3190,12 +3245,14 @@ fn try_gn_restoration<P: NlpProblem>(
         x_l: &state.x_l,
         x_u: &state.x_u,
     };
+    let g_l_combined_for_resto = state.g_l_combined();
+    let g_u_combined_for_resto = state.g_u_combined();
     let (x_rest, gn_success) = restoration.restore_with_outer(
         &state.x,
         &state.x_l,
         &state.x_u,
-        &state.g_l,
-        &state.g_u,
+        &g_l_combined_for_resto,
+        &g_u_combined_for_resto,
         &state.jac_rows,
         &state.jac_cols,
         n,
@@ -3520,8 +3577,10 @@ fn reevaluate_after_step<P: NlpProblem>(
         x_l: &state.x_l,
         x_u: &state.x_u,
     };
+    let g_l_combined_for_resto = state.g_l_combined();
+    let g_u_combined_for_resto = state.g_u_combined();
     let (x_rest, success) = restoration.restore_with_outer(
-        &state.x, &state.x_l, &state.x_u, &state.g_l, &state.g_u,
+        &state.x, &state.x_l, &state.x_u, &g_l_combined_for_resto, &g_u_combined_for_resto,
         &state.jac_rows, &state.jac_cols, n, m, options,
         &|theta, phi| filter.is_acceptable(theta, phi),
         &|x_eval, g_out| problem.constraints(x_eval, true, g_out),
@@ -3867,15 +3926,15 @@ fn compute_alpha_max(
             }
         }
         for i in 0..state.m {
-            let l_fin = state.g_l[i].is_finite();
-            let u_fin = state.g_u[i].is_finite();
-            if l_fin && u_fin && (state.g_l[i] - state.g_u[i]).abs() < 1e-14 {
+            let l_fin = state.g_l_at(i).is_finite();
+            let u_fin = state.g_u_at(i).is_finite();
+            if l_fin && u_fin && (state.g_l_at(i) - state.g_u_at(i)).abs() < 1e-14 {
                 continue;
             }
             let ds_i = state.ds_at(i);
             let s_i = state.s_at(i);
             if l_fin && ds_i < 0.0 {
-                let slack = (s_i - state.g_l[i]).max(0.0);
+                let slack = (s_i - state.g_l_at(i)).max(0.0);
                 let a = -tau * slack / ds_i;
                 if a < lim_alpha {
                     lim_alpha = a;
@@ -3885,7 +3944,7 @@ fn compute_alpha_max(
                 }
             }
             if u_fin && ds_i > 0.0 {
-                let slack = (state.g_u[i] - s_i).max(0.0);
+                let slack = (state.g_u_at(i) - s_i).max(0.0);
                 let a = tau * slack / ds_i;
                 if a < lim_alpha {
                     lim_alpha = a;
@@ -3906,7 +3965,7 @@ fn compute_alpha_max(
         if lim_idx != usize::MAX {
             let (xv, xb, dxv, slack) = if lim_block == "s" {
                 let xv = state.s_at(lim_idx);
-                let xb = if lim_side == "L" { state.g_l[lim_idx] } else { state.g_u[lim_idx] };
+                let xb = if lim_side == "L" { state.g_l_at(lim_idx) } else { state.g_u_at(lim_idx) };
                 (xv, xb, state.ds_at(lim_idx), (xv - xb).abs())
             } else {
                 let xv = state.x[lim_idx];
@@ -4059,9 +4118,9 @@ fn compute_centrality_xi(state: &SolverState, avg_compl: f64) -> f64 {
         }
     }
     for i in 0..state.m {
-        let l_fin = state.g_l[i].is_finite();
-        let u_fin = state.g_u[i].is_finite();
-        if l_fin && u_fin && (state.g_l[i] - state.g_u[i]).abs() < 1e-14 {
+        let l_fin = state.g_l_at(i).is_finite();
+        let u_fin = state.g_u_at(i).is_finite();
+        if l_fin && u_fin && (state.g_l_at(i) - state.g_u_at(i)).abs() < 1e-14 {
             continue;
         }
         if l_fin {
@@ -4314,9 +4373,9 @@ fn compute_quality_function_mu(
             }
         }
         for i in 0..m {
-            let l_fin = state.g_l[i].is_finite();
-            let u_fin = state.g_u[i].is_finite();
-            if l_fin && u_fin && (state.g_l[i] - state.g_u[i]).abs() < 1e-14 {
+            let l_fin = state.g_l_at(i).is_finite();
+            let u_fin = state.g_u_at(i).is_finite();
+            if l_fin && u_fin && (state.g_l_at(i) - state.g_u_at(i)).abs() < 1e-14 {
                 continue;
             }
             if l_fin {
@@ -4374,9 +4433,9 @@ fn compute_quality_function_mu(
                 }
             }
             for i in 0..m {
-                let l_fin = state.g_l[i].is_finite();
-                let u_fin = state.g_u[i].is_finite();
-                if l_fin && u_fin && (state.g_l[i] - state.g_u[i]).abs() < 1e-14 {
+                let l_fin = state.g_l_at(i).is_finite();
+                let u_fin = state.g_u_at(i).is_finite();
+                if l_fin && u_fin && (state.g_l_at(i) - state.g_u_at(i)).abs() < 1e-14 {
                     continue;
                 }
                 if l_fin {
@@ -5312,20 +5371,20 @@ fn build_iterate_snapshot(state: &SolverState) -> crate::intermediate::IterateSn
     let mut constr_viol = vec![0.0; m];
     let mut compl_g_vec = vec![0.0; m];
     for i in 0..m {
-        if state.g_l[i].is_finite() && state.g[i] < state.g_l[i] {
-            constr_viol[i] = state.g_l[i] - state.g[i];
-        } else if state.g_u[i].is_finite() && state.g[i] > state.g_u[i] {
-            constr_viol[i] = state.g[i] - state.g_u[i];
+        if state.g_l_at(i).is_finite() && state.g[i] < state.g_l_at(i) {
+            constr_viol[i] = state.g_l_at(i) - state.g[i];
+        } else if state.g_u_at(i).is_finite() && state.g[i] > state.g_u_at(i) {
+            constr_viol[i] = state.g[i] - state.g_u_at(i);
         }
         // Complementarity: lambda_i * c_i where c_i is the active constraint slack
         let yi = state.y_at(i);
-        if state.g_l[i].is_finite() && state.g_u[i].is_finite() {
+        if state.g_l_at(i).is_finite() && state.g_u_at(i).is_finite() {
             // Equality or range: use min slack
-            compl_g_vec[i] = yi * (state.g[i] - state.g_l[i]).min(state.g_u[i] - state.g[i]);
-        } else if state.g_l[i].is_finite() {
-            compl_g_vec[i] = yi * (state.g[i] - state.g_l[i]);
-        } else if state.g_u[i].is_finite() {
-            compl_g_vec[i] = yi * (state.g_u[i] - state.g[i]);
+            compl_g_vec[i] = yi * (state.g[i] - state.g_l_at(i)).min(state.g_u_at(i) - state.g[i]);
+        } else if state.g_l_at(i).is_finite() {
+            compl_g_vec[i] = yi * (state.g[i] - state.g_l_at(i));
+        } else if state.g_u_at(i).is_finite() {
+            compl_g_vec[i] = yi * (state.g_u_at(i) - state.g[i]);
         }
     }
     IterateSnapshot {
@@ -5472,20 +5531,20 @@ fn initialize_slack_iterate(state: &mut SolverState, m: usize, options: &SolverO
             // Phase 3d: no sentinel write — `s` no longer carries equality slots.
             continue;
         }
-        let l_fin = state.g_l[i].is_finite();
-        let u_fin = state.g_u[i].is_finite();
+        let l_fin = state.g_l_at(i).is_finite();
+        let u_fin = state.g_u_at(i).is_finite();
         let mut s_i = state.g[i];
         if l_fin && u_fin {
-            let range = state.g_u[i] - state.g_l[i];
-            let p_l = (kappa1 * state.g_l[i].abs().max(1.0)).min(kappa2 * range);
-            let p_u = (kappa1 * state.g_u[i].abs().max(1.0)).min(kappa2 * range);
-            s_i = s_i.max(state.g_l[i] + p_l).min(state.g_u[i] - p_u);
+            let range = state.g_u_at(i) - state.g_l_at(i);
+            let p_l = (kappa1 * state.g_l_at(i).abs().max(1.0)).min(kappa2 * range);
+            let p_u = (kappa1 * state.g_u_at(i).abs().max(1.0)).min(kappa2 * range);
+            s_i = s_i.max(state.g_l_at(i) + p_l).min(state.g_u_at(i) - p_u);
         } else if l_fin {
-            let p_l = kappa1 * state.g_l[i].abs().max(1.0);
-            s_i = s_i.max(state.g_l[i] + p_l);
+            let p_l = kappa1 * state.g_l_at(i).abs().max(1.0);
+            s_i = s_i.max(state.g_l_at(i) + p_l);
         } else if u_fin {
-            let p_u = kappa1 * state.g_u[i].abs().max(1.0);
-            s_i = s_i.min(state.g_u[i] - p_u);
+            let p_u = kappa1 * state.g_u_at(i).abs().max(1.0);
+            s_i = s_i.min(state.g_u_at(i) - p_u);
         }
         state.set_s_at(i, s_i);
     }
@@ -5521,10 +5580,10 @@ fn initialize_constraint_slack_multipliers(state: &mut SolverState, m: usize, op
         if constraint_is_equality(state, i) {
             continue;
         }
-        if state.g_l[i].is_finite() {
+        if state.g_l_at(i).is_finite() {
             state.set_v_l_at(i, v_init);
         }
-        if state.g_u[i].is_finite() {
+        if state.g_u_at(i).is_finite() {
             state.set_v_u_at(i, v_init);
         }
         if !ls_active {
@@ -5571,19 +5630,19 @@ fn apply_warm_start(state: &mut SolverState, options: &SolverOptions) {
                 continue;
             }
             let mut s_i = init_s[i];
-            let l_fin = state.g_l[i].is_finite();
-            let u_fin = state.g_u[i].is_finite();
+            let l_fin = state.g_l_at(i).is_finite();
+            let u_fin = state.g_u_at(i).is_finite();
             if l_fin && u_fin {
-                let range = state.g_u[i] - state.g_l[i];
-                let p_l = (kappa1 * state.g_l[i].abs().max(1.0)).min(kappa2 * range);
-                let p_u = (kappa1 * state.g_u[i].abs().max(1.0)).min(kappa2 * range);
-                s_i = s_i.max(state.g_l[i] + p_l).min(state.g_u[i] - p_u);
+                let range = state.g_u_at(i) - state.g_l_at(i);
+                let p_l = (kappa1 * state.g_l_at(i).abs().max(1.0)).min(kappa2 * range);
+                let p_u = (kappa1 * state.g_u_at(i).abs().max(1.0)).min(kappa2 * range);
+                s_i = s_i.max(state.g_l_at(i) + p_l).min(state.g_u_at(i) - p_u);
             } else if l_fin {
-                let p_l = kappa1 * state.g_l[i].abs().max(1.0);
-                s_i = s_i.max(state.g_l[i] + p_l);
+                let p_l = kappa1 * state.g_l_at(i).abs().max(1.0);
+                s_i = s_i.max(state.g_l_at(i) + p_l);
             } else if u_fin {
-                let p_u = kappa1 * state.g_u[i].abs().max(1.0);
-                s_i = s_i.min(state.g_u[i] - p_u);
+                let p_u = kappa1 * state.g_u_at(i).abs().max(1.0);
+                s_i = s_i.min(state.g_u_at(i) - p_u);
             }
             state.set_s_at(i, s_i);
         }
@@ -6197,6 +6256,8 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         let s_combined_for_aug = state.s_combined();
         let v_l_combined_for_aug = state.v_l_combined();
         let v_u_combined_for_aug = state.v_u_combined();
+        let g_l_combined_for_aug = state.g_l_combined();
+        let g_u_combined_for_aug = state.g_u_combined();
         let (step, _dc, mu_new_opt, aug_kkt, _iter_dw, _iter_dc) = if probing {
             let avg_compl = compute_avg_complementarity(&state);
             let mu_max = mu_state.mu_max_cap(options, avg_compl);
@@ -6205,7 +6266,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 &state.hess_rows, &state.hess_cols, &state.hess_vals,
                 &state.jac_rows, &state.jac_cols, &state.jac_vals,
                 &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u,
-                &s_combined_for_aug, &state.g, &state.g_l, &state.g_u, &y_combined_for_aug,
+                &s_combined_for_aug, &state.g, &g_l_combined_for_aug, &g_u_combined_for_aug, &y_combined_for_aug,
                 &v_l_combined_for_aug, &v_u_combined_for_aug,
                 state.mu, options.kappa_d,
                 crate::kkt_aug::PROBING_SIGMA_MAX_DEFAULT,
@@ -6226,7 +6287,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 &state.hess_rows, &state.hess_cols, &state.hess_vals,
                 &state.jac_rows, &state.jac_cols, &state.jac_vals,
                 &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u,
-                &s_combined_for_aug, &state.g, &state.g_l, &state.g_u, &y_combined_for_aug,
+                &s_combined_for_aug, &state.g, &g_l_combined_for_aug, &g_u_combined_for_aug, &y_combined_for_aug,
                 &v_l_combined_for_aug, &v_u_combined_for_aug,
                 state.mu, options.kappa_d,
                 use_sparse,
@@ -6357,8 +6418,8 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 for (r, _coeff) in j_col.iter().take(8) {
                     let r = *r;
                     let g_r = state.g[r];
-                    let gl_r = state.g_l[r];
-                    let gu_r = state.g_u[r];
+                    let gl_r = state.g_l_at(r);
+                    let gu_r = state.g_u_at(r);
                     let dy_r = state.dy_at(r);
                     let s_r = if r < state.m { state.s_at(r) } else { f64::NAN };
                     // collect J row r (cols, vals)
@@ -6942,7 +7003,9 @@ fn attempt_soc_aug<P: NlpProblem>(
         return None;
     }
 
-    let partition = crate::constraint_layout::ConstraintLayout::new(&state.g_l, &state.g_u);
+    let g_l_combined_for_soc = state.g_l_combined();
+    let g_u_combined_for_soc = state.g_u_combined();
+    let partition = crate::constraint_layout::ConstraintLayout::new(&g_l_combined_for_soc, &g_u_combined_for_soc);
     let n_c = partition.n_c;
     let n_d = partition.n_d;
 
@@ -6952,7 +7015,7 @@ fn attempt_soc_aug<P: NlpProblem>(
     let mut dms_soc = vec![0.0; n_d];
     for i in 0..m {
         if let Some(k) = partition.eq_pos[i] {
-            c_soc[k] = state.g[i] - state.g_l[i];
+            c_soc[k] = state.g[i] - state.g_l_at(i);
         } else if let Some(k) = partition.ineq_pos[i] {
             // Phase 3d: state.s is d-block-native, indexed directly by k.
             dms_soc[k] = state.g[i] - state.s[k];
@@ -6964,7 +7027,7 @@ fn attempt_soc_aug<P: NlpProblem>(
     let mut latest_trial_dms = vec![0.0; n_d];
     for i in 0..m {
         if let Some(k) = partition.eq_pos[i] {
-            latest_trial_c[k] = g_trial[i] - state.g_l[i];
+            latest_trial_c[k] = g_trial[i] - state.g_l_at(i);
         } else if let Some(k) = partition.ineq_pos[i] {
             let s_trial_i = state.s[k] + alpha * state.ds[k];
             latest_trial_dms[k] = g_trial[i] - s_trial_i;
@@ -7001,7 +7064,7 @@ fn attempt_soc_aug<P: NlpProblem>(
             n, &state.grad_f,
             &state.jac_rows, &state.jac_cols, &state.jac_vals,
             &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u,
-            &s_combined_for_soc, &state.g, &state.g_l, &state.g_u, &y_combined_for_soc,
+            &s_combined_for_soc, &state.g, &g_l_combined_for_soc, &g_u_combined_for_soc, &y_combined_for_soc,
             &v_l_combined_for_soc, &v_u_combined_for_soc,
             state.mu, options.kappa_d,
             aug_solver,
@@ -7037,7 +7100,7 @@ fn attempt_soc_aug<P: NlpProblem>(
                 //   s_soc[k] = state.s[k] + α_p_soc · ds_d_soc[k]   for k ∈ d-block.
                 for i in 0..m {
                     if let Some(k) = partition.eq_pos[i] {
-                        latest_trial_c[k] = g_soc[i] - state.g_l[i];
+                        latest_trial_c[k] = g_soc[i] - state.g_l_at(i);
                     } else if let Some(k) = partition.ineq_pos[i] {
                         let s_soc_i = state.s[k] + alpha_primal_soc * ds_d_soc[k];
                         latest_trial_dms[k] = g_soc[i] - s_soc_i;
@@ -7198,9 +7261,11 @@ fn recompute_y_after_restoration(
     if m == 0 {
         return;
     }
+    let g_l_combined_for_ls = state.g_l_combined();
+    let g_u_combined_for_ls = state.g_u_combined();
     let y_ls_result = compute_ls_multiplier_estimate_augmented(
         &state.grad_f, &state.jac_rows, &state.jac_cols, &state.jac_vals,
-        &state.g_l, &state.g_u, n, m,
+        &g_l_combined_for_ls, &g_u_combined_for_ls, n, m,
         Some(&state.z_l), Some(&state.z_u),
         None,
     );
@@ -7241,9 +7306,11 @@ fn recompute_y_post_step_full_augmented(
     }
     let v_l_combined_for_ls = state.v_l_combined();
     let v_u_combined_for_ls = state.v_u_combined();
+    let g_l_combined_for_ls = state.g_l_combined();
+    let g_u_combined_for_ls = state.g_u_combined();
     let y_ls_result = compute_ls_multiplier_estimate_augmented(
         &state.grad_f, &state.jac_rows, &state.jac_cols, &state.jac_vals,
-        &state.g_l, &state.g_u, n, m,
+        &g_l_combined_for_ls, &g_u_combined_for_ls, n, m,
         Some(&state.z_l), Some(&state.z_u),
         Some((&v_l_combined_for_ls, &v_u_combined_for_ls)),
     );
@@ -7311,15 +7378,15 @@ fn reset_constraint_slack_multipliers_after_restoration(
             // to mirror Ipopt's per-d-row reset pattern.
             continue;
         }
-        let v_l_new = if state.g_l[i].is_finite() {
-            let slack = (state.g[i] - state.g_l[i]).max(1e-12);
+        let v_l_new = if state.g_l_at(i).is_finite() {
+            let slack = (state.g[i] - state.g_l_at(i)).max(1e-12);
             if nuclear_reset { 1.0 } else { mu_r / slack }
         } else {
             0.0
         };
         state.set_v_l_at(i, v_l_new);
-        let v_u_new = if state.g_u[i].is_finite() {
-            let slack = (state.g_u[i] - state.g[i]).max(1e-12);
+        let v_u_new = if state.g_u_at(i).is_finite() {
+            let slack = (state.g_u_at(i) - state.g[i]).max(1e-12);
             if nuclear_reset { 1.0 } else { mu_r / slack }
         } else {
             0.0
@@ -8296,7 +8363,7 @@ fn theta_for_g_s(state: &SolverState, g: &[f64], s_d: &[f64]) -> f64 {
         .layout
         .c_to_combined
         .iter()
-        .map(|&i| g[i] - state.g_l[i])
+        .map(|&i| g[i] - state.g_l_at(i))
         .collect();
     let g_d: Vec<f64> = state.layout.project_d(g);
     convergence::primal_infeasibility_internal_split(&g_c, &g_d, s_d)
@@ -8454,14 +8521,14 @@ fn fraction_to_boundary_primal_s(state: &SolverState, ds: &[f64], tau: f64) -> f
     debug_assert_eq!(ds.len(), state.layout.n_d);
     let mut alpha = 1.0_f64;
     for (k, &i) in state.layout.d_to_combined.iter().enumerate() {
-        let l_fin = state.g_l[i].is_finite();
-        let u_fin = state.g_u[i].is_finite();
+        let l_fin = state.g_l_at(i).is_finite();
+        let u_fin = state.g_u_at(i).is_finite();
         if l_fin && ds[k] < 0.0 {
-            let slack = (state.s[k] - state.g_l[i]).max(0.0);
+            let slack = (state.s[k] - state.g_l_at(i)).max(0.0);
             alpha = alpha.min(-tau * slack / ds[k]);
         }
         if u_fin && ds[k] > 0.0 {
-            let slack = (state.g_u[i] - state.s[k]).max(0.0);
+            let slack = (state.g_u_at(i) - state.s[k]).max(0.0);
             alpha = alpha.min(tau * slack / ds[k]);
         }
     }
@@ -8502,11 +8569,11 @@ fn compute_grad_theta_norm(state: &SolverState) -> f64 {
     let mut violation = vec![0.0; m];
     for i in 0..m {
         if constraint_is_equality(state, i) {
-            violation[i] = state.g[i] - state.g_l[i];
-        } else if state.g_l[i].is_finite() && state.g[i] < state.g_l[i] {
-            violation[i] = state.g[i] - state.g_l[i];
-        } else if state.g_u[i].is_finite() && state.g[i] > state.g_u[i] {
-            violation[i] = state.g[i] - state.g_u[i];
+            violation[i] = state.g[i] - state.g_l_at(i);
+        } else if state.g_l_at(i).is_finite() && state.g[i] < state.g_l_at(i) {
+            violation[i] = state.g[i] - state.g_l_at(i);
+        } else if state.g_u_at(i).is_finite() && state.g[i] > state.g_u_at(i) {
+            violation[i] = state.g[i] - state.g_u_at(i);
         }
     }
     let mut grad_theta = vec![0.0; n];
@@ -8727,8 +8794,8 @@ fn obj_and_grad_finite(state: &SolverState) -> bool {
 /// slacks). The 1e-15 tolerance matches Ipopt's `equality_tolerance`
 /// for `c(x) = 0` vs. `c_L ≤ c(x) ≤ c_U` row classification.
 fn constraint_is_equality(state: &SolverState, i: usize) -> bool {
-    state.g_l[i].is_finite() && state.g_u[i].is_finite()
-        && (state.g_l[i] - state.g_u[i]).abs() < 1e-15
+    state.g_l_at(i).is_finite() && state.g_u_at(i).is_finite()
+        && (state.g_l_at(i) - state.g_u_at(i)).abs() < 1e-15
 }
 
 /// Re-seed the bound multipliers `z_l`, `z_u` from the current
@@ -8791,14 +8858,14 @@ fn slack_xu(state: &SolverState, i: usize) -> f64 {
 /// top of every iteration (via `sync_state_s_to_g`); once B6 lands and `s`
 /// is advanced via Newton step, the sync is removed.
 fn slack_gl(state: &SolverState, i: usize) -> f64 {
-    (state.s_at(i) - state.g_l[i]).max(1e-20)
+    (state.s_at(i) - state.g_l_at(i)).max(1e-20)
 }
 
 /// Strictly-positive upper-side constraint slack `max(g_u - s, 1e-20)`.
 /// See [`slack_gl`] for the finite-guard contract and the `state.s`
 /// rationale.
 fn slack_gu(state: &SolverState, i: usize) -> f64 {
-    (state.g_u[i] - state.s_at(i)).max(1e-20)
+    (state.g_u_at(i) - state.s_at(i)).max(1e-20)
 }
 
 /// Test-only helper: copy `state.g` into `state.s` so the slack iterate
@@ -8927,9 +8994,11 @@ fn recover_dv_from_state(state: &SolverState, ds: &[f64], mu: f64) -> (Vec<f64>,
     let s_combined = state.s_combined();
     let v_l_combined = state.v_l_combined();
     let v_u_combined = state.v_u_combined();
+    let g_l_combined = state.g_l_combined();
+    let g_u_combined = state.g_u_combined();
     kkt::recover_dv(
         state.m,
-        &state.g_l, &state.g_u, &s_combined,
+        &g_l_combined, &g_u_combined, &s_combined,
         &v_l_combined, &v_u_combined, ds, mu,
     )
 }
@@ -8955,10 +9024,12 @@ fn recover_ds_from_state(
             .collect()
     };
     let s_combined = state.s_combined();
+    let g_l_combined = state.g_l_combined();
+    let g_u_combined = state.g_u_combined();
     kkt::recover_ds(
         state.n, state.m,
         &state.jac_rows, &state.jac_cols, &state.jac_vals,
-        &state.g, &state.g_l, &state.g_u, &s_combined,
+        &state.g, &g_l_combined, &g_u_combined, &s_combined,
         dx, dy, &delta_d_vec,
     )
 }
@@ -8981,11 +9052,13 @@ fn assemble_kkt_from_state(
     let s_combined = state.s_combined();
     let v_l_combined = state.v_l_combined();
     let v_u_combined = state.v_u_combined();
+    let g_l_combined = state.g_l_combined();
+    let g_u_combined = state.g_u_combined();
     let mut sys = kkt::assemble_kkt(
         n, m,
         &state.hess_rows, &state.hess_cols, &state.hess_vals,
         &state.jac_rows, &state.jac_cols, &state.jac_vals,
-        sigma, &state.grad_f, &state.g, &state.g_l, &state.g_u,
+        sigma, &state.grad_f, &state.g, &g_l_combined, &g_u_combined,
         &s_combined, &y_combined, &state.z_l, &state.z_u,
         &state.x, &state.x_l, &state.x_u, state.mu, kappa_d,
         use_sparse, &v_l_combined, &v_u_combined, &state.layout,
@@ -9142,10 +9215,10 @@ fn compute_bound_multiplier_count(state: &SolverState) -> usize {
         if constraint_is_equality(state, i) {
             continue;
         }
-        if state.g_l[i].is_finite() {
+        if state.g_l_at(i).is_finite() {
             n_bound += 1;
         }
-        if state.g_u[i].is_finite() {
+        if state.g_u_at(i).is_finite() {
             n_bound += 1;
         }
     }
@@ -9224,9 +9297,9 @@ fn compute_avg_complementarity(state: &SolverState) -> f64 {
     // existed) was a ripopt-specific tuning that left `avg_compl` blind
     // to slack centrality on mixed-bound problems.
     for i in 0..state.m {
-        let l_fin = state.g_l[i].is_finite();
-        let u_fin = state.g_u[i].is_finite();
-        if l_fin && u_fin && (state.g_l[i] - state.g_u[i]).abs() < 1e-14 {
+        let l_fin = state.g_l_at(i).is_finite();
+        let u_fin = state.g_u_at(i).is_finite();
+        if l_fin && u_fin && (state.g_l_at(i) - state.g_u_at(i)).abs() < 1e-14 {
             continue;
         }
         if l_fin {
@@ -9437,11 +9510,9 @@ mod tests {
             iter: 0,
             x_l: vec![f64::NEG_INFINITY; n],
             x_u: vec![f64::INFINITY; n],
-            g_l: vec![f64::NEG_INFINITY; m],
-            g_u: vec![f64::INFINITY; m],
-            // Phase 3f: test-only constructor uses an all-inequality layout
-            // (n_c = 0, n_d = m), so c_rhs is empty and d_l/d_u are m-sized
-            // and mirror the all-inf default bounds.
+            // Phase 3f-final: native split storage. Test-only constructor
+            // uses an all-inequality layout (n_c=0, n_d=m), so c_rhs is
+            // empty and d_l/d_u are m-sized with -inf/+inf sentinels.
             c_rhs: Vec::new(),
             d_l: vec![f64::NEG_INFINITY; m],
             d_u: vec![f64::INFINITY; m],
@@ -9480,6 +9551,41 @@ mod tests {
             n_jac_evals: 0,
             n_hess_evals: 0,
         }
+    }
+
+    /// Phase 3f test helper: replace the constraint bounds on a
+    /// `minimal_state`-derived fixture and rebuild the dependent storage
+    /// (layout, c_rhs/d_l/d_u, and per-layout vector sizes for y_c/y_d
+    /// /v_l/v_u/dy_c/dy_d/dv_l/dv_u/s/ds/c_scaling/d_scaling).
+    ///
+    /// Combined-form `g_l`/`g_u` are also written for parity with the
+    /// legacy `state.g_l = vec![…]` patterns the older fixtures used.
+    fn set_constraint_bounds(
+        state: &mut SolverState,
+        g_l: Vec<f64>,
+        g_u: Vec<f64>,
+    ) {
+        assert_eq!(g_l.len(), state.m);
+        assert_eq!(g_u.len(), state.m);
+        let layout = crate::constraint_layout::ConstraintLayout::new(&g_l, &g_u);
+        let n_c = layout.n_c;
+        let n_d = layout.n_d;
+        state.c_rhs = layout.c_to_combined.iter().map(|&i| g_l[i]).collect();
+        state.d_l = layout.project_d(&g_l);
+        state.d_u = layout.project_d(&g_u);
+        state.layout = layout;
+        state.y_c.resize(n_c, 0.0);
+        state.y_d.resize(n_d, 0.0);
+        state.v_l.resize(n_d, 0.0);
+        state.v_u.resize(n_d, 0.0);
+        state.dy_c.resize(n_c, 0.0);
+        state.dy_d.resize(n_d, 0.0);
+        state.dv_l.resize(n_d, 0.0);
+        state.dv_u.resize(n_d, 0.0);
+        state.s.resize(n_d, 0.0);
+        state.ds.resize(n_d, 0.0);
+        state.c_scaling.resize(n_c, 1.0);
+        state.d_scaling.resize(n_d, 1.0);
     }
 
     #[test]
@@ -9600,8 +9706,7 @@ mod tests {
         // g = 2.0, g_l = 1.0, v_l = 0.5 -> slack = 1.0, contrib = 0.5; avg = 0.5 / 1 = 0.5.
         let mut state = minimal_state(1, 1);
         state.g = vec![2.0];
-        state.g_l = vec![1.0];
-        state.g_u = vec![f64::INFINITY];
+        set_constraint_bounds(&mut state, vec![1.0], vec![f64::INFINITY]);
         state.v_l = vec![0.5];
         sync_state_s_to_g(&mut state);
         let avg = compute_avg_complementarity(&state);
@@ -9623,7 +9728,7 @@ mod tests {
         state.x_l = vec![1.0];
         state.z_l = vec![1.0];
         state.g = vec![2.0];
-        state.g_l = vec![1.0];
+        set_constraint_bounds(&mut state, vec![1.0], vec![f64::INFINITY]);
         state.v_l = vec![99.0];
         sync_state_s_to_g(&mut state);
         let avg = compute_avg_complementarity(&state);
@@ -9660,10 +9765,7 @@ mod tests {
         let mut state = minimal_state(2, 2);
         state.x_l[0] = 0.0;
         state.x_u[0] = 10.0;
-        state.g_l[0] = 0.0;
-        state.g_u[0] = f64::INFINITY;
-        state.g_l[1] = 5.0;
-        state.g_u[1] = 5.0;
+        set_constraint_bounds(&mut state, vec![0.0, 5.0], vec![f64::INFINITY, 5.0]);
         let count = compute_bound_multiplier_count(&state);
         assert_eq!(count, 3, "expected 3 finite bounds, got {}", count);
     }
@@ -9707,8 +9809,7 @@ mod tests {
         let mut state = minimal_state(1, 1);
         state.x = vec![0.0];
         state.g = vec![3.0];
-        state.g_l = vec![1.0];
-        state.g_u = vec![f64::INFINITY];
+        set_constraint_bounds(&mut state, vec![1.0], vec![f64::INFINITY]);
         state.v_l = vec![0.5];
         sync_state_s_to_g(&mut state);
         let err = compute_compl_err_at_state(&state);
@@ -9724,8 +9825,7 @@ mod tests {
         let mut state = minimal_state(1, 1);
         state.x = vec![0.0];
         state.g = vec![1.0];
-        state.g_l = vec![f64::NEG_INFINITY];
-        state.g_u = vec![4.0];
+        set_constraint_bounds(&mut state, vec![f64::NEG_INFINITY], vec![4.0]);
         state.v_u = vec![0.25];
         sync_state_s_to_g(&mut state);
         let err = compute_compl_err_at_state(&state);
@@ -9970,8 +10070,7 @@ mod tests {
         // Old x; constraint g(x) = x; equality g = 0.
         state.x = vec![0.5];
         state.g = vec![0.5];
-        state.g_l = vec![0.0];
-        state.g_u = vec![0.0];
+        set_constraint_bounds(&mut state, vec![0.0], vec![0.0]);
         state.x_l = vec![f64::NEG_INFINITY];
         state.x_u = vec![f64::INFINITY];
         state.mu = 0.1;
@@ -10028,8 +10127,7 @@ mod tests {
         let mut state = minimal_state(1, 1);
         state.x = vec![0.5];
         state.g = vec![0.5];
-        state.g_l = vec![0.0];
-        state.g_u = vec![0.0];
+        set_constraint_bounds(&mut state, vec![0.0], vec![0.0]);
         state.x_l = vec![f64::NEG_INFINITY];
         state.x_u = vec![f64::INFINITY];
         state.mu = 0.1;
@@ -10189,11 +10287,12 @@ mod tests {
         s.jac_cols = vec![0];
         s.jac_vals = vec![1.0];
         s.g = vec![g];
-        s.set_y_combined(&[999.0]);  // sentinel; recalc must overwrite
         if g_eq {
-            s.g_l = vec![0.0];
-            s.g_u = vec![0.0];
+            // Layout flip first — set_y_combined must write into the
+            // post-flip y_c/y_d sizing.
+            set_constraint_bounds(&mut s, vec![0.0], vec![0.0]);
         }
+        s.set_y_combined(&[999.0]);  // sentinel; recalc must overwrite
         s
     }
 
@@ -10242,8 +10341,7 @@ mod tests {
     #[test]
     fn test_recalc_y_full_augmented_inequality_uses_v_l_v_u() {
         let mut state = ls_y_equals_two_state(0.5, false);
-        state.g_l = vec![0.0];
-        state.g_u = vec![f64::INFINITY];
+        set_constraint_bounds(&mut state, vec![0.0], vec![f64::INFINITY]);
         state.v_l = vec![1.0];
         state.v_u = vec![0.0];
         let opts = SolverOptions { recalc_y: true, ..SolverOptions::default() };
@@ -10302,8 +10400,7 @@ mod tests {
             fn hessian_values(&self, _: &[f64], _: bool, _: f64, _: &[f64], _: &mut [f64]) -> bool { true }
         }
         let mut state = minimal_state(1, 1);
-        state.g_l = vec![0.0];
-        state.g_u = vec![0.0];
+        set_constraint_bounds(&mut state, vec![0.0], vec![0.0]);
         state.set_y_combined(&[0.5]);
         state.set_dy_combined(&[-3.0]);
         state.jac_rows = vec![0];
@@ -10344,8 +10441,7 @@ mod tests {
             fn hessian_values(&self, _: &[f64], _: bool, _: f64, _: &[f64], _: &mut [f64]) -> bool { true }
         }
         let mut state = minimal_state(1, 1);
-        state.g_l = vec![0.0];
-        state.g_u = vec![0.0];
+        set_constraint_bounds(&mut state, vec![0.0], vec![0.0]);
         state.set_y_combined(&[0.5]);
         state.set_dy_combined(&[-3.0]);
         state.jac_rows = vec![0];
@@ -10450,8 +10546,7 @@ mod tests {
         state.z_u = vec![0.0, 0.3];
         state.v_l = vec![0.4, 0.0];
         state.v_u = vec![0.0, 0.6];
-        state.g_l = vec![0.0, f64::NEG_INFINITY];
-        state.g_u = vec![f64::INFINITY, 5.0];
+        set_constraint_bounds(&mut state, vec![0.0, f64::NEG_INFINITY], vec![f64::INFINITY, 5.0]);
         state.g = vec![1.0, 2.0];
         state.mu = 0.1;
         let snapshot = (
