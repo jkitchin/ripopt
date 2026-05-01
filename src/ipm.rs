@@ -6385,12 +6385,6 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         // A8.7: `aug_solver` is hoisted above the loop so its symbolic
         // cache persists across iterations.
         let probing = options.mehrotra_pc;
-        let y_combined_for_aug = state.y_combined();
-        let s_combined_for_aug = state.s_combined();
-        let v_l_combined_for_aug = state.v_l_combined();
-        let v_u_combined_for_aug = state.v_u_combined();
-        let g_l_combined_for_aug = state.g_l_combined();
-        let g_u_combined_for_aug = state.g_u_combined();
         let (step, _dc, mu_new_opt, aug_kkt, _iter_dw, _iter_dc) = if probing {
             let avg_compl = compute_avg_complementarity(&state);
             let mu_max = mu_state.mu_max_cap(options, avg_compl);
@@ -6400,8 +6394,8 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals,
                 &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals,
                 &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u,
-                &s_combined_for_aug, &state.g, &g_l_combined_for_aug, &g_u_combined_for_aug, &y_combined_for_aug,
-                &v_l_combined_for_aug, &v_u_combined_for_aug,
+                &state.s, &state.c_x, &state.d_x, &state.d_l, &state.d_u,
+                &state.y_c, &state.y_d, &state.v_l, &state.v_u,
                 state.mu, options.kappa_d,
                 crate::kkt_aug::PROBING_SIGMA_MAX_DEFAULT,
                 options.mu_min, mu_max,
@@ -6422,8 +6416,8 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals,
                 &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals,
                 &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u,
-                &s_combined_for_aug, &state.g, &g_l_combined_for_aug, &g_u_combined_for_aug, &y_combined_for_aug,
-                &v_l_combined_for_aug, &v_u_combined_for_aug,
+                &state.s, &state.c_x, &state.d_x, &state.d_l, &state.d_u,
+                &state.y_c, &state.y_d, &state.v_l, &state.v_u,
                 state.mu, options.kappa_d,
                 use_sparse,
                 aug_solver.as_mut(),
@@ -6441,7 +6435,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             state.mu = mu_new;
         }
         install_step_directions(
-            &mut state, step.dx, step.dy_m, step.ds,
+            &mut state, step.dx, step.dy_c, step.dy_d, step.ds,
             step.dz_l, step.dz_u, step.dv_l, step.dv_u,
         );
 
@@ -7190,17 +7184,14 @@ fn attempt_soc_aug<P: NlpProblem>(
         // aug matrix (W + Σ + perturbation) is identical to the one
         // factored at the top of the IPM iteration; only the y_c/y_d RHS
         // slots change.
-        let y_combined_for_soc = state.y_combined();
-        let s_combined_for_soc = state.s_combined();
-        let v_l_combined_for_soc = state.v_l_combined();
-        let v_u_combined_for_soc = state.v_u_combined();
         let (dx_soc, ds_d_soc) = match crate::kkt_aug::aug_soc_solve_dx_factored(
             n, &state.grad_f,
             &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals,
             &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals,
             &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u,
-            &s_combined_for_soc, &state.g, &g_l_combined_for_soc, &g_u_combined_for_soc, &y_combined_for_soc,
-            &v_l_combined_for_soc, &v_u_combined_for_soc,
+            &state.s, &state.c_x, &state.d_x, &state.d_l, &state.d_u,
+            &state.y_c, &state.y_d,
+            &state.v_l, &state.v_u,
             state.mu, options.kappa_d,
             aug_solver,
             aug_kkt,
@@ -8685,20 +8676,27 @@ fn fraction_to_boundary_primal_s(state: &SolverState, ds: &[f64], tau: f64) -> f
 fn install_step_directions(
     state: &mut SolverState,
     dx: Vec<f64>,
-    dy: Vec<f64>,
+    dy_c: Vec<f64>,
+    dy_d: Vec<f64>,
     ds: Vec<f64>,
     dz_l: Vec<f64>,
     dz_u: Vec<f64>,
     dv_l: Vec<f64>,
     dv_u: Vec<f64>,
 ) {
+    debug_assert_eq!(dy_c.len(), state.layout.n_c);
+    debug_assert_eq!(dy_d.len(), state.layout.n_d);
+    debug_assert_eq!(ds.len(), state.layout.n_d);
+    debug_assert_eq!(dv_l.len(), state.layout.n_d);
+    debug_assert_eq!(dv_u.len(), state.layout.n_d);
     state.dx = dx;
-    state.set_dy_combined(&dy);
-    state.set_ds_combined(&ds);
+    state.dy_c = dy_c;
+    state.dy_d = dy_d;
+    state.ds = ds;
     state.dz_l = dz_l;
     state.dz_u = dz_u;
-    state.set_dv_l_combined(&dv_l);
-    state.set_dv_u_combined(&dv_u);
+    state.dv_l = dv_l;
+    state.dv_u = dv_u;
 }
 
 /// L-infinity norm of `J^T * c_violation`, where `c_violation` is the

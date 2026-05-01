@@ -30,23 +30,6 @@
 pub use crate::constraint_layout::ConstraintLayout;
 use crate::linear_solver::{KktMatrix, LinearSolver, SolverError};
 
-/// Project an m-indexed array onto the n_d-indexed inequality subset.
-/// Phase 5f bridge helper: callers that still receive m-form bound /
-/// slack vectors funnel through this once before invoking the native
-/// split-form `compute_sigma_s` and friends. Will disappear once the
-/// public `aug_step_from_state` family takes split inputs directly.
-#[inline]
-fn project_d(partition: &ConstraintLayout, v: &[f64]) -> Vec<f64> {
-    partition.d_to_combined.iter().map(|&i| v[i]).collect()
-}
-
-/// Project an m-indexed array onto the n_c-indexed equality subset.
-/// Phase 5f bridge helper (mirror of `project_d`).
-#[inline]
-fn project_c(partition: &ConstraintLayout, v: &[f64]) -> Vec<f64> {
-    partition.c_to_combined.iter().map(|&i| v[i]).collect()
-}
-
 /// Σ_s = diag(v_L / (s − d_L)) + diag(v_U / (d_U − s)), one entry per
 /// inequality constraint (length `n_d`). Phase 5f: native split-form —
 /// all inputs are n_d-indexed (Ipopt's `Pd_L`/`Pd_U` are baked into the
@@ -293,8 +276,8 @@ pub struct OuterRhs {
     /// Indexed `[0, n)`.
     pub rhs_z_l: Vec<f64>,
     pub rhs_z_u: Vec<f64>,
-    /// `rhs_v_L = (s − g_L) · v_L − μ` (per-inequality, zero for unbounded sides).
-    /// Indexed in `m`-space — caller can ignore equality entries which are zero.
+    /// `rhs_v_L = (s − d_L) · v_L − μ` (per-inequality, zero for unbounded sides).
+    /// Indexed in `n_d`-space (Phase 5f.3).
     pub rhs_v_l: Vec<f64>,
     pub rhs_v_u: Vec<f64>,
 }
@@ -312,7 +295,6 @@ pub struct OuterRhs {
 #[allow(clippy::too_many_arguments)]
 pub fn build_outer_rhs(
     n: usize,
-    partition: &ConstraintLayout,
     grad_f: &[f64],
     j_t_y: &[f64],
     x: &[f64],
@@ -320,18 +302,24 @@ pub fn build_outer_rhs(
     x_u: &[f64],
     z_l: &[f64],
     z_u: &[f64],
-    s: &[f64],
-    g: &[f64],
-    g_l: &[f64],
-    g_u: &[f64],
-    y: &[f64],
-    v_l: &[f64],
-    v_u: &[f64],
+    s_d: &[f64],
+    c_x: &[f64],
+    d_x: &[f64],
+    d_l: &[f64],
+    d_u: &[f64],
+    y_d: &[f64],
+    v_l_d: &[f64],
+    v_u_d: &[f64],
     mu: f64,
     kappa_d: f64,
 ) -> OuterRhs {
-    let n_c = partition.n_c;
-    let n_d = partition.n_d;
+    let n_d = d_x.len();
+    debug_assert_eq!(s_d.len(), n_d);
+    debug_assert_eq!(d_l.len(), n_d);
+    debug_assert_eq!(d_u.len(), n_d);
+    debug_assert_eq!(y_d.len(), n_d);
+    debug_assert_eq!(v_l_d.len(), n_d);
+    debug_assert_eq!(v_u_d.len(), n_d);
 
     // rhs_x = ∇f + J^T·y − Px_L·z_L + Px_U·z_U + κ_d damping for one-sided bounds.
     let mut rhs_x = vec![0.0; n];
@@ -346,9 +334,6 @@ pub fn build_outer_rhs(
             r += z_u[i];
         }
         if kappa_d > 0.0 && (l_fin ^ u_fin) {
-            // One-sided bound: damping pushes toward the open side.
-            // Sign mirrors `IpIpoptCalculatedQuantities.cpp:2172-2173`:
-            //   +κ_d·μ on lower-only, −κ_d·μ on upper-only.
             if l_fin {
                 r += kappa_d * mu;
             } else {
@@ -359,17 +344,17 @@ pub fn build_outer_rhs(
     }
 
     // rhs_s (n_d entries) = −y_d − Pd_L·v_L + Pd_U·v_U + κ_d damping per
-    // `IpIpoptCalculatedQuantities.cpp:2182-2227`. Iterate in n_d-space.
+    // `IpIpoptCalculatedQuantities.cpp:2182-2227`. Native split-form walk.
     let mut rhs_s = vec![0.0; n_d];
-    for (k, &i) in partition.d_to_combined.iter().enumerate() {
-        let mut r = -y[i];
-        let l_fin = g_l[i].is_finite();
-        let u_fin = g_u[i].is_finite();
+    for k in 0..n_d {
+        let mut r = -y_d[k];
+        let l_fin = d_l[k].is_finite();
+        let u_fin = d_u[k].is_finite();
         if l_fin {
-            r -= v_l[i];
+            r -= v_l_d[k];
         }
         if u_fin {
-            r += v_u[i];
+            r += v_u_d[k];
         }
         if kappa_d > 0.0 && (l_fin ^ u_fin) {
             if l_fin {
@@ -381,21 +366,17 @@ pub fn build_outer_rhs(
         rhs_s[k] = r;
     }
 
-    // rhs_y_c = c(x) for equality rows. Equality target value is
-    // g_l[i] = g_u[i], so c(x) = g[i] − g_l[i].
-    let mut rhs_y_c = vec![0.0; n_c];
-    for (k, &i) in partition.c_to_combined.iter().enumerate() {
-        rhs_y_c[k] = g[i] - g_l[i];
-    }
+    // rhs_y_c = c(x). State stores c_x natively as the equality residual
+    // (`IpOrigIpoptNLP::c`).
+    let rhs_y_c = c_x.to_vec();
 
-    // rhs_y_d = d(x) − s for inequality rows.
+    // rhs_y_d = d(x) − s. Native split walk.
     let mut rhs_y_d = vec![0.0; n_d];
-    for (k, &i) in partition.d_to_combined.iter().enumerate() {
-        rhs_y_d[k] = g[i] - s[i];
+    for k in 0..n_d {
+        rhs_y_d[k] = d_x[k] - s_d[k];
     }
 
-    // Bound complementarity residuals: rhs_z_L = z_L · (x − x_L) − μ for
-    // bounded variables; zero for unbounded. Per `IpIpoptCalculatedQuantities.cpp:2422-2428`.
+    // Bound complementarity residuals (n-indexed; zero for unbounded sides).
     let mut rhs_z_l = vec![0.0; n];
     let mut rhs_z_u = vec![0.0; n];
     for i in 0..n {
@@ -409,19 +390,17 @@ pub fn build_outer_rhs(
         }
     }
 
-    // Slack-bound complementarity residuals (m-indexed for caller convenience;
-    // equality rows stay 0).
-    let m = g.len();
-    let mut rhs_v_l = vec![0.0; m];
-    let mut rhs_v_u = vec![0.0; m];
-    for &i in partition.d_to_combined.iter() {
-        if g_l[i].is_finite() {
-            let s_l = (s[i] - g_l[i]).max(1e-20);
-            rhs_v_l[i] = v_l[i] * s_l - mu;
+    // Slack-bound complementarity residuals (n_d-indexed, Phase 5f.3).
+    let mut rhs_v_l = vec![0.0; n_d];
+    let mut rhs_v_u = vec![0.0; n_d];
+    for k in 0..n_d {
+        if d_l[k].is_finite() {
+            let s_l = (s_d[k] - d_l[k]).max(1e-20);
+            rhs_v_l[k] = v_l_d[k] * s_l - mu;
         }
-        if g_u[i].is_finite() {
-            let s_u = (g_u[i] - s[i]).max(1e-20);
-            rhs_v_u[i] = v_u[i] * s_u - mu;
+        if d_u[k].is_finite() {
+            let s_u = (d_u[k] - s_d[k]).max(1e-20);
+            rhs_v_u[k] = v_u_d[k] * s_u - mu;
         }
     }
 
@@ -455,17 +434,21 @@ pub fn build_outer_rhs(
 /// the same order as `assemble_aug_kkt`: `[x; s; y_c; y_d]`.
 pub fn fold_aug_rhs(
     n: usize,
-    partition: &ConstraintLayout,
     rhs: &OuterRhs,
     x: &[f64],
     x_l: &[f64],
     x_u: &[f64],
-    s: &[f64],
-    g_l: &[f64],
-    g_u: &[f64],
+    s_d: &[f64],
+    d_l: &[f64],
+    d_u: &[f64],
 ) -> Vec<f64> {
-    let n_c = partition.n_c;
-    let n_d = partition.n_d;
+    let n_c = rhs.rhs_y_c.len();
+    let n_d = rhs.rhs_y_d.len();
+    debug_assert_eq!(s_d.len(), n_d);
+    debug_assert_eq!(d_l.len(), n_d);
+    debug_assert_eq!(d_u.len(), n_d);
+    debug_assert_eq!(rhs.rhs_v_l.len(), n_d);
+    debug_assert_eq!(rhs.rhs_v_u.len(), n_d);
     let dim = n + n_d + n_c + n_d;
     let mut aug = vec![0.0; dim];
 
@@ -485,22 +468,21 @@ pub fn fold_aug_rhs(
         aug[i] = r;
     }
 
-    // s-block: same pattern with Pd_L / Pd_U and slack_s_L / slack_s_U.
-    for (k, &i) in partition.d_to_combined.iter().enumerate() {
+    // s-block: native split walk in n_d-space.
+    for k in 0..n_d {
         let mut r = -rhs.rhs_s[k];
-        if g_l[i].is_finite() {
-            let s_l = (s[i] - g_l[i]).max(1e-20);
-            r -= rhs.rhs_v_l[i] / s_l;
+        if d_l[k].is_finite() {
+            let s_l = (s_d[k] - d_l[k]).max(1e-20);
+            r -= rhs.rhs_v_l[k] / s_l;
         }
-        if g_u[i].is_finite() {
-            let s_u = (g_u[i] - s[i]).max(1e-20);
-            r += rhs.rhs_v_u[i] / s_u;
+        if d_u[k].is_finite() {
+            let s_u = (d_u[k] - s_d[k]).max(1e-20);
+            r += rhs.rhs_v_u[k] / s_u;
         }
         aug[n + k] = r;
     }
 
-    // y_c block: aug.y_c = −rhs_y_c. Per `:475` rhs.y_c flows through unchanged
-    // before the α=−1 flip; we negate.
+    // y_c block: aug.y_c = −rhs_y_c.
     for k in 0..n_c {
         aug[n + n_d + k] = -rhs.rhs_y_c[k];
     }
@@ -520,21 +502,19 @@ pub fn fold_aug_rhs(
 /// `IpPDFullSpaceSolver.cpp:653-656`.
 pub struct AugStep {
     pub dx: Vec<f64>,
-    /// Slack step in m-space (zero for equality rows, the inequality entries
-    /// carry the n_d-space step recovered from the augmented solve).
+    /// Slack step in n_d-space (Phase 5f.3). Mirrors Ipopt's
+    /// `delta_s` slot in `IteratesVector`.
     pub ds: Vec<f64>,
+    /// Equality multiplier step (size n_c).
     pub dy_c: Vec<f64>,
+    /// Inequality multiplier step (size n_d).
     pub dy_d: Vec<f64>,
-    /// Combined constraint multiplier step in m-space, formed by writing
-    /// `dy_c` into the equality positions and `dy_d` into the inequality
-    /// positions per `ConstraintLayout`. Convenient for IPM-side wiring
-    /// (the legacy `state.y` is m-indexed and combines both subsets).
-    pub dy_m: Vec<f64>,
     /// Per-variable Δz_L (zero for variables without a lower bound).
     pub dz_l: Vec<f64>,
     pub dz_u: Vec<f64>,
-    /// Per-constraint Δv_L (m-indexed; zero for equalities and unbounded sides).
+    /// Slack lower-bound multiplier step (size n_d, Phase 5f.3).
     pub dv_l: Vec<f64>,
+    /// Slack upper-bound multiplier step (size n_d, Phase 5f.3).
     pub dv_u: Vec<f64>,
 }
 
@@ -562,28 +542,30 @@ pub struct AugStep {
 #[allow(clippy::too_many_arguments)]
 pub fn recover_step(
     n: usize,
-    partition: &ConstraintLayout,
+    n_c: usize,
     aug_sol: &[f64],
     x: &[f64],
     x_l: &[f64],
     x_u: &[f64],
     z_l: &[f64],
     z_u: &[f64],
-    s: &[f64],
-    g_l: &[f64],
-    g_u: &[f64],
-    v_l: &[f64],
-    v_u: &[f64],
+    s_d: &[f64],
+    d_l: &[f64],
+    d_u: &[f64],
+    v_l_d: &[f64],
+    v_u_d: &[f64],
     mu: f64,
 ) -> AugStep {
-    let n_c = partition.n_c;
-    let n_d = partition.n_d;
-    let m = g_l.len();
+    let n_d = s_d.len();
+    debug_assert_eq!(d_l.len(), n_d);
+    debug_assert_eq!(d_u.len(), n_d);
+    debug_assert_eq!(v_l_d.len(), n_d);
+    debug_assert_eq!(v_u_d.len(), n_d);
     let expected = n + n_d + n_c + n_d;
     debug_assert_eq!(aug_sol.len(), expected);
 
     let dx = aug_sol[0..n].to_vec();
-    let ds_nd = aug_sol[n..n + n_d].to_vec();
+    let ds = aug_sol[n..n + n_d].to_vec();
     let dy_c = aug_sol[n + n_d..n + n_d + n_c].to_vec();
     let dy_d = aug_sol[n + n_d + n_c..expected].to_vec();
 
@@ -601,39 +583,22 @@ pub fn recover_step(
         }
     }
 
-    // Slack-bound recovery: ds is in n_d-space, indexed by inequality position.
-    let mut dv_l = vec![0.0; m];
-    let mut dv_u = vec![0.0; m];
-    for (k, &i) in partition.d_to_combined.iter().enumerate() {
-        let dsk = ds_nd[k];
-        if g_l[i].is_finite() {
-            let s_l = (s[i] - g_l[i]).max(1e-20);
-            dv_l[i] = (mu - v_l[i] * s_l) / s_l - (v_l[i] / s_l) * dsk;
+    // Slack-bound recovery: native split walk.
+    let mut dv_l = vec![0.0; n_d];
+    let mut dv_u = vec![0.0; n_d];
+    for k in 0..n_d {
+        let dsk = ds[k];
+        if d_l[k].is_finite() {
+            let s_l = (s_d[k] - d_l[k]).max(1e-20);
+            dv_l[k] = (mu - v_l_d[k] * s_l) / s_l - (v_l_d[k] / s_l) * dsk;
         }
-        if g_u[i].is_finite() {
-            let s_u = (g_u[i] - s[i]).max(1e-20);
-            dv_u[i] = (mu - v_u[i] * s_u) / s_u + (v_u[i] / s_u) * dsk;
+        if d_u[k].is_finite() {
+            let s_u = (d_u[k] - s_d[k]).max(1e-20);
+            dv_u[k] = (mu - v_u_d[k] * s_u) / s_u + (v_u_d[k] / s_u) * dsk;
         }
     }
 
-    // Promote ds back to m-space (zero for equalities) so downstream code
-    // that uses the IPM's m-indexed `state.s` arrays can stay unchanged.
-    let mut ds = vec![0.0; m];
-    for (k, &i) in partition.d_to_combined.iter().enumerate() {
-        ds[i] = ds_nd[k];
-    }
-
-    // Build combined m-space dy: dy_c entries land at equality positions,
-    // dy_d entries at inequality positions.
-    let mut dy_m = vec![0.0; m];
-    for (k, &i) in partition.c_to_combined.iter().enumerate() {
-        dy_m[i] = dy_c[k];
-    }
-    for (k, &i) in partition.d_to_combined.iter().enumerate() {
-        dy_m[i] = dy_d[k];
-    }
-
-    AugStep { dx, ds, dy_c, dy_d, dy_m, dz_l, dz_u, dv_l, dv_u }
+    AugStep { dx, ds, dy_c, dy_d, dz_l, dz_u, dv_l, dv_u }
 }
 
 /// Result of `solve_aug_with_ir`: the linear-solver output (Newton step Δ in
@@ -1023,20 +988,23 @@ pub fn aug_step_from_state(
     x_u: &[f64],
     z_l: &[f64],
     z_u: &[f64],
-    s: &[f64],
-    g: &[f64],
-    g_l: &[f64],
-    g_u: &[f64],
-    y: &[f64],
-    v_l: &[f64],
-    v_u: &[f64],
+    s_d: &[f64],
+    c_x: &[f64],
+    d_x: &[f64],
+    d_l: &[f64],
+    d_u: &[f64],
+    y_c: &[f64],
+    y_d: &[f64],
+    v_l_d: &[f64],
+    v_u_d: &[f64],
     mu: f64,
     kappa_d: f64,
     use_sparse: bool,
     solver: &mut dyn LinearSolver,
     perturbation: &mut crate::kkt::InertiaCorrectionParams,
 ) -> Result<(AugStep, f64, f64, AugKktSystem), SolverError> {
-    let partition = ConstraintLayout::new(g_l, g_u);
+    let n_c = c_x.len();
+    let n_d = d_x.len();
 
     // Σ_x: `IpIpoptCalculatedQuantities.cpp:3501-3540`. Pre-projected — zero
     // for fully unbounded variables.
@@ -1051,17 +1019,12 @@ pub fn aug_step_from_state(
             sigma_x[i] += z_u[i] / s_u;
         }
     }
-    let s_d = project_d(&partition, s);
-    let d_l = project_d(&partition, g_l);
-    let d_u = project_d(&partition, g_u);
-    let v_l_d = project_d(&partition, v_l);
-    let v_u_d = project_d(&partition, v_u);
-    let sigma_s = compute_sigma_s(&d_l, &d_u, &s_d, &v_l_d, &v_u_d);
+    let sigma_s = compute_sigma_s(d_l, d_u, s_d, v_l_d, v_u_d);
 
     // Assemble the unperturbed matrix (δ_* zeroed; perturbation layered on
     // by factor_aug_with_inertia_correction).
     let mut aug = assemble_aug_kkt(
-        n, partition.n_c, partition.n_d,
+        n, n_c, n_d,
         hess_rows, hess_cols, hess_vals,
         jac_c_rows, jac_c_cols, jac_c_vals,
         jac_d_rows, jac_d_cols, jac_d_vals,
@@ -1071,25 +1034,20 @@ pub fn aug_step_from_state(
     );
 
     // Compute J^T·y once (used both by RHS construction and the unperturbed-matvec
-    // sanity check that the IR loop performs internally). Phase 4b: split form.
-    let y_c = project_c(&partition, y);
-    let y_d = project_d(&partition, y);
+    // sanity check that the IR loop performs internally).
     let j_t_y = compute_j_t_y_split(
-        n, &y_c, &y_d,
+        n, y_c, y_d,
         jac_c_rows, jac_c_cols, jac_c_vals,
         jac_d_rows, jac_d_cols, jac_d_vals,
     );
 
-    // Build the eight outer RHS slots and fold them into the four-block
-    // augmented form (with Ipopt's α=−1 flip already baked in so the
-    // linear solver output IS the step).
     let outer = build_outer_rhs(
-        n, &partition, grad_f, &j_t_y,
+        n, grad_f, &j_t_y,
         x, x_l, x_u, z_l, z_u,
-        s, g, g_l, g_u, y, v_l, v_u,
+        s_d, c_x, d_x, d_l, d_u, y_d, v_l_d, v_u_d,
         mu, kappa_d,
     );
-    let aug_rhs = fold_aug_rhs(n, &partition, &outer, x, x_l, x_u, s, g_l, g_u);
+    let aug_rhs = fold_aug_rhs(n, &outer, x, x_l, x_u, s_d, d_l, d_u);
 
     // Drive the perturbation ladder (A5/A6 inertia target = (n+n_d, n_c+n_d, 0)).
     let (dw, dc) =
@@ -1104,15 +1062,10 @@ pub fn aug_step_from_state(
         IR_IMPROVEMENT_FACTOR_DEFAULT,
     )?;
 
-    // A8.21: env-var-gated probe — dump the IR diagnostics (final residual
-    // ratio, refinement count) and the inf-norm of the recovered solution
-    // alongside per-block inf-norms. Lets the caller see whether a 6%-level
-    // dx gap vs Ipopt at iter 0 is upstream of the IR loop (factorization
-    // accuracy) or downstream (post-solve back-sub).
     if std::env::var("RIPOPT_IR_PROBE").is_ok() {
         let nx = n;
-        let nd = partition.n_d;
-        let nc = partition.n_c;
+        let nd = n_d;
+        let nc = n_c;
         let dx_block = &result.sol[0..nx];
         let ds_block = &result.sol[nx..nx+nd];
         let dyc_block = &result.sol[nx+nd..nx+nd+nc];
@@ -1127,13 +1080,10 @@ pub fn aug_step_from_state(
 
     // Recover the eight-block step.
     let step = recover_step(
-        n, &partition, &result.sol,
+        n, n_c, &result.sol,
         x, x_l, x_u, z_l, z_u,
-        s, g_l, g_u, v_l, v_u, mu,
+        s_d, d_l, d_u, v_l_d, v_u_d, mu,
     );
-    // A7.7: return the perturbed `AugKktSystem` so callers (line search → SOC)
-    // can reuse the just-installed factorization without reassembling and
-    // re-factoring the same matrix.
     Ok((step, dw, dc, aug))
 }
 
@@ -1170,10 +1120,9 @@ pub const PROBING_SIGMA_MAX_DEFAULT: f64 = 1e2;
 #[allow(clippy::too_many_arguments)]
 pub fn aug_probing_mu_from_affine(
     n: usize,
-    partition: &ConstraintLayout,
     step_aff: &AugStep,
     x: &[f64], x_l: &[f64], x_u: &[f64], z_l: &[f64], z_u: &[f64],
-    s: &[f64], g_l: &[f64], g_u: &[f64], v_l: &[f64], v_u: &[f64],
+    s_d: &[f64], d_l: &[f64], d_u: &[f64], v_l_d: &[f64], v_u_d: &[f64],
     mu_curr: f64,
     sigma_max: f64,
     mu_min: f64,
@@ -1182,12 +1131,13 @@ pub fn aug_probing_mu_from_affine(
     if mu_curr <= 0.0 {
         return None;
     }
+    let n_d = s_d.len();
+    debug_assert_eq!(step_aff.ds.len(), n_d);
+    debug_assert_eq!(step_aff.dv_l.len(), n_d);
+    debug_assert_eq!(step_aff.dv_u.len(), n_d);
     let tau = 1.0_f64;
 
-    // α_p_aff over the four primal slack groups. Per-group test:
-    // `slack + α · P^T · Δx > 0` ⇒ `α ≤ τ · slack / (−P^T · Δx)` when the
-    // direction is negative. Only Px_L and Pd_L contribute with sign +α
-    // (slack growth direction is +Δx); Px_U and Pd_U with sign −α.
+    // α_p_aff over the four primal slack groups.
     let mut alpha_p = 1.0_f64;
     for i in 0..n {
         if x_l[i].is_finite() && step_aff.dx[i] < 0.0 {
@@ -1199,20 +1149,19 @@ pub fn aug_probing_mu_from_affine(
             alpha_p = alpha_p.min(tau * s_u / step_aff.dx[i]);
         }
     }
-    for &i in partition.d_to_combined.iter() {
-        let dsi = step_aff.ds[i];
-        if g_l[i].is_finite() && dsi < 0.0 {
-            let s_l = (s[i] - g_l[i]).max(1e-20);
-            alpha_p = alpha_p.min(tau * s_l / (-dsi));
+    for k in 0..n_d {
+        let dsk = step_aff.ds[k];
+        if d_l[k].is_finite() && dsk < 0.0 {
+            let s_l = (s_d[k] - d_l[k]).max(1e-20);
+            alpha_p = alpha_p.min(tau * s_l / (-dsk));
         }
-        if g_u[i].is_finite() && dsi > 0.0 {
-            let s_u = (g_u[i] - s[i]).max(1e-20);
-            alpha_p = alpha_p.min(tau * s_u / dsi);
+        if d_u[k].is_finite() && dsk > 0.0 {
+            let s_u = (d_u[k] - s_d[k]).max(1e-20);
+            alpha_p = alpha_p.min(tau * s_u / dsk);
         }
     }
 
-    // α_d_aff over the four bound multipliers. Each multiplier z must stay
-    // ≥ 0, so when Δz < 0 the bound is `α ≤ τ · z / (−Δz)`.
+    // α_d_aff over the four bound multipliers.
     let mut alpha_d = 1.0_f64;
     for i in 0..n {
         if x_l[i].is_finite() && step_aff.dz_l[i] < 0.0 {
@@ -1222,20 +1171,18 @@ pub fn aug_probing_mu_from_affine(
             alpha_d = alpha_d.min(tau * z_u[i].max(1e-20) / (-step_aff.dz_u[i]));
         }
     }
-    for &i in partition.d_to_combined.iter() {
-        if g_l[i].is_finite() && step_aff.dv_l[i] < 0.0 {
-            alpha_d = alpha_d.min(tau * v_l[i].max(1e-20) / (-step_aff.dv_l[i]));
+    for k in 0..n_d {
+        if d_l[k].is_finite() && step_aff.dv_l[k] < 0.0 {
+            alpha_d = alpha_d.min(tau * v_l_d[k].max(1e-20) / (-step_aff.dv_l[k]));
         }
-        if g_u[i].is_finite() && step_aff.dv_u[i] < 0.0 {
-            alpha_d = alpha_d.min(tau * v_u[i].max(1e-20) / (-step_aff.dv_u[i]));
+        if d_u[k].is_finite() && step_aff.dv_u[k] < 0.0 {
+            alpha_d = alpha_d.min(tau * v_u_d[k].max(1e-20) / (-step_aff.dv_u[k]));
         }
     }
     let alpha_p = alpha_p.clamp(0.0, 1.0);
     let alpha_d = alpha_d.clamp(0.0, 1.0);
 
     // μ_aff via CalculateAffineMu. Sum slack' · mult' over the four groups.
-    // For Px_L: slack' = slack_x_L + α_p · Δx, mult' = z_L + α_d · Δz_L.
-    // For Px_U: slack' = slack_x_U − α_p · Δx, mult' = z_U + α_d · Δz_U.
     let mut sum = 0.0_f64;
     let mut ncomp = 0_usize;
     for i in 0..n {
@@ -1254,19 +1201,19 @@ pub fn aug_probing_mu_from_affine(
             ncomp += 1;
         }
     }
-    for &i in partition.d_to_combined.iter() {
-        let dsi = step_aff.ds[i];
-        if g_l[i].is_finite() {
-            let s_l = (s[i] - g_l[i]).max(1e-20);
-            let s_new = s_l + alpha_p * dsi;
-            let v_new = v_l[i] + alpha_d * step_aff.dv_l[i];
+    for k in 0..n_d {
+        let dsk = step_aff.ds[k];
+        if d_l[k].is_finite() {
+            let s_l = (s_d[k] - d_l[k]).max(1e-20);
+            let s_new = s_l + alpha_p * dsk;
+            let v_new = v_l_d[k] + alpha_d * step_aff.dv_l[k];
             sum += s_new * v_new;
             ncomp += 1;
         }
-        if g_u[i].is_finite() {
-            let s_u = (g_u[i] - s[i]).max(1e-20);
-            let s_new = s_u - alpha_p * dsi;
-            let v_new = v_u[i] + alpha_d * step_aff.dv_u[i];
+        if d_u[k].is_finite() {
+            let s_u = (d_u[k] - s_d[k]).max(1e-20);
+            let s_new = s_u - alpha_p * dsk;
+            let v_new = v_u_d[k] + alpha_d * step_aff.dv_u[k];
             sum += s_new * v_new;
             ncomp += 1;
         }
@@ -1320,13 +1267,15 @@ pub fn aug_step_from_state_mehrotra(
     x_u: &[f64],
     z_l: &[f64],
     z_u: &[f64],
-    s: &[f64],
-    g: &[f64],
-    g_l: &[f64],
-    g_u: &[f64],
-    y: &[f64],
-    v_l: &[f64],
-    v_u: &[f64],
+    s_d: &[f64],
+    c_x: &[f64],
+    d_x: &[f64],
+    d_l: &[f64],
+    d_u: &[f64],
+    y_c: &[f64],
+    y_d: &[f64],
+    v_l_d: &[f64],
+    v_u_d: &[f64],
     mu_curr: f64,
     kappa_d: f64,
     sigma_max: f64,
@@ -1336,11 +1285,9 @@ pub fn aug_step_from_state_mehrotra(
     solver: &mut dyn LinearSolver,
     perturbation: &mut crate::kkt::InertiaCorrectionParams,
 ) -> Result<(AugStep, f64, f64, f64, AugKktSystem), SolverError> {
-    let partition = ConstraintLayout::new(g_l, g_u);
+    let n_c = c_x.len();
+    let n_d = d_x.len();
 
-    // Σ_x and Σ_s do not depend on μ — they're functions of bound multipliers
-    // and slacks at the current iterate. Reused across the affine and Newton
-    // solves. (Per `IpIpoptCalculatedQuantities.cpp:3501-3540`.)
     let mut sigma_x = vec![0.0; n];
     for i in 0..n {
         if x_l[i].is_finite() {
@@ -1352,15 +1299,10 @@ pub fn aug_step_from_state_mehrotra(
             sigma_x[i] += z_u[i] / s_u;
         }
     }
-    let s_d = project_d(&partition, s);
-    let d_l = project_d(&partition, g_l);
-    let d_u = project_d(&partition, g_u);
-    let v_l_d = project_d(&partition, v_l);
-    let v_u_d = project_d(&partition, v_u);
-    let sigma_s = compute_sigma_s(&d_l, &d_u, &s_d, &v_l_d, &v_u_d);
+    let sigma_s = compute_sigma_s(d_l, d_u, s_d, v_l_d, v_u_d);
 
     let mut aug = assemble_aug_kkt(
-        n, partition.n_c, partition.n_d,
+        n, n_c, n_d,
         hess_rows, hess_cols, hess_vals,
         jac_c_rows, jac_c_cols, jac_c_vals,
         jac_d_rows, jac_d_cols, jac_d_vals,
@@ -1369,64 +1311,51 @@ pub fn aug_step_from_state_mehrotra(
         use_sparse,
     );
 
-    let y_c = project_c(&partition, y);
-    let y_d = project_d(&partition, y);
     let j_t_y = compute_j_t_y_split(
-        n, &y_c, &y_d,
+        n, y_c, y_d,
         jac_c_rows, jac_c_cols, jac_c_vals,
         jac_d_rows, jac_d_cols, jac_d_vals,
     );
 
-    // Affine RHS per `IpProbingMuOracle.cpp:63-72`:
-    //   x      ← grad_lag_x (no κ_d damping)
-    //   s      ← grad_lag_s (no κ_d damping)
-    //   y_c    ← c(x)
-    //   y_d    ← d(x) − s
-    //   z_*/v_* ← slack · mult (no μ subtracted)
-    // build_outer_rhs(mu=0, kappa_d=0) produces this exactly.
+    // Affine RHS per `IpProbingMuOracle.cpp:63-72`: build_outer_rhs(mu=0, kappa_d=0).
     let outer_aff = build_outer_rhs(
-        n, &partition, grad_f, &j_t_y,
+        n, grad_f, &j_t_y,
         x, x_l, x_u, z_l, z_u,
-        s, g, g_l, g_u, y, v_l, v_u,
+        s_d, c_x, d_x, d_l, d_u, y_d, v_l_d, v_u_d,
         0.0, 0.0,
     );
-    let aug_rhs_aff = fold_aug_rhs(n, &partition, &outer_aff, x, x_l, x_u, s, g_l, g_u);
+    let aug_rhs_aff = fold_aug_rhs(n, &outer_aff, x, x_l, x_u, s_d, d_l, d_u);
 
-    // Drive the perturbation ladder using the affine RHS as the probe.
     let (dw, dc) = factor_aug_with_inertia_correction(
         &mut aug, solver, perturbation, mu_curr, &aug_rhs_aff,
     )?;
 
-    // Affine solve (IR-protected). Reuses the factorization just installed.
     let aff_result = solve_aug_with_ir(
         solver, &aug, &aug_rhs_aff,
         IR_MIN_STEPS_DEFAULT, IR_MAX_STEPS_DEFAULT,
         IR_RATIO_MAX_DEFAULT, IR_IMPROVEMENT_FACTOR_DEFAULT,
     )?;
     let step_aff = recover_step(
-        n, &partition, &aff_result.sol,
+        n, n_c, &aff_result.sol,
         x, x_l, x_u, z_l, z_u,
-        s, g_l, g_u, v_l, v_u, 0.0,
+        s_d, d_l, d_u, v_l_d, v_u_d, 0.0,
     );
 
-    // Probing oracle → μ_new. Falls back to mu_curr when no bound multipliers
-    // exist or the affine step is degenerate.
     let mu_new = aug_probing_mu_from_affine(
-        n, &partition, &step_aff,
+        n, &step_aff,
         x, x_l, x_u, z_l, z_u,
-        s, g_l, g_u, v_l, v_u,
+        s_d, d_l, d_u, v_l_d, v_u_d,
         mu_curr, sigma_max, mu_min, mu_max,
     ).unwrap_or(mu_curr);
 
-    // Newton step at μ_new (with kappa_d damping). Build a fresh OuterRhs
-    // and fold; the matrix is unchanged so we reuse the existing factor.
+    // Newton step at μ_new — same matrix, fresh RHS.
     let outer = build_outer_rhs(
-        n, &partition, grad_f, &j_t_y,
+        n, grad_f, &j_t_y,
         x, x_l, x_u, z_l, z_u,
-        s, g, g_l, g_u, y, v_l, v_u,
+        s_d, c_x, d_x, d_l, d_u, y_d, v_l_d, v_u_d,
         mu_new, kappa_d,
     );
-    let aug_rhs = fold_aug_rhs(n, &partition, &outer, x, x_l, x_u, s, g_l, g_u);
+    let aug_rhs = fold_aug_rhs(n, &outer, x, x_l, x_u, s_d, d_l, d_u);
 
     let result = solve_aug_with_ir(
         solver, &aug, &aug_rhs,
@@ -1434,9 +1363,9 @@ pub fn aug_step_from_state_mehrotra(
         IR_RATIO_MAX_DEFAULT, IR_IMPROVEMENT_FACTOR_DEFAULT,
     )?;
     let step = recover_step(
-        n, &partition, &result.sol,
+        n, n_c, &result.sol,
         x, x_l, x_u, z_l, z_u,
-        s, g_l, g_u, v_l, v_u, mu_new,
+        s_d, d_l, d_u, v_l_d, v_u_d, mu_new,
     );
 
     Ok((step, mu_new, dw, dc, aug))
@@ -1476,27 +1405,28 @@ pub fn aug_soc_solve_dx(
     x_u: &[f64],
     z_l: &[f64],
     z_u: &[f64],
-    s: &[f64],
-    g: &[f64],
-    g_l: &[f64],
-    g_u: &[f64],
-    y: &[f64],
-    v_l: &[f64],
-    v_u: &[f64],
+    s_d: &[f64],
+    c_x: &[f64],
+    d_x: &[f64],
+    d_l: &[f64],
+    d_u: &[f64],
+    y_c: &[f64],
+    y_d: &[f64],
+    v_l_d: &[f64],
+    v_u_d: &[f64],
     mu: f64,
     kappa_d: f64,
     use_sparse: bool,
     solver: &mut dyn LinearSolver,
     perturbation: &mut crate::kkt::InertiaCorrectionParams,
-    // SOC-modified constraint residuals. Lengths must match partition sizes.
     c_soc: &[f64],
     dms_soc: &[f64],
 ) -> Option<(Vec<f64>, Vec<f64>)> {
-    let partition = ConstraintLayout::new(g_l, g_u);
-    if c_soc.len() != partition.n_c || dms_soc.len() != partition.n_d {
+    let n_c = c_x.len();
+    let n_d = d_x.len();
+    if c_soc.len() != n_c || dms_soc.len() != n_d {
         return None;
     }
-    let n_d = partition.n_d;
 
     let mut sigma_x = vec![0.0; n];
     for i in 0..n {
@@ -1509,15 +1439,10 @@ pub fn aug_soc_solve_dx(
             sigma_x[i] += z_u[i] / s_u;
         }
     }
-    let s_d = project_d(&partition, s);
-    let d_l = project_d(&partition, g_l);
-    let d_u = project_d(&partition, g_u);
-    let v_l_d = project_d(&partition, v_l);
-    let v_u_d = project_d(&partition, v_u);
-    let sigma_s = compute_sigma_s(&d_l, &d_u, &s_d, &v_l_d, &v_u_d);
+    let sigma_s = compute_sigma_s(d_l, d_u, s_d, v_l_d, v_u_d);
 
     let mut aug = assemble_aug_kkt(
-        n, partition.n_c, partition.n_d,
+        n, n_c, n_d,
         hess_rows, hess_cols, hess_vals,
         jac_c_rows, jac_c_cols, jac_c_vals,
         jac_d_rows, jac_d_cols, jac_d_vals,
@@ -1526,29 +1451,22 @@ pub fn aug_soc_solve_dx(
         use_sparse,
     );
 
-    let y_c = project_c(&partition, y);
-    let y_d = project_d(&partition, y);
     let j_t_y = compute_j_t_y_split(
-        n, &y_c, &y_d,
+        n, y_c, y_d,
         jac_c_rows, jac_c_cols, jac_c_vals,
         jac_d_rows, jac_d_cols, jac_d_vals,
     );
 
-    // Newton RHS at current state (x/s/z_*/v_* slots), then overwrite y_c/y_d
-    // with the SOC-accumulated residuals (`IpFilterLSAcceptor.cpp:581-582`,
-    // method 0).
     let mut outer = build_outer_rhs(
-        n, &partition, grad_f, &j_t_y,
+        n, grad_f, &j_t_y,
         x, x_l, x_u, z_l, z_u,
-        s, g, g_l, g_u, y, v_l, v_u,
+        s_d, c_x, d_x, d_l, d_u, y_d, v_l_d, v_u_d,
         mu, kappa_d,
     );
     outer.rhs_y_c.copy_from_slice(c_soc);
     outer.rhs_y_d.copy_from_slice(dms_soc);
-    let aug_rhs = fold_aug_rhs(n, &partition, &outer, x, x_l, x_u, s, g_l, g_u);
+    let aug_rhs = fold_aug_rhs(n, &outer, x, x_l, x_u, s_d, d_l, d_u);
 
-    // Factor (with inertia correction) and IR-solve. The matrix is identical
-    // to the upstream Newton step — A7.7 will share this factorization.
     if factor_aug_with_inertia_correction(&mut aug, solver, perturbation, mu, &aug_rhs)
         .is_err()
     {
@@ -1600,13 +1518,15 @@ pub fn aug_soc_solve_dx_factored(
     x_u: &[f64],
     z_l: &[f64],
     z_u: &[f64],
-    s: &[f64],
-    g: &[f64],
-    g_l: &[f64],
-    g_u: &[f64],
-    y: &[f64],
-    v_l: &[f64],
-    v_u: &[f64],
+    s_d: &[f64],
+    c_x: &[f64],
+    d_x: &[f64],
+    d_l: &[f64],
+    d_u: &[f64],
+    y_c: &[f64],
+    y_d: &[f64],
+    v_l_d: &[f64],
+    v_u_d: &[f64],
     mu: f64,
     kappa_d: f64,
     solver: &mut dyn LinearSolver,
@@ -1614,29 +1534,27 @@ pub fn aug_soc_solve_dx_factored(
     c_soc: &[f64],
     dms_soc: &[f64],
 ) -> Option<(Vec<f64>, Vec<f64>)> {
-    let partition = ConstraintLayout::new(g_l, g_u);
-    if c_soc.len() != partition.n_c || dms_soc.len() != partition.n_d {
+    let n_c = c_x.len();
+    let n_d = d_x.len();
+    if c_soc.len() != n_c || dms_soc.len() != n_d {
         return None;
     }
-    let n_d = partition.n_d;
 
-    let y_c = project_c(&partition, y);
-    let y_d = project_d(&partition, y);
     let j_t_y = compute_j_t_y_split(
-        n, &y_c, &y_d,
+        n, y_c, y_d,
         jac_c_rows, jac_c_cols, jac_c_vals,
         jac_d_rows, jac_d_cols, jac_d_vals,
     );
 
     let mut outer = build_outer_rhs(
-        n, &partition, grad_f, &j_t_y,
+        n, grad_f, &j_t_y,
         x, x_l, x_u, z_l, z_u,
-        s, g, g_l, g_u, y, v_l, v_u,
+        s_d, c_x, d_x, d_l, d_u, y_d, v_l_d, v_u_d,
         mu, kappa_d,
     );
     outer.rhs_y_c.copy_from_slice(c_soc);
     outer.rhs_y_d.copy_from_slice(dms_soc);
-    let aug_rhs = fold_aug_rhs(n, &partition, &outer, x, x_l, x_u, s, g_l, g_u);
+    let aug_rhs = fold_aug_rhs(n, &outer, x, x_l, x_u, s_d, d_l, d_u);
 
     let result = match solve_aug_with_ir(
         solver, aug, &aug_rhs,
@@ -1801,9 +1719,7 @@ mod tests {
     fn outer_rhs_pure_equality_no_slack_entries() {
         // 2 vars unbounded, 1 equality g(x) = 0 with current g(x)=0.5.
         let n = 2usize;
-        let g_l = vec![0.0];
-        let g_u = vec![0.0];
-        let p = ConstraintLayout::new(&g_l, &g_u);
+        // 1 equality row → n_c=1, n_d=0.
         let grad_f = vec![1.0, 2.0];
         let j_t_y = vec![0.1, 0.2];
         let x = vec![0.0, 0.0];
@@ -1811,15 +1727,18 @@ mod tests {
         let x_u = vec![f64::INFINITY; 2];
         let z_l = vec![0.0; 2];
         let z_u = vec![0.0; 2];
-        let s = vec![0.0];
-        let g = vec![0.5];
-        let y = vec![0.3];
-        let v_l = vec![0.0];
-        let v_u = vec![0.0];
+        let s_d: Vec<f64> = vec![];
+        let c_x = vec![0.5]; // g - c_rhs = 0.5 - 0 = 0.5
+        let d_x: Vec<f64> = vec![];
+        let d_l: Vec<f64> = vec![];
+        let d_u: Vec<f64> = vec![];
+        let y_d: Vec<f64> = vec![];
+        let v_l_d: Vec<f64> = vec![];
+        let v_u_d: Vec<f64> = vec![];
         let r = build_outer_rhs(
-            n, &p, &grad_f, &j_t_y,
+            n, &grad_f, &j_t_y,
             &x, &x_l, &x_u, &z_l, &z_u,
-            &s, &g, &g_l, &g_u, &y, &v_l, &v_u,
+            &s_d, &c_x, &d_x, &d_l, &d_u, &y_d, &v_l_d, &v_u_d,
             1e-3, 0.0,
         );
         // No bounds → rhs_x = grad_f + j_t_y.
@@ -1838,9 +1757,6 @@ mod tests {
         // 3 vars: var 0 lower-only, var 1 upper-only, var 2 two-sided.
         // Damping should land on 0 (+κ_d·μ) and 1 (−κ_d·μ); var 2 untouched.
         let n = 3usize;
-        let g_l: Vec<f64> = vec![];
-        let g_u: Vec<f64> = vec![];
-        let p = ConstraintLayout::new(&g_l, &g_u);
         let grad_f = vec![0.0, 0.0, 0.0];
         let j_t_y = vec![0.0, 0.0, 0.0];
         let x = vec![1.0, 1.0, 1.0];
@@ -1848,17 +1764,20 @@ mod tests {
         let x_u = vec![f64::INFINITY, 2.0, 2.0];
         let z_l = vec![5.0, 0.0, 7.0];
         let z_u = vec![0.0, 11.0, 13.0];
-        let s = vec![];
-        let g = vec![];
-        let y = vec![];
-        let v_l = vec![];
-        let v_u = vec![];
+        let s_d: Vec<f64> = vec![];
+        let c_x: Vec<f64> = vec![];
+        let d_x: Vec<f64> = vec![];
+        let d_l: Vec<f64> = vec![];
+        let d_u: Vec<f64> = vec![];
+        let y_d: Vec<f64> = vec![];
+        let v_l_d: Vec<f64> = vec![];
+        let v_u_d: Vec<f64> = vec![];
         let mu = 0.01;
         let kappa_d = 1e-5;
         let r = build_outer_rhs(
-            n, &p, &grad_f, &j_t_y,
+            n, &grad_f, &j_t_y,
             &x, &x_l, &x_u, &z_l, &z_u,
-            &s, &g, &g_l, &g_u, &y, &v_l, &v_u,
+            &s_d, &c_x, &d_x, &d_l, &d_u, &y_d, &v_l_d, &v_u_d,
             mu, kappa_d,
         );
         // var 0 (lower-only): -z_l + κ_d·μ
@@ -1877,27 +1796,28 @@ mod tests {
         // This is the smoke test the spec called for.
         use crate::linear_solver::dense::DenseLdl;
         let n = 1usize;
-        // 1 ineq with both bounds.
-        let g_l = vec![0.0];
-        let g_u = vec![10.0];
-        let p = ConstraintLayout::new(&g_l, &g_u);
+        // 1 ineq with both bounds → n_c=0, n_d=1.
+        let n_c = 0usize;
         // x bounded in [0, ∞), so only z_l contributes.
         let x_l = vec![0.0];
         let x_u = vec![f64::INFINITY];
         let x = vec![1.0];
         let z_l = vec![0.5];
         let z_u = vec![0.0];
-        let s = vec![3.0];
-        let g = vec![3.5];     // residual d-s = 0.5
-        let y = vec![0.7];
-        let v_l = vec![0.4];
-        let v_u = vec![0.6];
+        let s_d = vec![3.0];
+        let c_x: Vec<f64> = vec![];
+        let d_x = vec![3.5];   // residual d-s = 0.5
+        let d_l = vec![0.0];
+        let d_u = vec![10.0];
+        let y_d = vec![0.7];
+        let v_l_d = vec![0.4];
+        let v_u_d = vec![0.6];
         let mu = 0.1;
 
         // Σ_x = z_l/(x-x_l) = 0.5/1 = 0.5.
         let sigma_x = vec![0.5];
-        // Σ_s = v_l/(s-g_l) + v_u/(g_u-s) = 0.4/3 + 0.6/7
-        let sigma_s = compute_sigma_s(&g_l, &g_u, &s, &v_l, &v_u);
+        // Σ_s = v_l/(s-d_L) + v_u/(d_U-s) = 0.4/3 + 0.6/7
+        let sigma_s = compute_sigma_s(&d_l, &d_u, &s_d, &v_l_d, &v_u_d);
 
         // Hessian H = [[2.0]], Jacobian J row 0 (ineq, kd=0): [3.0].
         let hess_rows = vec![0];
@@ -1911,7 +1831,7 @@ mod tests {
         let jac_d_vals = vec![3.0];
 
         let aug = assemble_aug_kkt(
-            n, p.n_c, p.n_d,
+            n, n_c, 1,
             &hess_rows, &hess_cols, &hess_vals,
             &jac_c_rows, &jac_c_cols, &jac_c_vals,
             &jac_d_rows, &jac_d_cols, &jac_d_vals,
@@ -1924,12 +1844,12 @@ mod tests {
         let grad_f = vec![10.0];
         let j_t_y = vec![3.0 * 0.7]; // J^T·y
         let outer = build_outer_rhs(
-            n, &p, &grad_f, &j_t_y,
+            n, &grad_f, &j_t_y,
             &x, &x_l, &x_u, &z_l, &z_u,
-            &s, &g, &g_l, &g_u, &y, &v_l, &v_u,
+            &s_d, &c_x, &d_x, &d_l, &d_u, &y_d, &v_l_d, &v_u_d,
             mu, 0.0,
         );
-        let aug_rhs = fold_aug_rhs(n, &p, &outer, &x, &x_l, &x_u, &s, &g_l, &g_u);
+        let aug_rhs = fold_aug_rhs(n, &outer, &x, &x_l, &x_u, &s_d, &d_l, &d_u);
         assert_eq!(aug_rhs.len(), 3);
 
         // Solve K·sol = aug_rhs with a dense solver.
@@ -1950,12 +1870,12 @@ mod tests {
 
         // Recover full step and sanity-check shapes.
         let step = recover_step(
-            n, &p, &sol,
+            n, n_c, &sol,
             &x, &x_l, &x_u, &z_l, &z_u,
-            &s, &g_l, &g_u, &v_l, &v_u, mu,
+            &s_d, &d_l, &d_u, &v_l_d, &v_u_d, mu,
         );
         assert_eq!(step.dx.len(), 1);
-        assert_eq!(step.ds.len(), 1); // m-space
+        assert_eq!(step.ds.len(), 1); // n_d-space
         assert_eq!(step.dy_c.len(), 0);
         assert_eq!(step.dy_d.len(), 1);
         // Lower bound on x is finite, so dz_l[0] should be defined.
@@ -1963,7 +1883,7 @@ mod tests {
         let expected_dz_l = (mu - z_l[0] * s_l_x) / s_l_x - (z_l[0] / s_l_x) * step.dx[0];
         assert!((step.dz_l[0] - expected_dz_l).abs() < 1e-12);
         assert_eq!(step.dz_u[0], 0.0);
-        // Both v bounds are active.
+        // Both v bounds are active (n_d-form indexing).
         assert!(step.dv_l[0] != 0.0);
         assert!(step.dv_u[0] != 0.0);
     }
@@ -1989,13 +1909,15 @@ mod tests {
         let x_u = vec![f64::INFINITY];
         let z_l = vec![0.0];
         let z_u = vec![0.0];
-        let s: Vec<f64> = vec![];
-        let g: Vec<f64> = vec![];
-        let g_l: Vec<f64> = vec![];
-        let g_u: Vec<f64> = vec![];
-        let y: Vec<f64> = vec![];
-        let v_l: Vec<f64> = vec![];
-        let v_u: Vec<f64> = vec![];
+        let s_d: Vec<f64> = vec![];
+        let c_x: Vec<f64> = vec![];
+        let d_x: Vec<f64> = vec![];
+        let d_l: Vec<f64> = vec![];
+        let d_u: Vec<f64> = vec![];
+        let y_c: Vec<f64> = vec![];
+        let y_d: Vec<f64> = vec![];
+        let v_l_d: Vec<f64> = vec![];
+        let v_u_d: Vec<f64> = vec![];
         let mu = 1e-3;
         let mut solver: Box<dyn LinearSolver> = Box::new(DenseLdl::new());
         let mut params = crate::kkt::InertiaCorrectionParams::default();
@@ -2005,7 +1927,7 @@ mod tests {
             &jac_c_rows, &jac_c_cols, &jac_c_vals,
             &jac_d_rows, &jac_d_cols, &jac_d_vals,
             &x, &x_l, &x_u, &z_l, &z_u,
-            &s, &g, &g_l, &g_u, &y, &v_l, &v_u,
+            &s_d, &c_x, &d_x, &d_l, &d_u, &y_c, &y_d, &v_l_d, &v_u_d,
             mu, 0.0, false,
             solver.as_mut(), &mut params,
         ).unwrap();
