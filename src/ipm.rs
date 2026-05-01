@@ -5653,29 +5653,29 @@ fn detect_linear_constraint_flags<P: NlpProblem>(
 /// strictly-positive `s_L = s − g_l` and `s_U = g_u − s` so the IPM's
 /// log-barrier on the slack is well defined at iteration 0.
 fn initialize_slack_iterate(state: &mut SolverState, m: usize, options: &SolverOptions) {
+    // Phase 5f: walk d-block natively. `s[k] = clamp(d_x[k], d_l[k]+pL, d_u[k]-pU)`.
     let kappa1 = options.bound_push;
     let kappa2 = options.bound_frac;
-    for i in 0..m {
-        if constraint_is_equality(state, i) {
-            // Phase 3d: no sentinel write — `s` no longer carries equality slots.
-            continue;
-        }
-        let l_fin = state.g_l_at(i).is_finite();
-        let u_fin = state.g_u_at(i).is_finite();
-        let mut s_i = state.g[i];
+    let _ = m;
+    for k in 0..state.layout.n_d {
+        let dl = state.d_l[k];
+        let du = state.d_u[k];
+        let l_fin = dl.is_finite();
+        let u_fin = du.is_finite();
+        let mut s_i = state.d_x[k];
         if l_fin && u_fin {
-            let range = state.g_u_at(i) - state.g_l_at(i);
-            let p_l = (kappa1 * state.g_l_at(i).abs().max(1.0)).min(kappa2 * range);
-            let p_u = (kappa1 * state.g_u_at(i).abs().max(1.0)).min(kappa2 * range);
-            s_i = s_i.max(state.g_l_at(i) + p_l).min(state.g_u_at(i) - p_u);
+            let range = du - dl;
+            let p_l = (kappa1 * dl.abs().max(1.0)).min(kappa2 * range);
+            let p_u = (kappa1 * du.abs().max(1.0)).min(kappa2 * range);
+            s_i = s_i.max(dl + p_l).min(du - p_u);
         } else if l_fin {
-            let p_l = kappa1 * state.g_l_at(i).abs().max(1.0);
-            s_i = s_i.max(state.g_l_at(i) + p_l);
+            let p_l = kappa1 * dl.abs().max(1.0);
+            s_i = s_i.max(dl + p_l);
         } else if u_fin {
-            let p_u = kappa1 * state.g_u_at(i).abs().max(1.0);
-            s_i = s_i.min(state.g_u_at(i) - p_u);
+            let p_u = kappa1 * du.abs().max(1.0);
+            s_i = s_i.min(du - p_u);
         }
-        state.set_s_at(i, s_i);
+        state.s[k] = s_i;
     }
 }
 
@@ -7505,28 +7505,27 @@ fn reset_constraint_slack_multipliers_after_restoration(
     m: usize,
     nuclear_reset: bool,
 ) {
+    // Phase 5f: walk d-block natively.
     let mu_r = state.mu;
-    for i in 0..m {
-        if constraint_is_equality(state, i) {
-            // Equality rows have no slack-bound multipliers; the d-block
-            // setters route them away anyway, but keep the early continue
-            // to mirror Ipopt's per-d-row reset pattern.
-            continue;
-        }
-        let v_l_new = if state.g_l_at(i).is_finite() {
-            let slack = (state.g[i] - state.g_l_at(i)).max(1e-12);
+    let _ = m;
+    for k in 0..state.layout.n_d {
+        let dl = state.d_l[k];
+        let du = state.d_u[k];
+        let dx = state.d_x[k];
+        let v_l_new = if dl.is_finite() {
+            let slack = (dx - dl).max(1e-12);
             if nuclear_reset { 1.0 } else { mu_r / slack }
         } else {
             0.0
         };
-        state.set_v_l_at(i, v_l_new);
-        let v_u_new = if state.g_u_at(i).is_finite() {
-            let slack = (state.g_u_at(i) - state.g[i]).max(1e-12);
+        state.v_l[k] = v_l_new;
+        let v_u_new = if du.is_finite() {
+            let slack = (du - dx).max(1e-12);
             if nuclear_reset { 1.0 } else { mu_r / slack }
         } else {
             0.0
         };
-        state.set_v_u_at(i, v_u_new);
+        state.v_u[k] = v_u_new;
     }
 }
 
@@ -9043,11 +9042,9 @@ fn slack_gu(state: &SolverState, i: usize) -> f64 {
 /// with the constraint values they just installed.
 #[cfg(test)]
 pub(crate) fn sync_state_s_to_g(state: &mut SolverState) {
-    // Phase 3d: `s` is d-block-native. Walk the d-block directly and copy
-    // `g[i]` for the corresponding combined row.
+    // Phase 3d / 5f: `s` is d-block-native; mirror `d_x` directly.
     for k in 0..state.layout.n_d {
-        let i = state.layout.d_to_combined[k];
-        state.s[k] = state.g[i];
+        state.s[k] = state.d_x[k];
     }
 }
 
@@ -9981,6 +9978,7 @@ mod tests {
         let mut state = minimal_state(1, 1);
         state.g = vec![2.0];
         set_constraint_bounds(&mut state, vec![1.0], vec![f64::INFINITY]);
+        state.refresh_split_constraints();
         state.v_l = vec![0.5];
         sync_state_s_to_g(&mut state);
         let avg = compute_avg_complementarity(&state);
@@ -10003,6 +10001,7 @@ mod tests {
         state.z_l = vec![1.0];
         state.g = vec![2.0];
         set_constraint_bounds(&mut state, vec![1.0], vec![f64::INFINITY]);
+        state.refresh_split_constraints();
         state.v_l = vec![99.0];
         sync_state_s_to_g(&mut state);
         let avg = compute_avg_complementarity(&state);
