@@ -6203,8 +6203,12 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                     if v.abs() > av { (i, v.abs()) } else { (ai, av) }
                 });
             let mut jty = vec![0.0; state.n];
-            for (idx, (&row, &col)) in state.jac_rows.iter().zip(state.jac_cols.iter()).enumerate() {
-                jty[col] += state.jac_vals[idx] * state.y_at(row);
+            // Phase 5d: split-form J^T·y diagnostic.
+            for (idx, (&kc, &col)) in state.jac_c_rows.iter().zip(state.jac_c_cols.iter()).enumerate() {
+                jty[col] += state.jac_c_vals[idx] * state.y_c[kc];
+            }
+            for (idx, (&kd, &col)) in state.jac_d_rows.iter().zip(state.jac_d_cols.iter()).enumerate() {
+                jty[col] += state.jac_d_vals[idx] * state.y_d[kd];
             }
             let jty_inf = jty.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
             let zl_inf = state.z_l.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
@@ -7124,17 +7128,16 @@ fn attempt_soc_aug<P: NlpProblem>(
     let n_c = partition.n_c;
     let n_d = partition.n_d;
 
-    // c_soc[k]    = curr_c[k]            = g[i] - g_l[i]   for equality row i.
-    // dms_soc[k]  = curr_d_minus_s[k]    = g[i] - s[i]     for inequality row i.
+    // Phase 5d: read split storage directly. c_soc[k] = c(x)[k] (Ipopt's
+    // curr_c, IpIpoptCalculatedQuantities); dms_soc[k] = d(x)[k] - s[k]
+    // (curr_d_minus_s).
     let mut c_soc = vec![0.0; n_c];
     let mut dms_soc = vec![0.0; n_d];
-    for i in 0..m {
-        if let Some(k) = partition.eq_pos[i] {
-            c_soc[k] = state.g[i] - state.g_l_at(i);
-        } else if let Some(k) = partition.ineq_pos[i] {
-            // Phase 3d: state.s is d-block-native, indexed directly by k.
-            dms_soc[k] = state.g[i] - state.s[k];
-        }
+    for k in 0..n_c {
+        c_soc[k] = state.c_x[k];
+    }
+    for k in 0..n_d {
+        dms_soc[k] = state.d_x[k] - state.s[k];
     }
 
     // First-iteration trial residuals: g_trial / s_trial = s + α·ds.
@@ -8475,11 +8478,17 @@ fn compute_s_d_at_state(state: &SolverState) -> f64 {
 /// reconstruction.
 fn theta_for_g_s(state: &SolverState, g: &[f64], s_d: &[f64]) -> f64 {
     debug_assert_eq!(s_d.len(), state.layout.n_d);
+    // Phase 5d: read split storage directly when `g` matches `state.g`.
+    // The four call sites all pass `state.g` or a g_trial that's been
+    // mirrored to state.c_x/state.d_x; project from the combined form
+    // here for the trial-evaluate path that hands a fresh g without
+    // going through state.refresh_split_constraints first.
     let g_c: Vec<f64> = state
         .layout
         .c_to_combined
         .iter()
-        .map(|&i| g[i] - state.g_l_at(i))
+        .enumerate()
+        .map(|(k, &i)| g[i] - state.c_rhs[k])
         .collect();
     let g_d: Vec<f64> = state.layout.project_d(g);
     convergence::primal_infeasibility_internal_split(&g_c, &g_d, s_d)
@@ -8504,8 +8513,12 @@ fn compute_trial_slack(state: &SolverState, alpha: f64) -> Vec<f64> {
 /// computations, the active-set z recovery, and the gradient-of-f +
 /// J^T y diagnostic used by stall classification.
 fn accumulate_jt_y(state: &SolverState, target: &mut [f64]) {
-    for (idx, (&row, &col)) in state.jac_rows.iter().zip(state.jac_cols.iter()).enumerate() {
-        target[col] += state.jac_vals[idx] * state.y_at(row);
+    // Phase 5d: split-form J^T·y, no combined materialisation.
+    for (idx, (&kc, &col)) in state.jac_c_rows.iter().zip(state.jac_c_cols.iter()).enumerate() {
+        target[col] += state.jac_c_vals[idx] * state.y_c[kc];
+    }
+    for (idx, (&kd, &col)) in state.jac_d_rows.iter().zip(state.jac_d_cols.iter()).enumerate() {
+        target[col] += state.jac_d_vals[idx] * state.y_d[kd];
     }
 }
 
