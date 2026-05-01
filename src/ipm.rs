@@ -494,7 +494,7 @@ impl IterateSnapshot {
     fn capture(state: &SolverState, filter: &Filter, iteration: usize) -> Self {
         Self {
             x: state.x.clone(),
-            y: state.y.clone(),
+            y: state.y_combined(),
             z_l: state.z_l.clone(),
             z_u: state.z_u.clone(),
             v_l: state.v_l.clone(),
@@ -511,7 +511,7 @@ impl IterateSnapshot {
 
     fn restore(&self, state: &mut SolverState, filter: &mut Filter) {
         state.x = self.x.clone();
-        state.y = self.y.clone();
+        state.set_y_combined(&self.y);
         state.z_l = self.z_l.clone();
         state.z_u = self.z_u.clone();
         state.v_l = self.v_l.clone();
@@ -549,7 +549,7 @@ impl WatchdogSavedState {
     fn snapshot(state: &SolverState, filter: &Filter, theta: f64, phi: f64) -> Self {
         Self {
             x: state.x.clone(),
-            y: state.y.clone(),
+            y: state.y_combined(),
             z_l: state.z_l.clone(),
             z_u: state.z_u.clone(),
             v_l: state.v_l.clone(),
@@ -570,7 +570,7 @@ impl WatchdogSavedState {
     /// the filter after restore, which the helper would obscure).
     fn restore(&self, state: &mut SolverState) {
         state.x = self.x.clone();
-        state.y = self.y.clone();
+        state.set_y_combined(&self.y);
         state.z_l = self.z_l.clone();
         state.z_u = self.z_u.clone();
         state.v_l = self.v_l.clone();
@@ -593,8 +593,15 @@ impl WatchdogSavedState {
 pub(crate) struct SolverState {
     /// Current primal variables.
     pub x: Vec<f64>,
-    /// Current constraint multipliers (lambda/y).
-    pub y: Vec<f64>,
+    /// Equality-constraint multipliers `y_c` (size n_c). Mirrors Ipopt's
+    /// `IteratesVector::y_c()` (`IpIteratesVector.hpp` slot 2). Phase 3b
+    /// of the data-layout refactor: replaces the combined `y: Vec<f64>`
+    /// (size m). User-facing combined multipliers are reconstructed in
+    /// `unscale_solution_vectors` via the layout.
+    pub y_c: Vec<f64>,
+    /// Inequality-constraint multipliers `y_d` (size n_d). Mirrors Ipopt's
+    /// `IteratesVector::y_d()` (slot 3).
+    pub y_d: Vec<f64>,
     /// Lower bound multipliers.
     pub z_l: Vec<f64>,
     /// Upper bound multipliers.
@@ -1197,9 +1204,16 @@ impl SolverState {
         let is_square = m == n || m_eq == n;
         let layout = crate::constraint_layout::ConstraintLayout::new(&g_l, &g_u);
 
+        // Phase 3b: split y into y_c (n_c) and y_d (n_d). Combined y from
+        // the LS init is projected via the layout; consumers needing the
+        // combined view reconstruct it via `state.y_combined()`.
+        let y_c = layout.project_c(&y);
+        let y_d = layout.project_d(&y);
+
         Self {
             x,
-            y,
+            y_c,
+            y_d,
             z_l,
             z_u,
             v_l: vec![0.0; m],
@@ -1305,16 +1319,68 @@ impl SolverState {
         self.layout.project_d(&self.g_u)
     }
 
-    /// Equality multipliers `y_c` (size n_c). Mirrors Ipopt's
-    /// `IteratesVector::y_c()` (`IpIteratesVector.hpp` slot 2).
+    /// Equality multipliers `y_c` (size n_c). Phase 3b: clones from the
+    /// new split storage. Mirrors Ipopt's `IteratesVector::y_c()`
+    /// (`IpIteratesVector.hpp` slot 2).
     pub fn y_c(&self) -> Vec<f64> {
-        self.layout.project_c(&self.y)
+        self.y_c.clone()
     }
 
-    /// Inequality multipliers `y_d` (size n_d). Mirrors Ipopt's
-    /// `IteratesVector::y_d()` (slot 3).
+    /// Inequality multipliers `y_d` (size n_d). Phase 3b: clones from the
+    /// new split storage. Mirrors Ipopt's `IteratesVector::y_d()` (slot 3).
     pub fn y_d(&self) -> Vec<f64> {
-        self.layout.project_d(&self.y)
+        self.y_d.clone()
+    }
+
+    /// Reconstruct the combined m-length multiplier vector from the split
+    /// storage. Allocates per call — for hot-path code, prefer reading
+    /// `state.y_c` / `state.y_d` directly via the layout. User-facing
+    /// (TNLPAdapter-style) sites and leaf-module signatures still take a
+    /// combined `&[f64]`, so this helper bridges them.
+    pub fn y_combined(&self) -> Vec<f64> {
+        let mut out = vec![0.0; self.m];
+        for (k, &i) in self.layout.c_to_combined.iter().enumerate() {
+            out[i] = self.y_c[k];
+        }
+        for (k, &i) in self.layout.d_to_combined.iter().enumerate() {
+            out[i] = self.y_d[k];
+        }
+        out
+    }
+
+    /// Read the combined-indexed multiplier `y[i]` by routing through the
+    /// layout (`y_c[k]` for equality rows, `y_d[k]` for inequality rows).
+    pub fn y_at(&self, i: usize) -> f64 {
+        if let Some(k) = self.layout.eq_pos[i] {
+            self.y_c[k]
+        } else {
+            let k = self.layout.ineq_pos[i].expect("row is c or d");
+            self.y_d[k]
+        }
+    }
+
+    /// Set the combined-indexed multiplier `y[i]` by routing through the
+    /// layout into the corresponding split storage slot.
+    pub fn set_y_at(&mut self, i: usize, v: f64) {
+        if let Some(k) = self.layout.eq_pos[i] {
+            self.y_c[k] = v;
+        } else {
+            let k = self.layout.ineq_pos[i].expect("row is c or d");
+            self.y_d[k] = v;
+        }
+    }
+
+    /// Overwrite the multipliers from a combined m-length slice. Splits
+    /// the input across y_c / y_d via the layout. Used by initial-y
+    /// least-squares, dual recompute, and snapshot restore.
+    pub fn set_y_combined(&mut self, y: &[f64]) {
+        debug_assert_eq!(y.len(), self.m);
+        for (k, &i) in self.layout.c_to_combined.iter().enumerate() {
+            self.y_c[k] = y[i];
+        }
+        for (k, &i) in self.layout.d_to_combined.iter().enumerate() {
+            self.y_d[k] = y[i];
+        }
     }
 
     /// Slack iterate `s` projected onto the d-block (size n_d). Equality-row
@@ -1411,7 +1477,7 @@ impl SolverState {
         }
         self.n_hess_evals += 1;
         if let Some(flags) = linear_constraints {
-            let mut lambda_for_hess = self.y.clone();
+            let mut lambda_for_hess = self.y_combined();
             for (i, &is_lin) in flags.iter().enumerate() {
                 if is_lin {
                     lambda_for_hess[i] = 0.0;
@@ -1419,7 +1485,8 @@ impl SolverState {
             }
             if !problem.hessian_values(&self.x, false, obj_factor, &lambda_for_hess, &mut self.hess_vals) { return false; }
         } else {
-            if !problem.hessian_values(&self.x, false, obj_factor, &self.y, &mut self.hess_vals) { return false; }
+            let lambda = self.y_combined();
+            if !problem.hessian_values(&self.x, false, obj_factor, &lambda, &mut self.hess_vals) { return false; }
         }
         true
     }
@@ -1862,8 +1929,9 @@ fn update_lbfgs_hessian(
     state: &mut SolverState,
 ) {
     if let Some(ref mut lbfgs) = lbfgs_state {
+        let y = state.y_combined();
         let lag_grad = LbfgsIpmState::compute_lagrangian_gradient(
-            &state.grad_f, &state.jac_rows, &state.jac_cols, &state.jac_vals, &state.y, state.n,
+            &state.grad_f, &state.jac_rows, &state.jac_cols, &state.jac_vals, &y, state.n,
         );
         lbfgs.update(&state.x, &lag_grad);
         lbfgs.fill_hessian(&mut state.hess_vals);
@@ -2410,7 +2478,8 @@ fn apply_slack_move(state: &mut SolverState, options: &SolverOptions) -> usize {
 /// removed here.
 fn apply_y_update(state: &mut SolverState, alpha_y: f64) {
     for i in 0..state.m {
-        state.y[i] += alpha_y * state.dy[i];
+        let v = state.y_at(i) + alpha_y * state.dy[i];
+        state.set_y_at(i, v);
     }
 }
 
@@ -2461,7 +2530,7 @@ fn compute_min_dual_infeas_alpha<P: NlpProblem>(
     // 975-980 then queries `curr_grad_lag_x_amax_func()`.)
     let mut r_x = grad_f_trial.clone();
     for (idx, (&row, &col)) in state.jac_rows.iter().zip(state.jac_cols.iter()).enumerate() {
-        r_x[col] += jac_trial[idx] * state.y[row];
+        r_x[col] += jac_trial[idx] * state.y_at(row);
     }
     for i in 0..n {
         r_x[i] -= state.z_l[i];
@@ -2474,7 +2543,7 @@ fn compute_min_dual_infeas_alpha<P: NlpProblem>(
     let mut dy_d = vec![0.0_f64; m];
     for i in 0..m {
         if !constraint_is_equality(state, i) {
-            r_s[i] = -state.y[i] - state.v_l[i] + state.v_u[i];
+            r_s[i] = -state.y_at(i) - state.v_l[i] + state.v_u[i];
             dy_d[i] = state.dy[i];
         }
     }
@@ -3356,7 +3425,7 @@ impl SoftRestoSnapshot {
     fn take(state: &SolverState) -> Self {
         Self {
             x: state.x.clone(),
-            y: state.y.clone(),
+            y: state.y_combined(),
             z_l: state.z_l.clone(),
             z_u: state.z_u.clone(),
             s: state.s.clone(),
@@ -3369,7 +3438,7 @@ impl SoftRestoSnapshot {
     }
     fn restore(self, state: &mut SolverState) {
         state.x = self.x;
-        state.y = self.y;
+        state.set_y_combined(&self.y);
         state.z_l = self.z_l;
         state.z_u = self.z_u;
         state.s = self.s;
@@ -3430,7 +3499,8 @@ fn attempt_soft_restoration<P: NlpProblem>(
     let x_trial = compute_clamped_trial_x(state, &state.dx, alpha_p);
     state.x = x_trial;
     for i in 0..m {
-        state.y[i] += alpha_d * state.dy[i];
+        let v = state.y_at(i) + alpha_d * state.dy[i];
+        state.set_y_at(i, v);
     }
     for i in 0..n {
         state.z_l[i] = (state.z_l[i] + alpha_d * state.dz_l[i]).max(0.0);
@@ -4252,7 +4322,7 @@ fn switch_to_fixed_mode_with_adaptive_init(
     if options.adaptive_mu_restore_previous_iterate {
         if let Some(snap) = mu_state.accepted_iterate.take() {
             state.x = snap.x;
-            state.y = snap.y;
+            state.set_y_combined(&snap.y);
             state.z_l = snap.z_l;
             state.z_u = snap.z_u;
             state.v_l = snap.v_l;
@@ -4304,7 +4374,7 @@ fn apply_free_mode_sufficient_progress_update(
     if options.adaptive_mu_restore_previous_iterate {
         mu_state.accepted_iterate = Some(AcceptedIterateSnapshot {
             x: state.x.clone(),
-            y: state.y.clone(),
+            y: state.y_combined(),
             z_l: state.z_l.clone(),
             z_u: state.z_u.clone(),
             v_l: state.v_l.clone(),
@@ -4982,13 +5052,14 @@ fn build_iterate_snapshot(state: &SolverState) -> crate::intermediate::IterateSn
             constr_viol[i] = state.g[i] - state.g_u[i];
         }
         // Complementarity: lambda_i * c_i where c_i is the active constraint slack
+        let yi = state.y_at(i);
         if state.g_l[i].is_finite() && state.g_u[i].is_finite() {
             // Equality or range: use min slack
-            compl_g_vec[i] = state.y[i] * (state.g[i] - state.g_l[i]).min(state.g_u[i] - state.g[i]);
+            compl_g_vec[i] = yi * (state.g[i] - state.g_l[i]).min(state.g_u[i] - state.g[i]);
         } else if state.g_l[i].is_finite() {
-            compl_g_vec[i] = state.y[i] * (state.g[i] - state.g_l[i]);
+            compl_g_vec[i] = yi * (state.g[i] - state.g_l[i]);
         } else if state.g_u[i].is_finite() {
-            compl_g_vec[i] = state.y[i] * (state.g_u[i] - state.g[i]);
+            compl_g_vec[i] = yi * (state.g_u[i] - state.g[i]);
         }
     }
     IterateSnapshot {
@@ -4996,7 +5067,7 @@ fn build_iterate_snapshot(state: &SolverState) -> crate::intermediate::IterateSn
         z_l: state.z_l.clone(),
         z_u: state.z_u.clone(),
         g: state.g.clone(),
-        lambda: state.y.clone(),
+        lambda: state.y_combined(),
         x_l_violation: x_l_viol,
         x_u_violation: x_u_viol,
         compl_x_l: compl_xl,
@@ -5193,7 +5264,7 @@ fn initialize_constraint_slack_multipliers(state: &mut SolverState, m: usize, op
             state.v_u[i] = v_init;
         }
         if !ls_active {
-            state.y[i] = state.v_u[i] - state.v_l[i];
+            state.set_y_at(i, state.v_u[i] - state.v_l[i]);
         }
     }
 }
@@ -5207,8 +5278,10 @@ fn apply_warm_start(state: &mut SolverState, options: &SolverOptions) {
         return;
     }
     if let Some(ref init_y) = options.warm_start_y {
-        let len = init_y.len().min(state.y.len());
-        state.y[..len].copy_from_slice(&init_y[..len]);
+        let len = init_y.len().min(state.m);
+        for i in 0..len {
+            state.set_y_at(i, init_y[i]);
+        }
     }
     if let Some(ref init_z_l) = options.warm_start_z_l {
         let len = init_z_l.len().min(state.z_l.len());
@@ -5687,13 +5760,22 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 });
             let mut jty = vec![0.0; state.n];
             for (idx, (&row, &col)) in state.jac_rows.iter().zip(state.jac_cols.iter()).enumerate() {
-                jty[col] += state.jac_vals[idx] * state.y[row];
+                jty[col] += state.jac_vals[idx] * state.y_at(row);
             }
             let jty_inf = jty.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
             let zl_inf = state.z_l.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
             let zu_inf = state.z_u.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
-            let y_inf = state.y.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
-            let y_sum: f64 = state.y.iter().map(|v| v.abs()).sum();
+            let y_inf = state
+                .y_c
+                .iter()
+                .chain(state.y_d.iter())
+                .fold(0.0f64, |a, &b| a.max(b.abs()));
+            let y_sum: f64 = state
+                .y_c
+                .iter()
+                .chain(state.y_d.iter())
+                .map(|v| v.abs())
+                .sum();
             let zl_sum: f64 = state.z_l.iter().map(|v| v.abs()).sum();
             let zu_sum: f64 = state.z_u.iter().map(|v| v.abs()).sum();
             let mut grad_lag = state.grad_f.clone();
@@ -5839,6 +5921,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         // A8.7: `aug_solver` is hoisted above the loop so its symbolic
         // cache persists across iterations.
         let probing = options.mehrotra_pc;
+        let y_combined_for_aug = state.y_combined();
         let (step, _dc, mu_new_opt, aug_kkt, _iter_dw, _iter_dc) = if probing {
             let avg_compl = compute_avg_complementarity(&state);
             let mu_max = mu_state.mu_max_cap(options, avg_compl);
@@ -5847,7 +5930,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 &state.hess_rows, &state.hess_cols, &state.hess_vals,
                 &state.jac_rows, &state.jac_cols, &state.jac_vals,
                 &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u,
-                &state.s, &state.g, &state.g_l, &state.g_u, &state.y,
+                &state.s, &state.g, &state.g_l, &state.g_u, &y_combined_for_aug,
                 &state.v_l, &state.v_u,
                 state.mu, options.kappa_d,
                 crate::kkt_aug::PROBING_SIGMA_MAX_DEFAULT,
@@ -5868,7 +5951,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 &state.hess_rows, &state.hess_cols, &state.hess_vals,
                 &state.jac_rows, &state.jac_cols, &state.jac_vals,
                 &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u,
-                &state.s, &state.g, &state.g_l, &state.g_u, &state.y,
+                &state.s, &state.g, &state.g_l, &state.g_u, &y_combined_for_aug,
                 &state.v_l, &state.v_u,
                 state.mu, options.kappa_d,
                 use_sparse,
@@ -6288,7 +6371,8 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         if std::env::var("RIPOPT_TRACE_DUAL").is_ok() {
             let mut y_inf = 0.0_f64;
             let mut y_idx = usize::MAX;
-            for (i, &yi) in state.y.iter().enumerate() {
+            for i in 0..state.m {
+                let yi = state.y_at(i);
                 if yi.abs() > y_inf {
                     y_inf = yi.abs();
                     y_idx = i;
@@ -6627,11 +6711,12 @@ fn attempt_soc_aug<P: NlpProblem>(
         // aug matrix (W + Σ + perturbation) is identical to the one
         // factored at the top of the IPM iteration; only the y_c/y_d RHS
         // slots change.
+        let y_combined_for_soc = state.y_combined();
         let (dx_soc, ds_d_soc) = match crate::kkt_aug::aug_soc_solve_dx_factored(
             n, &state.grad_f,
             &state.jac_rows, &state.jac_cols, &state.jac_vals,
             &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u,
-            &state.s, &state.g, &state.g_l, &state.g_u, &state.y,
+            &state.s, &state.g, &state.g_l, &state.g_u, &y_combined_for_soc,
             &state.v_l, &state.v_u,
             state.mu, options.kappa_d,
             aug_solver,
@@ -6852,7 +6937,7 @@ fn recompute_y_after_restoration(
     // discards information from a converged dual estimate and biases the
     // next Newton direction.
     if let Some(y_ls) = y_accepted {
-        state.y.copy_from_slice(&y_ls);
+        state.set_y_combined(&y_ls);
     }
 }
 
@@ -6880,7 +6965,7 @@ fn recompute_y_post_step_full_augmented(
         Some((&state.v_l, &state.v_u)),
     );
     if let Some(y_ls) = y_ls_result {
-        state.y.copy_from_slice(&y_ls);
+        state.set_y_combined(&y_ls);
     }
 }
 
@@ -7954,7 +8039,7 @@ fn compute_trial_slack(state: &SolverState, alpha: f64) -> Vec<f64> {
 /// J^T y diagnostic used by stall classification.
 fn accumulate_jt_y(state: &SolverState, target: &mut [f64]) {
     for (idx, (&row, &col)) in state.jac_rows.iter().zip(state.jac_cols.iter()).enumerate() {
-        target[col] += state.jac_vals[idx] * state.y[row];
+        target[col] += state.jac_vals[idx] * state.y_at(row);
     }
 }
 
@@ -8167,9 +8252,10 @@ fn compute_dual_inf_at_state(state: &SolverState) -> f64 {
     // 2069-2098) — no κ_d damping. The damped variants
     // (`curr_grad_lag_with_damping_x/s`, lines 2131-2227) are used
     // *only* in the augmented-system RHS (`curr_grad_barrier_obj_x`).
+    let y = state.y_combined();
     let x_part = convergence::dual_infeasibility(
         &state.grad_f, &state.jac_rows, &state.jac_cols, &state.jac_vals,
-        &state.y, &state.z_l, &state.z_u, state.n,
+        &y, &state.z_l, &state.z_u, state.n,
     );
     x_part.max(slack_dual_inf_max(state))
 }
@@ -8191,7 +8277,7 @@ fn slack_dual_inf_max(state: &SolverState) -> f64 {
         if constraint_is_equality(state, i) {
             continue;
         }
-        let r = -state.y[i] - state.v_l[i] + state.v_u[i];
+        let r = -state.y_at(i) - state.v_l[i] + state.v_u[i];
         let a = r.abs();
         if a > m {
             m = a;
@@ -8207,9 +8293,10 @@ fn slack_dual_inf_max(state: &SolverState) -> f64 {
 fn dual_inf_with_z(state: &SolverState, z_l: &[f64], z_u: &[f64]) -> f64 {
     // A8.10 / DEV-1: plain `curr_dual_infeasibility` — no κ_d damping
     // (`IpIpoptCalculatedQuantities.cpp:2682-2691`).
+    let y = state.y_combined();
     convergence::dual_infeasibility(
         &state.grad_f, &state.jac_rows, &state.jac_cols, &state.jac_vals,
-        &state.y, z_l, z_u, state.n,
+        &y, z_l, z_u, state.n,
     )
 }
 
@@ -8248,9 +8335,10 @@ fn compute_primal_inf_internal_max_at_state(state: &SolverState) -> f64 {
 fn compute_dual_inf_unscaled_at_state(state: &SolverState) -> f64 {
     // A8.10 / DEV-1: plain `curr_dual_infeasibility` — no κ_d damping
     // (`IpIpoptCalculatedQuantities.cpp:2682-2691`).
+    let y = state.y_combined();
     let x_part = convergence::dual_infeasibility_scaled(
         &state.grad_f, &state.jac_rows, &state.jac_cols, &state.jac_vals,
-        &state.y, &state.z_l, &state.z_u, state.n,
+        &y, &state.z_l, &state.z_u, state.n,
     );
     x_part.max(slack_dual_inf_max(state))
 }
@@ -8305,7 +8393,7 @@ fn compute_pderror_e_mu(state: &SolverState, mu: f64) -> f64 {
     let mut residual = vec![0.0; n];
     residual[..n].copy_from_slice(&state.grad_f[..n]);
     for (idx, (&row, &col)) in state.jac_rows.iter().zip(state.jac_cols.iter()).enumerate() {
-        residual[col] += state.jac_vals[idx] * state.y[row];
+        residual[col] += state.jac_vals[idx] * state.y_at(row);
     }
     for i in 0..n {
         residual[i] -= state.z_l[i];
@@ -8602,12 +8690,13 @@ fn assemble_kkt_from_state(
     use_sparse: bool,
     kappa_d: f64,
 ) -> kkt::KktSystem {
+    let y_combined = state.y_combined();
     let mut sys = kkt::assemble_kkt(
         n, m,
         &state.hess_rows, &state.hess_cols, &state.hess_vals,
         &state.jac_rows, &state.jac_cols, &state.jac_vals,
         sigma, &state.grad_f, &state.g, &state.g_l, &state.g_u,
-        &state.s, &state.y, &state.z_l, &state.z_u,
+        &state.s, &y_combined, &state.z_l, &state.z_u,
         &state.x, &state.x_l, &state.x_u, state.mu, kappa_d,
         use_sparse, &state.v_l, &state.v_u, &state.layout,
     );
@@ -8721,7 +8810,8 @@ fn commit_trial_point(
 /// (`IpIpoptCalculatedQuantities.cpp:3689-3690`,
 /// `y_c + y_d + z_L + z_U + v_L + v_U`).
 fn compute_multiplier_sum(state: &SolverState) -> f64 {
-    l1_norm(&state.y)
+    l1_norm(&state.y_c)
+        + l1_norm(&state.y_d)
         + l1_norm(&state.z_l)
         + l1_norm(&state.z_u)
         + l1_norm(&state.v_l)
@@ -8990,7 +9080,7 @@ fn unscale_solution_vectors(state: &SolverState) -> (Vec<f64>, Vec<f64>, Vec<f64
     // Reconstruct combined-indexed y_out / g_out from the split storage
     // (Phase 3): per-row scaling lives in c_scaling[k] for equalities,
     // d_scaling[k] for inequalities.
-    let mut y_out = state.y.clone();
+    let mut y_out = state.y_combined();
     let mut g_out = state.g.clone();
     for i in 0..m {
         let scale_i = if let Some(k) = state.layout.eq_pos[i] {
@@ -9000,7 +9090,7 @@ fn unscale_solution_vectors(state: &SolverState) -> (Vec<f64>, Vec<f64>, Vec<f64
         } else {
             1.0
         };
-        y_out[i] = state.y[i] * scale_i / state.obj_scaling;
+        y_out[i] = y_out[i] * scale_i / state.obj_scaling;
         g_out[i] /= scale_i;
     }
     (z_l_out, z_u_out, y_out, g_out)
@@ -9032,7 +9122,10 @@ mod tests {
     fn minimal_state(n: usize, m: usize) -> SolverState {
         SolverState {
             x: vec![0.0; n],
-            y: vec![0.0; m],
+            // Phase 3b: test-only constructor uses an all-inequality layout
+            // (n_c = 0, n_d = m), so y_c is empty and y_d is m-sized.
+            y_c: Vec::new(),
+            y_d: vec![0.0; m],
             z_l: vec![0.0; n],
             z_u: vec![0.0; n],
             v_l: vec![0.0; m],
@@ -9094,7 +9187,7 @@ mod tests {
     fn test_iterate_snapshot_capture_and_restore() {
         let mut state = minimal_state(2, 1);
         state.x = vec![1.5, 2.5];
-        state.y = vec![0.7];
+        state.set_y_combined(&[0.7]);
         state.z_l = vec![0.1, 0.2];
         state.z_u = vec![0.3, 0.4];
         state.mu = 1e-3;
@@ -9104,14 +9197,14 @@ mod tests {
         let snap = IterateSnapshot::capture(&state, &filter, 7);
         // Mutate state and filter to simulate further iterations.
         state.x = vec![9.0, 9.0];
-        state.y = vec![9.0];
+        state.set_y_combined(&[9.0]);
         state.mu = 1.0;
         state.obj = 0.0;
         filter.add(99.0, 99.0);
         // Restore and verify.
         snap.restore(&mut state, &mut filter);
         assert_eq!(state.x, vec![1.5, 2.5]);
-        assert_eq!(state.y, vec![0.7]);
+        assert_eq!(state.y_combined(), vec![0.7]);
         assert_eq!(state.z_l, vec![0.1, 0.2]);
         assert_eq!(state.z_u, vec![0.3, 0.4]);
         assert_eq!(state.mu, 1e-3);
@@ -9797,7 +9890,7 @@ mod tests {
         s.jac_cols = vec![0];
         s.jac_vals = vec![1.0];
         s.g = vec![g];
-        s.y = vec![999.0];          // sentinel; recalc must overwrite
+        s.set_y_combined(&[999.0]);  // sentinel; recalc must overwrite
         if g_eq {
             s.g_l = vec![0.0];
             s.g_u = vec![0.0];
@@ -9810,7 +9903,7 @@ mod tests {
         let mut state = ls_y_equals_two_state(0.0, true);
         let opts = SolverOptions::default();
         maybe_recalc_y_post_step(&mut state, &opts, 1, 1, false);
-        assert_eq!(state.y, vec![999.0], "default off must not touch y");
+        assert_eq!(state.y_combined(), vec![999.0], "default off must not touch y");
     }
 
     #[test]
@@ -9818,7 +9911,7 @@ mod tests {
         let mut state = ls_y_equals_two_state(0.0, true); // viol = 0 < tol
         let opts = SolverOptions::default();
         maybe_recalc_y_post_step(&mut state, &opts, 1, 1, true);
-        assert!((state.y[0] - 2.0).abs() < 1e-10, "lbfgs gate must recompute, got {}", state.y[0]);
+        assert!((state.y_at(0) - 2.0).abs() < 1e-10, "lbfgs gate must recompute, got {}", state.y_at(0));
     }
 
     #[test]
@@ -9826,7 +9919,7 @@ mod tests {
         let mut state = ls_y_equals_two_state(0.0, true);
         let opts = SolverOptions { recalc_y: true, ..SolverOptions::default() };
         maybe_recalc_y_post_step(&mut state, &opts, 1, 1, false);
-        assert!((state.y[0] - 2.0).abs() < 1e-10, "recalc_y=true must recompute, got {}", state.y[0]);
+        assert!((state.y_at(0) - 2.0).abs() < 1e-10, "recalc_y=true must recompute, got {}", state.y_at(0));
     }
 
     #[test]
@@ -9835,7 +9928,7 @@ mod tests {
         let mut state = ls_y_equals_two_state(1e-3, true);
         let opts = SolverOptions { recalc_y: true, ..SolverOptions::default() };
         maybe_recalc_y_post_step(&mut state, &opts, 1, 1, false);
-        assert_eq!(state.y, vec![999.0], "infeasible iterate must skip recalc_y");
+        assert_eq!(state.y_combined(), vec![999.0], "infeasible iterate must skip recalc_y");
     }
 
     /// T3.30 full augmented system: on an inequality constraint with
@@ -9857,8 +9950,8 @@ mod tests {
         let opts = SolverOptions { recalc_y: true, ..SolverOptions::default() };
         maybe_recalc_y_post_step(&mut state, &opts, 1, 1, false);
         assert!(
-            (state.y[0] - 0.5).abs() < 1e-10,
-            "full-augmented LS y mismatch: got {} expected 0.5", state.y[0]
+            (state.y_at(0) - 0.5).abs() < 1e-10,
+            "full-augmented LS y mismatch: got {} expected 0.5", state.y_at(0)
         );
     }
 
@@ -9873,8 +9966,8 @@ mod tests {
         let opts = SolverOptions { recalc_y: true, ..SolverOptions::default() };
         maybe_recalc_y_post_step(&mut state, &opts, 1, 1, false);
         assert!(
-            (state.y[0] - 2.0).abs() < 1e-10,
-            "equality row should match reduced: got {}", state.y[0]
+            (state.y_at(0) - 2.0).abs() < 1e-10,
+            "equality row should match reduced: got {}", state.y_at(0)
         );
     }
 
@@ -9912,7 +10005,7 @@ mod tests {
         let mut state = minimal_state(1, 1);
         state.g_l = vec![0.0];
         state.g_u = vec![0.0];
-        state.y = vec![0.5];
+        state.set_y_combined(&[0.5]);
         state.dy = vec![-3.0];
         state.jac_rows = vec![0];
         state.jac_cols = vec![0];
@@ -9954,7 +10047,7 @@ mod tests {
         let mut state = minimal_state(1, 1);
         state.g_l = vec![0.0];
         state.g_u = vec![0.0];
-        state.y = vec![0.5];
+        state.set_y_combined(&[0.5]);
         state.dy = vec![-3.0];
         state.jac_rows = vec![0];
         state.jac_cols = vec![0];
@@ -10053,7 +10146,7 @@ mod tests {
         // visible. v_l and g_l are configured as Ipopt would expect for
         // an inequality with finite lower bound.
         state.x = vec![3.0, 4.0];
-        state.y = vec![1.5, -0.5];
+        state.set_y_combined(&[1.5, -0.5]);
         state.z_l = vec![0.7, 0.2];
         state.z_u = vec![0.0, 0.3];
         state.v_l = vec![0.4, 0.0];
@@ -10064,7 +10157,7 @@ mod tests {
         state.mu = 0.1;
         let snapshot = (
             state.x.clone(),
-            state.y.clone(),
+            state.y_combined(),
             state.z_l.clone(),
             state.z_u.clone(),
             state.v_l.clone(),
@@ -10076,7 +10169,7 @@ mod tests {
         let n_on = apply_magic_step(&mut state, &opts_on);
         assert_eq!(n_on, 0, "no explicit slack vector exists, so no updates possible");
         assert_eq!(state.x, snapshot.0);
-        assert_eq!(state.y, snapshot.1);
+        assert_eq!(state.y_combined(), snapshot.1);
         assert_eq!(state.z_l, snapshot.2);
         assert_eq!(state.z_u, snapshot.3);
         assert_eq!(state.v_l, snapshot.4);
@@ -10088,7 +10181,7 @@ mod tests {
         let n_off = apply_magic_step(&mut state, &opts_off);
         assert_eq!(n_off, 0);
         assert_eq!(state.x, snapshot.0);
-        assert_eq!(state.y, snapshot.1);
+        assert_eq!(state.y_combined(), snapshot.1);
     }
 
     /// The option flag short-circuits the helper: when disabled the
@@ -10412,7 +10505,7 @@ mod tests {
         let mut state = minimal_state(1, 1);
         state.x = vec![1.0];
         state.dx = vec![1e-20];
-        state.y = vec![0.0];
+        state.set_y_combined(&[0.0]);
         state.dy = vec![1.0]; // dy_amax = 1.0, well above default 1e-2
 
         let opts = SolverOptions::default();
