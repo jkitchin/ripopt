@@ -59,6 +59,43 @@ pub fn compute_sigma_s(
     sigma_s
 }
 
+/// Compute `J^T · y` (length `n`) using the split-form Jacobian blocks.
+/// `y` is the combined m-form multiplier vector; the split Jacobian rows are
+/// indexed in `0..n_c` (eq) / `0..n_d` (ineq), and the partition supplies the
+/// `c_to_combined` / `d_to_combined` maps for projecting `y`.
+///
+/// Per Phase 4b, this replaces the per-triplet partition-lookup loop that
+/// previously walked the combined Jacobian and routed each entry via
+/// `partition.eq_pos[row]` / `ineq_pos[row]`.
+pub fn compute_j_t_y_split(
+    n: usize,
+    partition: &ConstraintLayout,
+    y: &[f64],
+    jac_c_rows: &[usize],
+    jac_c_cols: &[usize],
+    jac_c_vals: &[f64],
+    jac_d_rows: &[usize],
+    jac_d_cols: &[usize],
+    jac_d_vals: &[f64],
+) -> Vec<f64> {
+    let mut j_t_y = vec![0.0; n];
+    // Equality rows: y_c[kc] = y[c_to_combined[kc]].
+    for (idx, (&kc, &col)) in jac_c_rows.iter().zip(jac_c_cols.iter()).enumerate() {
+        if col < n && kc < partition.n_c {
+            let i = partition.c_to_combined[kc];
+            j_t_y[col] += jac_c_vals[idx] * y[i];
+        }
+    }
+    // Inequality rows: y_d[kd] = y[d_to_combined[kd]].
+    for (idx, (&kd, &col)) in jac_d_rows.iter().zip(jac_d_cols.iter()).enumerate() {
+        if col < n && kd < partition.n_d {
+            let i = partition.d_to_combined[kd];
+            j_t_y[col] += jac_d_vals[idx] * y[i];
+        }
+    }
+    j_t_y
+}
+
 /// Result of an augmented-KKT assembly. Mirrors `kkt::KktSystem` minus
 /// fields that don't apply to the new layout (e.g. condensed Σ_s
 /// post-recovery; that lives in A3).
@@ -94,12 +131,14 @@ pub struct AugKktSystem {
 /// rows. This matches Ipopt's `IpoptCalculatedQuantities` output where
 /// `AddMSinvZ` zeros out unbounded slots before the assembler is called.
 ///
-/// `partition` carries the eq/ineq split derived from the constraint bounds
-/// (`ConstraintLayout::new`).
+/// `n_c` / `n_d` give the equality / inequality counts (from
+/// `ConstraintLayout`).
 ///
-/// Jacobian triplets `(jac_rows, jac_cols, jac_vals)` are in flat
-/// `m × n` triplet form; each entry is routed to either the `(2,0)` block
-/// (if the row is an equality) or `(3,0)` (if it's an inequality).
+/// Jacobian arrives **already split** into two triplet blocks:
+///   * `jac_c_*` — equality rows in `0..n_c` (size n_c × n)
+///   * `jac_d_*` — inequality rows in `0..n_d` (size n_d × n)
+/// Per Phase 4 of the data-layout refactor (matches Ipopt 3.14
+/// `OrigIpoptNLP::Jac_c` / `Jac_d`); no per-entry partition lookup.
 ///
 /// Hessian triplets `(hess_rows, hess_cols, hess_vals)` populate the (0,0)
 /// block. The caller must pass them in lower-triangular form, matching the
@@ -107,13 +146,17 @@ pub struct AugKktSystem {
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_aug_kkt(
     n: usize,
-    partition: &ConstraintLayout,
+    n_c: usize,
+    n_d: usize,
     hess_rows: &[usize],
     hess_cols: &[usize],
     hess_vals: &[f64],
-    jac_rows: &[usize],
-    jac_cols: &[usize],
-    jac_vals: &[f64],
+    jac_c_rows: &[usize],
+    jac_c_cols: &[usize],
+    jac_c_vals: &[f64],
+    jac_d_rows: &[usize],
+    jac_d_cols: &[usize],
+    jac_d_vals: &[f64],
     sigma_x: &[f64],
     sigma_s: &[f64],
     delta_x: f64,
@@ -122,8 +165,6 @@ pub fn assemble_aug_kkt(
     delta_d: f64,
     use_sparse: bool,
 ) -> AugKktSystem {
-    let n_c = partition.n_c;
-    let n_d = partition.n_d;
     let dim = n + n_d + n_c + n_d;
 
     debug_assert_eq!(sigma_x.len(), n);
@@ -135,7 +176,8 @@ pub fn assemble_aug_kkt(
     let yd_off = n + n_d + n_c;     // (3,0)/(3,1)/(3,3) start
 
     // Capacity hint: H + Σx + Σs + δc·I + (-I) + δd·I + J_c + J_d.
-    let capacity = hess_rows.len() + jac_rows.len() + n + n_d + n_c + n_d;
+    let capacity =
+        hess_rows.len() + jac_c_rows.len() + jac_d_rows.len() + n + n_d + n_c + n_d;
     let mut matrix = if use_sparse {
         KktMatrix::zeros_sparse(dim, capacity)
     } else {
@@ -163,14 +205,12 @@ pub fn assemble_aug_kkt(
     }
 
     // (2,0): J_c (equality rows of the Jacobian). Per IpStdAugSystemSolver.cpp:401.
+    for (idx, (&kc, &col)) in jac_c_rows.iter().zip(jac_c_cols.iter()).enumerate() {
+        matrix.add(yc_off + kc, col, jac_c_vals[idx]);
+    }
     // (3,0): J_d (inequality rows of the Jacobian). Per IpStdAugSystemSolver.cpp:432.
-    for (idx, (&row, &col)) in jac_rows.iter().zip(jac_cols.iter()).enumerate() {
-        let v = jac_vals[idx];
-        if let Some(k_c) = partition.eq_pos[row] {
-            matrix.add(yc_off + k_c, col, v);
-        } else if let Some(k_d) = partition.ineq_pos[row] {
-            matrix.add(yd_off + k_d, col, v);
-        }
+    for (idx, (&kd, &col)) in jac_d_rows.iter().zip(jac_d_cols.iter()).enumerate() {
+        matrix.add(yd_off + kd, col, jac_d_vals[idx]);
     }
 
     // (3,1): -I (slack coupling). Per IpStdAugSystemSolver.cpp:436-438.
@@ -953,9 +993,12 @@ pub fn aug_step_from_state(
     hess_rows: &[usize],
     hess_cols: &[usize],
     hess_vals: &[f64],
-    jac_rows: &[usize],
-    jac_cols: &[usize],
-    jac_vals: &[f64],
+    jac_c_rows: &[usize],
+    jac_c_cols: &[usize],
+    jac_c_vals: &[f64],
+    jac_d_rows: &[usize],
+    jac_d_cols: &[usize],
+    jac_d_vals: &[f64],
     x: &[f64],
     x_l: &[f64],
     x_u: &[f64],
@@ -974,7 +1017,6 @@ pub fn aug_step_from_state(
     solver: &mut dyn LinearSolver,
     perturbation: &mut crate::kkt::InertiaCorrectionParams,
 ) -> Result<(AugStep, f64, f64, AugKktSystem), SolverError> {
-    let m = g.len();
     let partition = ConstraintLayout::new(g_l, g_u);
 
     // Σ_x: `IpIpoptCalculatedQuantities.cpp:3501-3540`. Pre-projected — zero
@@ -995,24 +1037,22 @@ pub fn aug_step_from_state(
     // Assemble the unperturbed matrix (δ_* zeroed; perturbation layered on
     // by factor_aug_with_inertia_correction).
     let mut aug = assemble_aug_kkt(
-        n, &partition,
+        n, partition.n_c, partition.n_d,
         hess_rows, hess_cols, hess_vals,
-        jac_rows, jac_cols, jac_vals,
+        jac_c_rows, jac_c_cols, jac_c_vals,
+        jac_d_rows, jac_d_cols, jac_d_vals,
         &sigma_x, &sigma_s,
         0.0, 0.0, 0.0, 0.0,
         use_sparse,
     );
 
     // Compute J^T·y once (used both by RHS construction and the unperturbed-matvec
-    // sanity check that the IR loop performs internally).
-    let mut j_t_y = vec![0.0; n];
-    for (idx, &row) in jac_rows.iter().enumerate() {
-        let col = jac_cols[idx];
-        let v = jac_vals[idx];
-        if row < m && col < n {
-            j_t_y[col] += v * y[row];
-        }
-    }
+    // sanity check that the IR loop performs internally). Phase 4b: split form.
+    let j_t_y = compute_j_t_y_split(
+        n, &partition, y,
+        jac_c_rows, jac_c_cols, jac_c_vals,
+        jac_d_rows, jac_d_cols, jac_d_vals,
+    );
 
     // Build the eight outer RHS slots and fold them into the four-block
     // augmented form (with Ipopt's α=−1 flip already baked in so the
@@ -1243,9 +1283,12 @@ pub fn aug_step_from_state_mehrotra(
     hess_rows: &[usize],
     hess_cols: &[usize],
     hess_vals: &[f64],
-    jac_rows: &[usize],
-    jac_cols: &[usize],
-    jac_vals: &[f64],
+    jac_c_rows: &[usize],
+    jac_c_cols: &[usize],
+    jac_c_vals: &[f64],
+    jac_d_rows: &[usize],
+    jac_d_cols: &[usize],
+    jac_d_vals: &[f64],
     x: &[f64],
     x_l: &[f64],
     x_u: &[f64],
@@ -1267,7 +1310,6 @@ pub fn aug_step_from_state_mehrotra(
     solver: &mut dyn LinearSolver,
     perturbation: &mut crate::kkt::InertiaCorrectionParams,
 ) -> Result<(AugStep, f64, f64, f64, AugKktSystem), SolverError> {
-    let m = g.len();
     let partition = ConstraintLayout::new(g_l, g_u);
 
     // Σ_x and Σ_s do not depend on μ — they're functions of bound multipliers
@@ -1287,22 +1329,20 @@ pub fn aug_step_from_state_mehrotra(
     let sigma_s = compute_sigma_s(&partition, s, g_l, g_u, v_l, v_u);
 
     let mut aug = assemble_aug_kkt(
-        n, &partition,
+        n, partition.n_c, partition.n_d,
         hess_rows, hess_cols, hess_vals,
-        jac_rows, jac_cols, jac_vals,
+        jac_c_rows, jac_c_cols, jac_c_vals,
+        jac_d_rows, jac_d_cols, jac_d_vals,
         &sigma_x, &sigma_s,
         0.0, 0.0, 0.0, 0.0,
         use_sparse,
     );
 
-    let mut j_t_y = vec![0.0; n];
-    for (idx, &row) in jac_rows.iter().enumerate() {
-        let col = jac_cols[idx];
-        let v = jac_vals[idx];
-        if row < m && col < n {
-            j_t_y[col] += v * y[row];
-        }
-    }
+    let j_t_y = compute_j_t_y_split(
+        n, &partition, y,
+        jac_c_rows, jac_c_cols, jac_c_vals,
+        jac_d_rows, jac_d_cols, jac_d_vals,
+    );
 
     // Affine RHS per `IpProbingMuOracle.cpp:63-72`:
     //   x      ← grad_lag_x (no κ_d damping)
@@ -1392,9 +1432,12 @@ pub fn aug_soc_solve_dx(
     hess_rows: &[usize],
     hess_cols: &[usize],
     hess_vals: &[f64],
-    jac_rows: &[usize],
-    jac_cols: &[usize],
-    jac_vals: &[f64],
+    jac_c_rows: &[usize],
+    jac_c_cols: &[usize],
+    jac_c_vals: &[f64],
+    jac_d_rows: &[usize],
+    jac_d_cols: &[usize],
+    jac_d_vals: &[f64],
     x: &[f64],
     x_l: &[f64],
     x_u: &[f64],
@@ -1416,7 +1459,6 @@ pub fn aug_soc_solve_dx(
     c_soc: &[f64],
     dms_soc: &[f64],
 ) -> Option<(Vec<f64>, Vec<f64>)> {
-    let m = g.len();
     let partition = ConstraintLayout::new(g_l, g_u);
     if c_soc.len() != partition.n_c || dms_soc.len() != partition.n_d {
         return None;
@@ -1437,22 +1479,20 @@ pub fn aug_soc_solve_dx(
     let sigma_s = compute_sigma_s(&partition, s, g_l, g_u, v_l, v_u);
 
     let mut aug = assemble_aug_kkt(
-        n, &partition,
+        n, partition.n_c, partition.n_d,
         hess_rows, hess_cols, hess_vals,
-        jac_rows, jac_cols, jac_vals,
+        jac_c_rows, jac_c_cols, jac_c_vals,
+        jac_d_rows, jac_d_cols, jac_d_vals,
         &sigma_x, &sigma_s,
         0.0, 0.0, 0.0, 0.0,
         use_sparse,
     );
 
-    let mut j_t_y = vec![0.0; n];
-    for (idx, &row) in jac_rows.iter().enumerate() {
-        let col = jac_cols[idx];
-        let v = jac_vals[idx];
-        if row < m && col < n {
-            j_t_y[col] += v * y[row];
-        }
-    }
+    let j_t_y = compute_j_t_y_split(
+        n, &partition, y,
+        jac_c_rows, jac_c_cols, jac_c_vals,
+        jac_d_rows, jac_d_cols, jac_d_vals,
+    );
 
     // Newton RHS at current state (x/s/z_*/v_* slots), then overwrite y_c/y_d
     // with the SOC-accumulated residuals (`IpFilterLSAcceptor.cpp:581-582`,
@@ -1509,9 +1549,12 @@ pub fn aug_soc_solve_dx(
 pub fn aug_soc_solve_dx_factored(
     n: usize,
     grad_f: &[f64],
-    jac_rows: &[usize],
-    jac_cols: &[usize],
-    jac_vals: &[f64],
+    jac_c_rows: &[usize],
+    jac_c_cols: &[usize],
+    jac_c_vals: &[f64],
+    jac_d_rows: &[usize],
+    jac_d_cols: &[usize],
+    jac_d_vals: &[f64],
     x: &[f64],
     x_l: &[f64],
     x_u: &[f64],
@@ -1531,21 +1574,17 @@ pub fn aug_soc_solve_dx_factored(
     c_soc: &[f64],
     dms_soc: &[f64],
 ) -> Option<(Vec<f64>, Vec<f64>)> {
-    let m = g.len();
     let partition = ConstraintLayout::new(g_l, g_u);
     if c_soc.len() != partition.n_c || dms_soc.len() != partition.n_d {
         return None;
     }
     let n_d = partition.n_d;
 
-    let mut j_t_y = vec![0.0; n];
-    for (idx, &row) in jac_rows.iter().enumerate() {
-        let col = jac_cols[idx];
-        let v = jac_vals[idx];
-        if row < m && col < n {
-            j_t_y[col] += v * y[row];
-        }
-    }
+    let j_t_y = compute_j_t_y_split(
+        n, &partition, y,
+        jac_c_rows, jac_c_cols, jac_c_vals,
+        jac_d_rows, jac_d_cols, jac_d_vals,
+    );
 
     let mut outer = build_outer_rhs(
         n, &partition, grad_f, &j_t_y,
@@ -1660,17 +1699,22 @@ mod tests {
         let hess_cols = vec![0, 1];
         let hess_vals = vec![7.0, 11.0];
 
-        // J: row 0 (eq) -> [1, 2]; row 1 (ineq) -> [3, 0]; row 2 (ineq) -> [0, 4].
-        let jac_rows = vec![0, 0, 1, 2];
-        let jac_cols = vec![0, 1, 0, 1];
-        let jac_vals = vec![1.0, 2.0, 3.0, 4.0];
+        // J split: row 0 is eq (kc=0) -> [1, 2]; row 1 is ineq (kd=0) -> [3, 0];
+        // row 2 is ineq (kd=1) -> [0, 4].
+        let jac_c_rows = vec![0, 0];
+        let jac_c_cols = vec![0, 1];
+        let jac_c_vals = vec![1.0, 2.0];
+        let jac_d_rows = vec![0, 1];
+        let jac_d_cols = vec![0, 1];
+        let jac_d_vals = vec![3.0, 4.0];
 
         let sigma_x = vec![0.5, 0.25];
         let sigma_s = vec![0.1, 0.2];
         let sys = assemble_aug_kkt(
-            n, &p,
+            n, p.n_c, p.n_d,
             &hess_rows, &hess_cols, &hess_vals,
-            &jac_rows, &jac_cols, &jac_vals,
+            &jac_c_rows, &jac_c_cols, &jac_c_vals,
+            &jac_d_rows, &jac_d_cols, &jac_d_vals,
             &sigma_x, &sigma_s,
             1e-3, 2e-3, 3e-4, 4e-4,
             false, // dense
@@ -1811,18 +1855,22 @@ mod tests {
         // Σ_s = v_l/(s-g_l) + v_u/(g_u-s) = 0.4/3 + 0.6/7
         let sigma_s = compute_sigma_s(&p, &s, &g_l, &g_u, &v_l, &v_u);
 
-        // Hessian H = [[2.0]], Jacobian J row 0 (ineq): [3.0].
+        // Hessian H = [[2.0]], Jacobian J row 0 (ineq, kd=0): [3.0].
         let hess_rows = vec![0];
         let hess_cols = vec![0];
         let hess_vals = vec![2.0];
-        let jac_rows = vec![0];
-        let jac_cols = vec![0];
-        let jac_vals = vec![3.0];
+        let jac_c_rows: Vec<usize> = vec![];
+        let jac_c_cols: Vec<usize> = vec![];
+        let jac_c_vals: Vec<f64> = vec![];
+        let jac_d_rows = vec![0];
+        let jac_d_cols = vec![0];
+        let jac_d_vals = vec![3.0];
 
         let aug = assemble_aug_kkt(
-            n, &p,
+            n, p.n_c, p.n_d,
             &hess_rows, &hess_cols, &hess_vals,
-            &jac_rows, &jac_cols, &jac_vals,
+            &jac_c_rows, &jac_c_cols, &jac_c_vals,
+            &jac_d_rows, &jac_d_cols, &jac_d_vals,
             &sigma_x, &sigma_s,
             0.0, 0.0, 0.0, 0.0,
             false,
@@ -1886,9 +1934,12 @@ mod tests {
         let hess_rows = vec![0];
         let hess_cols = vec![0];
         let hess_vals = vec![1.0];
-        let jac_rows: Vec<usize> = vec![];
-        let jac_cols: Vec<usize> = vec![];
-        let jac_vals: Vec<f64> = vec![];
+        let jac_c_rows: Vec<usize> = vec![];
+        let jac_c_cols: Vec<usize> = vec![];
+        let jac_c_vals: Vec<f64> = vec![];
+        let jac_d_rows: Vec<usize> = vec![];
+        let jac_d_cols: Vec<usize> = vec![];
+        let jac_d_vals: Vec<f64> = vec![];
         let x = vec![2.0];
         let x_l = vec![f64::NEG_INFINITY];
         let x_u = vec![f64::INFINITY];
@@ -1907,7 +1958,8 @@ mod tests {
         let (step, _dw, _dc, _aug) = aug_step_from_state(
             n, &grad_f,
             &hess_rows, &hess_cols, &hess_vals,
-            &jac_rows, &jac_cols, &jac_vals,
+            &jac_c_rows, &jac_c_cols, &jac_c_vals,
+            &jac_d_rows, &jac_d_cols, &jac_d_vals,
             &x, &x_l, &x_u, &z_l, &z_u,
             &s, &g, &g_l, &g_u, &y, &v_l, &v_u,
             mu, 0.0, false,
@@ -1984,13 +2036,17 @@ mod tests {
         let hess_rows = vec![0, 1];
         let hess_cols = vec![0, 1];
         let hess_vals = vec![1.0, 1.0];
-        let jac_rows = vec![0, 1];
-        let jac_cols = vec![0, 1];
-        let jac_vals = vec![5.0, 6.0];
+        let jac_c_rows = vec![0, 1];
+        let jac_c_cols = vec![0, 1];
+        let jac_c_vals = vec![5.0, 6.0];
+        let jac_d_rows: Vec<usize> = vec![];
+        let jac_d_cols: Vec<usize> = vec![];
+        let jac_d_vals: Vec<f64> = vec![];
         let sys = assemble_aug_kkt(
-            n, &p,
+            n, p.n_c, p.n_d,
             &hess_rows, &hess_cols, &hess_vals,
-            &jac_rows, &jac_cols, &jac_vals,
+            &jac_c_rows, &jac_c_cols, &jac_c_vals,
+            &jac_d_rows, &jac_d_cols, &jac_d_vals,
             &[0.0, 0.0], &[],
             0.0, 0.0, 0.0, 0.0,
             false,

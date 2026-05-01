@@ -6343,7 +6343,8 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             match crate::kkt_aug::aug_step_from_state_mehrotra(
                 n, &state.grad_f,
                 &state.hess_rows, &state.hess_cols, &state.hess_vals,
-                &state.jac_rows, &state.jac_cols, &state.jac_vals,
+                &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals,
+                &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals,
                 &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u,
                 &s_combined_for_aug, &state.g, &g_l_combined_for_aug, &g_u_combined_for_aug, &y_combined_for_aug,
                 &v_l_combined_for_aug, &v_u_combined_for_aug,
@@ -6364,7 +6365,8 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             match crate::kkt_aug::aug_step_from_state(
                 n, &state.grad_f,
                 &state.hess_rows, &state.hess_cols, &state.hess_vals,
-                &state.jac_rows, &state.jac_cols, &state.jac_vals,
+                &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals,
+                &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals,
                 &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u,
                 &s_combined_for_aug, &state.g, &g_l_combined_for_aug, &g_u_combined_for_aug, &y_combined_for_aug,
                 &v_l_combined_for_aug, &v_u_combined_for_aug,
@@ -7141,7 +7143,8 @@ fn attempt_soc_aug<P: NlpProblem>(
         let v_u_combined_for_soc = state.v_u_combined();
         let (dx_soc, ds_d_soc) = match crate::kkt_aug::aug_soc_solve_dx_factored(
             n, &state.grad_f,
-            &state.jac_rows, &state.jac_cols, &state.jac_vals,
+            &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals,
+            &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals,
             &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u,
             &s_combined_for_soc, &state.g, &g_l_combined_for_soc, &g_u_combined_for_soc, &y_combined_for_soc,
             &v_l_combined_for_soc, &v_u_combined_for_soc,
