@@ -322,13 +322,11 @@ pub fn build_outer_rhs(
         rhs_s[k] = r;
     }
 
-    // rhs_y_c = c(x) for equality rows.
+    // rhs_y_c = c(x) for equality rows. Equality target value is
+    // g_l[i] = g_u[i], so c(x) = g[i] − g_l[i].
     let mut rhs_y_c = vec![0.0; n_c];
-    for i in 0..g.len() {
-        if let Some(k) = partition.eq_pos[i] {
-            // Equality target value is g_l[i] = g_u[i].
-            rhs_y_c[k] = g[i] - g_l[i];
-        }
+    for (k, &i) in partition.c_to_combined.iter().enumerate() {
+        rhs_y_c[k] = g[i] - g_l[i];
     }
 
     // rhs_y_d = d(x) − s for inequality rows.
@@ -569,10 +567,8 @@ pub fn recover_step(
     // Build combined m-space dy: dy_c entries land at equality positions,
     // dy_d entries at inequality positions.
     let mut dy_m = vec![0.0; m];
-    for (i, eq) in partition.eq_pos.iter().enumerate() {
-        if let Some(k) = eq {
-            dy_m[i] = dy_c[*k];
-        }
+    for (k, &i) in partition.c_to_combined.iter().enumerate() {
+        dy_m[i] = dy_c[k];
     }
     for (k, &i) in partition.d_to_combined.iter().enumerate() {
         dy_m[i] = dy_d[k];
