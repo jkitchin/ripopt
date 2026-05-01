@@ -678,10 +678,37 @@ pub(crate) struct SolverState {
     pub grad_f: Vec<f64>,
     /// Current constraint values.
     pub g: Vec<f64>,
-    /// Jacobian structure and values.
+    /// Jacobian structure and values (combined m-row form). The
+    /// user-facing `NlpProblem` trait still emits a single combined
+    /// triplet; the split blocks below are derived projections.
     pub jac_rows: Vec<usize>,
     pub jac_cols: Vec<usize>,
     pub jac_vals: Vec<f64>,
+    /// Phase 4 split Jacobian — equality-row block (Ipopt's `Jac_c`,
+    /// `IpOrigIpoptNLP.hpp:439`). Triplet form sized `jac_c_nnz`:
+    ///   `jac_c_rows[k] ∈ 0..n_c`  (target row in `c`-block coordinates)
+    ///   `jac_c_cols[k] ∈ 0..n`
+    /// Populated at construction (structure) and refreshed each
+    /// `problem.jacobian_values` call via [`refresh_split_jac_vals`].
+    /// Phase 4a is additive — readers still consume the combined
+    /// triplet; Phase 4b will migrate `kkt_aug` and other consumers.
+    pub jac_c_rows: Vec<usize>,
+    pub jac_c_cols: Vec<usize>,
+    pub jac_c_vals: Vec<f64>,
+    /// Phase 4 split Jacobian — inequality-row block (Ipopt's `Jac_d`,
+    /// `IpOrigIpoptNLP.hpp:449`). Triplet form sized `jac_d_nnz`:
+    ///   `jac_d_rows[k] ∈ 0..n_d`  (target row in `d`-block coordinates)
+    ///   `jac_d_cols[k] ∈ 0..n`
+    pub jac_d_rows: Vec<usize>,
+    pub jac_d_cols: Vec<usize>,
+    pub jac_d_vals: Vec<f64>,
+    /// Phase 4 index maps: `jac_c_combined_idx[k]` is the position in
+    /// the combined `jac_*` triplet that supplies `jac_c_vals[k]`. Same
+    /// for `jac_d`. Built once at construction; used by
+    /// `refresh_split_jac_vals` to copy values without re-checking the
+    /// layout per triplet.
+    pub jac_c_combined_idx: Vec<usize>,
+    pub jac_d_combined_idx: Vec<usize>,
     /// Hessian structure and values.
     pub hess_rows: Vec<usize>,
     pub hess_cols: Vec<usize>,
@@ -1235,6 +1262,32 @@ impl SolverState {
         let d_l = layout.project_d(&g_l);
         let d_u = layout.project_d(&g_u);
 
+        // Phase 4a: build the split Jacobian structure by walking the
+        // combined triplet once and routing each entry to the c-block
+        // (eq row) or d-block (ineq row) using the layout's row maps.
+        // The combined-index map captures the per-split-entry source
+        // position so values can be copied without re-checking the
+        // partition each evaluate.
+        let mut jac_c_rows: Vec<usize> = Vec::new();
+        let mut jac_c_cols: Vec<usize> = Vec::new();
+        let mut jac_c_combined_idx: Vec<usize> = Vec::new();
+        let mut jac_d_rows: Vec<usize> = Vec::new();
+        let mut jac_d_cols: Vec<usize> = Vec::new();
+        let mut jac_d_combined_idx: Vec<usize> = Vec::new();
+        for (idx, (&row, &col)) in jac_rows.iter().zip(jac_cols.iter()).enumerate() {
+            if let Some(k_c) = layout.eq_pos[row] {
+                jac_c_rows.push(k_c);
+                jac_c_cols.push(col);
+                jac_c_combined_idx.push(idx);
+            } else if let Some(k_d) = layout.ineq_pos[row] {
+                jac_d_rows.push(k_d);
+                jac_d_cols.push(col);
+                jac_d_combined_idx.push(idx);
+            }
+        }
+        let jac_c_vals = vec![0.0; jac_c_rows.len()];
+        let jac_d_vals = vec![0.0; jac_d_rows.len()];
+
         Self {
             x,
             y_c,
@@ -1273,6 +1326,14 @@ impl SolverState {
             jac_rows,
             jac_cols,
             jac_vals: vec![0.0; jac_nnz],
+            jac_c_rows,
+            jac_c_cols,
+            jac_c_vals,
+            jac_d_rows,
+            jac_d_cols,
+            jac_d_vals,
+            jac_c_combined_idx,
+            jac_d_combined_idx,
             hess_rows,
             hess_cols,
             hess_vals: vec![0.0; hess_nnz],
@@ -1747,6 +1808,20 @@ impl SolverState {
         self.layout.n_d
     }
 
+    /// Phase 4a: refresh the split Jacobian value blocks from the
+    /// combined `jac_vals`. Uses the per-entry combined-index map built
+    /// at construction so the per-iteration cost is one indirect read
+    /// per nnz, no partition lookup. Call after every site that updates
+    /// `state.jac_vals` so the split mirrors stay consistent.
+    pub fn refresh_split_jac_vals(&mut self) {
+        for (k, &idx) in self.jac_c_combined_idx.iter().enumerate() {
+            self.jac_c_vals[k] = self.jac_vals[idx];
+        }
+        for (k, &idx) in self.jac_d_combined_idx.iter().enumerate() {
+            self.jac_d_vals[k] = self.jac_vals[idx];
+        }
+    }
+
     /// Evaluate all functions, zeroing Hessian lambda for linear constraints.
     /// When `skip_hessian` is true (L-BFGS mode), the Hessian evaluation is skipped.
     fn evaluate_with_linear<P: NlpProblem>(
@@ -1777,6 +1852,7 @@ impl SolverState {
             if !problem.constraints(&self.x, false, &mut self.g) { return false; }
             self.n_jac_evals += 1;
             if !problem.jacobian_values(&self.x, false, &mut self.jac_vals) { return false; }
+            self.refresh_split_jac_vals();
         }
         self.x_last_eval.copy_from_slice(&self.x);
         if skip_hessian {
@@ -3756,6 +3832,9 @@ impl SoftRestoSnapshot {
         state.g = self.g;
         state.grad_f = self.grad_f;
         state.jac_vals = self.jac_vals;
+        // Phase 4a: keep the split mirror in sync with the restored
+        // combined values.
+        state.refresh_split_jac_vals();
         state.alpha_primal = self.alpha_primal;
         // T3.25: snapshot restore touches every tracked input.
         state.bump_all_kkt_atags();
@@ -9524,6 +9603,18 @@ mod tests {
             jac_rows: Vec::new(),
             jac_cols: Vec::new(),
             jac_vals: Vec::new(),
+            // Phase 4a: empty split-Jacobian storage in minimal_state;
+            // tests that exercise Jacobian-consuming code build their
+            // own structure and call refresh_split_jac_vals() (or use
+            // a dedicated helper) as needed.
+            jac_c_rows: Vec::new(),
+            jac_c_cols: Vec::new(),
+            jac_c_vals: Vec::new(),
+            jac_d_rows: Vec::new(),
+            jac_d_cols: Vec::new(),
+            jac_d_vals: Vec::new(),
+            jac_c_combined_idx: Vec::new(),
+            jac_d_combined_idx: Vec::new(),
             hess_rows: Vec::new(),
             hess_cols: Vec::new(),
             hess_vals: Vec::new(),
@@ -9586,6 +9677,61 @@ mod tests {
         state.ds.resize(n_d, 0.0);
         state.c_scaling.resize(n_c, 1.0);
         state.d_scaling.resize(n_d, 1.0);
+    }
+
+    /// Phase 4a: rebuild the split Jacobian structure from a combined
+    /// triplet (test helper). Mirrors the work `SolverState::new` does
+    /// for production states; tests that hand-craft jac_rows/jac_cols
+    /// via `minimal_state` use this to populate jac_c_*/jac_d_*.
+    fn rebuild_split_jac_structure(state: &mut SolverState) {
+        state.jac_c_rows.clear();
+        state.jac_c_cols.clear();
+        state.jac_c_combined_idx.clear();
+        state.jac_d_rows.clear();
+        state.jac_d_cols.clear();
+        state.jac_d_combined_idx.clear();
+        for (idx, (&row, &col)) in state.jac_rows.iter().zip(state.jac_cols.iter()).enumerate() {
+            if let Some(k_c) = state.layout.eq_pos[row] {
+                state.jac_c_rows.push(k_c);
+                state.jac_c_cols.push(col);
+                state.jac_c_combined_idx.push(idx);
+            } else if let Some(k_d) = state.layout.ineq_pos[row] {
+                state.jac_d_rows.push(k_d);
+                state.jac_d_cols.push(col);
+                state.jac_d_combined_idx.push(idx);
+            }
+        }
+        state.jac_c_vals = vec![0.0; state.jac_c_rows.len()];
+        state.jac_d_vals = vec![0.0; state.jac_d_rows.len()];
+    }
+
+    #[test]
+    fn test_phase4a_split_jac_mirrors_combined() {
+        // 2 constraints, 2 vars: row 0 equality (g_l=g_u=0), row 1 ineq.
+        // Combined Jacobian: [[1.0, 2.0], [3.0, 4.0]] in dense layout.
+        // Triplet form: rows=[0,0,1,1], cols=[0,1,0,1], vals=[1,2,3,4].
+        // Split: c-block has rows=[0,0], cols=[0,1], vals=[1,2];
+        //        d-block has rows=[0,0], cols=[0,1], vals=[3,4].
+        let mut state = minimal_state(2, 2);
+        set_constraint_bounds(&mut state, vec![0.0, 1.0], vec![0.0, f64::INFINITY]);
+        state.jac_rows = vec![0, 0, 1, 1];
+        state.jac_cols = vec![0, 1, 0, 1];
+        state.jac_vals = vec![1.0, 2.0, 3.0, 4.0];
+        rebuild_split_jac_structure(&mut state);
+        state.refresh_split_jac_vals();
+
+        assert_eq!(state.jac_c_rows, vec![0, 0]);
+        assert_eq!(state.jac_c_cols, vec![0, 1]);
+        assert_eq!(state.jac_c_vals, vec![1.0, 2.0]);
+        assert_eq!(state.jac_d_rows, vec![0, 0]);
+        assert_eq!(state.jac_d_cols, vec![0, 1]);
+        assert_eq!(state.jac_d_vals, vec![3.0, 4.0]);
+
+        // Refresh after value mutation: split mirror tracks combined.
+        state.jac_vals = vec![10.0, 20.0, 30.0, 40.0];
+        state.refresh_split_jac_vals();
+        assert_eq!(state.jac_c_vals, vec![10.0, 20.0]);
+        assert_eq!(state.jac_d_vals, vec![30.0, 40.0]);
     }
 
     #[test]
