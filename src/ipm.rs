@@ -8716,10 +8716,11 @@ fn compute_dual_inf_at_state(state: &SolverState) -> f64 {
     // 2069-2098) — no κ_d damping. The damped variants
     // (`curr_grad_lag_with_damping_x/s`, lines 2131-2227) are used
     // *only* in the augmented-system RHS (`curr_grad_barrier_obj_x`).
-    let y = state.y_combined();
-    let x_part = convergence::dual_infeasibility(
-        &state.grad_f, &state.jac_rows, &state.jac_cols, &state.jac_vals,
-        &y, &state.z_l, &state.z_u, state.n,
+    let x_part = convergence::dual_infeasibility_split(
+        &state.grad_f,
+        &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals, &state.y_c,
+        &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals, &state.y_d,
+        &state.z_l, &state.z_u, state.n,
     );
     x_part.max(slack_dual_inf_max(state))
 }
@@ -8757,10 +8758,11 @@ fn slack_dual_inf_max(state: &SolverState) -> f64 {
 fn dual_inf_with_z(state: &SolverState, z_l: &[f64], z_u: &[f64]) -> f64 {
     // A8.10 / DEV-1: plain `curr_dual_infeasibility` — no κ_d damping
     // (`IpIpoptCalculatedQuantities.cpp:2682-2691`).
-    let y = state.y_combined();
-    convergence::dual_infeasibility(
-        &state.grad_f, &state.jac_rows, &state.jac_cols, &state.jac_vals,
-        &y, z_l, z_u, state.n,
+    convergence::dual_infeasibility_split(
+        &state.grad_f,
+        &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals, &state.y_c,
+        &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals, &state.y_d,
+        z_l, z_u, state.n,
     )
 }
 
@@ -8799,10 +8801,14 @@ fn compute_primal_inf_internal_max_at_state(state: &SolverState) -> f64 {
 fn compute_dual_inf_unscaled_at_state(state: &SolverState) -> f64 {
     // A8.10 / DEV-1: plain `curr_dual_infeasibility` — no κ_d damping
     // (`IpIpoptCalculatedQuantities.cpp:2682-2691`).
-    let y = state.y_combined();
-    let x_part = convergence::dual_infeasibility_scaled(
-        &state.grad_f, &state.jac_rows, &state.jac_cols, &state.jac_vals,
-        &y, &state.z_l, &state.z_u, state.n,
+    // Phase 5c: `dual_infeasibility_scaled` was bit-equivalent to
+    // `dual_infeasibility` (same Lagrangian gradient, no per-component
+    // divisor — see T3.1). Routes through the split form too.
+    let x_part = convergence::dual_infeasibility_split(
+        &state.grad_f,
+        &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals, &state.y_c,
+        &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals, &state.y_d,
+        &state.z_l, &state.z_u, state.n,
     );
     x_part.max(slack_dual_inf_max(state))
 }

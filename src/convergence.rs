@@ -591,6 +591,46 @@ pub fn complementarity_error_full_split(
     max_err
 }
 
+/// Dual infeasibility max-norm on the split-form Jacobian. Computes
+/// `||grad_f + J_c^T y_c + J_d^T y_d - z_L + z_U||_∞` without
+/// materialising the combined `(jac_*, y)` triplet. Mirrors Ipopt's
+/// plain `curr_grad_lag_x` (`IpIpoptCalculatedQuantities.cpp:1993-2030`)
+/// — no κ_d damping, used by the convergence test.
+#[allow(clippy::too_many_arguments)]
+pub fn dual_infeasibility_split(
+    grad_f: &[f64],
+    jac_c_rows: &[usize],
+    jac_c_cols: &[usize],
+    jac_c_vals: &[f64],
+    y_c: &[f64],
+    jac_d_rows: &[usize],
+    jac_d_cols: &[usize],
+    jac_d_vals: &[f64],
+    y_d: &[f64],
+    z_l: &[f64],
+    z_u: &[f64],
+    n: usize,
+) -> f64 {
+    let mut residual = vec![0.0; n];
+    residual[..n].copy_from_slice(&grad_f[..n]);
+
+    // J_c^T * y_c (Phase 5c: split-form, no combined materialisation)
+    for (idx, (&kc, &col)) in jac_c_rows.iter().zip(jac_c_cols.iter()).enumerate() {
+        residual[col] += jac_c_vals[idx] * y_c[kc];
+    }
+    // J_d^T * y_d
+    for (idx, (&kd, &col)) in jac_d_rows.iter().zip(jac_d_cols.iter()).enumerate() {
+        residual[col] += jac_d_vals[idx] * y_d[kd];
+    }
+
+    for i in 0..n {
+        residual[i] -= z_l[i];
+        residual[i] += z_u[i];
+    }
+
+    residual.iter().map(|r| r.abs()).fold(0.0f64, f64::max)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
