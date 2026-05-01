@@ -688,27 +688,22 @@ pub(crate) struct SolverState {
     pub obj: f64,
     /// Current gradient.
     pub grad_f: Vec<f64>,
-    /// Current constraint values.
-    pub g: Vec<f64>,
-    /// Phase 5a split constraint values — equality residual `c(x)` (size
-    /// `n_c`). Mirrors Ipopt's `OrigIpoptNLP::c()` (`IpIpoptNLP.hpp:117`),
-    /// where the equality target is baked into the residual so `c(x) = 0`
-    /// at feasibility. Computed as `g[c_to_combined[k]] - c_rhs[k]` once
-    /// per evaluate via [`refresh_split_constraints`]. Phase 5a is
-    /// additive — readers still consume `g` + the `g_c()` accessor;
-    /// Phase 5b–5e migrate consumers and Phase 5f drops `g`.
+    /// Phase 5f: equality residual `c(x)` (size `n_c`). Mirrors Ipopt's
+    /// `OrigIpoptNLP::c()` (`IpIpoptNLP.hpp:117`), where the equality
+    /// target is baked into the residual so `c(x) = 0` at feasibility.
+    /// Written by `evaluate_with_linear` (and by the test-only
+    /// `set_g_combined`).
     pub c_x: Vec<f64>,
-    /// Phase 5a split constraint values — inequality value `d(x)` (size
-    /// `n_d`). Mirrors Ipopt's `OrigIpoptNLP::d()` (`IpIpoptNLP.hpp:118`).
-    /// Computed as `g[d_to_combined[k]]` once per evaluate via
-    /// [`refresh_split_constraints`].
+    /// Phase 5f: inequality value `d(x)` (size `n_d`). Mirrors Ipopt's
+    /// `OrigIpoptNLP::d()` (`IpIpoptNLP.hpp:118`).
     pub d_x: Vec<f64>,
-    /// Jacobian structure and values (combined m-row form). The
-    /// user-facing `NlpProblem` trait still emits a single combined
-    /// triplet; the split blocks below are derived projections.
+    /// Jacobian sparsity pattern (combined m-row wire form). Kept as an
+    /// immutable wire for the restoration NLP boundary, which still
+    /// expects an m-form triplet pattern. Numerical values live in the
+    /// split `jac_c_vals` / `jac_d_vals` storage; there is no combined
+    /// values mirror.
     pub jac_rows: Vec<usize>,
     pub jac_cols: Vec<usize>,
-    pub jac_vals: Vec<f64>,
     /// Phase 4 split Jacobian — equality-row block (Ipopt's `Jac_c`,
     /// `IpOrigIpoptNLP.hpp:439`). Triplet form sized `jac_c_nnz`:
     ///   `jac_c_rows[k] ∈ 0..n_c`  (target row in `c`-block coordinates)
@@ -1355,12 +1350,10 @@ impl SolverState {
             m,
             obj: 0.0,
             grad_f: vec![0.0; n],
-            g: vec![0.0; m],
             c_x: vec![0.0; layout.n_c],
             d_x: vec![0.0; layout.n_d],
             jac_rows,
             jac_cols,
-            jac_vals: vec![0.0; jac_nnz],
             jac_c_rows,
             jac_c_cols,
             jac_c_vals,
@@ -1855,30 +1848,32 @@ impl SolverState {
 
     /// Phase 4a: refresh the split Jacobian value blocks from the
     /// combined `jac_vals`. Uses the per-entry combined-index map built
-    /// at construction so the per-iteration cost is one indirect read
-    /// per nnz, no partition lookup. Call after every site that updates
-    /// `state.jac_vals` so the split mirrors stay consistent.
-    pub fn refresh_split_jac_vals(&mut self) {
+    /// Split a combined m-form jacobian-values vector into the c-block
+    /// and d-block native storage. Used by `evaluate_with_linear` (which
+    /// calls `problem.jacobian_values` into a local m-form scratch) and
+    /// by test fixtures that hand-craft a combined-form Jacobian.
+    pub fn set_jac_vals_combined(&mut self, vals: &[f64]) {
         for (k, &idx) in self.jac_c_combined_idx.iter().enumerate() {
-            self.jac_c_vals[k] = self.jac_vals[idx];
+            self.jac_c_vals[k] = vals[idx];
         }
         for (k, &idx) in self.jac_d_combined_idx.iter().enumerate() {
-            self.jac_d_vals[k] = self.jac_vals[idx];
+            self.jac_d_vals[k] = vals[idx];
         }
     }
 
-    /// Phase 5a: refresh the split constraint storage from the combined
-    /// `g`. `c_x[k] = g[c_to_combined[k]] - c_rhs[k]` (Ipopt's `c(x)`,
-    /// equality residual baked at TNLPAdapter level — `IpTNLPAdapter.cpp:567-570`)
-    /// and `d_x[k] = g[d_to_combined[k]]` (Ipopt's raw `d(x)` value).
-    /// Call after every site that updates `state.g` so the split mirror
-    /// stays consistent until Phase 5f drops `g` entirely.
-    pub fn refresh_split_constraints(&mut self) {
+    /// Split a combined m-form constraint vector into the c-block and
+    /// d-block native storage. `c_x[k] = g[c_to_combined[k]] - c_rhs[k]`
+    /// (Ipopt's `c(x)`, equality residual baked at TNLPAdapter level —
+    /// `IpTNLPAdapter.cpp:567-570`) and `d_x[k] = g[d_to_combined[k]]`
+    /// (Ipopt's raw `d(x)` value). Used by `evaluate_with_linear` (which
+    /// calls `problem.constraints` into a local m-form scratch) and by
+    /// test fixtures that hand-craft a combined-form constraint vector.
+    pub fn set_g_combined(&mut self, g: &[f64]) {
         for (k, &i) in self.layout.c_to_combined.iter().enumerate() {
-            self.c_x[k] = self.g[i] - self.c_rhs[k];
+            self.c_x[k] = g[i] - self.c_rhs[k];
         }
         for (k, &i) in self.layout.d_to_combined.iter().enumerate() {
-            self.d_x[k] = self.g[i];
+            self.d_x[k] = g[i];
         }
     }
 
@@ -9137,9 +9132,6 @@ fn slack_gu(state: &SolverState, i: usize) -> f64 {
 #[cfg(test)]
 pub(crate) fn sync_state_s_to_g(state: &mut SolverState) {
     // Phase 3d / 5f: `s` is d-block-native; mirror `d_x` directly.
-    // Refresh split mirrors first so tests that wrote `state.g` directly
-    // see their assignment reflected in `d_x`.
-    state.refresh_split_constraints();
     for k in 0..state.layout.n_d {
         state.s[k] = state.d_x[k];
     }
@@ -9781,7 +9773,6 @@ mod tests {
             m,
             obj: 0.0,
             grad_f: vec![0.0; n],
-            g: vec![0.0; m],
             // Phase 5a: native split constraint storage. Test-only
             // constructor uses an all-inequality layout (n_c=0, n_d=m),
             // so c_x is empty and d_x mirrors g.
@@ -9789,11 +9780,10 @@ mod tests {
             d_x: vec![0.0; m],
             jac_rows: Vec::new(),
             jac_cols: Vec::new(),
-            jac_vals: Vec::new(),
             // Phase 4a: empty split-Jacobian storage in minimal_state;
             // tests that exercise Jacobian-consuming code build their
-            // own structure and call refresh_split_jac_vals() (or use
-            // a dedicated helper) as needed.
+            // own structure and call set_jac_vals_combined() (or write
+            // jac_c_vals/jac_d_vals directly) as needed.
             jac_c_rows: Vec::new(),
             jac_c_cols: Vec::new(),
             jac_c_vals: Vec::new(),
@@ -9917,15 +9907,12 @@ mod tests {
         assert_eq!(state.c_x.len(), 1);
         assert_eq!(state.d_x.len(), 2);
 
-        state.g = vec![10.0, 7.5, 30.0];
-        state.refresh_split_constraints();
+        state.set_g_combined(&[10.0, 7.5, 30.0]);
         assert_eq!(state.c_x, vec![5.0]);
         assert_eq!(state.d_x, vec![10.0, 30.0]);
 
-        // Reactivity: mutating combined and refreshing must propagate.
-        state.g[1] = 4.5;
-        state.g[0] = 11.0;
-        state.refresh_split_constraints();
+        // Reactivity: re-splitting a fresh combined snapshot must propagate.
+        state.set_g_combined(&[11.0, 4.5, 30.0]);
         assert_eq!(state.c_x, vec![2.0]);
         assert_eq!(state.d_x, vec![11.0, 30.0]);
     }
@@ -9941,9 +9928,8 @@ mod tests {
         set_constraint_bounds(&mut state, vec![0.0, 1.0], vec![0.0, f64::INFINITY]);
         state.jac_rows = vec![0, 0, 1, 1];
         state.jac_cols = vec![0, 1, 0, 1];
-        state.jac_vals = vec![1.0, 2.0, 3.0, 4.0];
         rebuild_split_jac_structure(&mut state);
-        state.refresh_split_jac_vals();
+        state.set_jac_vals_combined(&[1.0, 2.0, 3.0, 4.0]);
 
         assert_eq!(state.jac_c_rows, vec![0, 0]);
         assert_eq!(state.jac_c_cols, vec![0, 1]);
@@ -9952,9 +9938,8 @@ mod tests {
         assert_eq!(state.jac_d_cols, vec![0, 1]);
         assert_eq!(state.jac_d_vals, vec![3.0, 4.0]);
 
-        // Refresh after value mutation: split mirror tracks combined.
-        state.jac_vals = vec![10.0, 20.0, 30.0, 40.0];
-        state.refresh_split_jac_vals();
+        // Re-splitting after mutation: split mirror tracks combined.
+        state.set_jac_vals_combined(&[10.0, 20.0, 30.0, 40.0]);
         assert_eq!(state.jac_c_vals, vec![10.0, 20.0]);
         assert_eq!(state.jac_d_vals, vec![30.0, 40.0]);
     }
@@ -10076,9 +10061,8 @@ mod tests {
         // No variable bounds, but an inequality constraint with v_l > 0 triggers fallback.
         // g = 2.0, g_l = 1.0, v_l = 0.5 -> slack = 1.0, contrib = 0.5; avg = 0.5 / 1 = 0.5.
         let mut state = minimal_state(1, 1);
-        state.g = vec![2.0];
         set_constraint_bounds(&mut state, vec![1.0], vec![f64::INFINITY]);
-        state.refresh_split_constraints();
+        state.set_g_combined(&[2.0]);
         state.v_l = vec![0.5];
         sync_state_s_to_g(&mut state);
         let avg = compute_avg_complementarity(&state);
@@ -10099,9 +10083,8 @@ mod tests {
         state.x = vec![2.0];
         state.x_l = vec![1.0];
         state.z_l = vec![1.0];
-        state.g = vec![2.0];
         set_constraint_bounds(&mut state, vec![1.0], vec![f64::INFINITY]);
-        state.refresh_split_constraints();
+        state.set_g_combined(&[2.0]);
         state.v_l = vec![99.0];
         sync_state_s_to_g(&mut state);
         let avg = compute_avg_complementarity(&state);
@@ -10181,8 +10164,8 @@ mod tests {
         // multipliers, not max(y,0) (IpIpoptCalculatedQuantities.cpp:2467-2497).
         let mut state = minimal_state(1, 1);
         state.x = vec![0.0];
-        state.g = vec![3.0];
         set_constraint_bounds(&mut state, vec![1.0], vec![f64::INFINITY]);
+        state.set_g_combined(&[3.0]);
         state.v_l = vec![0.5];
         sync_state_s_to_g(&mut state);
         let err = compute_compl_err_at_state(&state);
@@ -10197,8 +10180,8 @@ mod tests {
         // Constraint-slack block: |3.0 * 0.25 - 0.0| = 0.75.
         let mut state = minimal_state(1, 1);
         state.x = vec![0.0];
-        state.g = vec![1.0];
         set_constraint_bounds(&mut state, vec![f64::NEG_INFINITY], vec![4.0]);
+        state.set_g_combined(&[1.0]);
         state.v_u = vec![0.25];
         sync_state_s_to_g(&mut state);
         let err = compute_compl_err_at_state(&state);
@@ -10442,8 +10425,8 @@ mod tests {
         let mut state = minimal_state(1, 1);
         // Old x; constraint g(x) = x; equality g = 0.
         state.x = vec![0.5];
-        state.g = vec![0.5];
         set_constraint_bounds(&mut state, vec![0.0], vec![0.0]);
+        state.set_g_combined(&[0.5]);
         state.x_l = vec![f64::NEG_INFINITY];
         state.x_u = vec![f64::INFINITY];
         state.mu = 0.1;
@@ -10499,8 +10482,8 @@ mod tests {
     fn test_apply_restoration_success_filter_accepts_and_preserves_entries() {
         let mut state = minimal_state(1, 1);
         state.x = vec![0.5];
-        state.g = vec![0.5];
         set_constraint_bounds(&mut state, vec![0.0], vec![0.0]);
+        state.set_g_combined(&[0.5]);
         state.x_l = vec![f64::NEG_INFINITY];
         state.x_u = vec![f64::INFINITY];
         state.mu = 0.1;
@@ -10658,18 +10641,19 @@ mod tests {
         s.grad_f = vec![2.0];
         s.jac_rows = vec![0];
         s.jac_cols = vec![0];
-        s.jac_vals = vec![1.0];
-        s.g = vec![g];
         if g_eq {
             // Layout flip first — set_y_combined must write into the
             // post-flip y_c/y_d sizing.
             set_constraint_bounds(&mut s, vec![0.0], vec![0.0]);
         }
-        // Phase 5f.4b: sync split mirrors so production code paths reading
-        // jac_c_*/jac_d_*/c_x/d_x see the test fixture's combined writes.
+        // Phase 5f.4b: split storage is canonical. Build the split
+        // Jacobian structure from the m-form pattern, then write split
+        // values + split constraint state directly via the combined
+        // setters (the values lookup via `combined_idx` mirrors what
+        // `evaluate_with_linear` does at runtime).
         rebuild_split_jac_structure(&mut s);
-        s.refresh_split_jac_vals();
-        s.refresh_split_constraints();
+        s.set_jac_vals_combined(&[1.0]);
+        s.set_g_combined(&[g]);
         s.set_y_combined(&[999.0]);  // sentinel; recalc must overwrite
         s
     }
@@ -10783,9 +10767,8 @@ mod tests {
         state.set_dy_combined(&[-3.0]);
         state.jac_rows = vec![0];
         state.jac_cols = vec![0];
-        state.jac_vals = vec![1.0];
         rebuild_split_jac_structure(&mut state);
-        state.refresh_split_jac_vals();
+        state.set_jac_vals_combined(&[1.0]);
 
         let alpha = compute_min_dual_infeas_alpha(
             &state, &ConstantProblem, AlphaForY::MinDualInfeas, 0.5, 0.5,
@@ -10826,9 +10809,8 @@ mod tests {
         state.set_dy_combined(&[-3.0]);
         state.jac_rows = vec![0];
         state.jac_cols = vec![0];
-        state.jac_vals = vec![1.0];
         rebuild_split_jac_structure(&mut state);
-        state.refresh_split_jac_vals();
+        state.set_jac_vals_combined(&[1.0]);
 
         let alpha = compute_min_dual_infeas_alpha(
             &state, &ConstantProblem, AlphaForY::SaferMinDualInfeas, 0.2, 0.5,
@@ -10929,7 +10911,7 @@ mod tests {
         state.v_l = vec![0.4, 0.0];
         state.v_u = vec![0.0, 0.6];
         set_constraint_bounds(&mut state, vec![0.0, f64::NEG_INFINITY], vec![f64::INFINITY, 5.0]);
-        state.g = vec![1.0, 2.0];
+        state.set_g_combined(&[1.0, 2.0]);
         state.mu = 0.1;
         let snapshot = (
             state.x.clone(),
@@ -10938,7 +10920,7 @@ mod tests {
             state.z_u.clone(),
             state.v_l.clone(),
             state.v_u.clone(),
-            state.g.clone(),
+            state.g_combined(),
         );
 
         let opts_on = SolverOptions { magic_step: true, ..SolverOptions::default() };
@@ -10950,7 +10932,7 @@ mod tests {
         assert_eq!(state.z_u, snapshot.3);
         assert_eq!(state.v_l, snapshot.4);
         assert_eq!(state.v_u, snapshot.5);
-        assert_eq!(state.g, snapshot.6);
+        assert_eq!(state.g_combined(), snapshot.6);
 
         // With option off, identical (no-op) result.
         let opts_off = SolverOptions { magic_step: false, ..SolverOptions::default() };
