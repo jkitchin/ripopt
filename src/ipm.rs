@@ -656,10 +656,22 @@ pub(crate) struct SolverState {
     pub x_l: Vec<f64>,
     /// Variable upper bounds.
     pub x_u: Vec<f64>,
-    /// Constraint lower bounds.
+    /// Constraint lower bounds (combined m-form, kept as the boundary
+    /// representation that ScaledProblem and the user trait pass through).
     pub g_l: Vec<f64>,
-    /// Constraint upper bounds.
+    /// Constraint upper bounds (combined m-form). See `g_l` doc.
     pub g_u: Vec<f64>,
+    /// Equality-row target value (Ipopt's `c_rhs`, size `layout.n_c`):
+    /// `g_l[i] == g_u[i]` for each equality row. Phase 3f: split-form
+    /// projection of `g_l`/`g_u` populated once at construction; never
+    /// changes during solve.
+    pub c_rhs: Vec<f64>,
+    /// Inequality-row lower bounds (Ipopt's `d_L`, size `layout.n_d`).
+    /// Phase 3f: split-form projection of `g_l`.
+    pub d_l: Vec<f64>,
+    /// Inequality-row upper bounds (Ipopt's `d_U`, size `layout.n_d`).
+    /// Phase 3f: split-form projection of `g_u`.
+    pub d_u: Vec<f64>,
     /// Number of variables.
     pub n: usize,
     /// Number of constraints.
@@ -1220,6 +1232,13 @@ impl SolverState {
         let y_c = layout.project_c(&y);
         let y_d = layout.project_d(&y);
 
+        // Phase 3f: split-form bound storage. c_rhs holds the equality
+        // target (= g_l[eq] = g_u[eq]); d_l/d_u hold the inequality
+        // bounds. These are invariant during solve, populated once.
+        let c_rhs: Vec<f64> = layout.c_to_combined.iter().map(|&i| g_l[i]).collect();
+        let d_l = layout.project_d(&g_l);
+        let d_u = layout.project_d(&g_u);
+
         Self {
             x,
             y_c,
@@ -1249,6 +1268,9 @@ impl SolverState {
             x_u,
             g_l,
             g_u,
+            c_rhs,
+            d_l,
+            d_u,
             n,
             m,
             obj: 0.0,
@@ -1320,12 +1342,20 @@ impl SolverState {
 
     /// Inequality lower bounds `d_L` (size n_d, may contain -inf).
     /// Mirrors Ipopt's `OrigIpoptNLP::d_L()` (`IpIpoptNLP.hpp:153`).
+    /// Phase 3f: still projects from combined `g_l` so test fixtures that
+    /// write `state.g_l` directly continue to work; the native `d_l`
+    /// field is populated at construction and matches `project_d(&g_l)`
+    /// for any state initialized through `SolverState::new`. Phase 4
+    /// will migrate readers to the native field once test fixtures use
+    /// a layout-aware bound setter.
     pub fn d_l(&self) -> Vec<f64> {
         self.layout.project_d(&self.g_l)
     }
 
     /// Inequality upper bounds `d_U` (size n_d, may contain +inf).
     /// Mirrors Ipopt's `OrigIpoptNLP::d_U()` (`IpIpoptNLP.hpp:155`).
+    /// Phase 3f: see `d_l()` — still projects from combined `g_u` for
+    /// test-fixture compatibility.
     pub fn d_u(&self) -> Vec<f64> {
         self.layout.project_d(&self.g_u)
     }
@@ -9409,6 +9439,12 @@ mod tests {
             x_u: vec![f64::INFINITY; n],
             g_l: vec![f64::NEG_INFINITY; m],
             g_u: vec![f64::INFINITY; m],
+            // Phase 3f: test-only constructor uses an all-inequality layout
+            // (n_c = 0, n_d = m), so c_rhs is empty and d_l/d_u are m-sized
+            // and mirror the all-inf default bounds.
+            c_rhs: Vec::new(),
+            d_l: vec![f64::NEG_INFINITY; m],
+            d_u: vec![f64::INFINITY; m],
             n,
             m,
             obj: 0.0,
