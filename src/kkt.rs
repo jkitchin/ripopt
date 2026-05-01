@@ -1,4 +1,4 @@
-use crate::convergence::is_equality_constraint;
+use crate::constraint_layout::ConstraintLayout;
 use crate::linear_solver::{KktMatrix, LinearSolver, SolverError, SparseSymmetricMatrix, SymmetricMatrix};
 
 /// Information about the KKT system structure.
@@ -168,6 +168,7 @@ pub fn assemble_kkt(
     use_sparse: bool,
     v_l: &[f64],
     v_u: &[f64],
+    partition: &ConstraintLayout,
 ) -> KktSystem {
     let dim = n + m;
     let capacity = hess_rows.len() + jac_rows.len() + n + m;
@@ -266,7 +267,7 @@ pub fn assemble_kkt(
     // For infeasible inequality constraints: no barrier, r_c = -(g - bound).
     let mut has_sigma_s = vec![false; m]; // tracks which constraints got a (2,2) diagonal entry
     for i in 0..m {
-        if is_equality_constraint(g_l[i], g_u[i]) {
+        if partition.eq_pos[i].is_some() {
             rhs[n + i] = -(g[i] - g_l[i]);
             continue;
         }
@@ -2275,11 +2276,12 @@ mod tests {
         let z_l = vec![0.0; 2];
         let z_u = vec![0.0; 2];
 
+        let layout = ConstraintLayout::new(&[], &[]);
         let kkt = assemble_kkt(
             n, m, &hess_rows, &hess_cols, &hess_vals,
             &[], &[], &[], &sigma, &grad_f,
             &[], &[], &[], &[], &[], &z_l, &z_u,
-            &x, &x_l, &x_u, 0.1, 0.0, false, &[], &[],
+            &x, &x_l, &x_u, 0.1, 0.0, false, &[], &[], &layout,
         );
 
         assert_eq!(kkt.dim, 2);
@@ -2314,11 +2316,12 @@ mod tests {
         let v_l = vec![0.0; m];
         let v_u = vec![0.0; m];
         let s = g.clone();
+        let layout = ConstraintLayout::new(&g_l, &g_u);
         let kkt = assemble_kkt(
             n, m, &hess_rows, &hess_cols, &hess_vals,
             &jac_rows, &jac_cols, &jac_vals, &sigma, &grad_f,
             &g, &g_l, &g_u, &s, &y, &z_l, &z_u,
-            &x, &x_l, &x_u, 0.1, 0.0, false, &v_l, &v_u,
+            &x, &x_l, &x_u, 0.1, 0.0, false, &v_l, &v_u, &layout,
         );
 
         assert_eq!(kkt.dim, 3);
@@ -2361,11 +2364,12 @@ mod tests {
         let v_l = vec![0.0; m];
         let v_u = vec![0.0; m];
         let s = g.clone();
+        let layout = ConstraintLayout::new(&g_l, &g_u);
         let kkt = assemble_kkt(
             n, m, &hess_rows, &hess_cols, &hess_vals,
             &jac_rows, &jac_cols, &jac_vals, &sigma, &grad_f,
             &g, &g_l, &g_u, &s, &y, &z_l, &z_u,
-            &x, &x_l, &x_u, 0.1, 0.0, false, &v_l, &v_u,
+            &x, &x_l, &x_u, 0.1, 0.0, false, &v_l, &v_u, &layout,
         );
 
         // r_d = -grad_f + z_l - z_u = -3.0 + 0 - 0 = -3.0
@@ -2404,11 +2408,12 @@ mod tests {
         let mu = 0.01;
 
         let s = g.clone();
+        let layout = ConstraintLayout::new(&g_l, &g_u);
         let kkt = assemble_kkt(
             n, m, &hess_rows, &hess_cols, &hess_vals,
             &jac_rows, &jac_cols, &jac_vals, &sigma, &grad_f,
             &g, &g_l, &g_u, &s, &y, &z_l, &z_u,
-            &x, &x_l, &x_u, mu, 0.0, false, &v_l, &v_u,
+            &x, &x_l, &x_u, mu, 0.0, false, &v_l, &v_u, &layout,
         );
         let d_22 = kkt.matrix.get(1, 1);
         assert!((d_22 - (-0.2)).abs() < 1e-9,
@@ -2440,11 +2445,12 @@ mod tests {
         let mu = 0.01;
 
         let s = g.clone();
+        let layout = ConstraintLayout::new(&g_l, &g_u);
         let kkt = assemble_kkt(
             n, m, &hess_rows, &hess_cols, &hess_vals,
             &jac_rows, &jac_cols, &jac_vals, &sigma, &grad_f,
             &g, &g_l, &g_u, &s, &y, &z_l, &z_u,
-            &x, &x_l, &x_u, mu, 0.0, false, &v_l, &v_u,
+            &x, &x_l, &x_u, mu, 0.0, false, &v_l, &v_u, &layout,
         );
         let d_22 = kkt.matrix.get(1, 1);
         // Σ_s = (μ/(κ_σ·s)) / s = μ / (κ_σ·s²) = 0.01 / (1e10·0.09) ≈ 1.111e-11
@@ -2481,11 +2487,12 @@ mod tests {
         let v_l = vec![0.0; m];
         let v_u = vec![0.0; m];
         let s = g.clone();
+        let layout = ConstraintLayout::new(&g_l, &g_u);
         let kkt = assemble_kkt(
             n, m, &hess_rows, &hess_cols, &hess_vals,
             &jac_rows, &jac_cols, &jac_vals, &sigma, &grad_f,
             &g, &g_l, &g_u, &s, &y, &z_l, &z_u,
-            &x, &x_l, &x_u, mu, 0.0, false, &v_l, &v_u,
+            &x, &x_l, &x_u, mu, 0.0, false, &v_l, &v_u, &layout,
         );
 
         // (2,2) block should be negative (from -Σ_s^{-1})

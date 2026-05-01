@@ -8585,7 +8585,7 @@ fn assemble_kkt_from_state(
         sigma, &state.grad_f, &state.g, &state.g_l, &state.g_u,
         &state.s, &state.y, &state.z_l, &state.z_u,
         &state.x, &state.x_l, &state.x_u, state.mu, kappa_d,
-        use_sparse, &state.v_l, &state.v_u,
+        use_sparse, &state.v_l, &state.v_u, &state.layout,
     );
     // T3.25: snapshot the upstream atags. The assembled matrix is a
     // pure function of (W, J, sigma_x, sigma_s, slacks, multipliers),
