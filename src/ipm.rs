@@ -9164,20 +9164,18 @@ fn assemble_kkt_from_state(
     use_sparse: bool,
     kappa_d: f64,
 ) -> kkt::KktSystem {
-    let y_combined = state.y_combined();
-    let s_combined = state.s_combined();
-    let v_l_combined = state.v_l_combined();
-    let v_u_combined = state.v_u_combined();
-    let g_l_combined = state.g_l_combined();
-    let g_u_combined = state.g_u_combined();
+    debug_assert_eq!(m, state.layout.n_c + state.layout.n_d);
     let mut sys = kkt::assemble_kkt(
-        n, m,
+        n, state.layout.n_c, state.layout.n_d,
         &state.hess_rows, &state.hess_cols, &state.hess_vals,
-        &state.jac_rows, &state.jac_cols, &state.jac_vals,
-        sigma, &state.grad_f, &state.g, &g_l_combined, &g_u_combined,
-        &s_combined, &y_combined, &state.z_l, &state.z_u,
+        &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals,
+        &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals,
+        sigma, &state.grad_f,
+        &state.c_x, &state.d_x,
+        &state.d_l, &state.d_u,
+        &state.s, &state.y_c, &state.y_d,
         &state.x, &state.x_l, &state.x_u, state.mu, kappa_d,
-        use_sparse, &v_l_combined, &v_u_combined, &state.layout,
+        use_sparse, &state.v_l, &state.v_u, &state.layout,
     );
     // T3.25: snapshot the upstream atags. The assembled matrix is a
     // pure function of (W, J, sigma_x, sigma_s, slacks, multipliers),

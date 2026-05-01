@@ -130,36 +130,46 @@ impl FactorCache {
 ///
 /// # Arguments
 /// - `n`: number of variables
-/// - `m`: number of constraints
+/// - `n_c`, `n_d`: number of equality / inequality constraints (m = n_c + n_d)
 /// - `hess_rows`, `hess_cols`, `hess_vals`: Hessian lower triangle in COO
-/// - `jac_rows`, `jac_cols`, `jac_vals`: Jacobian in COO
-/// - `sigma`: barrier diagonal (length n)
+/// - `jac_c_rows` / `jac_c_cols` / `jac_c_vals`: equality-block Jacobian
+///   `J_c` (`n_c × n`) in COO; rows are c-block coordinates
+/// - `jac_d_rows` / `jac_d_cols` / `jac_d_vals`: inequality-block Jacobian
+///   `J_d` (`n_d × n`) in COO; rows are d-block coordinates
+/// - `sigma`: barrier diagonal Σ_x (length n)
 /// - `grad_f`: gradient of objective (length n)
-/// - `g`: constraint values (length m)
-/// - `g_l`, `g_u`: constraint bounds
-/// - `y`: current constraint multipliers (length m)
-/// - `z_l`, `z_u`: bound multipliers
-/// - `x`, `x_l`, `x_u`: current point and bounds
+/// - `c_x`: equality residual `c(x)` (length n_c)
+/// - `d_x`: inequality value `d(x)` (length n_d)
+/// - `d_l`, `d_u`: inequality bounds (length n_d each)
+/// - `s`: inequality slacks (length n_d)
+/// - `y_c`, `y_d`: split constraint multipliers (lengths n_c, n_d)
+/// - `x`, `x_l`, `x_u`: current point and variable bounds
 /// - `mu`: barrier parameter
+/// - `v_l`, `v_u`: slack bound multipliers (lengths n_d each)
+/// - `layout`: c/d row maps used to place split entries into the n+m KKT
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_kkt(
     n: usize,
-    m: usize,
+    n_c: usize,
+    n_d: usize,
     hess_rows: &[usize],
     hess_cols: &[usize],
     hess_vals: &[f64],
-    jac_rows: &[usize],
-    jac_cols: &[usize],
-    jac_vals: &[f64],
+    jac_c_rows: &[usize],
+    jac_c_cols: &[usize],
+    jac_c_vals: &[f64],
+    jac_d_rows: &[usize],
+    jac_d_cols: &[usize],
+    jac_d_vals: &[f64],
     sigma: &[f64],
     grad_f: &[f64],
-    g: &[f64],
-    g_l: &[f64],
-    g_u: &[f64],
+    c_x: &[f64],
+    d_x: &[f64],
+    d_l: &[f64],
+    d_u: &[f64],
     s: &[f64],
-    y: &[f64],
-    _z_l: &[f64],
-    _z_u: &[f64],
+    y_c: &[f64],
+    y_d: &[f64],
     x: &[f64],
     x_l: &[f64],
     x_u: &[f64],
@@ -168,10 +178,11 @@ pub fn assemble_kkt(
     use_sparse: bool,
     v_l: &[f64],
     v_u: &[f64],
-    partition: &ConstraintLayout,
+    layout: &ConstraintLayout,
 ) -> KktSystem {
+    let m = n_c + n_d;
     let dim = n + m;
-    let capacity = hess_rows.len() + jac_rows.len() + n + m;
+    let capacity = hess_rows.len() + jac_c_rows.len() + jac_d_rows.len() + n + m;
     let mut matrix = if use_sparse {
         KktMatrix::zeros_sparse(dim, capacity)
     } else {
@@ -194,9 +205,17 @@ pub fn assemble_kkt(
         matrix.add(i, i, sigma[i]);
     }
 
-    // (2,1) block: J
-    for (idx, (&row, &col)) in jac_rows.iter().zip(jac_cols.iter()).enumerate() {
-        matrix.add(n + row, col, jac_vals[idx]);
+    // (2,1) block: J — split-form Phase 5b. The c-block and d-block live
+    // in two contiguous-by-projection regions of the m-row band; each
+    // entry's combined-row index comes from `layout.c_to_combined` /
+    // `layout.d_to_combined`. No per-triplet partition dispatch.
+    for (idx, (&kc, &col)) in jac_c_rows.iter().zip(jac_c_cols.iter()).enumerate() {
+        let i = layout.c_to_combined[kc];
+        matrix.add(n + i, col, jac_c_vals[idx]);
+    }
+    for (idx, (&kd, &col)) in jac_d_rows.iter().zip(jac_d_cols.iter()).enumerate() {
+        let i = layout.d_to_combined[kd];
+        matrix.add(n + i, col, jac_d_vals[idx]);
     }
 
     // RHS: dual residual r_d (first n entries).
@@ -243,9 +262,12 @@ pub fn assemble_kkt(
         rhs[i] = rd;
     }
 
-    // Subtract J^T * y contribution from r_d
-    for (idx, (&row, &col)) in jac_rows.iter().zip(jac_cols.iter()).enumerate() {
-        rhs[col] -= jac_vals[idx] * y[row];
+    // Subtract J^T * y contribution from r_d (split form — Phase 5b).
+    for (idx, (&kc, &col)) in jac_c_rows.iter().zip(jac_c_cols.iter()).enumerate() {
+        rhs[col] -= jac_c_vals[idx] * y_c[kc];
+    }
+    for (idx, (&kd, &col)) in jac_d_rows.iter().zip(jac_d_cols.iter()).enumerate() {
+        rhs[col] -= jac_d_vals[idx] * y_d[kd];
     }
 
     // RHS: primal residual r_p (last m entries) and (2,2) block for inequality constraints.
@@ -263,18 +285,22 @@ pub fn assemble_kkt(
     // i.e. just row 4 rearranged, which yields Σ_s^{-1}·(Δy − grad_lag_s)
     // exactly when the d-row RHS includes the -(g - s) term above.
     //
-    // For equality constraints: no slack, (2,2) = 0, r_c = -(g - g_l).
-    // For infeasible inequality constraints: no barrier, r_c = -(g - bound).
+    // For equality constraints: no slack, (2,2) = 0, r_c = -c_x.
+    // For infeasible inequality constraints: no barrier, r_c = -(d_x - bound).
     let mut has_sigma_s = vec![false; m]; // tracks which constraints got a (2,2) diagonal entry
-    for i in 0..m {
-        if partition.eq_pos[i].is_some() {
-            rhs[n + i] = -(g[i] - g_l[i]);
-            continue;
-        }
 
-        // Compute Σ_s and the RHS correction term (y + μ/s_l - μ/s_u)
+    // Equality block (Phase 5b: split-form, no partition dispatch).
+    for k_c in 0..n_c {
+        let i = layout.c_to_combined[k_c];
+        rhs[n + i] = -c_x[k_c];
+    }
+
+    // Inequality block. Compute Σ_s and (2,2) entry per d-row.
+    let kappa_sigma = 1e10_f64;
+    for k_d in 0..n_d {
+        let i = layout.d_to_combined[k_d];
         let mut sigma_s = 0.0;
-        let mut rhs_correction = y[i]; // starts with y
+        let mut rhs_correction = y_d[k_d]; // starts with y_d
         let mut any_feasible = false;
         let mut rhs_infeasible = 0.0;
 
@@ -290,35 +316,34 @@ pub fn assemble_kkt(
         // μ/(κ_σ·s) — 1e10× smaller than μ/s — exploding the condensed
         // RHS by κ_σ on problems with strictly interior inequality
         // constraints (e.g. arki0003 had |rhs|_inf ≈ 1e13 before).
-        let kappa_sigma = 1e10_f64;
-        if g_l[i].is_finite() {
-            let slack = s[i] - g_l[i];
+        if d_l[k_d].is_finite() {
+            let slack = s[k_d] - d_l[k_d];
             if slack >= -1e-8 {
                 let safe_slack = slack.max(mu.max(1e-10));
                 let mu_over_s = mu / safe_slack;
-                let mut z_sl = v_l[i];
+                let mut z_sl = v_l[k_d];
                 z_sl = z_sl.max(mu_over_s / kappa_sigma).min(kappa_sigma * mu_over_s);
                 sigma_s += z_sl / safe_slack;
                 rhs_correction += mu / safe_slack;
                 any_feasible = true;
             } else {
                 // Truly infeasible: drive toward feasibility
-                rhs_infeasible += -(g[i] - g_l[i]);
+                rhs_infeasible += -(d_x[k_d] - d_l[k_d]);
             }
         }
-        if g_u[i].is_finite() {
-            let slack = g_u[i] - s[i];
+        if d_u[k_d].is_finite() {
+            let slack = d_u[k_d] - s[k_d];
             if slack >= -1e-8 {
                 let safe_slack = slack.max(mu.max(1e-10));
                 let mu_over_s = mu / safe_slack;
-                let mut z_su = v_u[i];
+                let mut z_su = v_u[k_d];
                 z_su = z_su.max(mu_over_s / kappa_sigma).min(kappa_sigma * mu_over_s);
                 sigma_s += z_su / safe_slack;
                 rhs_correction -= mu / safe_slack;
                 any_feasible = true;
             } else {
                 // Truly infeasible: drive toward feasibility
-                rhs_infeasible += -(g[i] - g_u[i]);
+                rhs_infeasible += -(d_x[k_d] - d_u[k_d]);
             }
         }
 
@@ -327,19 +352,19 @@ pub fn assemble_kkt(
             // (2,2) block: -Σ_s^{-1} (always negative, correct for KKT inertia)
             matrix.add(n + i, n + i, -sigma_s_inv);
             has_sigma_s[i] = true;
-            // RHS: -(g - s) + Σ_s^{-1} * (y + μ/s_l - μ/s_u) + infeasible contributions.
-            // The -(g - s) term is the d-block primal residual from Ipopt's
+            // RHS: -(d_x - s) + Σ_s^{-1} * (y_d + μ/s_l - μ/s_u) + infeasible contributions.
+            // The -(d_x - s) term is the d-block primal residual from Ipopt's
             // full augmented system row 4. Without it, the linear solve ignores
-            // the c_d(x) − s mismatch and the Δs recovery below dumps the full
+            // the d(x) − s mismatch and the Δs recovery below dumps the full
             // residual into Δs, producing huge slack-step FTB clamps when the
-            // initial slacks differ from c_d(x_0) (e.g. arki0003 row 1097
-            // had |g − s| ≈ 1.16e8, ds ≈ 1.16e8, α_pr clamped to 8.5e-11).
-            rhs[n + i] = -(g[i] - s[i]) + sigma_s_inv * rhs_correction + rhs_infeasible;
+            // initial slacks differ from d(x_0) (e.g. arki0003 row 1097
+            // had |d − s| ≈ 1.16e8, ds ≈ 1.16e8, α_pr clamped to 8.5e-11).
+            rhs[n + i] = -(d_x[k_d] - s[k_d]) + sigma_s_inv * rhs_correction + rhs_infeasible;
             if std::env::var("RIPOPT_TRACE_RHS").is_ok() && rhs[n + i].abs() > 1e10 {
                 eprintln!(
-                    "  rhs-trace: row n+{}={} sigma_s={:.3e} sigma_s_inv={:.3e} rhs_corr={:.3e} rhs_infeas={:.3e} rhs[n+i]={:.3e} y={:.3e} g={:.3e} g_l={:.3e} g_u={:.3e}",
+                    "  rhs-trace: row n+{}={} sigma_s={:.3e} sigma_s_inv={:.3e} rhs_corr={:.3e} rhs_infeas={:.3e} rhs[n+i]={:.3e} y_d={:.3e} d_x={:.3e} d_l={:.3e} d_u={:.3e}",
                     i, n+i, sigma_s, sigma_s_inv, rhs_correction, rhs_infeasible, rhs[n + i],
-                    y[i], g[i], g_l[i], g_u[i]
+                    y_d[k_d], d_x[k_d], d_l[k_d], d_u[k_d]
                 );
             }
         } else {
@@ -2264,7 +2289,6 @@ mod tests {
         // 2 vars, no constraints
         // H = [[2, 0], [0, 3]]
         let n = 2;
-        let m = 0;
         let hess_rows = vec![0, 1];
         let hess_cols = vec![0, 1];
         let hess_vals = vec![2.0, 3.0];
@@ -2273,14 +2297,12 @@ mod tests {
         let x = vec![1.0, 2.0];
         let x_l = vec![f64::NEG_INFINITY; 2];
         let x_u = vec![f64::INFINITY; 2];
-        let z_l = vec![0.0; 2];
-        let z_u = vec![0.0; 2];
 
         let layout = ConstraintLayout::new(&[], &[]);
         let kkt = assemble_kkt(
-            n, m, &hess_rows, &hess_cols, &hess_vals,
-            &[], &[], &[], &sigma, &grad_f,
-            &[], &[], &[], &[], &[], &z_l, &z_u,
+            n, 0, 0, &hess_rows, &hess_cols, &hess_vals,
+            &[], &[], &[], &[], &[], &[], &sigma, &grad_f,
+            &[], &[], &[], &[], &[], &[], &[],
             &x, &x_l, &x_u, 0.1, 0.0, false, &[], &[], &layout,
         );
 
@@ -2294,34 +2316,32 @@ mod tests {
     fn test_assemble_kkt_equality_constraint() {
         // 2 vars, 1 equality constraint: x0 + x1 = 1
         let n = 2;
-        let m = 1;
         let hess_rows = vec![0, 1];
         let hess_cols = vec![0, 1];
         let hess_vals = vec![2.0, 2.0];
-        let jac_rows = vec![0, 0];
-        let jac_cols = vec![0, 1];
-        let jac_vals = vec![1.0, 1.0];
+        // Combined Jac was rows=[0,0], cols=[0,1], vals=[1,1] for the
+        // single equality row. Split form: J_c with row 0 → c-block 0.
+        let jac_c_rows = vec![0, 0];
+        let jac_c_cols = vec![0, 1];
+        let jac_c_vals = vec![1.0, 1.0];
         let sigma = vec![0.0; 2];
         let grad_f = vec![1.0, 1.0];
-        let g = vec![0.7]; // current constraint value
-        let g_l = vec![1.0];
-        let g_u = vec![1.0];
-        let y = vec![0.5];
+        // c_x = g - c_rhs = 0.7 - 1.0 = -0.3
+        let c_x = vec![-0.3];
+        let y_c = vec![0.5];
         let x = vec![0.3, 0.4];
         let x_l = vec![f64::NEG_INFINITY; 2];
         let x_u = vec![f64::INFINITY; 2];
-        let z_l = vec![0.0; 2];
-        let z_u = vec![0.0; 2];
 
-        let v_l = vec![0.0; m];
-        let v_u = vec![0.0; m];
-        let s = g.clone();
+        let g_l = vec![1.0];
+        let g_u = vec![1.0];
         let layout = ConstraintLayout::new(&g_l, &g_u);
         let kkt = assemble_kkt(
-            n, m, &hess_rows, &hess_cols, &hess_vals,
-            &jac_rows, &jac_cols, &jac_vals, &sigma, &grad_f,
-            &g, &g_l, &g_u, &s, &y, &z_l, &z_u,
-            &x, &x_l, &x_u, 0.1, 0.0, false, &v_l, &v_u, &layout,
+            n, 1, 0, &hess_rows, &hess_cols, &hess_vals,
+            &jac_c_rows, &jac_c_cols, &jac_c_vals,
+            &[], &[], &[], &sigma, &grad_f,
+            &c_x, &[], &[], &[], &[], &y_c, &[],
+            &x, &x_l, &x_u, 0.1, 0.0, false, &[], &[], &layout,
         );
 
         assert_eq!(kkt.dim, 3);
@@ -2342,34 +2362,30 @@ mod tests {
     fn test_assemble_kkt_rhs_sign_convention() {
         // Regression: J^T*y must be subtracted from r_d
         let n = 1;
-        let m = 1;
         let hess_rows = vec![0];
         let hess_cols = vec![0];
         let hess_vals = vec![1.0];
-        let jac_rows = vec![0];
-        let jac_cols = vec![0];
-        let jac_vals = vec![2.0]; // J = [2]
+        // Single equality row, combined Jac = [2]. Split: J_c row 0.
+        let jac_c_rows = vec![0];
+        let jac_c_cols = vec![0];
+        let jac_c_vals = vec![2.0];
         let sigma = vec![0.0];
         let grad_f = vec![3.0];
-        let g = vec![1.0];
-        let g_l = vec![1.0];
-        let g_u = vec![1.0];
-        let y = vec![1.0];
+        let c_x = vec![0.0]; // g - c_rhs = 1.0 - 1.0
+        let y_c = vec![1.0];
         let x = vec![1.0];
         let x_l = vec![f64::NEG_INFINITY];
         let x_u = vec![f64::INFINITY];
-        let z_l = vec![0.0];
-        let z_u = vec![0.0];
 
-        let v_l = vec![0.0; m];
-        let v_u = vec![0.0; m];
-        let s = g.clone();
+        let g_l = vec![1.0];
+        let g_u = vec![1.0];
         let layout = ConstraintLayout::new(&g_l, &g_u);
         let kkt = assemble_kkt(
-            n, m, &hess_rows, &hess_cols, &hess_vals,
-            &jac_rows, &jac_cols, &jac_vals, &sigma, &grad_f,
-            &g, &g_l, &g_u, &s, &y, &z_l, &z_u,
-            &x, &x_l, &x_u, 0.1, 0.0, false, &v_l, &v_u, &layout,
+            n, 1, 0, &hess_rows, &hess_cols, &hess_vals,
+            &jac_c_rows, &jac_c_cols, &jac_c_vals,
+            &[], &[], &[], &sigma, &grad_f,
+            &c_x, &[], &[], &[], &[], &y_c, &[],
+            &x, &x_l, &x_u, 0.1, 0.0, false, &[], &[], &layout,
         );
 
         // r_d = -grad_f + z_l - z_u = -3.0 + 0 - 0 = -3.0
@@ -2391,28 +2407,30 @@ mod tests {
     #[test]
     fn test_assemble_kkt_explicit_vL_within_kappa_sigma_band() {
         let n = 1;
-        let m = 1;
         let hess_rows = vec![0]; let hess_cols = vec![0]; let hess_vals = vec![1.0];
-        let jac_rows = vec![0]; let jac_cols = vec![0]; let jac_vals = vec![1.0];
+        // Single inequality row → split J_d row 0 only.
+        let jac_d_rows = vec![0]; let jac_d_cols = vec![0]; let jac_d_vals = vec![1.0];
         let sigma = vec![0.0];
         let grad_f = vec![0.0];
-        let g = vec![1.3];
-        let g_l = vec![1.0];
-        let g_u = vec![f64::INFINITY];
-        let y = vec![0.0];
+        let d_x = vec![1.3];
+        let d_l = vec![1.0];
+        let d_u = vec![f64::INFINITY];
+        let y_d = vec![0.0];
         let x = vec![1.3];
         let x_l = vec![f64::NEG_INFINITY];
         let x_u = vec![f64::INFINITY];
-        let z_l = vec![0.0]; let z_u = vec![0.0];
-        let v_l = vec![1.5]; let v_u = vec![0.0; m];
+        let v_l = vec![1.5]; let v_u = vec![0.0_f64; 1];
         let mu = 0.01;
 
-        let s = g.clone();
+        let s = d_x.clone();
+        let g_l = vec![1.0];
+        let g_u = vec![f64::INFINITY];
         let layout = ConstraintLayout::new(&g_l, &g_u);
         let kkt = assemble_kkt(
-            n, m, &hess_rows, &hess_cols, &hess_vals,
-            &jac_rows, &jac_cols, &jac_vals, &sigma, &grad_f,
-            &g, &g_l, &g_u, &s, &y, &z_l, &z_u,
+            n, 0, 1, &hess_rows, &hess_cols, &hess_vals,
+            &[], &[], &[], &jac_d_rows, &jac_d_cols, &jac_d_vals,
+            &sigma, &grad_f,
+            &[], &d_x, &d_l, &d_u, &s, &[], &y_d,
             &x, &x_l, &x_u, mu, 0.0, false, &v_l, &v_u, &layout,
         );
         let d_22 = kkt.matrix.get(1, 1);
@@ -2428,28 +2446,29 @@ mod tests {
     #[test]
     fn test_assemble_kkt_explicit_vL_zero_gets_kappa_sigma_floor() {
         let n = 1;
-        let m = 1;
         let hess_rows = vec![0]; let hess_cols = vec![0]; let hess_vals = vec![1.0];
-        let jac_rows = vec![0]; let jac_cols = vec![0]; let jac_vals = vec![1.0];
+        let jac_d_rows = vec![0]; let jac_d_cols = vec![0]; let jac_d_vals = vec![1.0];
         let sigma = vec![0.0];
         let grad_f = vec![0.0];
-        let g = vec![1.3];
-        let g_l = vec![1.0];
-        let g_u = vec![f64::INFINITY];
-        let y = vec![0.0];
+        let d_x = vec![1.3];
+        let d_l = vec![1.0];
+        let d_u = vec![f64::INFINITY];
+        let y_d = vec![0.0];
         let x = vec![1.3];
         let x_l = vec![f64::NEG_INFINITY];
         let x_u = vec![f64::INFINITY];
-        let z_l = vec![0.0]; let z_u = vec![0.0];
-        let v_l = vec![0.0; m]; let v_u = vec![0.0; m];
+        let v_l = vec![0.0_f64; 1]; let v_u = vec![0.0_f64; 1];
         let mu = 0.01;
 
-        let s = g.clone();
+        let s = d_x.clone();
+        let g_l = vec![1.0];
+        let g_u = vec![f64::INFINITY];
         let layout = ConstraintLayout::new(&g_l, &g_u);
         let kkt = assemble_kkt(
-            n, m, &hess_rows, &hess_cols, &hess_vals,
-            &jac_rows, &jac_cols, &jac_vals, &sigma, &grad_f,
-            &g, &g_l, &g_u, &s, &y, &z_l, &z_u,
+            n, 0, 1, &hess_rows, &hess_cols, &hess_vals,
+            &[], &[], &[], &jac_d_rows, &jac_d_cols, &jac_d_vals,
+            &sigma, &grad_f,
+            &[], &d_x, &d_l, &d_u, &s, &[], &y_d,
             &x, &x_l, &x_u, mu, 0.0, false, &v_l, &v_u, &layout,
         );
         let d_22 = kkt.matrix.get(1, 1);
@@ -2462,36 +2481,36 @@ mod tests {
 
     #[test]
     fn test_assemble_kkt_inequality_constraint() {
-        // Feasible inequality: g(x) = 2.0, g_l = 1.0, g_u = INF
+        // Feasible inequality: d(x) = 2.0, d_l = 1.0, d_u = INF
         let n = 1;
-        let m = 1;
         let hess_rows = vec![0];
         let hess_cols = vec![0];
         let hess_vals = vec![1.0];
-        let jac_rows = vec![0];
-        let jac_cols = vec![0];
-        let jac_vals = vec![1.0];
+        let jac_d_rows = vec![0];
+        let jac_d_cols = vec![0];
+        let jac_d_vals = vec![1.0];
         let sigma = vec![0.0];
         let grad_f = vec![0.0];
-        let g = vec![2.0]; // feasible: 2.0 > 1.0
-        let g_l = vec![1.0];
-        let g_u = vec![f64::INFINITY];
-        let y = vec![0.0];
+        let d_x = vec![2.0]; // feasible: 2.0 > 1.0
+        let d_l = vec![1.0];
+        let d_u = vec![f64::INFINITY];
+        let y_d = vec![0.0];
         let x = vec![2.0];
         let x_l = vec![f64::NEG_INFINITY];
         let x_u = vec![f64::INFINITY];
-        let z_l = vec![0.0];
-        let z_u = vec![0.0];
         let mu = 0.1;
 
-        let v_l = vec![0.0; m];
-        let v_u = vec![0.0; m];
-        let s = g.clone();
+        let v_l = vec![0.0_f64; 1];
+        let v_u = vec![0.0_f64; 1];
+        let s = d_x.clone();
+        let g_l = vec![1.0];
+        let g_u = vec![f64::INFINITY];
         let layout = ConstraintLayout::new(&g_l, &g_u);
         let kkt = assemble_kkt(
-            n, m, &hess_rows, &hess_cols, &hess_vals,
-            &jac_rows, &jac_cols, &jac_vals, &sigma, &grad_f,
-            &g, &g_l, &g_u, &s, &y, &z_l, &z_u,
+            n, 0, 1, &hess_rows, &hess_cols, &hess_vals,
+            &[], &[], &[], &jac_d_rows, &jac_d_cols, &jac_d_vals,
+            &sigma, &grad_f,
+            &[], &d_x, &d_l, &d_u, &s, &[], &y_d,
             &x, &x_l, &x_u, mu, 0.0, false, &v_l, &v_u, &layout,
         );
 
