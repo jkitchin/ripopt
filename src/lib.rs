@@ -97,6 +97,7 @@ pub mod restoration_nlp;
 pub mod result;
 pub mod sensitivity;
 pub mod slack_formulation;
+pub(crate) mod split_nlp;
 pub mod trace;
 pub mod warmstart;
 
