@@ -4186,7 +4186,7 @@ fn compute_alpha_max(
         .min(fraction_to_boundary_primal_s(state, &state.ds, tau))
         .clamp(0.0, 1.0);
 
-    let alpha_dual_z = fraction_to_boundary_dual_z_min(state, &state.dz_l, &state.dz_u, tau);
+    let alpha_dual_z = fraction_to_boundary_dual_z_min(state, &state.dz_l_compressed, &state.dz_u_compressed, tau);
     let alpha_dual_v = fraction_to_boundary_dual_v_min(state, &state.dv_l, &state.dv_u, tau);
     let alpha_dual_max = alpha_dual_z.min(alpha_dual_v);
 
@@ -4650,7 +4650,11 @@ fn compute_quality_function_mu(
         let alpha_p = fraction_to_boundary_primal_x(state, &dx, 1.0)
             .min(fraction_to_boundary_primal_s(state, &ds_d_qf, 1.0))
             .clamp(0.0, 1.0);
-        let alpha_d = fraction_to_boundary_dual_z_min(state, &dz_l, &dz_u, 1.0)
+        // Phase 6d.4: project σ-blended dz_l/dz_u to compressed form
+        // for the FTB scan signature.
+        let dz_l_c = state.bound_layout.project_l(&dz_l);
+        let dz_u_c = state.bound_layout.project_u(&dz_u);
+        let alpha_d = fraction_to_boundary_dual_z_min(state, &dz_l_c, &dz_u_c, 1.0)
             .min(fraction_to_boundary_dual_v_min(state, &dv_l_d_qf, &dv_u_d_qf, 1.0))
             .clamp(0.0, 1.0);
 
@@ -8906,18 +8910,14 @@ fn compute_e_mu(state: &SolverState, primal_inf: f64, dual_inf: f64, compl_inf: 
 /// affine-predictor cap — that all spell out two
 /// `filter::fraction_to_boundary` calls plus a `.min` inline.
 fn fraction_to_boundary_dual_z_min(state: &SolverState, dz_l: &[f64], dz_u: &[f64], tau: f64) -> f64 {
-    // Phase 6c.2: walk compressed-form bound multipliers. The legacy
-    // combined `state.z_l` zero-pads unbounded sides and `dz_l` is
-    // similarly zero on those sides under production invariants, so
-    // skipping them is bit-identical to the n-wide scan. The caller
-    // still passes a full-`n` `dz_l`/`dz_u`; index it via
-    // `bound_layout.x_l_to_full` so the compressed form on the state
-    // side stays in lockstep with the full-form direction on the call
-    // side. Phase 6c.3 will migrate the dz inputs themselves.
+    // Phase 6d.4: caller passes compressed dz_l/dz_u (length n_x_l/
+    // n_x_u). Direct index k on both z_*_compressed and the input
+    // direction; no map indirection needed.
+    debug_assert_eq!(dz_l.len(), state.bound_layout.n_x_l);
+    debug_assert_eq!(dz_u.len(), state.bound_layout.n_x_u);
     let mut alpha = 1.0_f64;
     for k in 0..state.bound_layout.n_x_l {
-        let i = state.bound_layout.x_l_to_full[k];
-        let dsi = dz_l[i];
+        let dsi = dz_l[k];
         if dsi < 0.0 {
             let r = -tau * state.z_l_compressed[k] / dsi;
             if r < alpha {
@@ -8926,8 +8926,7 @@ fn fraction_to_boundary_dual_z_min(state: &SolverState, dz_l: &[f64], dz_u: &[f6
         }
     }
     for k in 0..state.bound_layout.n_x_u {
-        let i = state.bound_layout.x_u_to_full[k];
-        let dsi = dz_u[i];
+        let dsi = dz_u[k];
         if dsi < 0.0 {
             let r = -tau * state.z_u_compressed[k] / dsi;
             if r < alpha {
