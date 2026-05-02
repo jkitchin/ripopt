@@ -3231,10 +3231,20 @@ fn compute_min_dual_infeas_alpha<P: NlpProblem>(
 
     // r_s and dy_d are d-block-only (Ipopt's slack rows don't exist on
     // equality constraints). Phase 5e: read directly from split storage.
+    // Phase 8c.5: walk compressed v_l/v_u mirrors via Pd_L/Pd_U (the
+    // unbounded zero-padded entries contribute nothing).
     let n_d = state.layout.n_d;
     let mut r_s = vec![0.0_f64; n_d];
     for k in 0..n_d {
-        r_s[k] = -state.y_d[k] - state.v_l[k] + state.v_u[k];
+        r_s[k] = -state.y_d[k];
+    }
+    for kc in 0..state.d_bound_layout.n_d_l {
+        let k = state.d_bound_layout.d_l_to_full[kc];
+        r_s[k] -= state.v_l_compressed[kc];
+    }
+    for kc in 0..state.d_bound_layout.n_d_u {
+        let k = state.d_bound_layout.d_u_to_full[kc];
+        r_s[k] += state.v_u_compressed[kc];
     }
     let _ = m;
 
@@ -4290,14 +4300,16 @@ fn compute_alpha_max(
         .clamp(0.0, 1.0);
 
     let alpha_dual_z = fraction_to_boundary_dual_z_min(state, &state.dz_l_compressed, &state.dz_u_compressed, tau);
-    let alpha_dual_v = fraction_to_boundary_dual_v_min(state, &state.dv_l, &state.dv_u, tau);
+    // Phase 8c.5: walk compressed v_l/v_u/dv_l/dv_u storage directly.
+    let alpha_dual_v = filter::fraction_to_boundary(&state.v_l_compressed, &state.dv_l_compressed, tau)
+        .min(filter::fraction_to_boundary(&state.v_u_compressed, &state.dv_u_compressed, tau));
     let alpha_dual_max = alpha_dual_z.min(alpha_dual_v);
 
     if std::env::var("RIPOPT_TRACE_STEP").is_ok() {
-        let dvl_inf = state.dv_l.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
-        let dvu_inf = state.dv_u.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
-        let vl_min = state.v_l.iter().cloned().fold(f64::INFINITY, f64::min);
-        let vu_min = state.v_u.iter().cloned().fold(f64::INFINITY, f64::min);
+        let dvl_inf = state.dv_l_compressed.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+        let dvu_inf = state.dv_u_compressed.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+        let vl_min = state.v_l_compressed.iter().cloned().fold(f64::INFINITY, f64::min);
+        let vu_min = state.v_u_compressed.iter().cloned().fold(f64::INFINITY, f64::min);
         eprintln!(
             "  dual-trace: alpha_d_z={:.3e} alpha_d_v={:.3e} | |dv_L|_inf={:.3e} |dv_U|_inf={:.3e} v_L_min={:.3e} v_U_min={:.3e}",
             alpha_dual_z, alpha_dual_v, dvl_inf, dvu_inf, vl_min, vu_min
@@ -6750,6 +6762,9 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             let z_u_full = state.z_u_combined();
             let x_l_full = state.x_l_combined();
             let x_u_full = state.x_u_combined();
+            // Phase 8c.5: same for compressed v_l/v_u → length n_d.
+            let v_l_full = state.d_bound_layout.expand_l(&state.v_l_compressed, 0.0);
+            let v_u_full = state.d_bound_layout.expand_u(&state.v_u_compressed, 0.0);
             match crate::kkt_aug::aug_step_from_state_mehrotra(
                 n, &state.grad_f,
                 &state.hess_rows, &state.hess_cols, &state.hess_vals,
@@ -6757,7 +6772,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals,
                 &state.x, &x_l_full, &x_u_full, &z_l_full, &z_u_full,
                 &state.s, &state.c_x, &state.d_x, &state.d_l, &state.d_u,
-                &state.y_c, &state.y_d, &state.v_l, &state.v_u,
+                &state.y_c, &state.y_d, &v_l_full, &v_u_full,
                 state.mu, options.kappa_d,
                 crate::kkt_aug::PROBING_SIGMA_MAX_DEFAULT,
                 options.mu_min, mu_max,
@@ -6777,6 +6792,9 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             let z_u_full = state.z_u_combined();
             let x_l_full = state.x_l_combined();
             let x_u_full = state.x_u_combined();
+            // Phase 8c.5: same for compressed v_l/v_u → length n_d.
+            let v_l_full = state.d_bound_layout.expand_l(&state.v_l_compressed, 0.0);
+            let v_u_full = state.d_bound_layout.expand_u(&state.v_u_compressed, 0.0);
             match crate::kkt_aug::aug_step_from_state(
                 n, &state.grad_f,
                 &state.hess_rows, &state.hess_cols, &state.hess_vals,
@@ -6784,7 +6802,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals,
                 &state.x, &x_l_full, &x_u_full, &z_l_full, &z_u_full,
                 &state.s, &state.c_x, &state.d_x, &state.d_l, &state.d_u,
-                &state.y_c, &state.y_d, &state.v_l, &state.v_u,
+                &state.y_c, &state.y_d, &v_l_full, &v_u_full,
                 state.mu, options.kappa_d,
                 use_sparse,
                 aug_solver.as_mut(),
@@ -7565,6 +7583,9 @@ fn attempt_soc_aug<P: NlpProblem>(
     // Phase 7c: same for x_l/x_u.
     let x_l_full = state.x_l_combined();
     let x_u_full = state.x_u_combined();
+    // Phase 8c.5: same for compressed v_l/v_u → length n_d.
+    let v_l_full = state.d_bound_layout.expand_l(&state.v_l_compressed, 0.0);
+    let v_u_full = state.d_bound_layout.expand_u(&state.v_u_compressed, 0.0);
 
     for _soc_iter in 0..options.max_soc {
         for k in 0..n_c {
@@ -7585,7 +7606,7 @@ fn attempt_soc_aug<P: NlpProblem>(
             &state.x, &x_l_full, &x_u_full, &z_l_full, &z_u_full,
             &state.s, &state.c_x, &state.d_x, &state.d_l, &state.d_u,
             &state.y_c, &state.y_d,
-            &state.v_l, &state.v_u,
+            &v_l_full, &v_u_full,
             state.mu, options.kappa_d,
             aug_solver,
             aug_kkt,
@@ -9087,8 +9108,15 @@ fn fraction_to_boundary_dual_z_min(state: &SolverState, dz_l: &[f64], dz_u: &[f6
 /// v_L, v_U via `IpFilterLSAcceptor::ComputeAlphaForY` ↔
 /// `IpIpoptCalculatedQuantities::CalcFracToBound`).
 fn fraction_to_boundary_dual_v_min(state: &SolverState, dv_l: &[f64], dv_u: &[f64], tau: f64) -> f64 {
-    filter::fraction_to_boundary(&state.v_l, dv_l, tau)
-        .min(filter::fraction_to_boundary(&state.v_u, dv_u, tau))
+    // Phase 8c.5: walk compressed slack-multiplier storage. Project
+    // the input dv_l/dv_u (length n_d) onto the same compressed
+    // index space so v[k]+α·dv[k] is checked only on d-rows with the
+    // corresponding finite slack bound. Unbounded sides have v=0
+    // (no boundary to hit) and are skipped by construction.
+    let dv_l_compressed = state.d_bound_layout.project_l(dv_l);
+    let dv_u_compressed = state.d_bound_layout.project_u(dv_u);
+    filter::fraction_to_boundary(&state.v_l_compressed, &dv_l_compressed, tau)
+        .min(filter::fraction_to_boundary(&state.v_u_compressed, &dv_u_compressed, tau))
 }
 
 /// Fraction-to-boundary cap on the primal step `α·dx` against the
@@ -9729,6 +9757,10 @@ fn assemble_kkt_from_state(
     // (still consumes full-`n` x_l/x_u slices).
     let x_l_full = state.x_l_combined();
     let x_u_full = state.x_u_combined();
+    // Phase 8c.5: materialize compressed v_l/v_u to length n_d
+    // (kkt::assemble_kkt still indexes v by d-block index k).
+    let v_l_full = state.d_bound_layout.expand_l(&state.v_l_compressed, 0.0);
+    let v_u_full = state.d_bound_layout.expand_u(&state.v_u_compressed, 0.0);
     let mut sys = kkt::assemble_kkt(
         n, state.layout.n_c, state.layout.n_d,
         &state.hess_rows, &state.hess_cols, &state.hess_vals,
@@ -9739,7 +9771,7 @@ fn assemble_kkt_from_state(
         &state.d_l, &state.d_u,
         &state.s, &state.y_c, &state.y_d,
         &state.x, &x_l_full, &x_u_full, state.mu, kappa_d,
-        use_sparse, &state.v_l, &state.v_u, &state.layout,
+        use_sparse, &v_l_full, &v_u_full, &state.layout,
     );
     // T3.25: snapshot the upstream atags. The assembled matrix is a
     // pure function of (W, J, sigma_x, sigma_s, slacks, multipliers),
@@ -9857,14 +9889,14 @@ fn commit_trial_point(
 /// (`IpIpoptCalculatedQuantities.cpp:3689-3690`,
 /// `y_c + y_d + z_L + z_U + v_L + v_U`).
 fn compute_multiplier_sum(state: &SolverState) -> f64 {
-    // Phase 6d.3: walk compressed bound mirrors. l1_norm over
+    // Phase 6d.3 / 8c.5: walk compressed bound mirrors. l1_norm over
     // unbounded zero-padded sides was 0 anyway.
     l1_norm(&state.y_c)
         + l1_norm(&state.y_d)
         + l1_norm(&state.z_l_compressed)
         + l1_norm(&state.z_u_compressed)
-        + l1_norm(&state.v_l)
-        + l1_norm(&state.v_u)
+        + l1_norm(&state.v_l_compressed)
+        + l1_norm(&state.v_u_compressed)
 }
 
 /// Sum of absolute values of bound-side multipliers contributing to
@@ -9873,12 +9905,12 @@ fn compute_multiplier_sum(state: &SolverState) -> f64 {
 /// `compute_bound_multiplier_count` (finite-bound count over
 /// x and inequality g rows) to form the complementarity scaling `s_c`.
 fn compute_bound_multiplier_sum(state: &SolverState) -> f64 {
-    // Phase 6d.3: walk compressed bound mirrors. l1_norm over
+    // Phase 6d.3 / 8c.5: walk compressed bound mirrors. l1_norm over
     // unbounded zero-padded sides was 0 anyway.
     l1_norm(&state.z_l_compressed)
         + l1_norm(&state.z_u_compressed)
-        + l1_norm(&state.v_l)
-        + l1_norm(&state.v_u)
+        + l1_norm(&state.v_l_compressed)
+        + l1_norm(&state.v_u_compressed)
 }
 
 /// Count of finite variable bounds (z_L.Dim() + z_U.Dim() in Ipopt) plus
