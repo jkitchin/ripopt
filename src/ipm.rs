@@ -769,6 +769,16 @@ pub(crate) struct SolverState {
     /// Compressed upper-bound multiplier search direction
     /// (size `bound_layout.n_x_u`). Phase 6b additive mirror of `dz_u`.
     pub dz_u_compressed: Vec<f64>,
+    /// Phase 7a: compressed lower variable bounds (size `bound_layout.n_x_l`),
+    /// holding only the finite lower-bound values (one entry per `k` in
+    /// `0..n_x_l`, mapped via `bound_layout.x_l_to_full`). Mirrors Ipopt's
+    /// `x_L_` (`IpOrigIpoptNLP.hpp:226`). Phase 7a is additive — readers
+    /// still consume the combined `x_l` (size `n` with `-inf` sentinels);
+    /// later sub-phases migrate readers and drop the combined form.
+    pub x_l_compressed: Vec<f64>,
+    /// Phase 7a: compressed upper variable bounds (size `bound_layout.n_x_u`).
+    /// Mirrors Ipopt's `x_U_`. See [`Self::x_l_compressed`].
+    pub x_u_compressed: Vec<f64>,
     /// Accumulated solver diagnostics.
     pub diagnostics: SolverDiagnostics,
     /// Last point at which evaluations were performed (for new_x tracking).
@@ -1300,6 +1310,10 @@ impl SolverState {
         // so `project_l`/`project_u` extracts only the active components.
         let z_l_compressed = bound_layout.project_l(&z_l);
         let z_u_compressed = bound_layout.project_u(&z_u);
+        // Phase 7a: compressed variable-bound storage (size n_x_l/n_x_u).
+        // Mirrors Ipopt's `x_L_`/`x_U_` (`IpOrigIpoptNLP.hpp:226,253`).
+        let x_l_compressed = bound_layout.project_l(&x_l);
+        let x_u_compressed = bound_layout.project_u(&x_u);
 
         // Phase 3b: split y into y_c (n_c) and y_d (n_d). Combined y from
         // the LS init is projected via the layout; consumers needing the
@@ -1394,6 +1408,8 @@ impl SolverState {
             z_u_compressed,
             dz_l_compressed: vec![0.0; bound_layout.n_x_l],
             dz_u_compressed: vec![0.0; bound_layout.n_x_u],
+            x_l_compressed,
+            x_u_compressed,
             bound_layout,
             diagnostics: SolverDiagnostics::default(),
             x_last_eval: vec![f64::NAN; n],
@@ -2914,6 +2930,8 @@ fn apply_slack_move(state: &mut SolverState, options: &SolverOptions) -> usize {
             let cap = slack_move * state.x_l[i].abs().max(1.0) + s_l;
             let new_s = from_mu.max(s_min).min(cap);
             state.x_l[i] -= new_s - s_l;
+            // Phase 7a: keep compressed mirror in sync.
+            state.x_l_compressed[k] = state.x_l[i];
             adjusted += 1;
         }
     }
@@ -2926,6 +2944,8 @@ fn apply_slack_move(state: &mut SolverState, options: &SolverOptions) -> usize {
             let cap = slack_move * state.x_u[i].abs().max(1.0) + s_u;
             let new_s = from_mu.max(s_min).min(cap);
             state.x_u[i] += new_s - s_u;
+            // Phase 7a: keep compressed mirror in sync.
+            state.x_u_compressed[k] = state.x_u[i];
             adjusted += 1;
         }
     }
@@ -10042,6 +10062,8 @@ mod tests {
             z_u_compressed: Vec::new(),
             dz_l_compressed: Vec::new(),
             dz_u_compressed: Vec::new(),
+            x_l_compressed: Vec::new(),
+            x_u_compressed: Vec::new(),
             diagnostics: SolverDiagnostics::default(),
             x_last_eval: vec![f64::NAN; n],
             adjusted_slacks_count: 0,
@@ -10109,6 +10131,8 @@ mod tests {
         state.z_u_compressed = vec![0.0; state.bound_layout.n_x_u];
         state.dz_l_compressed = vec![0.0; state.bound_layout.n_x_l];
         state.dz_u_compressed = vec![0.0; state.bound_layout.n_x_u];
+        state.x_l_compressed = state.bound_layout.project_l(&state.x_l);
+        state.x_u_compressed = state.bound_layout.project_u(&state.x_u);
     }
 
     #[test]
