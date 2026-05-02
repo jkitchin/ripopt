@@ -6629,12 +6629,16 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         let (step, _dc, mu_new_opt, aug_kkt, _iter_dw, _iter_dc) = if probing {
             let avg_compl = compute_avg_complementarity(&state);
             let mu_max = mu_state.mu_max_cap(options, avg_compl);
+            // Phase 6d.5: materialize compressed z to full-`n` for kkt_aug
+            // consumers (kkt_aug.rs still indexes by full var idx).
+            let z_l_full = state.z_l_combined();
+            let z_u_full = state.z_u_combined();
             match crate::kkt_aug::aug_step_from_state_mehrotra(
                 n, &state.grad_f,
                 &state.hess_rows, &state.hess_cols, &state.hess_vals,
                 &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals,
                 &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals,
-                &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u,
+                &state.x, &state.x_l, &state.x_u, &z_l_full, &z_u_full,
                 &state.s, &state.c_x, &state.d_x, &state.d_l, &state.d_u,
                 &state.y_c, &state.y_d, &state.v_l, &state.v_u,
                 state.mu, options.kappa_d,
@@ -6651,12 +6655,15 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 }
             }
         } else {
+            // Phase 6d.5: materialize compressed z to full-`n` for kkt_aug.
+            let z_l_full = state.z_l_combined();
+            let z_u_full = state.z_u_combined();
             match crate::kkt_aug::aug_step_from_state(
                 n, &state.grad_f,
                 &state.hess_rows, &state.hess_cols, &state.hess_vals,
                 &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals,
                 &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals,
-                &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u,
+                &state.x, &state.x_l, &state.x_u, &z_l_full, &z_u_full,
                 &state.s, &state.c_x, &state.d_x, &state.d_l, &state.d_u,
                 &state.y_c, &state.y_d, &state.v_l, &state.v_u,
                 state.mu, options.kappa_d,
@@ -7432,6 +7439,11 @@ fn attempt_soc_aug<P: NlpProblem>(
     let (c_seed_soc, d_seed_soc) = split_from_g(state, g_trial);
     let mut theta_prev_soc = theta_for_split_d_s(state, &c_seed_soc, &d_seed_soc, &s_trial_seed);
 
+    // Phase 6d.5: materialize compressed z once for the SOC inner loop's
+    // kkt_aug calls (kkt_aug.rs still consumes full-`n` z slices).
+    let z_l_full = state.z_l_combined();
+    let z_u_full = state.z_u_combined();
+
     for _soc_iter in 0..options.max_soc {
         for k in 0..n_c {
             c_soc[k] += alpha_primal_soc * latest_trial_c[k];
@@ -7448,7 +7460,7 @@ fn attempt_soc_aug<P: NlpProblem>(
             n, &state.grad_f,
             &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals,
             &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals,
-            &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u,
+            &state.x, &state.x_l, &state.x_u, &z_l_full, &z_u_full,
             &state.s, &state.c_x, &state.d_x, &state.d_l, &state.d_u,
             &state.y_c, &state.y_d,
             &state.v_l, &state.v_u,
@@ -7649,11 +7661,14 @@ fn recompute_y_after_restoration(
     }
     let g_l_combined_for_ls = state.g_l_combined();
     let g_u_combined_for_ls = state.g_u_combined();
+    // Phase 6d.5: materialize compressed z to full-`n` for LS estimator.
+    let z_l_full = state.z_l_combined();
+    let z_u_full = state.z_u_combined();
     let (jac_rows_m, jac_cols_m, jac_vals_m) = rebuild_combined_jac(state);
     let y_ls_result = compute_ls_multiplier_estimate_augmented(
         &state.grad_f, &jac_rows_m, &jac_cols_m, &jac_vals_m,
         &g_l_combined_for_ls, &g_u_combined_for_ls, n, m,
-        Some(&state.z_l), Some(&state.z_u),
+        Some(&z_l_full), Some(&z_u_full),
         None,
     );
     let y_accepted = match y_ls_result {
@@ -7695,11 +7710,14 @@ fn recompute_y_post_step_full_augmented(
     let v_u_combined_for_ls = state.v_u_combined();
     let g_l_combined_for_ls = state.g_l_combined();
     let g_u_combined_for_ls = state.g_u_combined();
+    // Phase 6d.5: materialize compressed z to full-`n` for LS estimator.
+    let z_l_full = state.z_l_combined();
+    let z_u_full = state.z_u_combined();
     let (jac_rows_m, jac_cols_m, jac_vals_m) = rebuild_combined_jac(state);
     let y_ls_result = compute_ls_multiplier_estimate_augmented(
         &state.grad_f, &jac_rows_m, &jac_cols_m, &jac_vals_m,
         &g_l_combined_for_ls, &g_u_combined_for_ls, n, m,
-        Some(&state.z_l), Some(&state.z_u),
+        Some(&z_l_full), Some(&z_u_full),
         Some((&v_l_combined_for_ls, &v_u_combined_for_ls)),
     );
     if let Some(y_ls) = y_ls_result {
@@ -9081,11 +9099,14 @@ fn compute_dual_inf_at_state(state: &SolverState) -> f64 {
     // 2069-2098) — no κ_d damping. The damped variants
     // (`curr_grad_lag_with_damping_x/s`, lines 2131-2227) are used
     // *only* in the augmented-system RHS (`curr_grad_barrier_obj_x`).
+    // Phase 6d.5: materialize compressed z for the convergence helper.
+    let z_l_full = state.z_l_combined();
+    let z_u_full = state.z_u_combined();
     let x_part = convergence::dual_infeasibility_split(
         &state.grad_f,
         &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals, &state.y_c,
         &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals, &state.y_d,
-        &state.z_l, &state.z_u, state.n,
+        &z_l_full, &z_u_full, state.n,
     );
     x_part.max(slack_dual_inf_max(state))
 }
@@ -9169,11 +9190,14 @@ fn compute_dual_inf_unscaled_at_state(state: &SolverState) -> f64 {
     // Phase 5c: `dual_infeasibility_scaled` was bit-equivalent to
     // `dual_infeasibility` (same Lagrangian gradient, no per-component
     // divisor — see T3.1). Routes through the split form too.
+    // Phase 6d.5: materialize compressed z for the convergence helper.
+    let z_l_full = state.z_l_combined();
+    let z_u_full = state.z_u_combined();
     let x_part = convergence::dual_infeasibility_split(
         &state.grad_f,
         &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals, &state.y_c,
         &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals, &state.y_d,
-        &state.z_l, &state.z_u, state.n,
+        &z_l_full, &z_u_full, state.n,
     );
     x_part.max(slack_dual_inf_max(state))
 }
@@ -9198,8 +9222,11 @@ fn compl_err_with_z(state: &SolverState, z_l: &[f64], z_u: &[f64]) -> f64 {
 /// terms the convergence test cannot detect a stalled inequality
 /// constraint where `y` and slack are both nonzero.
 fn compute_compl_err_at_state(state: &SolverState) -> f64 {
+    // Phase 6d.5: materialize compressed z for the convergence helper.
+    let z_l_full = state.z_l_combined();
+    let z_u_full = state.z_u_combined();
     convergence::complementarity_error_full_split(
-        &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u,
+        &state.x, &state.x_l, &state.x_u, &z_l_full, &z_u_full,
         &state.g_d(), &state.d_l(), &state.d_u(),
         &state.v_l_d(), &state.v_u_d(), 0.0,
     )
@@ -9483,9 +9510,13 @@ fn compute_sigma_from_state(state: &SolverState) -> Vec<f64> {
 /// two callers — the main-step recovery in solve_for_search_direction
 /// and the Mehrotra affine-predictor probe.
 fn recover_dz_from_state(state: &SolverState, dx: &[f64], mu: f64) -> (Vec<f64>, Vec<f64>) {
+    // Phase 6d.5: materialize compressed z for kkt::recover_dz (still
+    // indexes z by full var idx).
+    let z_l_full = state.z_l_combined();
+    let z_u_full = state.z_u_combined();
     kkt::recover_dz(
         &state.x, &state.x_l, &state.x_u,
-        &state.z_l, &state.z_u, dx, mu,
+        &z_l_full, &z_u_full, dx, mu,
     )
 }
 
