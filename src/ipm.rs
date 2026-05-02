@@ -659,10 +659,14 @@ pub(crate) struct SolverState {
     pub alpha_dual: f64,
     /// Iteration counter.
     pub iter: usize,
-    /// Variable lower bounds.
-    pub x_l: Vec<f64>,
-    /// Variable upper bounds.
-    pub x_u: Vec<f64>,
+    // Phase 7c: combined-form `x_l`/`x_u` (size `n` with `±inf` sentinels)
+    // dropped. The compressed mirrors `x_l_compressed` (size `n_x_l`) and
+    // `x_u_compressed` (size `n_x_u`) are now the sole canonical storage,
+    // matching Ipopt's `x_L_`/`x_U_` ExpansionMatrix-projected bounds
+    // (`IpOrigIpoptNLP.hpp:226,253`). Use `state.x_l_at(i)` / `x_u_at(i)`
+    // for per-element reads (returns `±inf` on unbounded sides) or
+    // `state.x_l_combined()` / `x_u_combined()` to materialize a full-`n`
+    // view at API boundaries.
     /// Equality-row target value (Ipopt's `c_rhs`, size `layout.n_c`):
     /// stores the equality-row target. Phase 3f-final: native split
     /// storage; the legacy combined `g_l`/`g_u` fields are gone.
@@ -1375,8 +1379,6 @@ impl SolverState {
             alpha_primal: 0.0,
             alpha_dual: 0.0,
             iter: 0,
-            x_l,
-            x_u,
             c_rhs,
             d_l,
             d_u,
@@ -1947,7 +1949,7 @@ impl SolverState {
     /// Phase 7b: full-`n` view of the lower variable bound. Reads from
     /// the compressed mirror via `bound_layout.full_to_x_l[i]`; unbounded
     /// indices return `f64::NEG_INFINITY`. Bit-identical to the legacy
-    /// `state.x_l[i]` read under the production invariant.
+    /// `state.x_l_at(i)` read under the production invariant.
     pub fn x_l_at(&self, i: usize) -> f64 {
         match self.bound_layout.full_to_x_l[i] {
             Some(k) => self.x_l_compressed[k],
@@ -2073,8 +2075,8 @@ impl SolverState {
         let mut grad_phi_dx = 0.0;
         let kappa_d = options.kappa_d;
         for i in 0..self.n {
-            let l_fin = self.x_l[i].is_finite();
-            let u_fin = self.x_u[i].is_finite();
+            let l_fin = self.x_l_at(i).is_finite();
+            let u_fin = self.x_u_at(i).is_finite();
             let mut grad_phi_i = self.grad_f[i];
             if l_fin {
                 grad_phi_i -= self.mu / slack_xl(self, i);
@@ -2404,8 +2406,8 @@ fn print_problem_header(state: &SolverState) {
     let mut var_both = 0usize;
     let mut var_only_upper = 0usize;
     for i in 0..n {
-        let l_fin = state.x_l[i].is_finite();
-        let u_fin = state.x_u[i].is_finite();
+        let l_fin = state.x_l_at(i).is_finite();
+        let u_fin = state.x_u_at(i).is_finite();
         match (l_fin, u_fin) {
             (true, true) => var_both += 1,
             (true, false) => var_only_lower += 1,
@@ -2555,14 +2557,14 @@ fn compute_barrier_phi(
 ) -> f64 {
     let mut phi = obj;
     for i in 0..n {
-        let l_fin = state.x_l[i].is_finite();
-        let u_fin = state.x_u[i].is_finite();
+        let l_fin = state.x_l_at(i).is_finite();
+        let u_fin = state.x_u_at(i).is_finite();
         if l_fin {
-            let slack = (x[i] - state.x_l[i]).max(1e-20);
+            let slack = (x[i] - state.x_l_at(i)).max(1e-20);
             phi -= state.mu * slack.ln();
         }
         if u_fin {
-            let slack = (state.x_u[i] - x[i]).max(1e-20);
+            let slack = (state.x_u_at(i) - x[i]).max(1e-20);
             phi -= state.mu * slack.ln();
         }
         // kappa_d damping: penalize drift toward the open side for
@@ -2570,9 +2572,9 @@ fn compute_barrier_phi(
         // CalcBarrierTerm in IpIpoptCalculatedQuantities.cpp.
         if kappa_d > 0.0 && (l_fin ^ u_fin) {
             let s_oneside = if l_fin {
-                (x[i] - state.x_l[i]).max(0.0)
+                (x[i] - state.x_l_at(i)).max(0.0)
             } else {
-                (state.x_u[i] - x[i]).max(0.0)
+                (state.x_u_at(i) - x[i]).max(0.0)
             };
             phi += kappa_d * state.mu * s_oneside;
         }
@@ -2965,8 +2967,6 @@ fn apply_slack_move(state: &mut SolverState, options: &SolverOptions) -> usize {
             let cap = slack_move * state.x_l_compressed[k].abs().max(1.0) + s_l;
             let new_s = from_mu.max(s_min).min(cap);
             state.x_l_compressed[k] -= new_s - s_l;
-            // Phase 7b: keep legacy combined mirror in sync (dropped in 7c).
-            state.x_l[i] = state.x_l_compressed[k];
             adjusted += 1;
         }
     }
@@ -2979,8 +2979,6 @@ fn apply_slack_move(state: &mut SolverState, options: &SolverOptions) -> usize {
             let cap = slack_move * state.x_u_compressed[k].abs().max(1.0) + s_u;
             let new_s = from_mu.max(s_min).min(cap);
             state.x_u_compressed[k] += new_s - s_u;
-            // Phase 7b: keep legacy combined mirror in sync (dropped in 7c).
-            state.x_u[i] = state.x_u_compressed[k];
             adjusted += 1;
         }
     }
@@ -3515,18 +3513,20 @@ fn try_gn_restoration<P: NlpProblem>(
     m: usize,
     deadline: Option<Instant>,
 ) -> bool {
+    let x_l_full = state.x_l_combined();
+    let x_u_full = state.x_u_combined();
     // T3.12: outer-NLP barrier context for TestOrigProgress.
     let outer_ctx = OuterBarrierContext {
         mu_outer: state.mu,
-        x_l: &state.x_l,
-        x_u: &state.x_u,
+        x_l: &x_l_full,
+        x_u: &x_u_full,
     };
     let g_l_combined_for_resto = state.g_l_combined();
     let g_u_combined_for_resto = state.g_u_combined();
     let (x_rest, gn_success) = restoration.restore_with_outer(
         &state.x,
-        &state.x_l,
-        &state.x_u,
+        &x_l_full,
+        &x_u_full,
         &g_l_combined_for_resto,
         &g_u_combined_for_resto,
         &state.jac_rows,
@@ -3847,16 +3847,18 @@ fn reevaluate_after_step<P: NlpProblem>(
     }
 
     // α halving exhausted: try restoration.
+    let x_l_full = state.x_l_combined();
+    let x_u_full = state.x_u_combined();
     // T3.12: outer-NLP barrier context for TestOrigProgress.
     let outer_ctx = OuterBarrierContext {
         mu_outer: state.mu,
-        x_l: &state.x_l,
-        x_u: &state.x_u,
+        x_l: &x_l_full,
+        x_u: &x_u_full,
     };
     let g_l_combined_for_resto = state.g_l_combined();
     let g_u_combined_for_resto = state.g_u_combined();
     let (x_rest, success) = restoration.restore_with_outer(
-        &state.x, &state.x_l, &state.x_u, &g_l_combined_for_resto, &g_u_combined_for_resto,
+        &state.x, &x_l_full, &x_u_full, &g_l_combined_for_resto, &g_u_combined_for_resto,
         &state.jac_rows, &state.jac_cols, n, m, options,
         &|theta, phi| filter.is_acceptable(theta, phi),
         &|x_eval, g_out| problem.constraints(x_eval, true, g_out),
@@ -4196,8 +4198,8 @@ fn compute_alpha_max(
         let mut lim_side = "";
         let mut lim_block = "x";
         for i in 0..state.n {
-            if state.x_l[i].is_finite() && state.dx[i] < 0.0 {
-                let slack = state.x[i] - state.x_l[i];
+            if state.x_l_at(i).is_finite() && state.dx[i] < 0.0 {
+                let slack = state.x[i] - state.x_l_at(i);
                 let a = -tau * slack / state.dx[i];
                 if a < lim_alpha {
                     lim_alpha = a;
@@ -4206,8 +4208,8 @@ fn compute_alpha_max(
                     lim_block = "x";
                 }
             }
-            if state.x_u[i].is_finite() && state.dx[i] > 0.0 {
-                let slack = state.x_u[i] - state.x[i];
+            if state.x_u_at(i).is_finite() && state.dx[i] > 0.0 {
+                let slack = state.x_u_at(i) - state.x[i];
                 let a = tau * slack / state.dx[i];
                 if a < lim_alpha {
                     lim_alpha = a;
@@ -4261,7 +4263,7 @@ fn compute_alpha_max(
                 (xv, xb, state.ds_at(lim_idx), (xv - xb).abs())
             } else {
                 let xv = state.x[lim_idx];
-                let xb = if lim_side == "L" { state.x_l[lim_idx] } else { state.x_u[lim_idx] };
+                let xb = if lim_side == "L" { state.x_l_at(lim_idx) } else { state.x_u_at(lim_idx) };
                 (xv, xb, state.dx[lim_idx], (xv - xb).abs())
             };
             eprintln!(
@@ -4578,8 +4580,10 @@ fn compute_quality_function_mu(
     // across columns; the default trait impl loops single-RHS solves and
     // matches the prior behavior. T3.26: mu oracles use inexact backsolves
     // (allow_inexact=true, IpPDFullSpaceSolver.cpp:229-239).
+    let x_l_full = state.x_l_combined();
+    let x_u_full = state.x_u_combined();
     let rhs_aff = kkt::affine_predictor_rhs(
-        &kkt.rhs, &state.x, &state.x_l, &state.x_u, state.mu, options.kappa_d,
+        &kkt.rhs, &state.x, &x_l_full, &x_u_full, state.mu, options.kappa_d,
     );
     let pairs = kkt::solve_with_custom_rhs_many(
         kkt.n, kkt.dim, solver.as_mut(), &[&rhs_aff, &kkt.rhs],
@@ -4864,7 +4868,7 @@ fn update_barrier_parameter(
     // which would destroy filter protection against infeasible steps. This
     // prevents the PENTAGON-type failure where mu=1e-11 at iteration 1 causes
     // the switching condition to accept a step that destroys feasibility.
-    let has_bounds = (0..n).any(|i| state.x_l[i].is_finite() || state.x_u[i].is_finite());
+    let has_bounds = (0..n).any(|i| state.x_l_at(i).is_finite() || state.x_u_at(i).is_finite());
     if !has_bounds {
         state.mu = state.mu.powf(options.mu_superlinear_decrease_power).max(options.mu_min);
         return;
@@ -5673,20 +5677,20 @@ fn build_iterate_snapshot(state: &SolverState) -> crate::intermediate::IterateSn
     // n-wide infeasibility sweep over x_l/x_u still needs the n-wide
     // viol arrays so split the loop.
     for i in 0..n {
-        if state.x_l[i].is_finite() {
-            x_l_viol[i] = (state.x_l[i] - state.x[i]).max(0.0);
+        if state.x_l_at(i).is_finite() {
+            x_l_viol[i] = (state.x_l_at(i) - state.x[i]).max(0.0);
         }
-        if state.x_u[i].is_finite() {
-            x_u_viol[i] = (state.x[i] - state.x_u[i]).max(0.0);
+        if state.x_u_at(i).is_finite() {
+            x_u_viol[i] = (state.x[i] - state.x_u_at(i)).max(0.0);
         }
     }
     for k in 0..state.bound_layout.n_x_l {
         let i = state.bound_layout.x_l_to_full[k];
-        compl_xl[i] = (state.x[i] - state.x_l[i]) * state.z_l_compressed[k];
+        compl_xl[i] = (state.x[i] - state.x_l_at(i)) * state.z_l_compressed[k];
     }
     for k in 0..state.bound_layout.n_x_u {
         let i = state.bound_layout.x_u_to_full[k];
-        compl_xu[i] = (state.x_u[i] - state.x[i]) * state.z_u_compressed[k];
+        compl_xu[i] = (state.x_u_at(i) - state.x[i]) * state.z_u_compressed[k];
     }
     // grad_lag = grad_f + J^T y - z_l + z_u
     let mut grad_lag = state.grad_f.clone();
@@ -6007,12 +6011,14 @@ fn apply_warm_start(state: &mut SolverState, options: &SolverOptions) {
     // compressed storage.
     let mut z_l_full = state.z_l_combined();
     let mut z_u_full = state.z_u_combined();
+    let x_l_full = state.x_l_combined();
+    let x_u_full = state.x_u_combined();
     state.mu = WarmStartInitializer::initialize(
         &mut state.x,
         &mut z_l_full,
         &mut z_u_full,
-        &state.x_l,
-        &state.x_u,
+        &x_l_full,
+        &x_u_full,
         options,
     );
     state.z_l_compressed = state.bound_layout.project_l(&z_l_full);
@@ -6042,20 +6048,20 @@ fn initial_evaluate_with_recovery<P: NlpProblem>(
     for &push_factor in &[1e-2, 1e-1, 0.5] {
         state.x.copy_from_slice(&x_saved);
         for i in 0..n {
-            if state.x_l[i].is_finite() && state.x_u[i].is_finite() {
-                let range = state.x_u[i] - state.x_l[i];
+            if state.x_l_at(i).is_finite() && state.x_u_at(i).is_finite() {
+                let range = state.x_u_at(i) - state.x_l_at(i);
                 let push = push_factor * range;
                 if range > 2.0 * push {
-                    state.x[i] = state.x[i].max(state.x_l[i] + push).min(state.x_u[i] - push);
+                    state.x[i] = state.x[i].max(state.x_l_at(i) + push).min(state.x_u_at(i) - push);
                 } else {
-                    state.x[i] = 0.5 * (state.x_l[i] + state.x_u[i]);
+                    state.x[i] = 0.5 * (state.x_l_at(i) + state.x_u_at(i));
                 }
-            } else if state.x_l[i].is_finite() {
-                let push = push_factor * state.x_l[i].abs().max(1.0);
-                state.x[i] = state.x[i].max(state.x_l[i] + push);
-            } else if state.x_u[i].is_finite() {
-                let push = push_factor * state.x_u[i].abs().max(1.0);
-                state.x[i] = state.x[i].min(state.x_u[i] - push);
+            } else if state.x_l_at(i).is_finite() {
+                let push = push_factor * state.x_l_at(i).abs().max(1.0);
+                state.x[i] = state.x[i].max(state.x_l_at(i) + push);
+            } else if state.x_u_at(i).is_finite() {
+                let push = push_factor * state.x_u_at(i).abs().max(1.0);
+                state.x[i] = state.x[i].min(state.x_u_at(i) - push);
             }
         }
         reseed_bound_multipliers_from_mu(state, options.mu_init);
@@ -6480,8 +6486,8 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 (0usize, 0.0f64),
                 |(ai, av), (i, &v)| if v.abs() > av { (i, v.abs()) } else { (ai, av) },
             );
-            let x_l_fin = state.x_l[gl_idx].is_finite();
-            let x_u_fin = state.x_u[gl_idx].is_finite();
+            let x_l_fin = state.x_l_at(gl_idx).is_finite();
+            let x_u_fin = state.x_u_at(gl_idx).is_finite();
             let x_inf = state.x.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
             rip_log!(
                 "ripopt: iter0-probe: |grad_f|_inf={:.3e}@var{}, |J^T y|_inf={:.3e}, |y|_inf={:.3e}, |z_L|_inf={:.3e}, |z_U|_inf={:.3e}, sum|y|={:.3e}, sum|z_L|={:.3e}, sum|z_U|={:.3e}, |x|_inf={:.3e}, n={} m={}",
@@ -6629,12 +6635,14 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             // consumers (kkt_aug.rs still indexes by full var idx).
             let z_l_full = state.z_l_combined();
             let z_u_full = state.z_u_combined();
+            let x_l_full = state.x_l_combined();
+            let x_u_full = state.x_u_combined();
             match crate::kkt_aug::aug_step_from_state_mehrotra(
                 n, &state.grad_f,
                 &state.hess_rows, &state.hess_cols, &state.hess_vals,
                 &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals,
                 &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals,
-                &state.x, &state.x_l, &state.x_u, &z_l_full, &z_u_full,
+                &state.x, &x_l_full, &x_u_full, &z_l_full, &z_u_full,
                 &state.s, &state.c_x, &state.d_x, &state.d_l, &state.d_u,
                 &state.y_c, &state.y_d, &state.v_l, &state.v_u,
                 state.mu, options.kappa_d,
@@ -6654,12 +6662,14 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             // Phase 6d.5: materialize compressed z to full-`n` for kkt_aug.
             let z_l_full = state.z_l_combined();
             let z_u_full = state.z_u_combined();
+            let x_l_full = state.x_l_combined();
+            let x_u_full = state.x_u_combined();
             match crate::kkt_aug::aug_step_from_state(
                 n, &state.grad_f,
                 &state.hess_rows, &state.hess_cols, &state.hess_vals,
                 &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals,
                 &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals,
-                &state.x, &state.x_l, &state.x_u, &z_l_full, &z_u_full,
+                &state.x, &x_l_full, &x_u_full, &z_l_full, &z_u_full,
                 &state.s, &state.c_x, &state.d_x, &state.d_l, &state.d_u,
                 &state.y_c, &state.y_d, &state.v_l, &state.v_u,
                 state.mu, options.kappa_d,
@@ -6742,8 +6752,8 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 let grad_f_pv = state.grad_f[probe_var];
                 // Σ_x at probe_var (matches kkt_aug::aug_step_from_state formula)
                 let xi = state.x[probe_var];
-                let xli = state.x_l[probe_var];
-                let xui = state.x_u[probe_var];
+                let xli = state.x_l_at(probe_var);
+                let xui = state.x_u_at(probe_var);
                 let mut sigma_x_pv = 0.0_f64;
                 // Phase 6d.3: index compressed mirrors via BoundLayout.
                 if let Some(k) = state.bound_layout.full_to_x_l[probe_var] {
@@ -6842,8 +6852,8 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             for &probe_i in &[1753usize, 1801usize, 1871usize] {
                 if probe_i < state.n {
                     let xi = state.x[probe_i];
-                    let xli = state.x_l[probe_i];
-                    let xui = state.x_u[probe_i];
+                    let xli = state.x_l_at(probe_i);
+                    let xui = state.x_u_at(probe_i);
                     // Phase 6d.3: index compressed mirrors via BoundLayout
                     // (unbounded sides report 0 — same as the legacy combined storage).
                     let zli = state.bound_layout.full_to_x_l[probe_i]
@@ -7127,7 +7137,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             // identical to the n-wide+is_finite scan.
             for k in 0..state.bound_layout.n_x_l {
                 let i = state.bound_layout.x_l_to_full[k];
-                let s = state.x[i] - state.x_l[i];
+                let s = state.x[i] - state.x_l_at(i);
                 if s > 0.0 {
                     let r = (state.z_l_compressed[k] * s).abs() / state.mu.max(1e-300);
                     if r > worst_zs_ratio { worst_zs_ratio = r; worst_zs_idx = i; worst_zs_side = "L"; }
@@ -7135,7 +7145,7 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             }
             for k in 0..state.bound_layout.n_x_u {
                 let i = state.bound_layout.x_u_to_full[k];
-                let s = state.x_u[i] - state.x[i];
+                let s = state.x_u_at(i) - state.x[i];
                 if s > 0.0 {
                     let r = (state.z_u_compressed[k] * s).abs() / state.mu.max(1e-300);
                     if r > worst_zs_ratio { worst_zs_ratio = r; worst_zs_idx = i; worst_zs_side = "U"; }
@@ -7439,6 +7449,9 @@ fn attempt_soc_aug<P: NlpProblem>(
     // kkt_aug calls (kkt_aug.rs still consumes full-`n` z slices).
     let z_l_full = state.z_l_combined();
     let z_u_full = state.z_u_combined();
+    // Phase 7c: same for x_l/x_u.
+    let x_l_full = state.x_l_combined();
+    let x_u_full = state.x_u_combined();
 
     for _soc_iter in 0..options.max_soc {
         for k in 0..n_c {
@@ -7456,7 +7469,7 @@ fn attempt_soc_aug<P: NlpProblem>(
             n, &state.grad_f,
             &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals,
             &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals,
-            &state.x, &state.x_l, &state.x_u, &z_l_full, &z_u_full,
+            &state.x, &x_l_full, &x_u_full, &z_l_full, &z_u_full,
             &state.s, &state.c_x, &state.d_x, &state.d_l, &state.d_u,
             &state.y_c, &state.y_d,
             &state.v_l, &state.v_u,
@@ -7552,8 +7565,8 @@ fn apply_kappa_sigma_clamp_to_resto_z(
     // user-supplied full-`n`, indexed by the bound's full var idx.
     for k in 0..state.bound_layout.n_x_l {
         let i = state.bound_layout.x_l_to_full[k];
-        let s_cur = (x_cur[i] - state.x_l[i]).max(1e-12);
-        let s_trial = (state.x[i] - state.x_l[i]).max(1e-12);
+        let s_cur = (x_cur[i] - state.x_l_at(i)).max(1e-12);
+        let s_trial = (state.x[i] - state.x_l_at(i)).max(1e-12);
         let z_in = if i < zl_resto.len() { zl_resto[i].max(1e-20) } else { mu / s_cur };
         let dz = (mu - z_in * (s_trial - s_cur)) / s_cur - z_in;
         let alpha_d = if dz < 0.0 {
@@ -7569,8 +7582,8 @@ fn apply_kappa_sigma_clamp_to_resto_z(
     }
     for k in 0..state.bound_layout.n_x_u {
         let i = state.bound_layout.x_u_to_full[k];
-        let s_cur = (state.x_u[i] - x_cur[i]).max(1e-12);
-        let s_trial = (state.x_u[i] - state.x[i]).max(1e-12);
+        let s_cur = (state.x_u_at(i) - x_cur[i]).max(1e-12);
+        let s_trial = (state.x_u_at(i) - state.x[i]).max(1e-12);
         let z_in = if i < zu_resto.len() { zu_resto[i].max(1e-20) } else { mu / s_cur };
         let dz = (mu - z_in * (s_trial - s_cur)) / s_cur - z_in;
         let alpha_d = if dz < 0.0 {
@@ -7595,13 +7608,13 @@ fn reset_bound_multipliers_after_restoration(state: &mut SolverState, n: usize) 
     // Phase 6d.6: walk compressed bound storage.
     for k in 0..state.bound_layout.n_x_l {
         let i = state.bound_layout.x_l_to_full[k];
-        let slack = (state.x[i] - state.x_l[i]).max(1e-12);
+        let slack = (state.x[i] - state.x_l_at(i)).max(1e-12);
         state.z_l_compressed[k] = mu_for_reset / slack;
         z_max = z_max.max(state.z_l_compressed[k]);
     }
     for k in 0..state.bound_layout.n_x_u {
         let i = state.bound_layout.x_u_to_full[k];
-        let slack = (state.x_u[i] - state.x[i]).max(1e-12);
+        let slack = (state.x_u_at(i) - state.x[i]).max(1e-12);
         state.z_u_compressed[k] = mu_for_reset / slack;
         z_max = z_max.max(state.z_u_compressed[k]);
     }
@@ -8854,11 +8867,11 @@ fn recover_active_set_z(state: &SolverState, gj: &[f64], n: usize) -> (Vec<f64>,
     let mut zu = vec![0.0; n];
     let kc = 1e10;
     for i in 0..n {
-        if gj[i] > 0.0 && state.x_l[i].is_finite() {
+        if gj[i] > 0.0 && state.x_l_at(i).is_finite() {
             if gj[i] * slack_xl(state, i) <= kc * state.mu.max(1e-20) {
                 zl[i] = gj[i];
             }
-        } else if gj[i] < 0.0 && state.x_u[i].is_finite() {
+        } else if gj[i] < 0.0 && state.x_u_at(i).is_finite() {
             if (-gj[i]) * slack_xu(state, i) <= kc * state.mu.max(1e-20) {
                 zu[i] = -gj[i];
             }
@@ -8967,12 +8980,12 @@ fn fraction_to_boundary_dual_v_min(state: &SolverState, dv_l: &[f64], dv_u: &[f6
 fn fraction_to_boundary_primal_x(state: &SolverState, dx: &[f64], tau: f64) -> f64 {
     let mut alpha = 1.0_f64;
     for i in 0..state.n {
-        if state.x_l[i].is_finite() && dx[i] < 0.0 {
-            let slack = state.x[i] - state.x_l[i];
+        if state.x_l_at(i).is_finite() && dx[i] < 0.0 {
+            let slack = state.x[i] - state.x_l_at(i);
             alpha = alpha.min(-tau * slack / dx[i]);
         }
-        if state.x_u[i].is_finite() && dx[i] > 0.0 {
-            let slack = state.x_u[i] - state.x[i];
+        if state.x_u_at(i).is_finite() && dx[i] > 0.0 {
+            let slack = state.x_u_at(i) - state.x[i];
             alpha = alpha.min(tau * slack / dx[i]);
         }
     }
@@ -9198,8 +9211,10 @@ fn compute_dual_inf_unscaled_at_state(state: &SolverState) -> f64 {
 /// instead of `state.z_l`/`state.z_u`. Always evaluated with `μ = 0`
 /// (the optimality complementarity rather than the centered-path one).
 fn compl_err_with_z(state: &SolverState, z_l: &[f64], z_u: &[f64]) -> f64 {
+    let x_l_full = state.x_l_combined();
+    let x_u_full = state.x_u_combined();
     convergence::complementarity_error(
-        &state.x, &state.x_l, &state.x_u, z_l, z_u, 0.0,
+        &state.x, &x_l_full, &x_u_full, z_l, z_u, 0.0,
     )
 }
 
@@ -9215,8 +9230,10 @@ fn compute_compl_err_at_state(state: &SolverState) -> f64 {
     // Phase 6d.5: materialize compressed z for the convergence helper.
     let z_l_full = state.z_l_combined();
     let z_u_full = state.z_u_combined();
+    let x_l_full = state.x_l_combined();
+    let x_u_full = state.x_u_combined();
     convergence::complementarity_error_full_split(
-        &state.x, &state.x_l, &state.x_u, &z_l_full, &z_u_full,
+        &state.x, &x_l_full, &x_u_full, &z_l_full, &z_u_full,
         &state.g_d(), &state.d_l(), &state.d_u(),
         &state.v_l_d(), &state.v_u_d(), 0.0,
     )
@@ -9278,13 +9295,13 @@ fn compute_pderror_e_mu(state: &SolverState, mu: f64) -> f64 {
     // Phase 6d.3: walk compressed bound mirrors.
     for k in 0..state.bound_layout.n_x_l {
         let i = state.bound_layout.x_l_to_full[k];
-        let slack = (state.x[i] - state.x_l[i]).max(0.0);
+        let slack = (state.x[i] - state.x_l_at(i)).max(0.0);
         compl_l1 += (slack * state.z_l_compressed[k] - mu).abs();
         n_compl += 1;
     }
     for k in 0..state.bound_layout.n_x_u {
         let i = state.bound_layout.x_u_to_full[k];
-        let slack = (state.x_u[i] - state.x[i]).max(0.0);
+        let slack = (state.x_u_at(i) - state.x[i]).max(0.0);
         compl_l1 += (slack * state.z_u_compressed[k] - mu).abs();
         n_compl += 1;
     }
@@ -9351,16 +9368,16 @@ fn clamp_to_open_bounds(arr: &mut [f64], x_l: &[f64], x_u: &[f64], i: usize) {
 /// Strictly-positive lower-bound primal slack `max(x - x_l, 1e-20)`,
 /// clamped away from zero so callers can divide by it without producing
 /// inf/NaN. Caller is responsible for the `x_l[i].is_finite()` guard;
-/// without that guard `state.x_l[i]` may be -inf and the result is
+/// without that guard `state.x_l_at(i)` may be -inf and the result is
 /// undefined.
 fn slack_xl(state: &SolverState, i: usize) -> f64 {
-    (state.x[i] - state.x_l[i]).max(1e-20)
+    (state.x[i] - state.x_l_at(i)).max(1e-20)
 }
 
 /// Strictly-positive upper-bound primal slack `max(x_u - x, 1e-20)`.
 /// See [`slack_xl`] for the finite-guard contract.
 fn slack_xu(state: &SolverState, i: usize) -> f64 {
-    (state.x_u[i] - state.x[i]).max(1e-20)
+    (state.x_u_at(i) - state.x[i]).max(1e-20)
 }
 
 /// Strictly-positive lower-side constraint slack `max(s - g_l, 1e-20)`.
@@ -9406,10 +9423,12 @@ pub(crate) fn sync_state_s_to_g(state: &mut SolverState) {
 fn compute_clamped_trial_x(state: &SolverState, dx: &[f64], alpha: f64) -> Vec<f64> {
     let n = state.n;
     let mut x_trial = vec![0.0; n];
+    let x_l_full = state.x_l_combined();
+    let x_u_full = state.x_u_combined();
     #[allow(clippy::needless_range_loop)]
     for i in 0..n {
         x_trial[i] = state.x[i] + alpha * dx[i];
-        clamp_to_open_bounds(&mut x_trial, &state.x_l, &state.x_u, i);
+        clamp_to_open_bounds(&mut x_trial, &x_l_full, &x_u_full, i);
     }
     x_trial
 }
@@ -9484,10 +9503,14 @@ fn sentinel_bounds_to_infinity(
 /// perturbation recovery path in try_early_perturbation_recovery.
 /// Phase 6c.3: routes through the compressed mirror via BoundLayout.
 fn compute_sigma_from_state(state: &SolverState) -> Vec<f64> {
+    // Phase 7c: materialize compressed x bounds for kkt::compute_sigma_compressed
+    // (still consumes full-`n` x_l/x_u slices).
+    let x_l_full = state.x_l_combined();
+    let x_u_full = state.x_u_combined();
     kkt::compute_sigma_compressed(
         &state.x,
-        &state.x_l,
-        &state.x_u,
+        &x_l_full,
+        &x_u_full,
         &state.z_l_compressed,
         &state.z_u_compressed,
         &state.bound_layout,
@@ -9502,10 +9525,13 @@ fn compute_sigma_from_state(state: &SolverState) -> Vec<f64> {
 fn recover_dz_from_state(state: &SolverState, dx: &[f64], mu: f64) -> (Vec<f64>, Vec<f64>) {
     // Phase 6d.5: materialize compressed z for kkt::recover_dz (still
     // indexes z by full var idx).
+    // Phase 7c: same for compressed x_l/x_u bounds.
     let z_l_full = state.z_l_combined();
     let z_u_full = state.z_u_combined();
+    let x_l_full = state.x_l_combined();
+    let x_u_full = state.x_u_combined();
     kkt::recover_dz(
-        &state.x, &state.x_l, &state.x_u,
+        &state.x, &x_l_full, &x_u_full,
         &z_l_full, &z_u_full, dx, mu,
     )
 }
@@ -9576,6 +9602,10 @@ fn assemble_kkt_from_state(
     kappa_d: f64,
 ) -> kkt::KktSystem {
     debug_assert_eq!(m, state.layout.n_c + state.layout.n_d);
+    // Phase 7c: materialize compressed x bounds for kkt::assemble_kkt
+    // (still consumes full-`n` x_l/x_u slices).
+    let x_l_full = state.x_l_combined();
+    let x_u_full = state.x_u_combined();
     let mut sys = kkt::assemble_kkt(
         n, state.layout.n_c, state.layout.n_d,
         &state.hess_rows, &state.hess_cols, &state.hess_vals,
@@ -9585,7 +9615,7 @@ fn assemble_kkt_from_state(
         &state.c_x, &state.d_x,
         &state.d_l, &state.d_u,
         &state.s, &state.y_c, &state.y_d,
-        &state.x, &state.x_l, &state.x_u, state.mu, kappa_d,
+        &state.x, &x_l_full, &x_u_full, state.mu, kappa_d,
         use_sparse, &state.v_l, &state.v_u, &state.layout,
     );
     // T3.25: snapshot the upstream atags. The assembled matrix is a
@@ -9638,12 +9668,12 @@ fn commit_trial_point(
         let mut min_s_side = "";
         let mut max_z_x = 0.0_f64;
         for i in 0..state.n {
-            if state.x_l[i].is_finite() {
-                let s = state.x[i] - state.x_l[i];
+            if state.x_l_at(i).is_finite() {
+                let s = state.x[i] - state.x_l_at(i);
                 if s > 0.0 && s < min_s_x { min_s_x = s; min_s_idx = i; min_s_side = "L"; }
             }
-            if state.x_u[i].is_finite() {
-                let s = state.x_u[i] - state.x[i];
+            if state.x_u_at(i).is_finite() {
+                let s = state.x_u_at(i) - state.x[i];
                 if s > 0.0 && s < min_s_x { min_s_x = s; min_s_idx = i; min_s_side = "U"; }
             }
         }
@@ -9656,7 +9686,7 @@ fn commit_trial_point(
         }
         let (xv, bv) = if min_s_idx < state.n {
             let xv = state.x[min_s_idx];
-            let bv = if min_s_side == "L" { state.x_l[min_s_idx] } else { state.x_u[min_s_idx] };
+            let bv = if min_s_side == "L" { state.x_l_at(min_s_idx) } else { state.x_u_at(min_s_idx) };
             (xv, bv)
         } else { (f64::NAN, f64::NAN) };
         eprintln!(
@@ -9738,15 +9768,7 @@ fn compute_bound_multiplier_sum(state: &SolverState) -> f64 {
 /// counts separately, matching Ipopt's bookkeeping where equality
 /// constraints don't appear in v_L/v_U at all — only inequalities do.
 fn compute_bound_multiplier_count(state: &SolverState) -> usize {
-    let mut n_bound = 0usize;
-    for i in 0..state.n {
-        if state.x_l[i].is_finite() {
-            n_bound += 1;
-        }
-        if state.x_u[i].is_finite() {
-            n_bound += 1;
-        }
-    }
+    let mut n_bound = state.bound_layout.n_x_l + state.bound_layout.n_x_u;
     for i in 0..state.m {
         if constraint_is_equality(state, i) {
             continue;
@@ -10043,8 +10065,6 @@ mod tests {
             alpha_primal: 0.0,
             alpha_dual: 0.0,
             iter: 0,
-            x_l: vec![f64::NEG_INFINITY; n],
-            x_u: vec![f64::INFINITY; n],
             // Phase 3f-final: native split storage. Test-only constructor
             // uses an all-inequality layout (n_c=0, n_d=m), so c_rhs is
             // empty and d_l/d_u are m-sized with -inf/+inf sentinels.
@@ -10158,16 +10178,13 @@ mod tests {
     fn set_variable_bounds(state: &mut SolverState, x_l: Vec<f64>, x_u: Vec<f64>) {
         assert_eq!(x_l.len(), state.n);
         assert_eq!(x_u.len(), state.n);
-        state.x_l = x_l;
-        state.x_u = x_u;
-        state.bound_layout =
-            crate::bound_layout::BoundLayout::new(&state.x_l, &state.x_u);
+        state.bound_layout = crate::bound_layout::BoundLayout::new(&x_l, &x_u);
         state.z_l_compressed = vec![0.0; state.bound_layout.n_x_l];
         state.z_u_compressed = vec![0.0; state.bound_layout.n_x_u];
         state.dz_l_compressed = vec![0.0; state.bound_layout.n_x_l];
         state.dz_u_compressed = vec![0.0; state.bound_layout.n_x_u];
-        state.x_l_compressed = state.bound_layout.project_l(&state.x_l);
-        state.x_u_compressed = state.bound_layout.project_u(&state.x_u);
+        state.x_l_compressed = state.bound_layout.project_l(&x_l);
+        state.x_u_compressed = state.bound_layout.project_u(&x_u);
     }
 
     #[test]
@@ -10463,8 +10480,11 @@ mod tests {
     fn test_bound_multiplier_count_finite_bounds_only() {
         // T0.2: 3 vars but only 1 finite bound; count must be 1, not 6.
         let mut state = minimal_state(3, 0);
-        state.x_l[0] = 0.0; // finite lower on var 0
-        // var 1 and var 2: x_l = -inf, x_u = +inf (default)
+        set_variable_bounds(
+            &mut state,
+            vec![0.0, f64::NEG_INFINITY, f64::NEG_INFINITY], // finite lower on var 0
+            vec![f64::INFINITY, f64::INFINITY, f64::INFINITY],
+        );
         let count = compute_bound_multiplier_count(&state);
         assert_eq!(count, 1, "only 1 finite variable bound; got {}", count);
     }
@@ -10478,8 +10498,11 @@ mod tests {
         //   constraint 1: g_l = g_u (equality) => 0 (skipped)
         // Total = 3.
         let mut state = minimal_state(2, 2);
-        state.x_l[0] = 0.0;
-        state.x_u[0] = 10.0;
+        set_variable_bounds(
+            &mut state,
+            vec![0.0, f64::NEG_INFINITY],
+            vec![10.0, f64::INFINITY],
+        );
         set_constraint_bounds(&mut state, vec![0.0, 5.0], vec![f64::INFINITY, 5.0]);
         let count = compute_bound_multiplier_count(&state);
         assert_eq!(count, 3, "expected 3 finite bounds, got {}", count);
@@ -10553,7 +10576,11 @@ mod tests {
         // T0.2: multiplier_count = m + finite_bound_count.
         // m=2, 1 finite var bound => count = 2 + 1 = 3.
         let mut state = minimal_state(3, 2);
-        state.x_l[0] = 0.0;
+        set_variable_bounds(
+            &mut state,
+            vec![0.0, f64::NEG_INFINITY, f64::NEG_INFINITY],
+            vec![f64::INFINITY, f64::INFINITY, f64::INFINITY],
+        );
         let count = compute_multiplier_count(&state);
         assert_eq!(count, 3);
     }
@@ -10783,8 +10810,7 @@ mod tests {
         state.x = vec![0.5];
         set_constraint_bounds(&mut state, vec![0.0], vec![0.0]);
         state.set_g_combined(&[0.5]);
-        state.x_l = vec![f64::NEG_INFINITY];
-        state.x_u = vec![f64::INFINITY];
+        // x_l = -inf, x_u = +inf via minimal_state default (no bounds).
         state.mu = 0.1;
 
         // Mock NLP: objective = x[0], constraints = x[0] = 0.
@@ -10840,8 +10866,7 @@ mod tests {
         state.x = vec![0.5];
         set_constraint_bounds(&mut state, vec![0.0], vec![0.0]);
         state.set_g_combined(&[0.5]);
-        state.x_l = vec![f64::NEG_INFINITY];
-        state.x_u = vec![f64::INFINITY];
+        // x_l = -inf, x_u = +inf via minimal_state default (no bounds).
         state.mu = 0.1;
 
         // Trial point: x = 1e-3 → theta = 1e-3, phi = 1e-3. Better
