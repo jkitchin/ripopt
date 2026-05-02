@@ -484,6 +484,9 @@ struct IterateSnapshot {
     z_u_compressed: Vec<f64>,
     v_l: Vec<f64>,
     v_u: Vec<f64>,
+    /// Phase 8b: native compressed slack-bound multipliers.
+    v_l_compressed: Vec<f64>,
+    v_u_compressed: Vec<f64>,
     s: Vec<f64>,
     mu: f64,
     obj: f64,
@@ -504,6 +507,8 @@ impl IterateSnapshot {
             z_u_compressed: state.z_u_compressed.clone(),
             v_l: state.v_l.clone(),
             v_u: state.v_u.clone(),
+            v_l_compressed: state.v_l_compressed.clone(),
+            v_u_compressed: state.v_u_compressed.clone(),
             s: state.s.clone(),
             mu: state.mu,
             obj: state.obj,
@@ -523,6 +528,8 @@ impl IterateSnapshot {
         state.z_u_compressed = self.z_u_compressed.clone();
         state.v_l = self.v_l.clone();
         state.v_u = self.v_u.clone();
+        state.v_l_compressed = self.v_l_compressed.clone();
+        state.v_u_compressed = self.v_u_compressed.clone();
         state.s = self.s.clone();
         state.mu = self.mu;
         state.obj = self.obj;
@@ -543,6 +550,9 @@ struct WatchdogSavedState {
     z_u_compressed: Vec<f64>,
     v_l: Vec<f64>,
     v_u: Vec<f64>,
+    /// Phase 8b: native compressed slack-bound multipliers.
+    v_l_compressed: Vec<f64>,
+    v_u_compressed: Vec<f64>,
     s: Vec<f64>,
     mu: f64,
     obj: f64,
@@ -566,6 +576,8 @@ impl WatchdogSavedState {
             z_u_compressed: state.z_u_compressed.clone(),
             v_l: state.v_l.clone(),
             v_u: state.v_u.clone(),
+            v_l_compressed: state.v_l_compressed.clone(),
+            v_u_compressed: state.v_u_compressed.clone(),
             s: state.s.clone(),
             mu: state.mu,
             obj: state.obj,
@@ -589,6 +601,8 @@ impl WatchdogSavedState {
         state.z_u_compressed = self.z_u_compressed.clone();
         state.v_l = self.v_l.clone();
         state.v_u = self.v_u.clone();
+        state.v_l_compressed = self.v_l_compressed.clone();
+        state.v_u_compressed = self.v_u_compressed.clone();
         state.s = self.s.clone();
         state.mu = self.mu;
         state.obj = self.obj;
@@ -783,6 +797,26 @@ pub(crate) struct SolverState {
     /// Phase 7a: compressed upper variable bounds (size `bound_layout.n_x_u`).
     /// Mirrors Ipopt's `x_U_`. See [`Self::x_l_compressed`].
     pub x_u_compressed: Vec<f64>,
+    /// Phase 8a: slack-bound expansion-matrix layout. Mirrors Ipopt's
+    /// `Pd_L_`/`Pd_U_` ExpansionMatrix pair (`IpOrigIpoptNLP.hpp:241-263`).
+    /// Indexes the n_d slack rows; classifies each as having a finite
+    /// lower / upper slack bound. Built once per `SolverState` from
+    /// `d_l`/`d_u`.
+    pub d_bound_layout: crate::d_bound_layout::DBoundLayout,
+    /// Phase 8b: compressed slack-lower-bound multipliers (size
+    /// `d_bound_layout.n_d_l`). Mirrors Ipopt's `v_L`. Populated as a
+    /// projection of the combined `v_l` at every mutation site; Phase 8c
+    /// migrates readers and Phase 8d drops the combined storage.
+    pub v_l_compressed: Vec<f64>,
+    /// Phase 8b: compressed slack-upper-bound multipliers (size
+    /// `d_bound_layout.n_d_u`). Mirrors Ipopt's `v_U`.
+    pub v_u_compressed: Vec<f64>,
+    /// Phase 8b: compressed slack-lower-bound multiplier search
+    /// direction (size `d_bound_layout.n_d_l`). Mirrors Ipopt's `dv_L`.
+    pub dv_l_compressed: Vec<f64>,
+    /// Phase 8b: compressed slack-upper-bound multiplier search
+    /// direction (size `d_bound_layout.n_d_u`).
+    pub dv_u_compressed: Vec<f64>,
     /// Accumulated solver diagnostics.
     pub diagnostics: SolverDiagnostics,
     /// Last point at which evaluations were performed (for new_x tracking).
@@ -1318,6 +1352,15 @@ impl SolverState {
         // Mirrors Ipopt's `x_L_`/`x_U_` (`IpOrigIpoptNLP.hpp:226,253`).
         let x_l_compressed = bound_layout.project_l(&x_l);
         let x_u_compressed = bound_layout.project_u(&x_u);
+        // Phase 8a/b: slack-bound expansion-matrix layout + compressed
+        // multiplier mirrors. Mirrors Ipopt's `Pd_L_`/`Pd_U_` and
+        // `v_L`/`v_U` (`IpOrigIpoptNLP.hpp:241-263`).
+        let d_bound_layout =
+            crate::d_bound_layout::DBoundLayout::new(&layout.project_d(&g_l), &layout.project_d(&g_u));
+        let v_l_compressed = vec![0.0; d_bound_layout.n_d_l];
+        let v_u_compressed = vec![0.0; d_bound_layout.n_d_u];
+        let dv_l_compressed = vec![0.0; d_bound_layout.n_d_l];
+        let dv_u_compressed = vec![0.0; d_bound_layout.n_d_u];
 
         // Phase 3b: split y into y_c (n_c) and y_d (n_d). Combined y from
         // the LS init is projected via the layout; consumers needing the
@@ -1413,6 +1456,11 @@ impl SolverState {
             x_l_compressed,
             x_u_compressed,
             bound_layout,
+            d_bound_layout,
+            v_l_compressed,
+            v_u_compressed,
+            dv_l_compressed,
+            dv_u_compressed,
             diagnostics: SolverDiagnostics::default(),
             x_last_eval: vec![f64::NAN; n],
             adjusted_slacks_count: 0,
@@ -1760,6 +1808,10 @@ impl SolverState {
     pub fn set_v_l_at(&mut self, i: usize, v: f64) {
         if let Some(k) = self.layout.ineq_pos[i] {
             self.v_l[k] = v;
+            // Phase 8b: lockstep mirror update.
+            if let Some(kc) = self.d_bound_layout.full_to_d_l[k] {
+                self.v_l_compressed[kc] = v;
+            }
         }
     }
 
@@ -1767,6 +1819,9 @@ impl SolverState {
     pub fn set_v_u_at(&mut self, i: usize, v: f64) {
         if let Some(k) = self.layout.ineq_pos[i] {
             self.v_u[k] = v;
+            if let Some(kc) = self.d_bound_layout.full_to_d_u[k] {
+                self.v_u_compressed[kc] = v;
+            }
         }
     }
 
@@ -1776,6 +1831,8 @@ impl SolverState {
         for (k, &i) in self.layout.d_to_combined.iter().enumerate() {
             self.v_l[k] = v[i];
         }
+        // Phase 8b: rebuild compressed mirror from the freshly written v_l.
+        self.v_l_compressed = self.d_bound_layout.project_l(&self.v_l);
     }
 
     /// Overwrite v_U from a combined m-length slice (drops eq rows).
@@ -1784,6 +1841,7 @@ impl SolverState {
         for (k, &i) in self.layout.d_to_combined.iter().enumerate() {
             self.v_u[k] = v[i];
         }
+        self.v_u_compressed = self.d_bound_layout.project_u(&self.v_u);
     }
 
     /// Combined-indexed read: `dv_l[k]` for ineq rows, 0 for eq rows.
@@ -2854,9 +2912,16 @@ fn advance_z_to_trial(state: &mut SolverState, alpha_d: f64) {
     for (k, &i) in state.layout.d_to_combined.clone().iter().enumerate() {
         if state.g_l_at(i).is_finite() {
             state.v_l[k] = (state.v_l[k] + alpha_d * state.dv_l[k]).max(1e-20);
+            // Phase 8b: lockstep mirror update.
+            if let Some(kc) = state.d_bound_layout.full_to_d_l[k] {
+                state.v_l_compressed[kc] = state.v_l[k];
+            }
         }
         if state.g_u_at(i).is_finite() {
             state.v_u[k] = (state.v_u[k] + alpha_d * state.dv_u[k]).max(1e-20);
+            if let Some(kc) = state.d_bound_layout.full_to_d_u[k] {
+                state.v_u_compressed[kc] = state.v_u[k];
+            }
         }
     }
     // T3.25: bump dual atags so a downstream factor doesn't reuse a
@@ -2909,12 +2974,19 @@ fn apply_kappa_sigma_bound_multiplier_reset(
             let v_lo = mu_ks / (kappa_sigma * s_l);
             let v_hi = kappa_sigma * mu_ks / s_l;
             state.v_l[k] = state.v_l[k].clamp(v_lo, v_hi);
+            // Phase 8b: lockstep mirror update.
+            if let Some(kc) = state.d_bound_layout.full_to_d_l[k] {
+                state.v_l_compressed[kc] = state.v_l[k];
+            }
         }
         if state.g_u_at(i).is_finite() {
             let s_u = slack_gu(state, i);
             let v_lo = mu_ks / (kappa_sigma * s_u);
             let v_hi = kappa_sigma * mu_ks / s_u;
             state.v_u[k] = state.v_u[k].clamp(v_lo, v_hi);
+            if let Some(kc) = state.d_bound_layout.full_to_d_u[k] {
+                state.v_u_compressed[kc] = state.v_u[k];
+            }
         }
     }
     let _ = m;
@@ -7795,6 +7867,10 @@ fn reset_constraint_slack_multipliers_after_restoration(
             0.0
         };
         state.v_l[k] = v_l_new;
+        // Phase 8b: lockstep mirror update.
+        if let Some(kc) = state.d_bound_layout.full_to_d_l[k] {
+            state.v_l_compressed[kc] = v_l_new;
+        }
         let v_u_new = if du.is_finite() {
             let slack = (du - dx).max(1e-12);
             if nuclear_reset { 1.0 } else { mu_r / slack }
@@ -7802,6 +7878,9 @@ fn reset_constraint_slack_multipliers_after_restoration(
             0.0
         };
         state.v_u[k] = v_u_new;
+        if let Some(kc) = state.d_bound_layout.full_to_d_u[k] {
+            state.v_u_compressed[kc] = v_u_new;
+        }
     }
 }
 
@@ -9047,6 +9126,9 @@ fn install_step_directions(
     state.dz_u_compressed = state.bound_layout.project_u(&dz_u);
     state.dv_l = dv_l;
     state.dv_u = dv_u;
+    // Phase 8b: lockstep mirror update.
+    state.dv_l_compressed = state.d_bound_layout.project_l(&state.dv_l);
+    state.dv_u_compressed = state.d_bound_layout.project_u(&state.dv_u);
 }
 
 /// L-infinity norm of `J^T * c_violation`, where `c_violation` is the
@@ -10119,6 +10201,16 @@ mod tests {
             dz_u_compressed: Vec::new(),
             x_l_compressed: Vec::new(),
             x_u_compressed: Vec::new(),
+            // Phase 8a/b: test-only constructor uses a no-bounds slack
+            // layout (n_d_l = n_d_u = 0); compressed mirrors empty.
+            d_bound_layout: crate::d_bound_layout::DBoundLayout::new(
+                &vec![f64::NEG_INFINITY; m],
+                &vec![f64::INFINITY; m],
+            ),
+            v_l_compressed: Vec::new(),
+            v_u_compressed: Vec::new(),
+            dv_l_compressed: Vec::new(),
+            dv_u_compressed: Vec::new(),
             diagnostics: SolverDiagnostics::default(),
             x_last_eval: vec![f64::NAN; n],
             adjusted_slacks_count: 0,
@@ -10156,6 +10248,13 @@ mod tests {
         state.d_l = layout.project_d(&g_l);
         state.d_u = layout.project_d(&g_u);
         state.layout = layout;
+        // Phase 8b: rebuild slack-bound layout + compressed v/dv mirrors.
+        state.d_bound_layout =
+            crate::d_bound_layout::DBoundLayout::new(&state.d_l, &state.d_u);
+        state.v_l_compressed = vec![0.0; state.d_bound_layout.n_d_l];
+        state.v_u_compressed = vec![0.0; state.d_bound_layout.n_d_u];
+        state.dv_l_compressed = vec![0.0; state.d_bound_layout.n_d_l];
+        state.dv_u_compressed = vec![0.0; state.d_bound_layout.n_d_u];
         state.y_c.resize(n_c, 0.0);
         state.y_d.resize(n_d, 0.0);
         state.v_l.resize(n_d, 0.0);
