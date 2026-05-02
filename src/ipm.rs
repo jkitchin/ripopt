@@ -1942,6 +1942,32 @@ impl SolverState {
             .extend(self.bound_layout.x_u_to_full.iter().map(|&i| self.dz_u[i]));
     }
 
+    /// Phase 6d.1: materialize a full-`n` view of `z_l` from the
+    /// compressed mirror. Unbounded sides pad to 0 (the production
+    /// invariant). Used at API boundaries (`unscale_solution_vectors`)
+    /// and for kkt_aug callsites that still consume full-`n` slices.
+    pub fn z_l_combined(&self) -> Vec<f64> {
+        self.bound_layout.expand_l(&self.z_l_compressed, 0.0)
+    }
+
+    /// Phase 6d.1: materialize a full-`n` view of `z_u` from the
+    /// compressed mirror. Unbounded sides pad to 0.
+    pub fn z_u_combined(&self) -> Vec<f64> {
+        self.bound_layout.expand_u(&self.z_u_compressed, 0.0)
+    }
+
+    /// Phase 6d.1: materialize a full-`n` view of `dz_l` from the
+    /// compressed mirror. Unbounded sides pad to 0.
+    pub fn dz_l_combined(&self) -> Vec<f64> {
+        self.bound_layout.expand_l(&self.dz_l_compressed, 0.0)
+    }
+
+    /// Phase 6d.1: materialize a full-`n` view of `dz_u` from the
+    /// compressed mirror. Unbounded sides pad to 0.
+    pub fn dz_u_combined(&self) -> Vec<f64> {
+        self.bound_layout.expand_u(&self.dz_u_compressed, 0.0)
+    }
+
     /// Evaluate all functions, zeroing Hessian lambda for linear constraints.
     /// When `skip_hessian` is true (L-BFGS mode), the Hessian evaluation is skipped.
     fn evaluate_with_linear<P: NlpProblem>(
@@ -9843,11 +9869,13 @@ fn populate_final_diagnostics(state: &SolverState) -> SolverDiagnostics {
 fn unscale_solution_vectors(state: &SolverState) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
     let n = state.n;
     let m = state.m;
-    let mut z_l_out = vec![0.0; n];
-    let mut z_u_out = vec![0.0; n];
+    // Phase 6d.1: materialize z_l/z_u from the compressed mirrors
+    // (BoundLayout::expand_l/u pads unbounded sides to 0).
+    let mut z_l_out = state.z_l_combined();
+    let mut z_u_out = state.z_u_combined();
     for i in 0..n {
-        z_l_out[i] = state.z_l[i] / state.obj_scaling;
-        z_u_out[i] = state.z_u[i] / state.obj_scaling;
+        z_l_out[i] /= state.obj_scaling;
+        z_u_out[i] /= state.obj_scaling;
     }
     // Reconstruct combined-indexed y_out / g_out from the split storage
     // (Phase 3): per-row scaling lives in c_scaling[k] for equalities,
