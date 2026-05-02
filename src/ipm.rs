@@ -527,6 +527,9 @@ impl IterateSnapshot {
         state.c_x = self.c_x.clone();
         state.d_x = self.d_x.clone();
         state.grad_f = self.grad_f.clone();
+        // Phase 6b: keep compressed z-mirrors in sync with the combined
+        // arrays we just bulk-replaced.
+        state.refresh_compressed_z();
         filter.restore_entries(self.filter_entries.clone());
     }
 }
@@ -592,6 +595,8 @@ impl WatchdogSavedState {
         state.c_x = self.c_x.clone();
         state.d_x = self.d_x.clone();
         state.grad_f = self.grad_f.clone();
+        // Phase 6b: keep compressed z-mirrors in sync.
+        state.refresh_compressed_z();
         // T3.25 follow-up: watchdog revert mutates x/y/z/v outside the
         // line-search choke point that bumps atags. Bump them and drop
         // the cache so the next factor cannot replay a stale `(δ_w,
@@ -752,6 +757,28 @@ pub(crate) struct SolverState {
     /// `ConstraintLayout::new` calls — Phase 1 of the data-layout refactor,
     /// see `docs/V0.8_DATA_LAYOUT_REFACTOR_PLAN.md`).
     pub layout: crate::constraint_layout::ConstraintLayout,
+    /// Variable-bound layout. Built once from `x_l`/`x_u` at construction;
+    /// stable for the problem lifetime. Single source of truth for the
+    /// finite-bound compression that mirrors Ipopt's `Px_L_` / `Px_U_`
+    /// ExpansionMatrix pair (`IpOrigIpoptNLP.hpp:197-219`). Phase 6 of
+    /// the data-layout refactor — see
+    /// `docs/V0.8_DATA_LAYOUT_REFACTOR_PLAN.md`.
+    pub bound_layout: crate::bound_layout::BoundLayout,
+    /// Compressed lower-bound multipliers (size `bound_layout.n_x_l`).
+    /// Mirrors Ipopt's `z_L` (`IpIpoptData.cpp:140`). Phase 6b: populated
+    /// as a projection of the combined `z_l` at every mutation site.
+    /// Phase 6c will flip readers to consume this instead of the combined
+    /// form; Phase 6d will drop the combined.
+    pub z_l_compressed: Vec<f64>,
+    /// Compressed upper-bound multipliers (size `bound_layout.n_x_u`).
+    /// Mirrors Ipopt's `z_U`. See [`Self::z_l_compressed`].
+    pub z_u_compressed: Vec<f64>,
+    /// Compressed lower-bound multiplier search direction
+    /// (size `bound_layout.n_x_l`). Phase 6b additive mirror of `dz_l`.
+    pub dz_l_compressed: Vec<f64>,
+    /// Compressed upper-bound multiplier search direction
+    /// (size `bound_layout.n_x_u`). Phase 6b additive mirror of `dz_u`.
+    pub dz_u_compressed: Vec<f64>,
     /// Accumulated solver diagnostics.
     pub diagnostics: SolverDiagnostics,
     /// Last point at which evaluations were performed (for new_x tracking).
@@ -1276,6 +1303,12 @@ impl SolverState {
         let m_eq = (0..m).filter(|&i| g_l[i] == g_u[i]).count();
         let is_square = m == n || m_eq == n;
         let layout = crate::constraint_layout::ConstraintLayout::new(&g_l, &g_u);
+        let bound_layout = crate::bound_layout::BoundLayout::new(&x_l, &x_u);
+        // Phase 6b: native compressed bound-multiplier mirrors. At
+        // construction, `z_l`/`z_u` already carry zero on unbounded sides,
+        // so `project_l`/`project_u` extracts only the active components.
+        let z_l_compressed = bound_layout.project_l(&z_l);
+        let z_u_compressed = bound_layout.project_u(&z_u);
 
         // Phase 3b: split y into y_c (n_c) and y_d (n_d). Combined y from
         // the LS init is projected via the layout; consumers needing the
@@ -1370,6 +1403,11 @@ impl SolverState {
             c_scaling: vec![1.0; layout.n_c],
             d_scaling: vec![1.0; layout.n_d],
             layout,
+            z_l_compressed,
+            z_u_compressed,
+            dz_l_compressed: vec![0.0; bound_layout.n_x_l],
+            dz_u_compressed: vec![0.0; bound_layout.n_x_u],
+            bound_layout,
             diagnostics: SolverDiagnostics::default(),
             x_last_eval: vec![f64::NAN; n],
             adjusted_slacks_count: 0,
@@ -1875,6 +1913,33 @@ impl SolverState {
         for (k, &i) in self.layout.d_to_combined.iter().enumerate() {
             self.d_x[k] = g[i];
         }
+    }
+
+    /// Phase 6b: refresh the compressed bound-multiplier mirrors
+    /// (`z_l_compressed`, `z_u_compressed`, `dz_l_compressed`,
+    /// `dz_u_compressed`) by projecting the combined `z_l`/`z_u`/`dz_l`/
+    /// `dz_u` arrays through `bound_layout`. Called at every mutation
+    /// site for the combined arrays so the compressed mirrors stay live
+    /// while readers continue to consume the combined form. Phase 6c will
+    /// flip readers; Phase 6d will drop the combined arrays and this
+    /// helper.
+    pub(crate) fn refresh_compressed_z(&mut self) {
+        debug_assert_eq!(self.z_l.len(), self.n);
+        debug_assert_eq!(self.z_u.len(), self.n);
+        debug_assert_eq!(self.dz_l.len(), self.n);
+        debug_assert_eq!(self.dz_u.len(), self.n);
+        self.z_l_compressed.clear();
+        self.z_l_compressed
+            .extend(self.bound_layout.x_l_to_full.iter().map(|&i| self.z_l[i]));
+        self.z_u_compressed.clear();
+        self.z_u_compressed
+            .extend(self.bound_layout.x_u_to_full.iter().map(|&i| self.z_u[i]));
+        self.dz_l_compressed.clear();
+        self.dz_l_compressed
+            .extend(self.bound_layout.x_l_to_full.iter().map(|&i| self.dz_l[i]));
+        self.dz_u_compressed.clear();
+        self.dz_u_compressed
+            .extend(self.bound_layout.x_u_to_full.iter().map(|&i| self.dz_u[i]));
     }
 
     /// Evaluate all functions, zeroing Hessian lambda for linear constraints.
@@ -2757,6 +2822,9 @@ fn advance_z_to_trial(state: &mut SolverState, alpha_d: f64) {
     // T3.25: bump dual atags so a downstream factor doesn't reuse a
     // stale fingerprint after this trial-step write.
     state.bump_dual_atags();
+    // Phase 6b: refresh compressed z-mirrors after the per-element
+    // trial-step write to combined z_l/z_u.
+    state.refresh_compressed_z();
 }
 
 /// Apply the kappa_sigma reset to bound multipliers (Ipopt's
@@ -2813,6 +2881,9 @@ fn apply_kappa_sigma_bound_multiplier_reset(
         }
     }
     let _ = m;
+    // Phase 6b: refresh compressed z-mirrors after the per-element
+    // kappa_sigma clamp on combined z_l/z_u.
+    state.refresh_compressed_z();
     mu_ks
 }
 
@@ -3926,6 +3997,8 @@ impl SoftRestoSnapshot {
         state.jac_c_vals = self.jac_c_vals;
         state.jac_d_vals = self.jac_d_vals;
         state.alpha_primal = self.alpha_primal;
+        // Phase 6b: keep compressed z-mirrors in sync after bulk restore.
+        state.refresh_compressed_z();
         // T3.25: snapshot restore touches every tracked input.
         state.bump_all_kkt_atags();
     }
@@ -3985,6 +4058,9 @@ fn attempt_soft_restoration<P: NlpProblem>(
         state.z_l[i] = (state.z_l[i] + alpha_d * state.dz_l[i]).max(0.0);
         state.z_u[i] = (state.z_u[i] + alpha_d * state.dz_u[i]).max(0.0);
     }
+    // Phase 6b: keep compressed z-mirrors in sync after the per-element
+    // soft-resto dual update on combined z_l/z_u.
+    state.refresh_compressed_z();
     // T3.25: soft-resto trial step writes x and duals directly (does
     // not go through commit_trial_point), so bump atags ourselves.
     state.bump_all_kkt_atags();
@@ -4821,6 +4897,8 @@ fn switch_to_fixed_mode_with_adaptive_init(
             state.z_u = snap.z_u;
             state.set_v_l_combined(&snap.v_l);
             state.set_v_u_combined(&snap.v_u);
+            // Phase 6b: keep compressed z-mirrors in sync.
+            state.refresh_compressed_z();
             // T3.25: rollback touches every tracked KKT input.
             state.bump_all_kkt_atags();
             log::debug!("Free→Fixed rollback: restored accepted_point");
@@ -8788,6 +8866,10 @@ fn install_step_directions(
     state.dz_u = dz_u;
     state.dv_l = dv_l;
     state.dv_u = dv_u;
+    // Phase 6b: refresh compressed dz-mirrors from the new combined dz_l/dz_u.
+    // (z_l/z_u are unchanged here so we still re-project them — cheap and
+    // keeps the helper unconditional.)
+    state.refresh_compressed_z();
 }
 
 /// L-infinity norm of `J^T * c_violation`, where `c_violation` is the
@@ -9805,6 +9887,16 @@ mod tests {
                 &vec![f64::NEG_INFINITY; m],
                 &vec![f64::INFINITY; m],
             ),
+            // Phase 6b: test-only constructor uses a no-bounds layout
+            // (n_x_l = n_x_u = 0); compressed mirrors are empty.
+            bound_layout: crate::bound_layout::BoundLayout::new(
+                &vec![f64::NEG_INFINITY; n],
+                &vec![f64::INFINITY; n],
+            ),
+            z_l_compressed: Vec::new(),
+            z_u_compressed: Vec::new(),
+            dz_l_compressed: Vec::new(),
+            dz_u_compressed: Vec::new(),
             diagnostics: SolverDiagnostics::default(),
             x_last_eval: vec![f64::NAN; n],
             adjusted_slacks_count: 0,
@@ -9856,6 +9948,76 @@ mod tests {
         state.d_scaling.resize(n_d, 1.0);
         state.c_x.resize(n_c, 0.0);
         state.d_x.resize(n_d, 0.0);
+    }
+
+    /// Phase 6b test helper: install variable bounds + matching
+    /// `BoundLayout`. Resizes the four compressed mirrors to the new
+    /// `n_x_l`/`n_x_u` and reprojects from combined `z_l`/`z_u`/`dz_l`/
+    /// `dz_u` (which are still size `n`).
+    fn set_variable_bounds(state: &mut SolverState, x_l: Vec<f64>, x_u: Vec<f64>) {
+        assert_eq!(x_l.len(), state.n);
+        assert_eq!(x_u.len(), state.n);
+        state.x_l = x_l;
+        state.x_u = x_u;
+        state.bound_layout =
+            crate::bound_layout::BoundLayout::new(&state.x_l, &state.x_u);
+        state.z_l_compressed.resize(state.bound_layout.n_x_l, 0.0);
+        state.z_u_compressed.resize(state.bound_layout.n_x_u, 0.0);
+        state.dz_l_compressed.resize(state.bound_layout.n_x_l, 0.0);
+        state.dz_u_compressed.resize(state.bound_layout.n_x_u, 0.0);
+        state.refresh_compressed_z();
+    }
+
+    #[test]
+    fn test_phase6b_compressed_z_mirrors_combined() {
+        // 4 vars: var 0 lower-only, var 1 upper-only, var 2 free, var 3 two-sided.
+        let mut state = minimal_state(4, 0);
+        set_variable_bounds(
+            &mut state,
+            vec![0.0, f64::NEG_INFINITY, f64::NEG_INFINITY, -1.0],
+            vec![f64::INFINITY, 5.0, f64::INFINITY, 1.0],
+        );
+        assert_eq!(state.bound_layout.n_x_l, 2);
+        assert_eq!(state.bound_layout.n_x_u, 2);
+
+        // Seed combined z_l/z_u/dz_l/dz_u with non-zero entries on the
+        // bounded sides only (matching production invariant).
+        state.z_l = vec![1.0, 0.0, 0.0, 4.0];
+        state.z_u = vec![0.0, 2.0, 0.0, 5.0];
+        state.dz_l = vec![0.1, 0.0, 0.0, 0.4];
+        state.dz_u = vec![0.0, 0.2, 0.0, 0.5];
+
+        state.refresh_compressed_z();
+        assert_eq!(state.z_l_compressed, vec![1.0, 4.0]);
+        assert_eq!(state.z_u_compressed, vec![2.0, 5.0]);
+        assert_eq!(state.dz_l_compressed, vec![0.1, 0.4]);
+        assert_eq!(state.dz_u_compressed, vec![0.2, 0.5]);
+
+        // Mutate combined; refresh; expect mirrors to follow.
+        state.z_l[0] = 9.0;
+        state.refresh_compressed_z();
+        assert_eq!(state.z_l_compressed, vec![9.0, 4.0]);
+    }
+
+    #[test]
+    fn test_phase6b_advance_z_to_trial_syncs_compressed() {
+        // Single-bound problem on 1 var.
+        let mut state = minimal_state(1, 0);
+        set_variable_bounds(&mut state, vec![0.0], vec![10.0]);
+        state.z_l = vec![1.0];
+        state.z_u = vec![2.0];
+        state.dz_l = vec![0.5];
+        state.dz_u = vec![-0.5];
+        state.refresh_compressed_z();
+
+        // After advance_z_to_trial(α=1), z_l = max(1.0+0.5, 1e-20) = 1.5
+        // and z_u = max(2.0-0.5, 1e-20) = 1.5. The compressed mirrors must
+        // reflect the post-step combined values.
+        advance_z_to_trial(&mut state, 1.0);
+        assert!((state.z_l[0] - 1.5).abs() < 1e-12);
+        assert!((state.z_u[0] - 1.5).abs() < 1e-12);
+        assert!((state.z_l_compressed[0] - 1.5).abs() < 1e-12);
+        assert!((state.z_u_compressed[0] - 1.5).abs() < 1e-12);
     }
 
     /// Phase 4a: rebuild the split Jacobian structure from a combined
