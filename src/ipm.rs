@@ -2798,14 +2798,21 @@ fn run_line_search_loop<P: NlpProblem>(
 /// `apply_slack_move` (which fires between this and the kappa_sigma
 /// clamp, per Ipopt order) sees the trial z, not the previous-iter z.
 fn advance_z_to_trial(state: &mut SolverState, alpha_d: f64) {
-    let n = state.n;
-    for i in 0..n {
-        if state.x_l[i].is_finite() {
-            state.z_l[i] = (state.z_l[i] + alpha_d * state.dz_l[i]).max(1e-20);
-        }
-        if state.x_u[i].is_finite() {
-            state.z_u[i] = (state.z_u[i] + alpha_d * state.dz_u[i]).max(1e-20);
-        }
+    // Phase 6c.1: walk compressed-bound storage natively. The
+    // combined `state.z_l`/`state.z_u` are kept in sync via
+    // `refresh_compressed_z` at function exit until Phase 6d drops
+    // them. Per-bound iteration replaces the n-wide `is_finite` scan.
+    for k in 0..state.bound_layout.n_x_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        let new_z = (state.z_l_compressed[k] + alpha_d * state.dz_l_compressed[k]).max(1e-20);
+        state.z_l_compressed[k] = new_z;
+        state.z_l[i] = new_z;
+    }
+    for k in 0..state.bound_layout.n_x_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        let new_z = (state.z_u_compressed[k] + alpha_d * state.dz_u_compressed[k]).max(1e-20);
+        state.z_u_compressed[k] = new_z;
+        state.z_u[i] = new_z;
     }
     // Slack-bound multipliers v_L, v_U: same Newton update as z_L, z_U
     // (Ipopt's `IpIpoptAlg.cpp:652-770` advances all four blocks with the
@@ -2822,9 +2829,6 @@ fn advance_z_to_trial(state: &mut SolverState, alpha_d: f64) {
     // T3.25: bump dual atags so a downstream factor doesn't reuse a
     // stale fingerprint after this trial-step write.
     state.bump_dual_atags();
-    // Phase 6b: refresh compressed z-mirrors after the per-element
-    // trial-step write to combined z_l/z_u.
-    state.refresh_compressed_z();
 }
 
 /// Apply the kappa_sigma reset to bound multipliers (Ipopt's
@@ -2836,7 +2840,6 @@ fn apply_kappa_sigma_bound_multiplier_reset(
     state: &mut SolverState,
     mu_state: &MuState,
 ) -> f64 {
-    let n = state.n;
     let m = state.m;
     let kappa_sigma = 1e10;
     // T2.3: drop the ripopt-specific `.max(state.mu)` clamp on the Free-mode
@@ -2848,19 +2851,26 @@ fn apply_kappa_sigma_bound_multiplier_reset(
     } else {
         state.mu
     };
-    for i in 0..n {
-        if state.x_l[i].is_finite() {
-            let s_l = slack_xl(state, i);
-            let z_lo = mu_ks / (kappa_sigma * s_l);
-            let z_hi = kappa_sigma * mu_ks / s_l;
-            state.z_l[i] = state.z_l[i].clamp(z_lo, z_hi);
-        }
-        if state.x_u[i].is_finite() {
-            let s_u = slack_xu(state, i);
-            let z_lo = mu_ks / (kappa_sigma * s_u);
-            let z_hi = kappa_sigma * mu_ks / s_u;
-            state.z_u[i] = state.z_u[i].clamp(z_lo, z_hi);
-        }
+    // Phase 6c.1: walk compressed-bound storage natively; mirror the
+    // clamp into combined z_l/z_u so legacy readers keep their view
+    // until Phase 6d drops the combined arrays.
+    for k in 0..state.bound_layout.n_x_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        let s_l = slack_xl(state, i);
+        let z_lo = mu_ks / (kappa_sigma * s_l);
+        let z_hi = kappa_sigma * mu_ks / s_l;
+        let clamped = state.z_l_compressed[k].clamp(z_lo, z_hi);
+        state.z_l_compressed[k] = clamped;
+        state.z_l[i] = clamped;
+    }
+    for k in 0..state.bound_layout.n_x_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        let s_u = slack_xu(state, i);
+        let z_lo = mu_ks / (kappa_sigma * s_u);
+        let z_hi = kappa_sigma * mu_ks / s_u;
+        let clamped = state.z_u_compressed[k].clamp(z_lo, z_hi);
+        state.z_u_compressed[k] = clamped;
+        state.z_u[i] = clamped;
     }
     // Apply the same κ_σ band to the slack-bound multipliers v_L, v_U
     // (Ipopt's `correct_bound_multiplier` runs over ALL FOUR blocks,
@@ -2881,9 +2891,6 @@ fn apply_kappa_sigma_bound_multiplier_reset(
         }
     }
     let _ = m;
-    // Phase 6b: refresh compressed z-mirrors after the per-element
-    // kappa_sigma clamp on combined z_l/z_u.
-    state.refresh_compressed_z();
     mu_ks
 }
 
@@ -4054,13 +4061,21 @@ fn attempt_soft_restoration<P: NlpProblem>(
         let v = state.y_at(i) + alpha_d * state.dy_at(i);
         state.set_y_at(i, v);
     }
-    for i in 0..n {
-        state.z_l[i] = (state.z_l[i] + alpha_d * state.dz_l[i]).max(0.0);
-        state.z_u[i] = (state.z_u[i] + alpha_d * state.dz_u[i]).max(0.0);
+    // Phase 6c.1: soft-resto direct dual step now walks compressed-bound
+    // storage natively. Mirror to combined `z_l`/`z_u` until Phase 6d
+    // drops them. Note the soft-resto floor is `0.0`, not `1e-20`.
+    for k in 0..state.bound_layout.n_x_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        let new_z = (state.z_l_compressed[k] + alpha_d * state.dz_l_compressed[k]).max(0.0);
+        state.z_l_compressed[k] = new_z;
+        state.z_l[i] = new_z;
     }
-    // Phase 6b: keep compressed z-mirrors in sync after the per-element
-    // soft-resto dual update on combined z_l/z_u.
-    state.refresh_compressed_z();
+    for k in 0..state.bound_layout.n_x_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        let new_z = (state.z_u_compressed[k] + alpha_d * state.dz_u_compressed[k]).max(0.0);
+        state.z_u_compressed[k] = new_z;
+        state.z_u[i] = new_z;
+    }
     // T3.25: soft-resto trial step writes x and duals directly (does
     // not go through commit_trial_point), so bump atags ourselves.
     state.bump_all_kkt_atags();
