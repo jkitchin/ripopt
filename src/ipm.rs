@@ -2961,28 +2961,31 @@ fn apply_slack_move(state: &mut SolverState, options: &SolverOptions) -> usize {
     // so small that s_min underflows. See IpIpoptCalculatedQuantities.cpp:469-477.
     let s_min = (f64::EPSILON * mu.min(1.0)).max(f64::MIN_POSITIVE);
     let mut adjusted = 0usize;
-    for i in 0..n {
-        if state.x_l[i].is_finite() {
-            let s_l = state.x[i] - state.x_l[i];
-            if s_l < s_min {
-                let z = state.z_l[i];
-                let from_mu = if z > 0.0 { mu / z } else { f64::INFINITY };
-                let cap = slack_move * state.x_l[i].abs().max(1.0) + s_l;
-                let new_s = from_mu.max(s_min).min(cap);
-                state.x_l[i] -= new_s - s_l;
-                adjusted += 1;
-            }
+    // Phase 6d.3: walk compressed bound mirrors. The set
+    // {i : x_l[i].is_finite()} matches `x_l_to_full[..n_x_l]` exactly.
+    let _ = n;
+    for k in 0..state.bound_layout.n_x_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        let s_l = state.x[i] - state.x_l[i];
+        if s_l < s_min {
+            let z = state.z_l_compressed[k];
+            let from_mu = if z > 0.0 { mu / z } else { f64::INFINITY };
+            let cap = slack_move * state.x_l[i].abs().max(1.0) + s_l;
+            let new_s = from_mu.max(s_min).min(cap);
+            state.x_l[i] -= new_s - s_l;
+            adjusted += 1;
         }
-        if state.x_u[i].is_finite() {
-            let s_u = state.x_u[i] - state.x[i];
-            if s_u < s_min {
-                let z = state.z_u[i];
-                let from_mu = if z > 0.0 { mu / z } else { f64::INFINITY };
-                let cap = slack_move * state.x_u[i].abs().max(1.0) + s_u;
-                let new_s = from_mu.max(s_min).min(cap);
-                state.x_u[i] += new_s - s_u;
-                adjusted += 1;
-            }
+    }
+    for k in 0..state.bound_layout.n_x_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        let s_u = state.x_u[i] - state.x[i];
+        if s_u < s_min {
+            let z = state.z_u_compressed[k];
+            let from_mu = if z > 0.0 { mu / z } else { f64::INFINITY };
+            let cap = slack_move * state.x_u[i].abs().max(1.0) + s_u;
+            let new_s = from_mu.max(s_min).min(cap);
+            state.x_u[i] += new_s - s_u;
+            adjusted += 1;
         }
     }
     // B-cross8: extend slack_move to the constraint slack iterate `s`
@@ -3108,9 +3111,15 @@ fn compute_min_dual_infeas_alpha<P: NlpProblem>(
     for (k, (&kd, &col)) in state.jac_d_rows.iter().zip(state.jac_d_cols.iter()).enumerate() {
         r_x[col] += jac_d_trial[k] * state.y_d[kd];
     }
-    for i in 0..n {
-        r_x[i] -= state.z_l[i];
-        r_x[i] += state.z_u[i];
+    // Phase 6d.3: walk compressed bound mirrors. Unbounded sides
+    // contribute 0, identical to the n-wide form.
+    for k in 0..state.bound_layout.n_x_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        r_x[i] -= state.z_l_compressed[k];
+    }
+    for k in 0..state.bound_layout.n_x_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        r_x[i] += state.z_u_compressed[k];
     }
 
     // r_s and dy_d are d-block-only (Ipopt's slack rows don't exist on
@@ -5671,22 +5680,35 @@ fn build_iterate_snapshot(state: &SolverState) -> crate::intermediate::IterateSn
     let mut x_u_viol = vec![0.0; n];
     let mut compl_xl = vec![0.0; n];
     let mut compl_xu = vec![0.0; n];
+    // Phase 6d.3: bound-side reads consume the compressed mirror; the
+    // n-wide infeasibility sweep over x_l/x_u still needs the n-wide
+    // viol arrays so split the loop.
     for i in 0..n {
         if state.x_l[i].is_finite() {
             x_l_viol[i] = (state.x_l[i] - state.x[i]).max(0.0);
-            compl_xl[i] = (state.x[i] - state.x_l[i]) * state.z_l[i];
         }
         if state.x_u[i].is_finite() {
             x_u_viol[i] = (state.x[i] - state.x_u[i]).max(0.0);
-            compl_xu[i] = (state.x_u[i] - state.x[i]) * state.z_u[i];
         }
+    }
+    for k in 0..state.bound_layout.n_x_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        compl_xl[i] = (state.x[i] - state.x_l[i]) * state.z_l_compressed[k];
+    }
+    for k in 0..state.bound_layout.n_x_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        compl_xu[i] = (state.x_u[i] - state.x[i]) * state.z_u_compressed[k];
     }
     // grad_lag = grad_f + J^T y - z_l + z_u
     let mut grad_lag = state.grad_f.clone();
     accumulate_jt_y(state, &mut grad_lag);
-    for i in 0..n {
-        grad_lag[i] -= state.z_l[i];
-        grad_lag[i] += state.z_u[i];
+    for k in 0..state.bound_layout.n_x_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        grad_lag[i] -= state.z_l_compressed[k];
+    }
+    for k in 0..state.bound_layout.n_x_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        grad_lag[i] += state.z_u_compressed[k];
     }
     // Materialise m-form g for the user-facing intermediate callback
     // (Ipopt's `IpoptCalculatedQuantities::curr_c`/`curr_d` projected
@@ -6424,8 +6446,11 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 jty[col] += state.jac_d_vals[idx] * state.y_d[kd];
             }
             let jty_inf = jty.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
-            let zl_inf = state.z_l.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
-            let zu_inf = state.z_u.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+            // Phase 6d.3: bound-side scalar diagnostics consume the
+            // compressed mirror; zero-padded entries contribute nothing
+            // to abs/max/sum.
+            let zl_inf = state.z_l_compressed.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+            let zu_inf = state.z_u_compressed.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
             let y_inf = state
                 .y_c
                 .iter()
@@ -6437,11 +6462,19 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 .chain(state.y_d.iter())
                 .map(|v| v.abs())
                 .sum();
-            let zl_sum: f64 = state.z_l.iter().map(|v| v.abs()).sum();
-            let zu_sum: f64 = state.z_u.iter().map(|v| v.abs()).sum();
+            let zl_sum: f64 = state.z_l_compressed.iter().map(|v| v.abs()).sum();
+            let zu_sum: f64 = state.z_u_compressed.iter().map(|v| v.abs()).sum();
             let mut grad_lag = state.grad_f.clone();
             for i in 0..state.n {
-                grad_lag[i] += jty[i] - state.z_l[i] + state.z_u[i];
+                grad_lag[i] += jty[i];
+            }
+            for k in 0..state.bound_layout.n_x_l {
+                let i = state.bound_layout.x_l_to_full[k];
+                grad_lag[i] -= state.z_l_compressed[k];
+            }
+            for k in 0..state.bound_layout.n_x_u {
+                let i = state.bound_layout.x_u_to_full[k];
+                grad_lag[i] += state.z_u_compressed[k];
             }
             let (gl_idx, gl_inf) = grad_lag.iter().enumerate().fold(
                 (0usize, 0.0f64),
@@ -6454,9 +6487,16 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 "ripopt: iter0-probe: |grad_f|_inf={:.3e}@var{}, |J^T y|_inf={:.3e}, |y|_inf={:.3e}, |z_L|_inf={:.3e}, |z_U|_inf={:.3e}, sum|y|={:.3e}, sum|z_L|={:.3e}, sum|z_U|={:.3e}, |x|_inf={:.3e}, n={} m={}",
                 gf_inf, gf_inf_idx, jty_inf, y_inf, zl_inf, zu_inf, y_sum, zl_sum, zu_sum, x_inf, state.n, state.m
             );
+            // Phase 6d.3: gl_idx may or may not have a compressed slot.
+            let zl_at_gl = state.bound_layout.full_to_x_l[gl_idx]
+                .map(|k| state.z_l_compressed[k])
+                .unwrap_or(0.0);
+            let zu_at_gl = state.bound_layout.full_to_x_u[gl_idx]
+                .map(|k| state.z_u_compressed[k])
+                .unwrap_or(0.0);
             rip_log!(
                 "ripopt: iter0-probe: |grad_lag|_inf={:.3e}@var{} (grad_f={:.3e}, J^T y={:.3e}, z_L={:.3e}, z_U={:.3e}, x_l_fin={}, x_u_fin={}, obj_scaling={:.3e})",
-                gl_inf, gl_idx, state.grad_f[gl_idx], jty[gl_idx], state.z_l[gl_idx], state.z_u[gl_idx], x_l_fin, x_u_fin, state.obj_scaling
+                gl_inf, gl_idx, state.grad_f[gl_idx], jty[gl_idx], zl_at_gl, zu_at_gl, x_l_fin, x_u_fin, state.obj_scaling
             );
         }
 
@@ -6666,12 +6706,17 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 _iter_dw, _iter_dc,
                 inertia_params.delta_w_last, inertia_params.delta_c_last
             );
+            // Phase 6d.3: materialize dz_l/dz_u to full-n for the
+            // top5 diagnostic so the printed var indices match
+            // absolute variable ids.
+            let dz_l_iter0 = state.dz_l_combined();
+            let dz_u_iter0 = state.dz_u_combined();
             for (name, vec) in [
                 ("dx", &state.dx[..]),
                 ("ds", &ds_combined_iter0[..]),
                 ("dy", &dy_combined_iter0[..]),
-                ("dz_l", &state.dz_l[..]),
-                ("dz_u", &state.dz_u[..]),
+                ("dz_l", &dz_l_iter0[..]),
+                ("dz_u", &dz_u_iter0[..]),
             ] {
                 let top = top5_signed(vec);
                 let mut s = format!("ripopt: iter0-step: top5 {}:", name);
@@ -6693,11 +6738,12 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 let xli = state.x_l[probe_var];
                 let xui = state.x_u[probe_var];
                 let mut sigma_x_pv = 0.0_f64;
-                if xli.is_finite() {
-                    sigma_x_pv += state.z_l[probe_var] / (xi - xli).max(1e-20);
+                // Phase 6d.3: index compressed mirrors via BoundLayout.
+                if let Some(k) = state.bound_layout.full_to_x_l[probe_var] {
+                    sigma_x_pv += state.z_l_compressed[k] / (xi - xli).max(1e-20);
                 }
-                if xui.is_finite() {
-                    sigma_x_pv += state.z_u[probe_var] / (xui - xi).max(1e-20);
+                if let Some(k) = state.bound_layout.full_to_x_u[probe_var] {
+                    sigma_x_pv += state.z_u_compressed[k] / (xui - xi).max(1e-20);
                 }
                 // Hessian row probe_var (lower-triangle entries (probe_var, *)
                 // and upper via (*, probe_var)).
@@ -6791,11 +6837,17 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                     let xi = state.x[probe_i];
                     let xli = state.x_l[probe_i];
                     let xui = state.x_u[probe_i];
-                    let zli = state.z_l[probe_i];
-                    let zui = state.z_u[probe_i];
+                    // Phase 6d.3: index compressed mirrors via BoundLayout
+                    // (unbounded sides report 0 — same as the legacy combined storage).
+                    let zli = state.bound_layout.full_to_x_l[probe_i]
+                        .map(|k| state.z_l_compressed[k]).unwrap_or(0.0);
+                    let zui = state.bound_layout.full_to_x_u[probe_i]
+                        .map(|k| state.z_u_compressed[k]).unwrap_or(0.0);
                     let dxi = state.dx[probe_i];
-                    let dzli = state.dz_l[probe_i];
-                    let dzui = state.dz_u[probe_i];
+                    let dzli = state.bound_layout.full_to_x_l[probe_i]
+                        .map(|k| state.dz_l_compressed[k]).unwrap_or(0.0);
+                    let dzui = state.bound_layout.full_to_x_u[probe_i]
+                        .map(|k| state.dz_u_compressed[k]).unwrap_or(0.0);
                     let slack_l = xi - xli;
                     let slack_u = xui - xi;
                     rip_log!(
@@ -9183,9 +9235,14 @@ fn compute_pderror_e_mu(state: &SolverState, mu: f64) -> f64 {
     for (idx, (&kd, &col)) in state.jac_d_rows.iter().zip(state.jac_d_cols.iter()).enumerate() {
         residual[col] += state.jac_d_vals[idx] * state.y_d[kd];
     }
-    for i in 0..n {
-        residual[i] -= state.z_l[i];
-        residual[i] += state.z_u[i];
+    // Phase 6d.3: walk compressed bound mirrors.
+    for k in 0..state.bound_layout.n_x_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        residual[i] -= state.z_l_compressed[k];
+    }
+    for k in 0..state.bound_layout.n_x_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        residual[i] += state.z_u_compressed[k];
     }
     let dual_l1: f64 = residual.iter().map(|r| r.abs()).sum();
 
@@ -9201,17 +9258,19 @@ fn compute_pderror_e_mu(state: &SolverState, mu: f64) -> f64 {
     // finite bounds, drop the term.
     let mut compl_l1 = 0.0f64;
     let mut n_compl = 0usize;
-    for i in 0..n {
-        if state.x_l[i].is_finite() {
-            let slack = (state.x[i] - state.x_l[i]).max(0.0);
-            compl_l1 += (slack * state.z_l[i] - mu).abs();
-            n_compl += 1;
-        }
-        if state.x_u[i].is_finite() {
-            let slack = (state.x_u[i] - state.x[i]).max(0.0);
-            compl_l1 += (slack * state.z_u[i] - mu).abs();
-            n_compl += 1;
-        }
+    let _ = n;
+    // Phase 6d.3: walk compressed bound mirrors.
+    for k in 0..state.bound_layout.n_x_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        let slack = (state.x[i] - state.x_l[i]).max(0.0);
+        compl_l1 += (slack * state.z_l_compressed[k] - mu).abs();
+        n_compl += 1;
+    }
+    for k in 0..state.bound_layout.n_x_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        let slack = (state.x_u[i] - state.x[i]).max(0.0);
+        compl_l1 += (slack * state.z_u_compressed[k] - mu).abs();
+        n_compl += 1;
     }
     let compl_term = if n_compl == 0 { 0.0 } else { compl_l1 / n_compl as f64 };
 
@@ -9567,8 +9626,13 @@ fn commit_trial_point(
                 let s = state.x_u[i] - state.x[i];
                 if s > 0.0 && s < min_s_x { min_s_x = s; min_s_idx = i; min_s_side = "U"; }
             }
-            if state.z_l[i].abs() > max_z_x { max_z_x = state.z_l[i].abs(); }
-            if state.z_u[i].abs() > max_z_x { max_z_x = state.z_u[i].abs(); }
+        }
+        // Phase 6d.3: walk compressed bound mirrors for max |z|.
+        for &v in &state.z_l_compressed {
+            if v.abs() > max_z_x { max_z_x = v.abs(); }
+        }
+        for &v in &state.z_u_compressed {
+            if v.abs() > max_z_x { max_z_x = v.abs(); }
         }
         let (xv, bv) = if min_s_idx < state.n {
             let xv = state.x[min_s_idx];
@@ -9620,10 +9684,12 @@ fn commit_trial_point(
 /// (`IpIpoptCalculatedQuantities.cpp:3689-3690`,
 /// `y_c + y_d + z_L + z_U + v_L + v_U`).
 fn compute_multiplier_sum(state: &SolverState) -> f64 {
+    // Phase 6d.3: walk compressed bound mirrors. l1_norm over
+    // unbounded zero-padded sides was 0 anyway.
     l1_norm(&state.y_c)
         + l1_norm(&state.y_d)
-        + l1_norm(&state.z_l)
-        + l1_norm(&state.z_u)
+        + l1_norm(&state.z_l_compressed)
+        + l1_norm(&state.z_u_compressed)
         + l1_norm(&state.v_l)
         + l1_norm(&state.v_u)
 }
@@ -9634,8 +9700,10 @@ fn compute_multiplier_sum(state: &SolverState) -> f64 {
 /// `compute_bound_multiplier_count` (finite-bound count over
 /// x and inequality g rows) to form the complementarity scaling `s_c`.
 fn compute_bound_multiplier_sum(state: &SolverState) -> f64 {
-    l1_norm(&state.z_l)
-        + l1_norm(&state.z_u)
+    // Phase 6d.3: walk compressed bound mirrors. l1_norm over
+    // unbounded zero-padded sides was 0 anyway.
+    l1_norm(&state.z_l_compressed)
+        + l1_norm(&state.z_u_compressed)
         + l1_norm(&state.v_l)
         + l1_norm(&state.v_u)
 }
@@ -9727,16 +9795,17 @@ fn compute_convergence_info_from_state(
 fn compute_avg_complementarity(state: &SolverState) -> f64 {
     let mut sum_compl = 0.0;
     let mut count = 0;
-    // Variable bound complementarity: z_l * (x - x_l), z_u * (x_u - x)
-    for i in 0..state.n {
-        if state.x_l[i].is_finite() {
-            sum_compl += slack_xl(state, i) * state.z_l[i];
-            count += 1;
-        }
-        if state.x_u[i].is_finite() {
-            sum_compl += slack_xu(state, i) * state.z_u[i];
-            count += 1;
-        }
+    // Phase 6d.3: walk compressed bound mirrors. The set
+    // {i : x_{l,u}[i].is_finite()} matches `x_{l,u}_to_full[..n_x_{l,u}]`.
+    for k in 0..state.bound_layout.n_x_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        sum_compl += slack_xl(state, i) * state.z_l_compressed[k];
+        count += 1;
+    }
+    for k in 0..state.bound_layout.n_x_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        sum_compl += slack_xu(state, i) * state.z_u_compressed[k];
+        count += 1;
     }
     // B-cross6: include slack-side complementarity v_L·s_L, v_U·s_U
     // unconditionally, matching Ipopt's `IpIpoptCalculatedQuantities::
@@ -9789,19 +9858,18 @@ fn compute_avg_complementarity(state: &SolverState) -> f64 {
 /// large — exactly the dual-stagnation symptom seen on arki0003 where
 /// μ froze at lg(μ)=2.83e-3 for 500+ iterations.
 fn compute_barrier_error(state: &SolverState) -> f64 {
-    let n = state.n;
-
     // ∇L = ∇f + J^T y − z_l + z_u (un-damped; matches
     // `curr_grad_lag_x` at IpIpoptCalculatedQuantities.cpp:1993-2030)
     let mut grad_lag = state.grad_f.clone();
     accumulate_jt_y(state, &mut grad_lag);
-    for i in 0..n {
-        if state.x_l[i].is_finite() {
-            grad_lag[i] -= state.z_l[i];
-        }
-        if state.x_u[i].is_finite() {
-            grad_lag[i] += state.z_u[i];
-        }
+    // Phase 6d.3: walk compressed bound mirrors.
+    for k in 0..state.bound_layout.n_x_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        grad_lag[i] -= state.z_l_compressed[k];
+    }
+    for k in 0..state.bound_layout.n_x_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        grad_lag[i] += state.z_u_compressed[k];
     }
     let s_d = compute_s_d_at_state(state);
     let dual_err = linf_norm(&grad_lag) / s_d;
@@ -9813,18 +9881,19 @@ fn compute_barrier_error(state: &SolverState) -> f64 {
         compute_bound_multiplier_count(state),
     );
     let mut compl_max: f64 = 0.0;
-    for i in 0..n {
-        if state.x_l[i].is_finite() {
-            let r = (slack_xl(state, i) * state.z_l[i] - state.mu).abs();
-            if r > compl_max {
-                compl_max = r;
-            }
+    // Phase 6d.3: walk compressed bound mirrors.
+    for k in 0..state.bound_layout.n_x_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        let r = (slack_xl(state, i) * state.z_l_compressed[k] - state.mu).abs();
+        if r > compl_max {
+            compl_max = r;
         }
-        if state.x_u[i].is_finite() {
-            let r = (slack_xu(state, i) * state.z_u[i] - state.mu).abs();
-            if r > compl_max {
-                compl_max = r;
-            }
+    }
+    for k in 0..state.bound_layout.n_x_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        let r = (slack_xu(state, i) * state.z_u_compressed[k] - state.mu).abs();
+        if r > compl_max {
+            compl_max = r;
         }
     }
     let compl_err = compl_max / s_c;
@@ -10321,8 +10390,9 @@ mod tests {
         // slacks = [0.5, 1.0]; avg_compl = (0.5*2.0 + 1.0*3.0) / 2 = 4.0 / 2 = 2.0
         let mut state = minimal_state(2, 0);
         state.x = vec![1.5, 2.0];
-        state.x_l = vec![1.0, 1.0];
+        set_variable_bounds(&mut state, vec![1.0, 1.0], vec![f64::INFINITY, f64::INFINITY]);
         state.z_l = vec![2.0, 3.0];
+        state.refresh_compressed_z();
         let avg = compute_avg_complementarity(&state);
         assert!((avg - 2.0).abs() < 1e-12, "expected 2.0, got {}", avg);
     }
@@ -10333,10 +10403,10 @@ mod tests {
         // avg = (0.5*2.0 + 0.5*3.0) / 2 = 2.5 / 2 = 1.25
         let mut state = minimal_state(1, 0);
         state.x = vec![1.5];
-        state.x_l = vec![1.0];
-        state.x_u = vec![2.0];
+        set_variable_bounds(&mut state, vec![1.0], vec![2.0]);
         state.z_l = vec![2.0];
         state.z_u = vec![3.0];
+        state.refresh_compressed_z();
         let avg = compute_avg_complementarity(&state);
         assert!((avg - 1.25).abs() < 1e-12, "expected 1.25, got {}", avg);
     }
@@ -10366,8 +10436,9 @@ mod tests {
         // → contrib=99.0. avg = (1.0 + 99.0) / 2 = 50.
         let mut state = minimal_state(1, 1);
         state.x = vec![2.0];
-        state.x_l = vec![1.0];
+        set_variable_bounds(&mut state, vec![1.0], vec![f64::INFINITY]);
         state.z_l = vec![1.0];
+        state.refresh_compressed_z();
         set_constraint_bounds(&mut state, vec![1.0], vec![f64::INFINITY]);
         state.set_g_combined(&[2.0]);
         state.v_l = vec![99.0];
@@ -11278,10 +11349,10 @@ mod tests {
         // Two variables x_l = 0 ≤ x with H = I, grad = (1, 1). Optimum at
         // x → 0 along both axes; KKT system has unique solution.
         s.x = vec![1.0, 1.0];
-        s.x_l = vec![0.0, 0.0];
-        s.x_u = vec![f64::INFINITY, f64::INFINITY];
+        set_variable_bounds(&mut s, vec![0.0, 0.0], vec![f64::INFINITY, f64::INFINITY]);
         s.z_l = vec![0.5, 0.5];
         s.z_u = vec![0.0, 0.0];
+        s.refresh_compressed_z();
         s.grad_f = vec![1.0, 1.0];
         s.hess_rows = vec![0, 1];
         s.hess_cols = vec![0, 1];
@@ -11331,6 +11402,7 @@ mod tests {
         let mut state = qf_minimal_state();
         state.x = vec![10.0, 0.01];
         state.z_l = vec![0.001, 5.0];
+        state.refresh_compressed_z();
         let avg = compute_avg_complementarity(&state);
 
         let opts_off = SolverOptions { quality_function_centrality: false, ..SolverOptions::default() };
