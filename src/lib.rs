@@ -79,6 +79,7 @@ pub(crate) mod logging;
 pub mod c_api;
 pub mod bound_layout;
 pub mod constraint_layout;
+pub mod d_bound_layout;
 pub mod convergence;
 pub mod filter;
 pub mod ipm;
