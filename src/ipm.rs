@@ -958,7 +958,7 @@ impl MuState {
             mode: MuMode::Free,
             ref_vals: Vec::with_capacity(8),
             num_refs_max: 4,
-            refs_red_fact: 0.999,
+            refs_red_fact: 0.9999,
             tiny_step: false,
             first_iter_in_mode: true,
             consecutive_restoration_failures: 0,
