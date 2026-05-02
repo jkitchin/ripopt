@@ -478,8 +478,10 @@ struct IterateSnapshot {
     x: Vec<f64>,
     y_c: Vec<f64>,
     y_d: Vec<f64>,
-    z_l: Vec<f64>,
-    z_u: Vec<f64>,
+    /// Phase 6d.2: native compressed bound multipliers; expanded back
+    /// into combined `state.z_l`/`state.z_u` on restore.
+    z_l_compressed: Vec<f64>,
+    z_u_compressed: Vec<f64>,
     v_l: Vec<f64>,
     v_u: Vec<f64>,
     s: Vec<f64>,
@@ -498,8 +500,8 @@ impl IterateSnapshot {
             x: state.x.clone(),
             y_c: state.y_c.clone(),
             y_d: state.y_d.clone(),
-            z_l: state.z_l.clone(),
-            z_u: state.z_u.clone(),
+            z_l_compressed: state.z_l_compressed.clone(),
+            z_u_compressed: state.z_u_compressed.clone(),
             v_l: state.v_l.clone(),
             v_u: state.v_u.clone(),
             s: state.s.clone(),
@@ -517,8 +519,13 @@ impl IterateSnapshot {
         state.x = self.x.clone();
         state.y_c = self.y_c.clone();
         state.y_d = self.y_d.clone();
-        state.z_l = self.z_l.clone();
-        state.z_u = self.z_u.clone();
+        // Phase 6d.2: restore compressed first, then expand into the
+        // combined `state.z_l`/`state.z_u` mirrors that legacy readers
+        // still consume.
+        state.z_l_compressed = self.z_l_compressed.clone();
+        state.z_u_compressed = self.z_u_compressed.clone();
+        state.z_l = state.bound_layout.expand_l(&state.z_l_compressed, 0.0);
+        state.z_u = state.bound_layout.expand_u(&state.z_u_compressed, 0.0);
         state.v_l = self.v_l.clone();
         state.v_u = self.v_u.clone();
         state.s = self.s.clone();
@@ -527,9 +534,6 @@ impl IterateSnapshot {
         state.c_x = self.c_x.clone();
         state.d_x = self.d_x.clone();
         state.grad_f = self.grad_f.clone();
-        // Phase 6b: keep compressed z-mirrors in sync with the combined
-        // arrays we just bulk-replaced.
-        state.refresh_compressed_z();
         filter.restore_entries(self.filter_entries.clone());
     }
 }
@@ -539,8 +543,9 @@ struct WatchdogSavedState {
     x: Vec<f64>,
     y_c: Vec<f64>,
     y_d: Vec<f64>,
-    z_l: Vec<f64>,
-    z_u: Vec<f64>,
+    /// Phase 6d.2: native compressed bound multipliers.
+    z_l_compressed: Vec<f64>,
+    z_u_compressed: Vec<f64>,
     v_l: Vec<f64>,
     v_u: Vec<f64>,
     s: Vec<f64>,
@@ -562,8 +567,8 @@ impl WatchdogSavedState {
             x: state.x.clone(),
             y_c: state.y_c.clone(),
             y_d: state.y_d.clone(),
-            z_l: state.z_l.clone(),
-            z_u: state.z_u.clone(),
+            z_l_compressed: state.z_l_compressed.clone(),
+            z_u_compressed: state.z_u_compressed.clone(),
             v_l: state.v_l.clone(),
             v_u: state.v_u.clone(),
             s: state.s.clone(),
@@ -585,8 +590,11 @@ impl WatchdogSavedState {
         state.x = self.x.clone();
         state.y_c = self.y_c.clone();
         state.y_d = self.y_d.clone();
-        state.z_l = self.z_l.clone();
-        state.z_u = self.z_u.clone();
+        // Phase 6d.2: restore compressed; expand into combined.
+        state.z_l_compressed = self.z_l_compressed.clone();
+        state.z_u_compressed = self.z_u_compressed.clone();
+        state.z_l = state.bound_layout.expand_l(&state.z_l_compressed, 0.0);
+        state.z_u = state.bound_layout.expand_u(&state.z_u_compressed, 0.0);
         state.v_l = self.v_l.clone();
         state.v_u = self.v_u.clone();
         state.s = self.s.clone();
@@ -595,8 +603,6 @@ impl WatchdogSavedState {
         state.c_x = self.c_x.clone();
         state.d_x = self.d_x.clone();
         state.grad_f = self.grad_f.clone();
-        // Phase 6b: keep compressed z-mirrors in sync.
-        state.refresh_compressed_z();
         // T3.25 follow-up: watchdog revert mutates x/y/z/v outside the
         // line-search choke point that bumps atags. Bump them and drop
         // the cache so the next factor cannot replay a stale `(δ_w,
@@ -927,8 +933,9 @@ struct MuState {
 struct AcceptedIterateSnapshot {
     x: Vec<f64>,
     y: Vec<f64>,
-    z_l: Vec<f64>,
-    z_u: Vec<f64>,
+    /// Phase 6d.2: native compressed bound multipliers.
+    z_l_compressed: Vec<f64>,
+    z_u_compressed: Vec<f64>,
     v_l: Vec<f64>,
     v_u: Vec<f64>,
 }
@@ -3987,8 +3994,9 @@ struct SoftRestoSnapshot {
     x: Vec<f64>,
     y_c: Vec<f64>,
     y_d: Vec<f64>,
-    z_l: Vec<f64>,
-    z_u: Vec<f64>,
+    /// Phase 6d.2: native compressed bound multipliers.
+    z_l_compressed: Vec<f64>,
+    z_u_compressed: Vec<f64>,
     s: Vec<f64>,
     obj: f64,
     c_x: Vec<f64>,
@@ -4004,8 +4012,8 @@ impl SoftRestoSnapshot {
             x: state.x.clone(),
             y_c: state.y_c.clone(),
             y_d: state.y_d.clone(),
-            z_l: state.z_l.clone(),
-            z_u: state.z_u.clone(),
+            z_l_compressed: state.z_l_compressed.clone(),
+            z_u_compressed: state.z_u_compressed.clone(),
             s: state.s.clone(),
             obj: state.obj,
             c_x: state.c_x.clone(),
@@ -4020,8 +4028,11 @@ impl SoftRestoSnapshot {
         state.x = self.x;
         state.y_c = self.y_c;
         state.y_d = self.y_d;
-        state.z_l = self.z_l;
-        state.z_u = self.z_u;
+        // Phase 6d.2: restore compressed; expand into combined.
+        state.z_l_compressed = self.z_l_compressed;
+        state.z_u_compressed = self.z_u_compressed;
+        state.z_l = state.bound_layout.expand_l(&state.z_l_compressed, 0.0);
+        state.z_u = state.bound_layout.expand_u(&state.z_u_compressed, 0.0);
         state.s = self.s;
         state.obj = self.obj;
         state.c_x = self.c_x;
@@ -4030,8 +4041,6 @@ impl SoftRestoSnapshot {
         state.jac_c_vals = self.jac_c_vals;
         state.jac_d_vals = self.jac_d_vals;
         state.alpha_primal = self.alpha_primal;
-        // Phase 6b: keep compressed z-mirrors in sync after bulk restore.
-        state.refresh_compressed_z();
         // T3.25: snapshot restore touches every tracked input.
         state.bump_all_kkt_atags();
     }
@@ -4941,12 +4950,13 @@ fn switch_to_fixed_mode_with_adaptive_init(
         if let Some(snap) = mu_state.accepted_iterate.take() {
             state.x = snap.x;
             state.set_y_combined(&snap.y);
-            state.z_l = snap.z_l;
-            state.z_u = snap.z_u;
+            // Phase 6d.2: restore compressed; expand into combined.
+            state.z_l_compressed = snap.z_l_compressed;
+            state.z_u_compressed = snap.z_u_compressed;
+            state.z_l = state.bound_layout.expand_l(&state.z_l_compressed, 0.0);
+            state.z_u = state.bound_layout.expand_u(&state.z_u_compressed, 0.0);
             state.set_v_l_combined(&snap.v_l);
             state.set_v_u_combined(&snap.v_u);
-            // Phase 6b: keep compressed z-mirrors in sync.
-            state.refresh_compressed_z();
             // T3.25: rollback touches every tracked KKT input.
             state.bump_all_kkt_atags();
             log::debug!("Free→Fixed rollback: restored accepted_point");
@@ -4995,8 +5005,8 @@ fn apply_free_mode_sufficient_progress_update(
         mu_state.accepted_iterate = Some(AcceptedIterateSnapshot {
             x: state.x.clone(),
             y: state.y_combined(),
-            z_l: state.z_l.clone(),
-            z_u: state.z_u.clone(),
+            z_l_compressed: state.z_l_compressed.clone(),
+            z_u_compressed: state.z_u_compressed.clone(),
             v_l: state.v_l_combined(),
             v_u: state.v_u_combined(),
         });
@@ -5703,8 +5713,10 @@ fn build_iterate_snapshot(state: &SolverState) -> crate::intermediate::IterateSn
     }
     IterateSnapshot {
         x: state.x.clone(),
-        z_l: state.z_l.clone(),
-        z_u: state.z_u.clone(),
+        // Phase 6d.2: materialize full-`n` z_l/z_u from compressed for
+        // the public callback API.
+        z_l: state.z_l_combined(),
+        z_u: state.z_u_combined(),
         g: g_m,
         lambda: state.y_combined(),
         x_l_violation: x_l_viol,
@@ -10212,10 +10224,15 @@ mod tests {
     #[test]
     fn test_iterate_snapshot_capture_and_restore() {
         let mut state = minimal_state(2, 1);
+        // Phase 6d.2: snapshot now stores compressed; install proper
+        // two-sided bounds via the test helper so the bound_layout has
+        // n_x_l=n_x_u=2 and the compressed mirror has matching shape.
+        set_variable_bounds(&mut state, vec![-10.0, -10.0], vec![10.0, 10.0]);
         state.x = vec![1.5, 2.5];
         state.set_y_combined(&[0.7]);
         state.z_l = vec![0.1, 0.2];
         state.z_u = vec![0.3, 0.4];
+        state.refresh_compressed_z();
         state.mu = 1e-3;
         state.obj = 42.0;
         let mut filter = Filter::new(1e4);
@@ -10224,6 +10241,9 @@ mod tests {
         // Mutate state and filter to simulate further iterations.
         state.x = vec![9.0, 9.0];
         state.set_y_combined(&[9.0]);
+        state.z_l = vec![0.0, 0.0];
+        state.z_u = vec![0.0, 0.0];
+        state.refresh_compressed_z();
         state.mu = 1.0;
         state.obj = 0.0;
         filter.add(99.0, 99.0);
