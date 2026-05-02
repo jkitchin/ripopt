@@ -7,9 +7,19 @@
 //! `c(x)` / `d(x)` and `Jac_c` / `Jac_d`. Combined m-vectors live only
 //! inside per-call scratch buffers owned by [`SplitNlp`].
 //!
-//! Phase 10a (additive landing): the type and methods are introduced
-//! here; production callers in `ipm.rs` / `restoration*.rs` migrate in
-//! Phase 10b sub-phases. No production code consumes this yet.
+//! Phase 10 status (post-10b.5): the IPM main driver in `ipm.rs`
+//! routes every post-`SolverState::new` `NlpProblem` callback through
+//! this adapter. The `NlpProblem` trait surface itself is unchanged
+//! (Phase 10c) — that is the user's TNLP equivalent and the only
+//! remaining user-facing combined-form surface, intentionally
+//! mirroring Ipopt's TNLP user contract.
+//!
+//! The remaining direct `problem.X` calls in `ipm.rs` are *upstream*
+//! of the IPM boundary (`SolverState::new`'s structural queries, the
+//! scaling preflight, LS multiplier-init invoked from the constructor
+//! itself). Diagnostic / preprocessing modules (`sensitivity.rs`,
+//! `linearity.rs`) and the alternative L-BFGS path (`lbfgs.rs`) sit
+//! outside the IPM main driver and have their own boundaries.
 
 use std::cell::RefCell;
 
@@ -19,7 +29,7 @@ use crate::problem::NlpProblem;
 /// Internal split-form NLP adapter. Holds a borrow of the user-supplied
 /// `NlpProblem` and the per-solve `ConstraintLayout`, plus reusable
 /// scratch buffers for the combined-form callbacks.
-#[allow(dead_code)] // Phase 10a: additive landing; consumers in 10b.
+#[allow(dead_code)] // Some methods exposed for completeness; not all are wired yet.
 pub(crate) struct SplitNlp<'a, P: NlpProblem> {
     problem: &'a P,
     layout: &'a ConstraintLayout,
@@ -32,7 +42,7 @@ pub(crate) struct SplitNlp<'a, P: NlpProblem> {
     lambda_scratch: RefCell<Vec<f64>>,
 }
 
-#[allow(dead_code)] // Phase 10a: additive landing; consumers in 10b.
+#[allow(dead_code)] // Some methods exposed for completeness; not all are wired yet.
 impl<'a, P: NlpProblem> SplitNlp<'a, P> {
     /// Build an adapter from a borrow of the problem and the per-solve
     /// constraint layout. Pre-sizes the `g` and `lambda` scratch
