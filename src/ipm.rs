@@ -2747,13 +2747,15 @@ fn evaluate_trial_point<P: NlpProblem>(
 ) -> Option<(Vec<f64>, f64, Vec<f64>, f64)> {
     let x_trial = compute_clamped_trial_x(state, &state.dx, alpha);
 
+    // Phase 10b.3: trial-point eval routes through SplitNlp.
+    let nlp = crate::split_nlp::SplitNlp::new(problem, &state.layout);
     let mut obj_trial = f64::INFINITY;
     state.n_obj_evals += 1;
-    let obj_ok = problem.objective(&x_trial, true, &mut obj_trial);
+    let obj_ok = nlp.objective(&x_trial, true, &mut obj_trial);
     let mut g_trial = vec![0.0; m];
     let constr_ok = if m > 0 {
         state.n_constr_evals += 1;
-        problem.constraints(&x_trial, true, &mut g_trial)
+        nlp.constraints_combined(&x_trial, true, &mut g_trial)
     } else {
         true
     };
@@ -3207,25 +3209,24 @@ fn compute_min_dual_infeas_alpha<P: NlpProblem>(
 
     // Evaluate grad_f and Jacobian values at the trial primal point.
     // `state.x` already holds the trial coords (committed pre-call).
+    // Phase 10b.4: route through SplitNlp; the adapter's
+    // `jacobian_split` collapses the combined→split projection.
+    let nlp = crate::split_nlp::SplitNlp::new(problem, &state.layout);
     let mut grad_f_trial = vec![0.0_f64; n];
-    if !problem.gradient(&state.x, true, &mut grad_f_trial) {
+    if !nlp.gradient(&state.x, true, &mut grad_f_trial) {
         return alpha_p; // graceful fallback
-    }
-    // Phase 5e: evaluate trial Jacobian into a scratch combined buffer,
-    // then project into split-form trial blocks via the same combined-idx
-    // map used by `refresh_split_jac_vals`.
-    let nnz_combined = state.jac_c_combined_idx.len() + state.jac_d_combined_idx.len();
-    let mut jac_trial = vec![0.0_f64; nnz_combined];
-    if !problem.jacobian_values(&state.x, false, &mut jac_trial) {
-        return alpha_p;
     }
     let mut jac_c_trial = vec![0.0_f64; state.jac_c_vals.len()];
     let mut jac_d_trial = vec![0.0_f64; state.jac_d_vals.len()];
-    for (k, &idx) in state.jac_c_combined_idx.iter().enumerate() {
-        jac_c_trial[k] = jac_trial[idx];
-    }
-    for (k, &idx) in state.jac_d_combined_idx.iter().enumerate() {
-        jac_d_trial[k] = jac_trial[idx];
+    if !nlp.jacobian_split(
+        &state.x,
+        false,
+        &state.jac_c_combined_idx,
+        &state.jac_d_combined_idx,
+        &mut jac_c_trial,
+        &mut jac_d_trial,
+    ) {
+        return alpha_p;
     }
 
     // r_x = grad_lag_x(trial) = grad_f_trial + J(trial)^T · y_curr − z_L + z_U.
@@ -3668,6 +3669,13 @@ fn try_gn_restoration<P: NlpProblem>(
     };
     let g_l_combined_for_resto = state.g_l_combined();
     let g_u_combined_for_resto = state.g_u_combined();
+    // Phase 10b.5: route the GN-restoration callbacks through SplitNlp.
+    // Restoration consumes m-form `g_out`/`jac_out` because the
+    // `RestorationNlp` builds the resto NLP against the original
+    // user row order; the adapter's `_combined` pass-throughs preserve
+    // that contract while keeping `problem.X` direct calls out of the
+    // IPM interior.
+    let nlp = crate::split_nlp::SplitNlp::new(problem, &state.layout);
     let (x_rest, gn_success) = restoration.restore_with_outer(
         &state.x,
         &x_l_full,
@@ -3680,9 +3688,9 @@ fn try_gn_restoration<P: NlpProblem>(
         m,
         options,
         &|theta, phi| filter.is_acceptable(theta, phi),
-        &|x_eval, g_out| problem.constraints(x_eval, true, g_out),
-        &|x_eval, jac_out| problem.jacobian_values(x_eval, true, jac_out),
-        Some(&|x_eval: &[f64], obj_out: &mut f64| problem.objective(x_eval, true, obj_out)),
+        &|x_eval, g_out| nlp.constraints_combined(x_eval, true, g_out),
+        &|x_eval, jac_out| nlp.jacobian_combined(x_eval, true, jac_out),
+        Some(&|x_eval: &[f64], obj_out: &mut f64| nlp.objective(x_eval, true, obj_out)),
         deadline,
         Some(&outer_ctx),
     );
@@ -4002,13 +4010,15 @@ fn reevaluate_after_step<P: NlpProblem>(
     };
     let g_l_combined_for_resto = state.g_l_combined();
     let g_u_combined_for_resto = state.g_u_combined();
+    // Phase 10b.5: route GN-restoration callbacks through SplitNlp.
+    let nlp = crate::split_nlp::SplitNlp::new(problem, &state.layout);
     let (x_rest, success) = restoration.restore_with_outer(
         &state.x, &x_l_full, &x_u_full, &g_l_combined_for_resto, &g_u_combined_for_resto,
         &state.jac_rows, &state.jac_cols, n, m, options,
         &|theta, phi| filter.is_acceptable(theta, phi),
-        &|x_eval, g_out| problem.constraints(x_eval, true, g_out),
-        &|x_eval, jac_out| problem.jacobian_values(x_eval, true, jac_out),
-        Some(&|x_eval: &[f64], obj_out: &mut f64| problem.objective(x_eval, true, obj_out)),
+        &|x_eval, g_out| nlp.constraints_combined(x_eval, true, g_out),
+        &|x_eval, jac_out| nlp.jacobian_combined(x_eval, true, jac_out),
+        Some(&|x_eval: &[f64], obj_out: &mut f64| nlp.objective(x_eval, true, obj_out)),
         deadline,
         Some(&outer_ctx),
     );
@@ -7487,12 +7497,17 @@ fn evaluate_soc_trial_and_check<P: NlpProblem>(
     kappa_soc: f64,
     theta_prev_soc: &mut f64,
 ) -> SocTrialOutcome {
+    // Phase 10b.2: SOC trial eval routes through SplitNlp. The
+    // m-form `g_soc` survives only inside the adapter's scratch and
+    // the caller-owned mirror used to feed `commit_trial_point` /
+    // `latest_trial_*` builders that still expect combined form.
+    let nlp = crate::split_nlp::SplitNlp::new(problem, &state.layout);
     let mut obj_soc = f64::INFINITY;
-    if !problem.objective(&x_soc, true, &mut obj_soc) || !obj_soc.is_finite() {
+    if !nlp.objective(&x_soc, true, &mut obj_soc) || !obj_soc.is_finite() {
         return SocTrialOutcome::Abort;
     }
     let mut g_soc = vec![0.0; m];
-    if !problem.constraints(&x_soc, false, &mut g_soc) {
+    if !nlp.constraints_combined(&x_soc, false, &mut g_soc) {
         return SocTrialOutcome::Abort;
     }
     if g_soc.iter().any(|v| !v.is_finite()) {
@@ -8001,10 +8016,12 @@ fn apply_restoration_success<P: NlpProblem>(
     // restoration check resets the filter implicitly when the
     // recovered point is feasible).
     {
+        // Phase 10b.3: post-restoration filter gate eval via SplitNlp.
+        let nlp = crate::split_nlp::SplitNlp::new(problem, &state.layout);
         let mut g_check = vec![0.0; m];
         let mut phi_check = f64::INFINITY;
-        let g_ok = m == 0 || problem.constraints(x_new, true, &mut g_check);
-        let phi_ok = problem.objective(x_new, true, &mut phi_check) && phi_check.is_finite();
+        let g_ok = m == 0 || nlp.constraints_combined(x_new, true, &mut g_check);
+        let phi_ok = nlp.objective(x_new, true, &mut phi_check) && phi_check.is_finite();
         if !g_ok || !phi_ok {
             return false;
         }
@@ -8180,9 +8197,11 @@ fn attempt_nlp_restoration<P: NlpProblem>(
         None
     };
 
+    // Phase 10b.3: post-restoration original-NLP eval via SplitNlp.
+    let nlp = crate::split_nlp::SplitNlp::new(problem, &state.layout);
     // Evaluate original constraints at the restored point
     let mut g_new = vec![0.0; m];
-    if !problem.constraints(&x_nlp, true, &mut g_new)
+    if !nlp.constraints_combined(&x_nlp, true, &mut g_new)
         || g_new.iter().any(|v| !v.is_finite())
     {
         return (x_nlp, resto_z, RestorationOutcome::Failed);
@@ -8197,7 +8216,7 @@ fn attempt_nlp_restoration<P: NlpProblem>(
 
     // Evaluate original objective at the restored point
     let mut phi_new = f64::INFINITY;
-    if !problem.objective(&x_nlp, false, &mut phi_new) || !phi_new.is_finite() {
+    if !nlp.objective(&x_nlp, false, &mut phi_new) || !phi_new.is_finite() {
         return (x_nlp, resto_z, RestorationOutcome::Failed);
     }
 
