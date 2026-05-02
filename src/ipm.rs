@@ -2114,11 +2114,16 @@ impl SolverState {
         skip_hessian: bool,
     ) -> bool {
         let new_x = self.x != self.x_last_eval;
+        // Phase 10b.1: route through the SplitNlp adapter. The combined
+        // m-form `g(x)` and `jac_g` live only in the adapter's internal
+        // scratch; this function sees only split-form `c(x)` / `d(x)`
+        // and `Jac_c` / `Jac_d`.
+        let nlp = crate::split_nlp::SplitNlp::new(problem, &self.layout);
         self.n_obj_evals += 1;
-        if !problem.objective(&self.x, new_x, &mut self.obj) { return false; }
+        if !nlp.objective(&self.x, new_x, &mut self.obj) { return false; }
         if !self.obj.is_finite() { return false; }
         self.n_grad_evals += 1;
-        if !problem.gradient(&self.x, false, &mut self.grad_f) { return false; }
+        if !nlp.gradient(&self.x, false, &mut self.grad_f) { return false; }
         // NB: 42f4015 added element-wise is_finite checks on grad_f and g
         // here. Benchmarking showed they caused regressions on CUTEst
         // problems (BIGGS6NE, CERI651*, HS84/89/92, MAKELA3, OPTCNTRL, ...)
@@ -2131,22 +2136,24 @@ impl SolverState {
         // user callback bool return.
         if self.m > 0 {
             self.n_constr_evals += 1;
-            let mut g_buf = vec![0.0; self.m];
-            if !problem.constraints(&self.x, false, &mut g_buf) { return false; }
-            for (k, &i) in self.layout.c_to_combined.iter().enumerate() {
-                self.c_x[k] = g_buf[i] - self.c_rhs[k];
+            // Adapter projects user `g(x)` into split `c_raw` and `d`.
+            // We then subtract `c_rhs` to land the equality residual.
+            if !nlp.constraints_split(&self.x, false, &mut self.c_x, &mut self.d_x) {
+                return false;
             }
-            for (k, &i) in self.layout.d_to_combined.iter().enumerate() {
-                self.d_x[k] = g_buf[i];
+            for k in 0..self.layout.n_c {
+                self.c_x[k] -= self.c_rhs[k];
             }
             self.n_jac_evals += 1;
-            let mut jac_buf = vec![0.0; self.jac_c_combined_idx.len() + self.jac_d_combined_idx.len()];
-            if !problem.jacobian_values(&self.x, false, &mut jac_buf) { return false; }
-            for (k, &idx) in self.jac_c_combined_idx.iter().enumerate() {
-                self.jac_c_vals[k] = jac_buf[idx];
-            }
-            for (k, &idx) in self.jac_d_combined_idx.iter().enumerate() {
-                self.jac_d_vals[k] = jac_buf[idx];
+            if !nlp.jacobian_split(
+                &self.x,
+                false,
+                &self.jac_c_combined_idx,
+                &self.jac_d_combined_idx,
+                &mut self.jac_c_vals,
+                &mut self.jac_d_vals,
+            ) {
+                return false;
             }
         }
         self.x_last_eval.copy_from_slice(&self.x);
@@ -2161,10 +2168,12 @@ impl SolverState {
                     lambda_for_hess[i] = 0.0;
                 }
             }
-            if !problem.hessian_values(&self.x, false, obj_factor, &lambda_for_hess, &mut self.hess_vals) { return false; }
+            if !nlp.hessian_combined(&self.x, false, obj_factor, &lambda_for_hess, &mut self.hess_vals) { return false; }
         } else {
-            let lambda = self.y_combined();
-            if !problem.hessian_values(&self.x, false, obj_factor, &lambda, &mut self.hess_vals) { return false; }
+            // Compose the m-form `lambda` from split `y_c` / `y_d`
+            // inside the adapter rather than materializing via
+            // `y_combined()` first.
+            if !nlp.hessian_from_split(&self.x, false, obj_factor, &self.y_c, &self.y_d, &mut self.hess_vals) { return false; }
         }
         true
     }
