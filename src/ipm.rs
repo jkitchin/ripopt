@@ -1776,32 +1776,54 @@ impl SolverState {
         self.v_u.clone()
     }
 
-    /// Reconstruct combined m-length `v_L` view (zero on equality rows).
+    /// Reconstruct combined m-length `v_L` view (zero on equality rows
+    /// and on inequality rows without a finite lower slack bound).
+    /// Phase 8c: routes through the compressed mirror via
+    /// `d_bound_layout.full_to_d_l`.
     pub fn v_l_combined(&self) -> Vec<f64> {
         let mut out = vec![0.0; self.m];
         for (k, &i) in self.layout.d_to_combined.iter().enumerate() {
-            out[i] = self.v_l[k];
+            if let Some(kc) = self.d_bound_layout.full_to_d_l[k] {
+                out[i] = self.v_l_compressed[kc];
+            }
         }
         out
     }
 
-    /// Reconstruct combined m-length `v_U` view (zero on equality rows).
+    /// Reconstruct combined m-length `v_U` view.
     pub fn v_u_combined(&self) -> Vec<f64> {
         let mut out = vec![0.0; self.m];
         for (k, &i) in self.layout.d_to_combined.iter().enumerate() {
-            out[i] = self.v_u[k];
+            if let Some(kc) = self.d_bound_layout.full_to_d_u[k] {
+                out[i] = self.v_u_compressed[kc];
+            }
         }
         out
     }
 
-    /// Combined-indexed read: `v_l[k]` for ineq rows, 0 for eq rows.
+    /// Combined-indexed read: `v_l[k]` for ineq rows with finite lower
+    /// slack bound, 0 otherwise. Phase 8c: routes through the compressed
+    /// mirror.
     pub fn v_l_at(&self, i: usize) -> f64 {
-        self.layout.ineq_pos[i].map(|k| self.v_l[k]).unwrap_or(0.0)
+        match self.layout.ineq_pos[i] {
+            Some(k) => match self.d_bound_layout.full_to_d_l[k] {
+                Some(kc) => self.v_l_compressed[kc],
+                None => 0.0,
+            },
+            None => 0.0,
+        }
     }
 
-    /// Combined-indexed read: `v_u[k]` for ineq rows, 0 for eq rows.
+    /// Combined-indexed read: `v_u[k]` for ineq rows with finite upper
+    /// slack bound, 0 otherwise. Phase 8c: compressed-routed.
     pub fn v_u_at(&self, i: usize) -> f64 {
-        self.layout.ineq_pos[i].map(|k| self.v_u[k]).unwrap_or(0.0)
+        match self.layout.ineq_pos[i] {
+            Some(k) => match self.d_bound_layout.full_to_d_u[k] {
+                Some(kc) => self.v_u_compressed[kc],
+                None => 0.0,
+            },
+            None => 0.0,
+        }
     }
 
     /// Combined-indexed write into `v_L`; no-op for equality rows.
@@ -1844,30 +1866,49 @@ impl SolverState {
         self.v_u_compressed = self.d_bound_layout.project_u(&self.v_u);
     }
 
-    /// Combined-indexed read: `dv_l[k]` for ineq rows, 0 for eq rows.
+    /// Combined-indexed read: `dv_l[k]` for ineq rows with finite
+    /// lower slack bound, 0 otherwise. Phase 8c: compressed-routed.
     pub fn dv_l_at(&self, i: usize) -> f64 {
-        self.layout.ineq_pos[i].map(|k| self.dv_l[k]).unwrap_or(0.0)
+        match self.layout.ineq_pos[i] {
+            Some(k) => match self.d_bound_layout.full_to_d_l[k] {
+                Some(kc) => self.dv_l_compressed[kc],
+                None => 0.0,
+            },
+            None => 0.0,
+        }
     }
 
-    /// Combined-indexed read: `dv_u[k]` for ineq rows, 0 for eq rows.
+    /// Combined-indexed read: `dv_u[k]` for ineq rows with finite
+    /// upper slack bound, 0 otherwise. Phase 8c: compressed-routed.
     pub fn dv_u_at(&self, i: usize) -> f64 {
-        self.layout.ineq_pos[i].map(|k| self.dv_u[k]).unwrap_or(0.0)
+        match self.layout.ineq_pos[i] {
+            Some(k) => match self.d_bound_layout.full_to_d_u[k] {
+                Some(kc) => self.dv_u_compressed[kc],
+                None => 0.0,
+            },
+            None => 0.0,
+        }
     }
 
-    /// Reconstruct combined m-length `dv_L` view (zero on eq rows).
+    /// Reconstruct combined m-length `dv_L` view (zero on eq rows and
+    /// on ineq rows without a finite lower slack bound).
     pub fn dv_l_combined(&self) -> Vec<f64> {
         let mut out = vec![0.0; self.m];
         for (k, &i) in self.layout.d_to_combined.iter().enumerate() {
-            out[i] = self.dv_l[k];
+            if let Some(kc) = self.d_bound_layout.full_to_d_l[k] {
+                out[i] = self.dv_l_compressed[kc];
+            }
         }
         out
     }
 
-    /// Reconstruct combined m-length `dv_U` view (zero on eq rows).
+    /// Reconstruct combined m-length `dv_U` view.
     pub fn dv_u_combined(&self) -> Vec<f64> {
         let mut out = vec![0.0; self.m];
         for (k, &i) in self.layout.d_to_combined.iter().enumerate() {
-            out[i] = self.dv_u[k];
+            if let Some(kc) = self.d_bound_layout.full_to_d_u[k] {
+                out[i] = self.dv_u_compressed[kc];
+            }
         }
         out
     }
@@ -10539,6 +10580,7 @@ mod tests {
         set_constraint_bounds(&mut state, vec![1.0], vec![f64::INFINITY]);
         state.set_g_combined(&[2.0]);
         state.v_l = vec![0.5];
+        state.v_l_compressed = vec![0.5];
         sync_state_s_to_g(&mut state);
         let avg = compute_avg_complementarity(&state);
         assert!((avg - 0.5).abs() < 1e-12, "fallback path: expected 0.5, got {}", avg);
@@ -10561,6 +10603,7 @@ mod tests {
         set_constraint_bounds(&mut state, vec![1.0], vec![f64::INFINITY]);
         state.set_g_combined(&[2.0]);
         state.v_l = vec![99.0];
+        state.v_l_compressed = vec![99.0];
         sync_state_s_to_g(&mut state);
         let avg = compute_avg_complementarity(&state);
         assert!((avg - 50.0).abs() < 1e-12,
@@ -11186,6 +11229,7 @@ mod tests {
         set_constraint_bounds(&mut state, vec![0.0], vec![f64::INFINITY]);
         state.v_l = vec![1.0];
         state.v_u = vec![0.0];
+        state.v_l_compressed = vec![1.0];
         let opts = SolverOptions { recalc_y: true, ..SolverOptions::default() };
         maybe_recalc_y_post_step(&mut state, &opts, 1, 1, false);
         assert!(
