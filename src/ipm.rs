@@ -1944,6 +1944,41 @@ impl SolverState {
         self.bound_layout.expand_u(&self.dz_u_compressed, 0.0)
     }
 
+    /// Phase 7b: full-`n` view of the lower variable bound. Reads from
+    /// the compressed mirror via `bound_layout.full_to_x_l[i]`; unbounded
+    /// indices return `f64::NEG_INFINITY`. Bit-identical to the legacy
+    /// `state.x_l[i]` read under the production invariant.
+    pub fn x_l_at(&self, i: usize) -> f64 {
+        match self.bound_layout.full_to_x_l[i] {
+            Some(k) => self.x_l_compressed[k],
+            None => f64::NEG_INFINITY,
+        }
+    }
+
+    /// Phase 7b: full-`n` view of the upper variable bound. Reads from
+    /// the compressed mirror via `bound_layout.full_to_x_u[i]`; unbounded
+    /// indices return `f64::INFINITY`.
+    pub fn x_u_at(&self, i: usize) -> f64 {
+        match self.bound_layout.full_to_x_u[i] {
+            Some(k) => self.x_u_compressed[k],
+            None => f64::INFINITY,
+        }
+    }
+
+    /// Phase 7b: materialize a full-`n` view of the lower variable bound
+    /// from the compressed mirror. Unbounded sides pad to
+    /// `f64::NEG_INFINITY`. Used for API boundaries that still expect
+    /// the legacy `&[f64]` slice with `±inf` sentinels.
+    pub fn x_l_combined(&self) -> Vec<f64> {
+        self.bound_layout.expand_l(&self.x_l_compressed, f64::NEG_INFINITY)
+    }
+
+    /// Phase 7b: materialize a full-`n` view of the upper variable bound
+    /// from the compressed mirror. Unbounded sides pad to `f64::INFINITY`.
+    pub fn x_u_combined(&self) -> Vec<f64> {
+        self.bound_layout.expand_u(&self.x_u_compressed, f64::INFINITY)
+    }
+
     /// Evaluate all functions, zeroing Hessian lambda for linear constraints.
     /// When `skip_hessian` is true (L-BFGS mode), the Hessian evaluation is skipped.
     fn evaluate_with_linear<P: NlpProblem>(
@@ -2923,29 +2958,29 @@ fn apply_slack_move(state: &mut SolverState, options: &SolverOptions) -> usize {
     let _ = n;
     for k in 0..state.bound_layout.n_x_l {
         let i = state.bound_layout.x_l_to_full[k];
-        let s_l = state.x[i] - state.x_l[i];
+        let s_l = state.x[i] - state.x_l_compressed[k];
         if s_l < s_min {
             let z = state.z_l_compressed[k];
             let from_mu = if z > 0.0 { mu / z } else { f64::INFINITY };
-            let cap = slack_move * state.x_l[i].abs().max(1.0) + s_l;
+            let cap = slack_move * state.x_l_compressed[k].abs().max(1.0) + s_l;
             let new_s = from_mu.max(s_min).min(cap);
-            state.x_l[i] -= new_s - s_l;
-            // Phase 7a: keep compressed mirror in sync.
-            state.x_l_compressed[k] = state.x_l[i];
+            state.x_l_compressed[k] -= new_s - s_l;
+            // Phase 7b: keep legacy combined mirror in sync (dropped in 7c).
+            state.x_l[i] = state.x_l_compressed[k];
             adjusted += 1;
         }
     }
     for k in 0..state.bound_layout.n_x_u {
         let i = state.bound_layout.x_u_to_full[k];
-        let s_u = state.x_u[i] - state.x[i];
+        let s_u = state.x_u_compressed[k] - state.x[i];
         if s_u < s_min {
             let z = state.z_u_compressed[k];
             let from_mu = if z > 0.0 { mu / z } else { f64::INFINITY };
-            let cap = slack_move * state.x_u[i].abs().max(1.0) + s_u;
+            let cap = slack_move * state.x_u_compressed[k].abs().max(1.0) + s_u;
             let new_s = from_mu.max(s_min).min(cap);
-            state.x_u[i] += new_s - s_u;
-            // Phase 7a: keep compressed mirror in sync.
-            state.x_u_compressed[k] = state.x_u[i];
+            state.x_u_compressed[k] += new_s - s_u;
+            // Phase 7b: keep legacy combined mirror in sync (dropped in 7c).
+            state.x_u[i] = state.x_u_compressed[k];
             adjusted += 1;
         }
     }
