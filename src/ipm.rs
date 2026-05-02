@@ -11145,8 +11145,11 @@ mod tests {
 
     #[test]
     fn test_relax_fixed_variable_bounds_default_widens() {
-        // Default option: RelaxBounds. x_l = x_u = 5.0 should be widened
-        // to [5 - 5e-8, 5 + 5e-8].
+        // Default option (Phase 11: MakeParameter). The IPM-layer fallback
+        // `relax_fixed_variable_bounds` widens for both RelaxBounds and
+        // MakeParameter (the latter is a safety net for callers that bypass
+        // the preprocessor and reach the IPM with literally-equal bounds).
+        // x_l = x_u = 5.0 should be widened to [5 - 5e-8, 5 + 5e-8].
         let opts = SolverOptions::default();
         let mut x_l = vec![5.0];
         let mut x_u = vec![5.0];

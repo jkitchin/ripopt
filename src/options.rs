@@ -1,11 +1,20 @@
 /// Treatment of variables with `x_L[i] == x_U[i]` (fixed variables).
 ///
 /// Mirrors Ipopt 3.14's `fixed_variable_treatment` (`TNLPAdapter`).
-/// Ipopt's default is `MakeParameter`: fixed variables are removed from
-/// the optimization. ripopt defaults to `RelaxBounds` for backward
-/// compatibility with pre-v0.8 callers; `MakeParameter` activates a
-/// fixed-var-only preprocessing pass (`PreprocessedProblem::new_fixed_only`)
-/// even when `enable_preprocessing` is off.
+/// Both Ipopt and ripopt default to `MakeParameter` (Phase 11 alignment):
+/// fixed variables are physically removed from the optimization before
+/// the IPM sees them. ripopt achieves this via the preprocessor wrapper
+/// `PreprocessedProblem::new_fixed_only`, which eliminates fixed vars
+/// without performing full preprocessing (no redundant-constraint
+/// detection, no bound tightening). The IPM then operates on the
+/// reduced problem and `state.x` has length `n_full − n_fixed`,
+/// matching Ipopt's TNLPAdapter `MAKE_PARAMETER` mode.
+///
+/// `RelaxBounds` is the pre-Phase-11 legacy default; it widens
+/// `[x_L, x_U]` by ±1e-8·max(|c|, 1) so the IPM has a non-empty
+/// interior on the fixed slot, paying one degree of freedom per fixed
+/// variable. Retained for backward compatibility and as a fallback for
+/// callers that don't want preprocessor-layer elimination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FixedVariableTreatment {
     /// Widen `[x_L, x_U]` by ±1e-8·max(|c|, 1) around the fixed value
@@ -22,7 +31,9 @@ pub enum FixedVariableTreatment {
 
 impl Default for FixedVariableTreatment {
     fn default() -> Self {
-        Self::RelaxBounds
+        // Phase 11: align default with Ipopt 3.14's TNLPAdapter
+        // (`fixed_variable_treatment = make_parameter`).
+        Self::MakeParameter
     }
 }
 
