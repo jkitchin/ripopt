@@ -440,6 +440,34 @@ pub fn compute_sigma(
     sigma
 }
 
+/// Phase 6c.3: compute the barrier diagonal Σ from compressed bound
+/// multipliers. Mirrors `compute_sigma` but walks the BoundLayout
+/// expansion maps (Px_L/Px_U) — bit-identical output for the
+/// production invariant where `z_l_compressed.len() == n_x_l` and
+/// `z_u_compressed.len() == n_x_u`.
+pub fn compute_sigma_compressed(
+    x: &[f64],
+    x_l: &[f64],
+    x_u: &[f64],
+    z_l_compressed: &[f64],
+    z_u_compressed: &[f64],
+    bound_layout: &crate::bound_layout::BoundLayout,
+) -> Vec<f64> {
+    let n = x.len();
+    let mut sigma = vec![0.0; n];
+    for k in 0..bound_layout.n_x_l {
+        let i = bound_layout.x_l_to_full[k];
+        let slack = (x[i] - x_l[i]).max(1e-20);
+        sigma[i] += z_l_compressed[k] / slack;
+    }
+    for k in 0..bound_layout.n_x_u {
+        let i = bound_layout.x_u_to_full[k];
+        let slack = (x_u[i] - x[i]).max(1e-20);
+        sigma[i] += z_u_compressed[k] / slack;
+    }
+    sigma
+}
+
 /// Apply Ruiz iterative equilibration to a KKT matrix and RHS.
 ///
 /// Computes diagonal scaling D such that the scaled matrix D*A*D has

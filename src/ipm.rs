@@ -9365,12 +9365,20 @@ fn sentinel_bounds_to_infinity(
     }
 }
 
-/// `kkt::compute_sigma` at the current iterate's
-/// `state.{x, x_l, x_u, z_l, z_u}`. Centralises the two callers —
-/// assemble_kkt_systems (main solve) and the perturbation recovery
-/// path in try_early_perturbation_recovery.
+/// `kkt::compute_sigma_compressed` at the current iterate's
+/// `state.{x, x_l, x_u, z_l_compressed, z_u_compressed}`. Centralises
+/// the two callers — assemble_kkt_systems (main solve) and the
+/// perturbation recovery path in try_early_perturbation_recovery.
+/// Phase 6c.3: routes through the compressed mirror via BoundLayout.
 fn compute_sigma_from_state(state: &SolverState) -> Vec<f64> {
-    kkt::compute_sigma(&state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u)
+    kkt::compute_sigma_compressed(
+        &state.x,
+        &state.x_l,
+        &state.x_u,
+        &state.z_l_compressed,
+        &state.z_u_compressed,
+        &state.bound_layout,
+    )
 }
 
 /// `kkt::recover_dz` (Fiacco bound-multiplier step recovery) at the
