@@ -664,12 +664,6 @@ pub(crate) struct SolverState {
     /// Materialise via `state.g_l_combined()` / `state.g_u_combined()`
     /// when an m-length slice is required.
     pub c_rhs: Vec<f64>,
-    /// Inequality-row lower bounds (Ipopt's `d_L`, size `layout.n_d`).
-    /// Phase 3f: split-form projection of `g_l`.
-    pub d_l: Vec<f64>,
-    /// Inequality-row upper bounds (Ipopt's `d_U`, size `layout.n_d`).
-    /// Phase 3f: split-form projection of `g_u`.
-    pub d_u: Vec<f64>,
     /// Number of variables.
     pub n: usize,
     /// Number of constraints.
@@ -1358,11 +1352,11 @@ impl SolverState {
         let y_d = layout.project_d(&y);
 
         // Phase 3f: split-form bound storage. c_rhs holds the equality
-        // target (= g_l[eq] = g_u[eq]); d_l/d_u hold the inequality
-        // bounds. These are invariant during solve, populated once.
+        // target (= g_l[eq] = g_u[eq]). Inequality bounds live in the
+        // compressed `d_l_compressed` / `d_u_compressed` mirrors built
+        // above (Phase 9b); the combined `d_l`/`d_u` storage was dropped
+        // in Phase 9d.
         let c_rhs: Vec<f64> = layout.c_to_combined.iter().map(|&i| g_l[i]).collect();
-        let d_l = layout.project_d(&g_l);
-        let d_u = layout.project_d(&g_u);
 
         // Phase 4a: build the split Jacobian structure by walking the
         // combined triplet once and routing each entry to the c-block
@@ -1408,8 +1402,6 @@ impl SolverState {
             alpha_dual: 0.0,
             iter: 0,
             c_rhs,
-            d_l,
-            d_u,
             n,
             m,
             obj: 0.0,
@@ -1499,38 +1491,61 @@ impl SolverState {
 
     /// Inequality lower bounds `d_L` (size n_d, may contain -inf).
     /// Mirrors Ipopt's `OrigIpoptNLP::d_L()` (`IpIpoptNLP.hpp:153`).
-    /// Phase 3f: native split storage.
+    /// Phase 9c: expand from compressed storage (`f64::NEG_INFINITY`
+    /// pad for d-rows without a finite lower bound).
     pub fn d_l(&self) -> Vec<f64> {
-        self.d_l.clone()
+        self.d_bound_layout
+            .expand_l(&self.d_l_compressed, f64::NEG_INFINITY)
     }
 
     /// Inequality upper bounds `d_U` (size n_d, may contain +inf).
     /// Mirrors Ipopt's `OrigIpoptNLP::d_U()` (`IpIpoptNLP.hpp:155`).
-    /// Phase 3f: native split storage.
+    /// Phase 9c: expand from compressed storage.
     pub fn d_u(&self) -> Vec<f64> {
-        self.d_u.clone()
+        self.d_bound_layout
+            .expand_u(&self.d_u_compressed, f64::INFINITY)
+    }
+
+    /// Inequality lower bound at d-block index `k`. Returns
+    /// `f64::NEG_INFINITY` when the d-row has no finite lower bound.
+    /// Phase 9c: routes through compressed storage.
+    pub fn d_l_at(&self, k: usize) -> f64 {
+        match self.d_bound_layout.full_to_d_l[k] {
+            Some(kc) => self.d_l_compressed[kc],
+            None => f64::NEG_INFINITY,
+        }
+    }
+
+    /// Inequality upper bound at d-block index `k`. Returns
+    /// `f64::INFINITY` when the d-row has no finite upper bound.
+    /// Phase 9c: routes through compressed storage.
+    pub fn d_u_at(&self, k: usize) -> f64 {
+        match self.d_bound_layout.full_to_d_u[k] {
+            Some(kc) => self.d_u_compressed[kc],
+            None => f64::INFINITY,
+        }
     }
 
     /// Combined-indexed read of the constraint lower bound. For eq rows
-    /// returns `c_rhs[k]`; for ineq rows returns `d_l[k]`. Phase 3f
-    /// replacement for direct `state.g_l_at(i)` access.
+    /// returns `c_rhs[k]`; for ineq rows returns `d_l_at(k)`. Phase 9c:
+    /// d-block read routes through compressed.
     pub fn g_l_at(&self, i: usize) -> f64 {
         if let Some(k) = self.layout.eq_pos[i] {
             self.c_rhs[k]
         } else if let Some(k) = self.layout.ineq_pos[i] {
-            self.d_l[k]
+            self.d_l_at(k)
         } else {
             unreachable!("constraint row {} is neither eq nor ineq", i)
         }
     }
 
     /// Combined-indexed read of the constraint upper bound. For eq rows
-    /// returns `c_rhs[k]`; for ineq rows returns `d_u[k]`.
+    /// returns `c_rhs[k]`; for ineq rows returns `d_u_at(k)`.
     pub fn g_u_at(&self, i: usize) -> f64 {
         if let Some(k) = self.layout.eq_pos[i] {
             self.c_rhs[k]
         } else if let Some(k) = self.layout.ineq_pos[i] {
-            self.d_u[k]
+            self.d_u_at(k)
         } else {
             unreachable!("constraint row {} is neither eq nor ineq", i)
         }
@@ -1548,13 +1563,17 @@ impl SolverState {
     }
 
     /// Combined-indexed write of the constraint lower bound. Routes to
-    /// `c_rhs` for eq rows or `d_l` for ineq rows. Phase 3f replacement
-    /// for direct `state.g_l_at(i) = v` writes.
+    /// `c_rhs` for eq rows or `d_l_compressed` for ineq rows with a
+    /// finite lower bound. Phase 9d: writes the compressed mirror
+    /// directly. The only runtime mutation site (`apply_slack_move`)
+    /// only nudges already-finite bounds, so the layout is invariant.
     pub fn set_g_l_at(&mut self, i: usize, v: f64) {
         if let Some(k) = self.layout.eq_pos[i] {
             self.c_rhs[k] = v;
         } else if let Some(k) = self.layout.ineq_pos[i] {
-            self.d_l[k] = v;
+            if let Some(kc) = self.d_bound_layout.full_to_d_l[k] {
+                self.d_l_compressed[kc] = v;
+            }
         } else {
             unreachable!("constraint row {} is neither eq nor ineq", i);
         }
@@ -1565,7 +1584,9 @@ impl SolverState {
         if let Some(k) = self.layout.eq_pos[i] {
             self.c_rhs[k] = v;
         } else if let Some(k) = self.layout.ineq_pos[i] {
-            self.d_u[k] = v;
+            if let Some(kc) = self.d_bound_layout.full_to_d_u[k] {
+                self.d_u_compressed[kc] = v;
+            }
         } else {
             unreachable!("constraint row {} is neither eq nor ineq", i);
         }
@@ -2208,8 +2229,8 @@ impl SolverState {
                 jdx_d[kd] += self.jac_d_vals[idx] * self.dx[col];
             }
             for k in 0..n_d {
-                let dl = self.d_l[k];
-                let du = self.d_u[k];
+                let dl = self.d_l_at(k);
+                let du = self.d_u_at(k);
                 if dl.is_finite() {
                     let slack = self.d_x[k] - dl;
                     if slack > self.mu * 1e-2 {
@@ -2683,8 +2704,8 @@ fn compute_barrier_phi(
     }
     if constraint_slack_barrier {
         for k in 0..state.layout.n_d {
-            let dl = state.d_l[k];
-            let du = state.d_u[k];
+            let dl = state.d_l_at(k);
+            let du = state.d_u_at(k);
             if dl.is_finite() {
                 let slack = d_x[k] - dl;
                 if slack > state.mu * 1e-2 {
@@ -5987,8 +6008,8 @@ fn initialize_slack_iterate(state: &mut SolverState, m: usize, options: &SolverO
     let kappa2 = options.bound_frac;
     let _ = m;
     for k in 0..state.layout.n_d {
-        let dl = state.d_l[k];
-        let du = state.d_u[k];
+        let dl = state.d_l_at(k);
+        let du = state.d_u_at(k);
         let l_fin = dl.is_finite();
         let u_fin = du.is_finite();
         let mut s_i = state.d_x[k];
@@ -6757,13 +6778,17 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             // Phase 8c.5: same for compressed v_l/v_u → length n_d.
             let v_l_full = state.d_bound_layout.expand_l(&state.v_l_compressed, 0.0);
             let v_u_full = state.d_bound_layout.expand_u(&state.v_u_compressed, 0.0);
+            // Phase 9c.5: same for compressed d_l/d_u → length n_d
+            // with ±∞ on unbounded sides.
+            let d_l_full = state.d_l();
+            let d_u_full = state.d_u();
             match crate::kkt_aug::aug_step_from_state_mehrotra(
                 n, &state.grad_f,
                 &state.hess_rows, &state.hess_cols, &state.hess_vals,
                 &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals,
                 &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals,
                 &state.x, &x_l_full, &x_u_full, &z_l_full, &z_u_full,
-                &state.s, &state.c_x, &state.d_x, &state.d_l, &state.d_u,
+                &state.s, &state.c_x, &state.d_x, &d_l_full, &d_u_full,
                 &state.y_c, &state.y_d, &v_l_full, &v_u_full,
                 state.mu, options.kappa_d,
                 crate::kkt_aug::PROBING_SIGMA_MAX_DEFAULT,
@@ -6787,13 +6812,16 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             // Phase 8c.5: same for compressed v_l/v_u → length n_d.
             let v_l_full = state.d_bound_layout.expand_l(&state.v_l_compressed, 0.0);
             let v_u_full = state.d_bound_layout.expand_u(&state.v_u_compressed, 0.0);
+            // Phase 9c.5: same for compressed d_l/d_u → length n_d.
+            let d_l_full = state.d_l();
+            let d_u_full = state.d_u();
             match crate::kkt_aug::aug_step_from_state(
                 n, &state.grad_f,
                 &state.hess_rows, &state.hess_cols, &state.hess_vals,
                 &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals,
                 &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals,
                 &state.x, &x_l_full, &x_u_full, &z_l_full, &z_u_full,
-                &state.s, &state.c_x, &state.d_x, &state.d_l, &state.d_u,
+                &state.s, &state.c_x, &state.d_x, &d_l_full, &d_u_full,
                 &state.y_c, &state.y_d, &v_l_full, &v_u_full,
                 state.mu, options.kappa_d,
                 use_sparse,
@@ -7578,6 +7606,9 @@ fn attempt_soc_aug<P: NlpProblem>(
     // Phase 8c.5: same for compressed v_l/v_u → length n_d.
     let v_l_full = state.d_bound_layout.expand_l(&state.v_l_compressed, 0.0);
     let v_u_full = state.d_bound_layout.expand_u(&state.v_u_compressed, 0.0);
+    // Phase 9c.5: same for compressed d_l/d_u → length n_d.
+    let d_l_full = state.d_l();
+    let d_u_full = state.d_u();
 
     for _soc_iter in 0..options.max_soc {
         for k in 0..n_c {
@@ -7596,7 +7627,7 @@ fn attempt_soc_aug<P: NlpProblem>(
             &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals,
             &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals,
             &state.x, &x_l_full, &x_u_full, &z_l_full, &z_u_full,
-            &state.s, &state.c_x, &state.d_x, &state.d_l, &state.d_u,
+            &state.s, &state.c_x, &state.d_x, &d_l_full, &d_u_full,
             &state.y_c, &state.y_d,
             &v_l_full, &v_u_full,
             state.mu, options.kappa_d,
@@ -7914,14 +7945,14 @@ fn reset_constraint_slack_multipliers_after_restoration(
     let _ = m;
     for kc in 0..state.d_bound_layout.n_d_l {
         let k = state.d_bound_layout.d_l_to_full[kc];
-        let dl = state.d_l[k];
+        let dl = state.d_l_compressed[kc];
         let dx = state.d_x[k];
         let slack = (dx - dl).max(1e-12);
         state.v_l_compressed[kc] = if nuclear_reset { 1.0 } else { mu_r / slack };
     }
     for kc in 0..state.d_bound_layout.n_d_u {
         let k = state.d_bound_layout.d_u_to_full[kc];
-        let du = state.d_u[k];
+        let du = state.d_u_compressed[kc];
         let dx = state.d_x[k];
         let slack = (du - dx).max(1e-12);
         state.v_u_compressed[kc] = if nuclear_reset { 1.0 } else { mu_r / slack };
@@ -9202,8 +9233,8 @@ fn compute_grad_theta_norm(state: &SolverState) -> f64 {
     }
     for (idx, (&kd, &col)) in state.jac_d_rows.iter().zip(state.jac_d_cols.iter()).enumerate() {
         let _ = n_d;
-        let dl = state.d_l[kd];
-        let du = state.d_u[kd];
+        let dl = state.d_l_at(kd);
+        let du = state.d_u_at(kd);
         let dx = state.d_x[kd];
         let v = if dl.is_finite() && dx < dl {
             dx - dl
@@ -9742,6 +9773,9 @@ fn assemble_kkt_from_state(
     // (kkt::assemble_kkt still indexes v by d-block index k).
     let v_l_full = state.d_bound_layout.expand_l(&state.v_l_compressed, 0.0);
     let v_u_full = state.d_bound_layout.expand_u(&state.v_u_compressed, 0.0);
+    // Phase 9c.5: same for compressed d_l/d_u → length n_d.
+    let d_l_full = state.d_l();
+    let d_u_full = state.d_u();
     let mut sys = kkt::assemble_kkt(
         n, state.layout.n_c, state.layout.n_d,
         &state.hess_rows, &state.hess_cols, &state.hess_vals,
@@ -9749,7 +9783,7 @@ fn assemble_kkt_from_state(
         &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals,
         sigma, &state.grad_f,
         &state.c_x, &state.d_x,
-        &state.d_l, &state.d_u,
+        &d_l_full, &d_u_full,
         &state.s, &state.y_c, &state.y_d,
         &state.x, &x_l_full, &x_u_full, state.mu, kappa_d,
         use_sparse, &v_l_full, &v_u_full, &state.layout,
@@ -10197,12 +10231,10 @@ mod tests {
             alpha_primal: 0.0,
             alpha_dual: 0.0,
             iter: 0,
-            // Phase 3f-final: native split storage. Test-only constructor
-            // uses an all-inequality layout (n_c=0, n_d=m), so c_rhs is
-            // empty and d_l/d_u are m-sized with -inf/+inf sentinels.
+            // Phase 9d: combined `d_l`/`d_u` storage dropped. Test-only
+            // constructor's no-bounds slack layout (n_d_l=n_d_u=0) leaves
+            // the compressed mirrors empty, set below.
             c_rhs: Vec::new(),
-            d_l: vec![f64::NEG_INFINITY; m],
-            d_u: vec![f64::INFINITY; m],
             n,
             m,
             obj: 0.0,
@@ -10297,19 +10329,19 @@ mod tests {
         let n_c = layout.n_c;
         let n_d = layout.n_d;
         state.c_rhs = layout.c_to_combined.iter().map(|&i| g_l[i]).collect();
-        state.d_l = layout.project_d(&g_l);
-        state.d_u = layout.project_d(&g_u);
+        let d_l_d = layout.project_d(&g_l);
+        let d_u_d = layout.project_d(&g_u);
         state.layout = layout;
         // Phase 8b: rebuild slack-bound layout + compressed v/dv mirrors.
         state.d_bound_layout =
-            crate::d_bound_layout::DBoundLayout::new(&state.d_l, &state.d_u);
+            crate::d_bound_layout::DBoundLayout::new(&d_l_d, &d_u_d);
         state.v_l_compressed = vec![0.0; state.d_bound_layout.n_d_l];
         state.v_u_compressed = vec![0.0; state.d_bound_layout.n_d_u];
         state.dv_l_compressed = vec![0.0; state.d_bound_layout.n_d_l];
         state.dv_u_compressed = vec![0.0; state.d_bound_layout.n_d_u];
-        // Phase 9b: compressed slack-bound storage.
-        state.d_l_compressed = state.d_bound_layout.project_l(&state.d_l);
-        state.d_u_compressed = state.d_bound_layout.project_u(&state.d_u);
+        // Phase 9b/d: compressed slack-bound storage (combined dropped).
+        state.d_l_compressed = state.d_bound_layout.project_l(&d_l_d);
+        state.d_u_compressed = state.d_bound_layout.project_u(&d_u_d);
         state.y_c.resize(n_c, 0.0);
         state.y_d.resize(n_d, 0.0);
         state.dy_c.resize(n_c, 0.0);
