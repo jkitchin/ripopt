@@ -4220,8 +4220,8 @@ fn compute_alpha_max(
             .iter()
             .chain(state.dy_d.iter())
             .fold(0.0f64, |a, &b| a.max(b.abs()));
-        let dzl_inf = state.dz_l.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
-        let dzu_inf = state.dz_u.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+        let dzl_inf = state.dz_l_compressed.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+        let dzu_inf = state.dz_u_compressed.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
         if lim_idx != usize::MAX {
             let (xv, xb, dxv, slack) = if lim_block == "s" {
                 let xv = state.s_at(lim_idx);
@@ -4369,13 +4369,17 @@ fn detect_tiny_step(
 /// `IpLoqoMuOracle::CalculateMu` ↔ `IpIpoptCalculatedQuantities::curr_compl_xi`.
 fn compute_centrality_xi(state: &SolverState, avg_compl: f64) -> f64 {
     let mut min_compl = f64::INFINITY;
-    for i in 0..state.n {
-        if state.x_l[i].is_finite() {
-            min_compl = min_compl.min(slack_xl(state, i) * state.z_l[i]);
-        }
-        if state.x_u[i].is_finite() {
-            min_compl = min_compl.min(slack_xu(state, i) * state.z_u[i]);
-        }
+    // Phase 6c.2: walk compressed bound multipliers; the iteration set
+    // is identical to {i : x_l[i].is_finite()} by BoundLayout
+    // construction, so the n-wide+is_finite scan and the compressed
+    // walk produce bit-identical output.
+    for k in 0..state.bound_layout.n_x_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        min_compl = min_compl.min(slack_xl(state, i) * state.z_l_compressed[k]);
+    }
+    for k in 0..state.bound_layout.n_x_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        min_compl = min_compl.min(slack_xu(state, i) * state.z_u_compressed[k]);
     }
     for i in 0..state.m {
         let l_fin = state.g_l_at(i).is_finite();
@@ -4620,17 +4624,19 @@ fn compute_quality_function_mu(
         // target is trivially met by the centered step) is broken.
         // B-cross6: scan all four blocks (z_L, z_U, v_L, v_U).
         let mut compl_max: f64 = 0.0;
-        for i in 0..n {
-            if state.x_l[i].is_finite() {
-                let s_plus = (slack_xl(state, i) + alpha_p * dx[i]).max(1e-20);
-                let z_plus = (state.z_l[i] + alpha_d * dz_l[i]).max(1e-20);
-                compl_max = compl_max.max(s_plus * z_plus);
-            }
-            if state.x_u[i].is_finite() {
-                let s_plus = (slack_xu(state, i) - alpha_p * dx[i]).max(1e-20);
-                let z_plus = (state.z_u[i] + alpha_d * dz_u[i]).max(1e-20);
-                compl_max = compl_max.max(s_plus * z_plus);
-            }
+        // Phase 6c.2: walk compressed bound mirrors. dz_l/dz_u are
+        // full-`n` σ-blended directions, indexed via x_l_to_full[k].
+        for k in 0..state.bound_layout.n_x_l {
+            let i = state.bound_layout.x_l_to_full[k];
+            let s_plus = (slack_xl(state, i) + alpha_p * dx[i]).max(1e-20);
+            let z_plus = (state.z_l_compressed[k] + alpha_d * dz_l[i]).max(1e-20);
+            compl_max = compl_max.max(s_plus * z_plus);
+        }
+        for k in 0..state.bound_layout.n_x_u {
+            let i = state.bound_layout.x_u_to_full[k];
+            let s_plus = (slack_xu(state, i) - alpha_p * dx[i]).max(1e-20);
+            let z_plus = (state.z_u_compressed[k] + alpha_d * dz_u[i]).max(1e-20);
+            compl_max = compl_max.max(s_plus * z_plus);
         }
         for i in 0..m {
             let l_fin = state.g_l_at(i).is_finite();
@@ -4674,23 +4680,24 @@ fn compute_quality_function_mu(
             let mut sum_sz = 0.0_f64;
             let mut min_sz = f64::INFINITY;
             let mut nb = 0usize;
-            for i in 0..n {
-                if state.x_l[i].is_finite() {
-                    let s_plus = (slack_xl(state, i) + alpha_p * dx[i]).max(1e-20);
-                    let z_plus = (state.z_l[i] + alpha_d * dz_l[i]).max(1e-20);
-                    let sz = s_plus * z_plus;
-                    sum_sz += sz;
-                    if sz < min_sz { min_sz = sz; }
-                    nb += 1;
-                }
-                if state.x_u[i].is_finite() {
-                    let s_plus = (slack_xu(state, i) - alpha_p * dx[i]).max(1e-20);
-                    let z_plus = (state.z_u[i] + alpha_d * dz_u[i]).max(1e-20);
-                    let sz = s_plus * z_plus;
-                    sum_sz += sz;
-                    if sz < min_sz { min_sz = sz; }
-                    nb += 1;
-                }
+            // Phase 6c.2: walk compressed bound mirrors.
+            for k in 0..state.bound_layout.n_x_l {
+                let i = state.bound_layout.x_l_to_full[k];
+                let s_plus = (slack_xl(state, i) + alpha_p * dx[i]).max(1e-20);
+                let z_plus = (state.z_l_compressed[k] + alpha_d * dz_l[i]).max(1e-20);
+                let sz = s_plus * z_plus;
+                sum_sz += sz;
+                if sz < min_sz { min_sz = sz; }
+                nb += 1;
+            }
+            for k in 0..state.bound_layout.n_x_u {
+                let i = state.bound_layout.x_u_to_full[k];
+                let s_plus = (slack_xu(state, i) - alpha_p * dx[i]).max(1e-20);
+                let z_plus = (state.z_u_compressed[k] + alpha_d * dz_u[i]).max(1e-20);
+                let sz = s_plus * z_plus;
+                sum_sz += sz;
+                if sz < min_sz { min_sz = sz; }
+                nb += 1;
             }
             for i in 0..m {
                 let l_fin = state.g_l_at(i).is_finite();
@@ -5503,14 +5510,29 @@ fn track_feasibility_and_detect_infeasibility(
 fn compute_sigma_condition(state: &SolverState) -> f64 {
     let mut mn = f64::INFINITY;
     let mut mx = 0.0_f64;
+    // Phase 6c.2: accumulate Σ_i = z_L_i/s_L_i + z_U_i/s_U_i across the
+    // union of variables with at least one finite bound, walking the
+    // compressed bound mirrors. Build per-variable Σ via two passes
+    // (L then U) keyed by full index to match the original semantics
+    // exactly: a single Σ_i value per variable, whether it has 1 or 2
+    // active bounds.
+    let mut sigma_by_var = vec![0.0_f64; state.n];
+    let mut active = vec![false; state.n];
+    for k in 0..state.bound_layout.n_x_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        sigma_by_var[i] += state.z_l_compressed[k] / slack_xl(state, i);
+        active[i] = true;
+    }
+    for k in 0..state.bound_layout.n_x_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        sigma_by_var[i] += state.z_u_compressed[k] / slack_xu(state, i);
+        active[i] = true;
+    }
     for i in 0..state.n {
-        let mut s_i = 0.0_f64;
-        if state.x_l[i].is_finite() {
-            s_i += state.z_l[i] / slack_xl(state, i);
+        if !active[i] {
+            continue;
         }
-        if state.x_u[i].is_finite() {
-            s_i += state.z_u[i] / slack_xu(state, i);
-        }
+        let s_i = sigma_by_var[i];
         if s_i > 0.0 {
             mn = mn.min(s_i);
             mx = mx.max(s_i);
@@ -5551,8 +5573,8 @@ fn emit_trace_row_if_enabled(
         return;
     }
     let dx_inf = linf_norm(&state.dx);
-    let dzl_inf = linf_norm(&state.dz_l);
-    let dzu_inf = linf_norm(&state.dz_u);
+    let dzl_inf = linf_norm(&state.dz_l_compressed);
+    let dzu_inf = linf_norm(&state.dz_u_compressed);
     let sigma_cond = compute_sigma_condition(state);
     trace::emit(&trace::TraceRow {
         iter: iteration,
@@ -6591,8 +6613,8 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             let ds_combined_iter0 = state.ds_combined();
             let dy_combined_iter0 = state.dy_combined();
             let dy_inf = dy_combined_iter0.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
-            let dzl_inf = state.dz_l.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
-            let dzu_inf = state.dz_u.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+            let dzl_inf = state.dz_l_compressed.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+            let dzu_inf = state.dz_u_compressed.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
             rip_log!(
                 "ripopt: iter0-step: ||dx||_inf={:.16e} ||ds||_inf={:.16e} ||dy||_inf={:.16e} ||dz_l||_inf={:.16e} ||dz_u||_inf={:.16e}",
                 dx_inf, ds_inf, dy_inf, dzl_inf, dzu_inf
@@ -6996,28 +7018,30 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 .iter()
                 .chain(state.dy_d.iter())
                 .fold(0.0f64, |a, &b| a.max(b.abs()));
-            let dzl_inf = linf_norm(&state.dz_l);
-            let dzu_inf = linf_norm(&state.dz_u);
+            let dzl_inf = linf_norm(&state.dz_l_compressed);
+            let dzu_inf = linf_norm(&state.dz_u_compressed);
             // Worst (z·s)/μ ratio: should be bounded by κ_Σ (default 1e10)
             // per Ipopt's reset_slack_multipliers / IpIpoptCalculatedQuantities.
             // Ratios >> 1 indicate the κ_Σ clamp is not enforcing.
             let mut worst_zs_ratio = 0.0_f64;
             let mut worst_zs_idx = usize::MAX;
             let mut worst_zs_side = "";
-            for i in 0..state.n {
-                if state.x_l[i].is_finite() {
-                    let s = state.x[i] - state.x_l[i];
-                    if s > 0.0 {
-                        let r = (state.z_l[i] * s).abs() / state.mu.max(1e-300);
-                        if r > worst_zs_ratio { worst_zs_ratio = r; worst_zs_idx = i; worst_zs_side = "L"; }
-                    }
+            // Phase 6c.2: walk compressed z mirrors; iteration set is
+            // identical to the n-wide+is_finite scan.
+            for k in 0..state.bound_layout.n_x_l {
+                let i = state.bound_layout.x_l_to_full[k];
+                let s = state.x[i] - state.x_l[i];
+                if s > 0.0 {
+                    let r = (state.z_l_compressed[k] * s).abs() / state.mu.max(1e-300);
+                    if r > worst_zs_ratio { worst_zs_ratio = r; worst_zs_idx = i; worst_zs_side = "L"; }
                 }
-                if state.x_u[i].is_finite() {
-                    let s = state.x_u[i] - state.x[i];
-                    if s > 0.0 {
-                        let r = (state.z_u[i] * s).abs() / state.mu.max(1e-300);
-                        if r > worst_zs_ratio { worst_zs_ratio = r; worst_zs_idx = i; worst_zs_side = "U"; }
-                    }
+            }
+            for k in 0..state.bound_layout.n_x_u {
+                let i = state.bound_layout.x_u_to_full[k];
+                let s = state.x_u[i] - state.x[i];
+                if s > 0.0 {
+                    let r = (state.z_u_compressed[k] * s).abs() / state.mu.max(1e-300);
+                    if r > worst_zs_ratio { worst_zs_ratio = r; worst_zs_idx = i; worst_zs_side = "U"; }
                 }
             }
             eprintln!(
@@ -8792,8 +8816,36 @@ fn compute_e_mu(state: &SolverState, primal_inf: f64, dual_inf: f64, compl_inf: 
 /// affine-predictor cap — that all spell out two
 /// `filter::fraction_to_boundary` calls plus a `.min` inline.
 fn fraction_to_boundary_dual_z_min(state: &SolverState, dz_l: &[f64], dz_u: &[f64], tau: f64) -> f64 {
-    filter::fraction_to_boundary(&state.z_l, dz_l, tau)
-        .min(filter::fraction_to_boundary(&state.z_u, dz_u, tau))
+    // Phase 6c.2: walk compressed-form bound multipliers. The legacy
+    // combined `state.z_l` zero-pads unbounded sides and `dz_l` is
+    // similarly zero on those sides under production invariants, so
+    // skipping them is bit-identical to the n-wide scan. The caller
+    // still passes a full-`n` `dz_l`/`dz_u`; index it via
+    // `bound_layout.x_l_to_full` so the compressed form on the state
+    // side stays in lockstep with the full-form direction on the call
+    // side. Phase 6c.3 will migrate the dz inputs themselves.
+    let mut alpha = 1.0_f64;
+    for k in 0..state.bound_layout.n_x_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        let dsi = dz_l[i];
+        if dsi < 0.0 {
+            let r = -tau * state.z_l_compressed[k] / dsi;
+            if r < alpha {
+                alpha = r;
+            }
+        }
+    }
+    for k in 0..state.bound_layout.n_x_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        let dsi = dz_u[i];
+        if dsi < 0.0 {
+            let r = -tau * state.z_u_compressed[k] / dsi;
+            if r < alpha {
+                alpha = r;
+            }
+        }
+    }
+    alpha.clamp(0.0, 1.0)
 }
 
 /// Fraction-to-boundary cap on `α·dv_L`, `α·dv_U` against the slack-bound
