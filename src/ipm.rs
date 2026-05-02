@@ -794,6 +794,15 @@ pub(crate) struct SolverState {
     /// Phase 8b: compressed slack-upper-bound multiplier search
     /// direction (size `d_bound_layout.n_d_u`).
     pub dv_u_compressed: Vec<f64>,
+    /// Phase 9b: compressed slack-row lower bounds (size
+    /// `d_bound_layout.n_d_l`). Mirrors Ipopt's `d_L_` in
+    /// `IpOrigIpoptNLP.hpp:241-263`. Holds finite lower bounds only;
+    /// the combined `d_l` array (size `n_d`) keeps `f64::NEG_INFINITY`
+    /// in the unbounded slots.
+    pub d_l_compressed: Vec<f64>,
+    /// Phase 9b: compressed slack-row upper bounds (size
+    /// `d_bound_layout.n_d_u`). Mirrors Ipopt's `d_U_`.
+    pub d_u_compressed: Vec<f64>,
     /// Accumulated solver diagnostics.
     pub diagnostics: SolverDiagnostics,
     /// Last point at which evaluations were performed (for new_x tracking).
@@ -1338,6 +1347,9 @@ impl SolverState {
         let v_u_compressed = vec![0.0; d_bound_layout.n_d_u];
         let dv_l_compressed = vec![0.0; d_bound_layout.n_d_l];
         let dv_u_compressed = vec![0.0; d_bound_layout.n_d_u];
+        // Phase 9b: compressed slack-bound storage (Ipopt's `d_L_`/`d_U_`).
+        let d_l_compressed = d_bound_layout.project_l(&layout.project_d(&g_l));
+        let d_u_compressed = d_bound_layout.project_u(&layout.project_d(&g_u));
 
         // Phase 3b: split y into y_c (n_c) and y_d (n_d). Combined y from
         // the LS init is projected via the layout; consumers needing the
@@ -1434,6 +1446,8 @@ impl SolverState {
             v_u_compressed,
             dv_l_compressed,
             dv_u_compressed,
+            d_l_compressed,
+            d_u_compressed,
             diagnostics: SolverDiagnostics::default(),
             x_last_eval: vec![f64::NAN; n],
             adjusted_slacks_count: 0,
@@ -10247,6 +10261,8 @@ mod tests {
             v_u_compressed: Vec::new(),
             dv_l_compressed: Vec::new(),
             dv_u_compressed: Vec::new(),
+            d_l_compressed: Vec::new(),
+            d_u_compressed: Vec::new(),
             diagnostics: SolverDiagnostics::default(),
             x_last_eval: vec![f64::NAN; n],
             adjusted_slacks_count: 0,
@@ -10291,6 +10307,9 @@ mod tests {
         state.v_u_compressed = vec![0.0; state.d_bound_layout.n_d_u];
         state.dv_l_compressed = vec![0.0; state.d_bound_layout.n_d_l];
         state.dv_u_compressed = vec![0.0; state.d_bound_layout.n_d_u];
+        // Phase 9b: compressed slack-bound storage.
+        state.d_l_compressed = state.d_bound_layout.project_l(&state.d_l);
+        state.d_u_compressed = state.d_bound_layout.project_u(&state.d_u);
         state.y_c.resize(n_c, 0.0);
         state.y_d.resize(n_d, 0.0);
         state.dy_c.resize(n_c, 0.0);
