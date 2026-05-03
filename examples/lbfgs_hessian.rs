@@ -56,7 +56,6 @@ impl NlpProblem for Rosenbrock {
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
     fn hessian_values(&self, _x: &[f64], _new_x: bool, _: f64, _: &[f64], _: &mut [f64]) -> bool {
         unreachable!("Hessian should not be called in limited-memory mode");
-        true
     }
 }
 

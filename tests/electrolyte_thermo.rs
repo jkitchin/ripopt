@@ -6,7 +6,7 @@
 mod problems;
 use problems::*;
 
-use ripopt::{BoundMultInitMethod, NlpProblem, SolveStatus, SolverOptions};
+use ripopt::{NlpProblem, SolveStatus, SolverOptions};
 use std::time::Instant;
 
 fn default_options() -> SolverOptions {
@@ -14,21 +14,15 @@ fn default_options() -> SolverOptions {
         tol: 1e-6,
         max_iter: 3000,
         print_level: 0,
-        // Gibbs-energy minimisation problems in exp(x) coordinates have
-        // multiple KKT stationary points (spurious local minima at higher
-        // Gibbs energies that still satisfy mass/charge balance). The
-        // default mu_init=0.1 trajectory lands in a high-pH basin on
-        // Co2WaterSpeciation; mu_init=1e-3 steers the adaptive trajectory
-        // to the chemically-correct acidic minimum (pH ~ 4.9, obj -6.93e-3)
-        // on every problem in this suite. Same mechanism handled per-test
-        // for phosphoric acid — see electrolyte_05 below.
-        //
-        // bound_mult_init_method is forced to MuBased: the chemistry-correct
-        // basin selection here depends on slack-driven initial multipliers
-        // (z = mu_init / slack). The Ipopt-default `Constant` init lands at
-        // a different stationary point (high-pH basin) on Co2WaterSpeciation.
+        // Gibbs-energy minimisation in exp(x) coordinates has multiple KKT
+        // stationary points (spurious basins at higher Gibbs energies that
+        // still satisfy mass/charge balance). With Ipopt's default `Constant`
+        // bound-mult init and the LSQ-init y multipliers (post-A8 alignment),
+        // mu_init=1e-3 routes the adaptive trajectory to the chemically-
+        // correct minimum (pH ~ 4.9, obj -6.93e-3) on every problem here.
+        // Same mechanism handled per-test for phosphoric acid — see
+        // electrolyte_05 below.
         mu_init: 1e-3,
-        bound_mult_init_method: BoundMultInitMethod::MuBased,
         ..SolverOptions::default()
     }
 }

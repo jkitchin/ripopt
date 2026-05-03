@@ -38,7 +38,6 @@ impl NlpProblem for Rosenbrock {
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
     fn hessian_values(&self, _x: &[f64], _new_x: bool, _obj_factor: f64, _lambda: &[f64], _vals: &mut [f64]) -> bool {
         panic!("hessian_values should not be called in limited-memory mode");
-        true
     }
 }
 
@@ -117,7 +116,6 @@ impl NlpProblem for Hs071Lbfgs {
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
     fn hessian_values(&self, _x: &[f64], _new_x: bool, _obj_factor: f64, _lambda: &[f64], _vals: &mut [f64]) -> bool {
         panic!("hessian_values should not be called in limited-memory mode");
-        true
     }
 }
 
@@ -187,7 +185,6 @@ impl NlpProblem for SimpleQuadratic {
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
     fn hessian_values(&self, _x: &[f64], _new_x: bool, _: f64, _: &[f64], _: &mut [f64]) -> bool {
         panic!("hessian_values must not be called in limited-memory mode");
-        true
     }
 }
 
