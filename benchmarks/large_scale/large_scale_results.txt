@@ -1,132 +1,84 @@
-   Compiling ripopt v0.7.0 (/Users/jkitchin/Dropbox/projects/ripopt)
-warning: unreachable expression
-  --> tests/lbfgs_ipm.rs:41:9
-   |
-40 |         panic!("hessian_values should not be called in limited-memory mode");
-   |         -------------------------------------------------------------------- any code following this expression is unreachable
-41 |         true
-   |         ^^^^ unreachable expression
-   |
-   = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
-
-warning: unreachable expression
-   --> tests/lbfgs_ipm.rs:120:9
-    |
-119 |         panic!("hessian_values should not be called in limited-memory mode");
-    |         -------------------------------------------------------------------- any code following this expression is unreachable
-120 |         true
-    |         ^^^^ unreachable expression
-
-warning: unreachable expression
-   --> tests/lbfgs_ipm.rs:195:9
-    |
-194 |         panic!("hessian_values must not be called in limited-memory mode");
-    |         ------------------------------------------------------------------ any code following this expression is unreachable
-195 |         true
-    |         ^^^^ unreachable expression
-
-warning: unused import: `HS_PROBLEMS`
- --> benchmarks/hs/run_ipopt_native.rs:7:19
-  |
-7 | use hs_problems::{HS_PROBLEMS, HsSolveResult};
-  |                   ^^^^^^^^^^^
-  |
-  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
-
-warning: `ripopt` (bin "ipopt_native" test) generated 1 warning (run `cargo fix --bin "ipopt_native" -p ripopt --tests` to apply 1 suggestion)
-warning: `ripopt` (test "lbfgs_ipm") generated 3 warnings
-warning: unreachable expression
-  --> examples/lbfgs_hessian.rs:59:9
-   |
-58 |         unreachable!("Hessian should not be called in limited-memory mode");
-   |         ------------------------------------------------------------------- any code following this expression is unreachable
-59 |         true
-   |         ^^^^ unreachable expression
-   |
-   = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
-
-warning: `ripopt` (example "lbfgs_hessian") generated 1 warning
-warning: `ripopt` (bin "ipopt_native") generated 1 warning (1 duplicate)
-    Finished `release` profile [optimized + debuginfo] target(s) in 4m 00s
-     Running unittests src/lib.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/ripopt-db159573a2c64f33)
+   Compiling ripopt v0.8.0-dev (/Users/jkitchin/Dropbox/projects/ripopt)
+    Finished `release` profile [optimized + debuginfo] target(s) in 3m 11s
+     Running unittests src/lib.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/ripopt-f79492db42b63ff7)
 
 running 0 tests
 
-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 175 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 323 filtered out; finished in 0.00s
 
-     Running unittests benchmarks/hs/run_ipopt_native.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/ipopt_native-d0d59d8b68749f13)
+     Running unittests src/bin/ripopt_ampl.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/ripopt-bcf474fa444293f7)
 
 running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-     Running unittests src/bin/ripopt_ampl.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/ripopt-7d497bb5334cc015)
-
-running 0 tests
-
-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
-
-     Running tests/augmented_lagrangian.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/augmented_lagrangian-108bdcb14a7e2d90)
-
-running 0 tests
-
-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
-
-     Running tests/c_api.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/c_api-7bccdfdb445bffbb)
-
-running 0 tests
-
-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
-
-     Running tests/correctness.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/correctness-8f673512a2ef7368)
-
-running 0 tests
-
-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 33 filtered out; finished in 0.00s
-
-     Running tests/electrolyte_thermo.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/electrolyte_thermo-bf4b8bd9eea0865e)
-
-running 0 tests
-
-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.00s
-
-     Running tests/grid.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/grid-7712a6d2ed12276d)
+     Running tests/aug_kkt_path.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/aug_kkt_path-8fc4ddc7a6a529ce)
 
 running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
 
-     Running tests/hs_problems_subset.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/hs_problems_subset-8ee56822dd54ef18)
+     Running tests/c_api.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/c_api-49a319a9bda9896f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+     Running tests/correctness.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/correctness-e7195c634d42fe33)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 33 filtered out; finished in 0.00s
+
+     Running tests/electrolyte_thermo.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/electrolyte_thermo-1ac0197a265c8dce)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.00s
+
+     Running tests/feral_solvers.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/feral_solvers-20983a1115a38152)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/grid.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/grid-e5d9dbd3481df612)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/hs_problems_subset.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/hs_problems_subset-351a8aeebf7033f2)
 
 running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-     Running tests/hs_regression.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/hs_regression-30064c123fbbf683)
+     Running tests/hs_regression.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/hs_regression-b6f1dcc861707675)
 
 running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s
 
-     Running tests/ipm_paths.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/ipm_paths-384d8463d712f3ab)
+     Running tests/ipm_paths.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/ipm_paths-424c1b86041d1c95)
 
 running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
 
-     Running tests/iterative_solvers.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/iterative_solvers-1dbc469bedf4b1d3)
+     Running tests/iterative_solvers.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/iterative_solvers-daf6664dbda396fe)
 
 running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
 
-     Running tests/large_scale.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/large_scale-35afbe9ee15e3ee3)
+     Running tests/large_scale.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/large_scale-f0d00ef404678006)
 
 running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
 
-     Running tests/large_scale_benchmark.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/large_scale_benchmark-a9795e038d60e3ae)
+     Running tests/large_scale_benchmark.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/large_scale_benchmark-371ea409a3b897c1)
 
 running 1 test
 
@@ -139,12 +91,42 @@ This program contains Ipopt, a library for large-scale nonlinear optimization.
          For more information visit https://github.com/coin-or/Ipopt
 ******************************************************************************
 
-BENCH: name=Rosenbrock 500, n=500, m=0, ripopt_status=Optimal, ripopt_obj=2.174612e-18, ripopt_iters=81, ripopt_time=0.0012, ipopt_status=Optimal, ipopt_obj=3.520843e-18, ipopt_iters=749, ipopt_time=0.2006, speedup=169.06x
-BENCH: name=Bratu 1K, n=1000, m=998, ripopt_status=Optimal, ripopt_obj=0.000000e0, ripopt_iters=3, ripopt_time=0.0023, ipopt_status=Optimal, ipopt_obj=0.000000e0, ipopt_iters=2, ipopt_time=0.0024, speedup=1.05x
-BENCH: name=SparseQP 1K, n=500, m=500, ripopt_status=Optimal, ripopt_obj=-1.248170e2, ripopt_iters=13, ripopt_time=0.1826, ipopt_status=Optimal, ipopt_obj=-1.248170e2, ipopt_iters=6, ipopt_time=0.0039, speedup=0.02x
-BENCH: name=OptControl 2.5K, n=2499, m=1250, ripopt_status=Optimal, ripopt_obj=1.176958e-1, ripopt_iters=1, ripopt_time=0.0061, ipopt_status=Optimal, ipopt_obj=1.176959e-1, ipopt_iters=1, ipopt_time=0.0028, speedup=0.45x
+BENCH: name=Rosenbrock 500, n=500, m=0, ripopt_status=Optimal, ripopt_obj=1.561961e-26, ripopt_iters=751, ripopt_time=0.0925, ipopt_status=Optimal, ipopt_obj=3.520843e-18, ipopt_iters=749, ipopt_time=0.1834, speedup=1.98x
+BENCH: name=Bratu 1K, n=1000, m=998, ripopt_status=Optimal, ripopt_obj=0.000000e0, ripopt_iters=2, ripopt_time=0.0076, ipopt_status=Optimal, ipopt_obj=0.000000e0, ipopt_iters=2, ipopt_time=0.0020, speedup=0.27x
+BENCH: name=SparseQP 1K, n=500, m=500, ripopt_status=Optimal, ripopt_obj=-1.248170e2, ripopt_iters=6, ripopt_time=0.0128, ipopt_status=Optimal, ipopt_obj=-1.248170e2, ipopt_iters=6, ipopt_time=0.0039, speedup=0.30x
+BENCH: name=OptControl 2.5K, n=2499, m=1250, ripopt_status=Optimal, ripopt_obj=1.176959e-1, ripopt_iters=1, ripopt_time=0.0269, ipopt_status=Optimal, ipopt_obj=1.176959e-1, ipopt_iters=1, ipopt_time=0.0026, speedup=0.10x
+BENCH: name=Poisson 2.5K, n=5000, m=2500, ripopt_status=Optimal, ripopt_obj=9.945800e-2, ripopt_iters=1, ripopt_time=5.7768, ipopt_status=Optimal, ipopt_obj=9.945800e-2, ipopt_iters=1, ipopt_time=0.0099, speedup=0.00x
+BENCH: name=Rosenbrock 5K, n=5000, m=0, ripopt_status=MaxIterations, ripopt_obj=2.927492e3, ripopt_iters=2999, ripopt_time=3.6963, ipopt_status=Failed, ipopt_obj=2.926793e3, ipopt_iters=3000, ipopt_time=3.6610, speedup=0.99x
+BENCH: name=Bratu 10K, n=10000, m=9998, ripopt_status=Optimal, ripopt_obj=0.000000e0, ripopt_iters=1, ripopt_time=0.1543, ipopt_status=Optimal, ipopt_obj=0.000000e0, ipopt_iters=2, ipopt_time=0.0117, speedup=0.08x
+BENCH: name=OptControl 20K, n=19999, m=10000, ripopt_status=Optimal, ripopt_obj=1.173789e-1, ripopt_iters=1, ripopt_time=1.2044, ipopt_status=Optimal, ipopt_obj=1.173789e-1, ipopt_iters=1, ipopt_time=0.0197, speedup=0.02x
 test large_scale_vs_ipopt has been running for over 60 seconds
-error: test failed, to rerun pass `--test large_scale_benchmark`
+BENCH: name=Poisson 50K, n=49928, m=24964, ripopt_status=Optimal, ripopt_obj=9.946953e-2, ripopt_iters=1, ripopt_time=4463.8009, ipopt_status=Optimal, ipopt_obj=9.946953e-2, ipopt_iters=1, ipopt_time=0.1208, speedup=0.00x
+BENCH: name=SparseQP 100K, n=50000, m=50000, ripopt_status=Optimal, ripopt_obj=-1.249982e4, ripopt_iters=6, ripopt_time=17.3477, ipopt_status=Optimal, ipopt_obj=-1.249982e4, ipopt_iters=6, ipopt_time=0.2970, speedup=0.02x
+test large_scale_vs_ipopt ... ok
 
-Caused by:
-  process didn't exit successfully: `/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/large_scale_benchmark-a9795e038d60e3ae --ignored large_scale_vs_ipopt --nocapture` (signal: 15, SIGTERM: termination signal)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4496.43s
+
+     Running tests/lbfgs_ipm.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/lbfgs_ipm-8c3de5b9f63bb4f0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/nl_integration.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/nl_integration-05f4cf47f78e2ada)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s
+
+     Running tests/sensitivity.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/sensitivity-5c5a3dd0794cbf67)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+   Doc-tests ripopt
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+

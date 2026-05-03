@@ -4,10 +4,10 @@
     "name": "CHO parmest",
     "n": 21672,
     "m": 21660,
-    "status": "Optimal",
-    "objective": 67673.126363555,
-    "iterations": 138,
-    "solve_time": 121.525981875
+    "status": "MaxIterations",
+    "objective": 68179.2318934025,
+    "iterations": 1,
+    "solve_time": 1650.261932292
   },
   {
     "solver": "ipopt",
@@ -17,6 +17,6 @@
     "status": "MaxIter",
     "objective": 65314.141495899035,
     "iterations": 5000,
-    "solve_time": 3573.671183958
+    "solve_time": 3487.165332542
   }
 ]
