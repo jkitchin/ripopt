@@ -1,7 +1,7 @@
 use crate::logging::rip_log;
 
 /// Status of the solve.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum SolveStatus {
     /// Converged to optimal solution within tolerance.
     Optimal,
@@ -51,7 +51,7 @@ pub enum SolveStatus {
 /// Captures counts of key solver events (restoration entries, barrier parameter
 /// mode switches, filter rejects, etc.) and final convergence measures.
 /// Useful for automated analysis and solver tuning.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct SolverDiagnostics {
     /// Number of GN (Gauss-Newton) restoration entries.
     pub restoration_count: usize,

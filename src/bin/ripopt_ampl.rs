@@ -1,5 +1,6 @@
 use ripopt::nl::{parse_nl_file, write_sol, NlProblem};
 use ripopt::options::NlpScalingMethod;
+use ripopt::solution_report::build_report;
 use ripopt::SolverOptions;
 use std::fs;
 use std::io::BufWriter;
@@ -23,18 +24,44 @@ fn main() {
     }
 
     if args.len() < 2 {
-        eprintln!("Usage: ripopt <problem.nl> [-AMPL] [key=value ...]");
+        eprintln!("Usage: ripopt <problem.nl> [-AMPL] [-o FILE] [key=value ...]");
         eprintln!("Try 'ripopt --help' for more information.");
         std::process::exit(1);
     }
 
     let nl_path = &args[1];
     let mut options = SolverOptions::default();
+    let mut output_path: Option<String> = None;
 
-    // Parse key=value options from command line
-    for arg in &args[2..] {
+    // Parse remaining args: handle -o/--output (with value), bool --json shortcut, and key=value.
+    let mut iter = args[2..].iter();
+    while let Some(arg) = iter.next() {
         if arg == "-AMPL" || arg == "--AMPL" {
-            continue; // AMPL mode flag, acknowledged
+            continue;
+        }
+        if arg == "-o" || arg == "--output" {
+            match iter.next() {
+                Some(p) => output_path = Some(p.clone()),
+                None => {
+                    eprintln!("Error: {} requires a filename argument", arg);
+                    std::process::exit(2);
+                }
+            }
+            continue;
+        }
+        if let Some(p) = arg.strip_prefix("--output=") {
+            output_path = Some(p.to_string());
+            continue;
+        }
+        if arg == "--json" {
+            // Shortcut: write JSON next to the .nl with .json extension.
+            let p = if nl_path.ends_with(".nl") {
+                format!("{}json", &nl_path[..nl_path.len() - 2])
+            } else {
+                format!("{}.json", nl_path)
+            };
+            output_path = Some(p);
+            continue;
         }
         if let Some((key, value)) = arg.split_once('=') {
             apply_option(&mut options, key.trim(), value.trim());
@@ -122,25 +149,59 @@ fn main() {
     // Print diagnostics to stderr
     result.diagnostics.print_summary(result.status, result.iterations);
 
-    // Write SOL file (replace .nl extension with .sol)
-    let sol_path = if nl_path.ends_with(".nl") {
-        format!("{}sol", &nl_path[..nl_path.len() - 2])
-    } else {
-        format!("{}.sol", nl_path)
-    };
+    // Determine output path. Default: .sol next to the .nl input.
+    let out_path = output_path.unwrap_or_else(|| {
+        if nl_path.ends_with(".nl") {
+            format!("{}sol", &nl_path[..nl_path.len() - 2])
+        } else {
+            format!("{}.sol", nl_path)
+        }
+    });
 
-    let sol_file = match fs::File::create(&sol_path) {
+    // Dispatch on extension: .json -> JSON report, anything else -> AMPL SOL.
+    let want_json = std::path::Path::new(&out_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+
+    let out_file = match fs::File::create(&out_path) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("Error creating {}: {}", sol_path, e);
+            eprintln!("Error creating {}: {}", out_path, e);
             std::process::exit(1);
         }
     };
+    let mut writer = BufWriter::new(out_file);
 
-    let mut writer = BufWriter::new(sol_file);
-    if let Err(e) = write_sol(&mut writer, &result, n_vars, n_constrs) {
-        eprintln!("Error writing SOL file: {}", e);
-        std::process::exit(1);
+    if want_json {
+        let problem_name = std::path::Path::new(nl_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string());
+        let problem_source = std::fs::canonicalize(nl_path)
+            .ok()
+            .and_then(|p| p.to_str().map(|s| s.to_string()))
+            .or_else(|| Some(nl_path.clone()));
+        let report = build_report(
+            &problem,
+            &result,
+            &options,
+            args.clone(),
+            problem_name,
+            problem_source,
+        );
+        if let Err(e) = serde_json::to_writer_pretty(&mut writer, &report) {
+            eprintln!("Error writing JSON report: {}", e);
+            std::process::exit(1);
+        }
+        use std::io::Write;
+        let _ = writer.write_all(b"\n");
+    } else {
+        if let Err(e) = write_sol(&mut writer, &result, n_vars, n_constrs) {
+            eprintln!("Error writing SOL file: {}", e);
+            std::process::exit(1);
+        }
     }
 }
 
@@ -148,12 +209,17 @@ fn print_help() {
     println!("ripopt {} — primal-dual interior point NLP solver", env!("CARGO_PKG_VERSION"));
     println!();
     println!("USAGE:");
-    println!("    ripopt <problem.nl> [-AMPL] [key=value ...]");
+    println!("    ripopt <problem.nl> [-AMPL] [-o FILE] [key=value ...]");
     println!();
     println!("FLAGS:");
     println!("    -h, --help       Print this help message and exit");
     println!("    -v, --version    Print version and exit");
     println!("    -AMPL            AMPL solver protocol mode");
+    println!("    -o, --output FILE   Write solution to FILE. Extension selects format:");
+    println!("                        .json -> structured JSON report (validated KKT,");
+    println!("                                 solver metadata, options, command line);");
+    println!("                        any other -> AMPL .sol format (default).");
+    println!("    --json           Shortcut for -o <problem>.json");
     println!();
     println!("OPTIONS:");
     println!();

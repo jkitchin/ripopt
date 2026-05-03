@@ -15,7 +15,7 @@
 /// interior on the fixed slot, paying one degree of freedom per fixed
 /// variable. Retained for backward compatibility and as a fallback for
 /// callers that don't want preprocessor-layer elimination.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum FixedVariableTreatment {
     /// Widen `[x_L, x_U]` by ±1e-8·max(|c|, 1) around the fixed value
     /// `c = x_L = x_U` so the IPM has a non-empty interior. Adds one
@@ -42,7 +42,7 @@ impl Default for FixedVariableTreatment {
 /// Mirrors Ipopt 3.14's `bound_mult_init_method`
 /// (`IpDefaultIterateInitializer.cpp:254-288`). Ipopt's default is
 /// `Constant` with `bound_mult_init_val = 1.0`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum BoundMultInitMethod {
     /// `z_l = z_u = bound_mult_init_val` for every finite bound.
     /// Ipopt default.
@@ -59,7 +59,7 @@ impl Default for BoundMultInitMethod {
 }
 
 /// Choice of linear solver for the KKT system.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum LinearSolverChoice {
     /// Direct multifrontal LDL^T (default). Exact solve, provides inertia.
     Direct,
@@ -82,7 +82,7 @@ impl Default for LinearSolverChoice {
 /// Newton step. Mirrors Ipopt 3.14 `alpha_for_y` option
 /// (`IpBacktrackingLineSearch.cpp:84-104` and the closed-form 1D
 /// minimizer at `:969-998`). All seven Ipopt modes are implemented.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 pub enum AlphaForY {
     /// `alpha_y = alpha_primal` (Ipopt default).
     #[default]
@@ -117,7 +117,7 @@ pub enum AlphaForY {
 /// registered in `IpAlgBuilder.cpp:343-353` and dispatched in
 /// `IpAlgBuilder.cpp:678-696`. The `Equilibration` variant (Curtis-Reid
 /// via Harwell MC19) is omitted — ripopt has no MC19 binding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 pub enum NlpScalingMethod {
     /// No automatic scaling. `obj_scaling_factor` is still applied
     /// multiplicatively (matches Ipopt's `NoNLPScalingObject` inheriting
@@ -135,7 +135,7 @@ pub enum NlpScalingMethod {
 }
 
 /// Solver options matching Ipopt defaults.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SolverOptions {
     /// Convergence tolerance for optimality.
     pub tol: f64,

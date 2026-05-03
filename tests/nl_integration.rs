@@ -741,3 +741,140 @@ fn nl_scaling_factors_is_empty_default() {
     let sf = ripopt::nl::NlScalingFactors::default();
     assert!(sf.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// JSON output (--output FILE.json) — issue #27
+// ---------------------------------------------------------------------------
+
+const ROSENBROCK_NL: &str = "\
+g3 1 1 0
+ 2 0 1 0 0
+ 0 1
+ 0 0
+ 2 2 0
+ 0 0 0 0 0
+ 0 0 0 0 0
+ 0 2
+ 0 0
+ 0 0 0 0 0
+O0 0
+o0
+o5
+o1
+n1
+v0
+n2
+o2
+n100
+o5
+o1
+v1
+o5
+v0
+n2
+n2
+b
+3
+3
+G0 2
+0 0
+1 0
+x2
+0 -1.2
+1 1
+";
+
+#[test]
+fn cli_writes_validated_json_report() {
+    // End-to-end check that `ripopt -o out.json prob.nl` produces a JSON
+    // report whose validation block reflects the optimum we know analytically.
+    let _guard = env_lock().lock().unwrap();
+
+    let tmp = std::env::temp_dir().join(format!(
+        "ripopt_issue27_{}_{}.nl",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(&tmp, ROSENBROCK_NL).expect("write nl");
+    let json_path = tmp.with_extension("json");
+
+    let exe = env!("CARGO_BIN_EXE_ripopt");
+    let out = std::process::Command::new(exe)
+        .arg(tmp.to_str().unwrap())
+        .arg("-o")
+        .arg(json_path.to_str().unwrap())
+        .arg("print_level=0")
+        .output()
+        .expect("ripopt failed to spawn");
+    assert!(
+        out.status.success(),
+        "ripopt exited with {:?}\nstderr:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let bytes = std::fs::read(&json_path).expect("read json");
+    let v: serde_json::Value = serde_json::from_slice(&bytes).expect("parse json");
+
+    assert_eq!(v["solver"]["name"], "ripopt");
+    assert_eq!(v["status"], "Optimal");
+    assert_eq!(v["problem"]["n_variables"], 2);
+    assert_eq!(v["problem"]["n_constraints"], 0);
+
+    let max_bound_v = v["validation"]["max_bound_violation"].as_f64().unwrap();
+    let max_constr_v = v["validation"]["max_constraint_violation"].as_f64().unwrap();
+    let stat = v["validation"]["stationarity_inf_norm"].as_f64().unwrap();
+    let kkt_ok = v["validation"]["kkt_satisfied"].as_bool().unwrap();
+    assert_eq!(max_bound_v, 0.0, "no bounds in this problem");
+    assert_eq!(max_constr_v, 0.0, "no constraints in this problem");
+    assert!(
+        stat < 1e-4,
+        "stationarity should be small at Rosenbrock minimum, got {}",
+        stat
+    );
+    assert!(kkt_ok, "kkt_satisfied should be true at the optimum");
+
+    // Command line is captured.
+    let cmd = v["command"].as_array().expect("command array");
+    assert!(cmd.iter().any(|s| s.as_str() == Some("-o")));
+
+    // Options are echoed back so the run can be reproduced.
+    assert_eq!(v["options"]["print_level"], 0);
+
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&json_path);
+}
+
+#[test]
+fn cli_default_still_writes_sol() {
+    // No -o/--output: must preserve the legacy behavior of writing
+    // <stem>.sol next to the input.
+    let _guard = env_lock().lock().unwrap();
+
+    let tmp = std::env::temp_dir().join(format!(
+        "ripopt_issue27_default_{}_{}.nl",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(&tmp, ROSENBROCK_NL).expect("write nl");
+    let sol_path = tmp.with_extension("sol");
+    let _ = std::fs::remove_file(&sol_path);
+
+    let exe = env!("CARGO_BIN_EXE_ripopt");
+    let out = std::process::Command::new(exe)
+        .arg(tmp.to_str().unwrap())
+        .arg("print_level=0")
+        .output()
+        .expect("ripopt failed to spawn");
+    assert!(out.status.success());
+    assert!(sol_path.exists(), "default run should produce {sol_path:?}");
+
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&sol_path);
+}
