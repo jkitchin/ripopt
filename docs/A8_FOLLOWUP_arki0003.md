@@ -1399,3 +1399,509 @@ divergence signature before further deep-dive on arki0003.
 **Refs**: `src/ipm.rs:5743-5832` (extended conrow probe);
 `src/ipm.rs:180-248` (ScaledProblem wrapper).
 
+## A8.23 — current-state re-measurement after P1–P10 alignment pass (2026-05-02)
+
+**Trigger**: pick up arki0003 after the v0.8 alignment pass (P1–P10
+defaults audit). User's working hypothesis: ripopt is now equivalent to
+Ipopt on arki0003.
+
+**Method**: re-ran arki0003 with `RIPOPT_TRACE_PERTURB=1`,
+`max_iter=700`, `print_level=5` against the post-P1–P10 binary
+(P3 `watchdog_trial_iter_max` 5→3, P4 `resto_proximity_weight=1.0`
+option, P6 `y_d := v_U − v_L` shortcut removed). Pre/post traces saved
+at `/tmp/arki_pert.log` and `/tmp/arki_pert_v2.log`.
+
+**Finding 1 — P1–P10 changes are bit-identical on arki0003 through
+iter 400**:
+
+| iter | obj         | inf_pr  | inf_du  | compl  | mu      |
+|------|-------------|---------|---------|--------|---------|
+| 0    | -0.0000e0   | 1.16e8  | 1.00e0  | 1.00e7 | 1.00e-1 |
+| 100  | 1.1389e7    | 1.72e6  | 2.74e6  | 5.94e5 | 1.00e-1 |
+| 200  | 1.2175e7    | 8.04e3  | 2.01e6  | 3.84e5 | 2.83e-3 |
+| 300  | 1.0630e7    | 2.00e0  | 7.32e4  | 5.29e1 | 1.50e-4 |
+| 400  | 9.4114e4    | 5.38e-3 | 5.95e3  | 7.94e1 | 1.84e-6 |
+
+The pre-pass and post-pass logs match the displayed columns exactly at
+iters 0/10/25/50/100/110/150/200/300/400 — P3/P4/P6 do not move the
+arki0003 trajectory because (a) watchdog is not triggered on this
+problem (no consecutive shortened-step run), (b) restoration is not
+entered (kappa_resto progress holds), and (c) `least_squares_mult_init`
+is on by default so the deleted `y_d := v_U − v_L` branch was never
+taken.
+
+**Finding 2 — perturbation handler is conclusively NOT the bottleneck**:
+across 928 augmented-system factor calls in the trace,
+- 543 used `dx=0, dc=0` (no perturbation),
+- 385 used a nonzero `dx` perturbation (`3e-5 → 0.18`, the warm-shrink
+  ladder operating correctly),
+- `dc` is *never* nonzero on this problem.
+
+Inertia is recovered on every observed call (target inertia
+`(3563+, 2138-, 0)` reached). This rules out the A8 `_last`-reset bug
+hypothesis stated in the followup doc's introduction: ripopt's
+`PDPerturbationHandler` is in fact correctly aligned with Ipopt
+(verified by direct read of `IpPDPerturbationHandler.cpp` — both
+implementations carry `_last` forward when `_curr=0` under
+`reset_last_=false`, and `reset_last_` is never flipped to `true` in
+the file).
+
+**Finding 3 — actual stagnation signature**: the run progresses well
+through iter 400, then asymptotically approaches but does not satisfy
+the dual-feasibility tolerance:
+
+- inf_pr: 1.16e8 → 5.38e-3 (10 orders of magnitude reduction) ✅
+- compl: 1.00e7 → 7.94e1 (5 orders of magnitude reduction)
+- inf_du: 1.00e0 → 5.95e3 (**increased** then frozen at ~6e3) ❌
+
+mu hit its lower bound (`mu_min = 1.84e-6`, set by `mu_target` and
+`compl_inf_tol`) at iter ≈280 and stayed there for the rest of the run.
+α_pr in the 5e-8 → 1e-3 range across iter 300+ — line search consumes
+nearly the entire step but the dual residual never reduces.
+
+**Diagnosis**: the dual-feasibility residual is the bottleneck, not the
+perturbation handler, not feasibility, not complementarity. This is
+the cumulative-drift signature predicted by A8.20: the per-iteration
+direction differs from Ipopt's by a small amount, and 400 iterations
+of small differences leave inf_du stuck where Ipopt's would have
+converged.
+
+**Concrete next-step recommendation**: per A8.20 / A8.22, arki0003 is
+no longer a single-bug diagnostic — it requires an Ipopt
+`print_level=12` Jacobian/Hessian/dz dump at iter 0 to bisect against
+ripopt's, which is a substantial parsing exercise. The four open
+candidates from A8.22 (Hessian assembly, Jacobian column 1753, Σ_s
+coupling, FP-accumulation in elimination tree) cannot be ranked
+without that dump.
+
+**Two routes for the next session**:
+
+1. **Pivot to a smaller divergence target** (A8.20 / A8.22
+   recommendation): pick a CUTEst problem where ripopt and Ipopt
+   agree to ≪0.1% on objective until a specific iter, then diverge
+   sharply. The step-direction-difference root cause should manifest
+   identically but on a problem where the divergence is localizable
+   to one alignable heuristic. Suggested filtering pass: across the
+   v0.8 baseline `results_v0.8.0-dev_baseline.json` regressions, find
+   problems where ripopt iter-by-iter `α_pr` differs from Ipopt's by a
+   constant factor or where Ipopt converges in `<50` iterations and
+   ripopt hits `MaxIterations`.
+
+2. **Parse the Ipopt print_level=12 dump** for arki0003 iter 0
+   (Jacobian, Hessian, dz post-solve) and diff column-by-column
+   against ripopt's iter-0 probe (`src/ipm.rs:5703-5775`,
+   `src/kkt_aug.rs:1086-1106`, both already gated on
+   `RIPOPT_IR_PROBE=1`). The 6.16% gap at slot `dx[1753]`
+   (A8.21 finding) is the localizing signal — whichever block
+   (H | J | Σ_s | dz) shows a comparable gap at the matching index is
+   the assembly-side culprit.
+
+Route 1 has higher expected information-per-hour (clean signature,
+small problem, fast iteration). Route 2 is the only way to *close
+out* arki0003 specifically.
+
+**Status**: arki0003 remains deprioritized. P1–P10 alignment pass had
+zero effect on its trajectory, confirming the gap is not in any of
+the audited defaults. Issuing the recommendation to pivot to a smaller
+divergence target before resuming arki0003 deep-dive.
+
+**Refs**: `/tmp/arki_pert_v2.log` (post-P1-P10 trace, 1209 lines, iters
+0–404, timed out at 3 min); `src/options.rs:692-694` (P3 default);
+`src/options.rs:331-334, 705` + `src/ipm.rs:8171-8177` (P4 plumbing);
+`src/ipm.rs:6074-6091` (P6 shortcut removal).
+
+## A8.24 — Iter-0 dump differ localizes divergence to .nl evaluator (2026-05-03)
+
+**Trigger**: Route 2 from A8.23 — build cross-binary iter-0 dump
+support and diff ripopt vs Ipopt block-by-block at the same `x_init`,
+`mu`, and `bound_mult_init`.
+
+**Method**: three-stage pipeline.
+
+1. `src/iter0_dump.rs` — flat JSON schema (lengths declared in the
+   header struct) with `Vec<Option<f64>>` for finite/unbounded sides
+   so JSON null round-trips (avoids serde_json's NaN→null lossy
+   default).
+2. `RIPOPT_IR_DUMP=<path>` env-gated dump in `src/ipm.rs`
+   (post-KKT-solve, post-step-recovery, pre-line-search at iter 0).
+   Materializes x, bounds, multipliers (full-n indexing), Σ_x/Σ_s,
+   ∇f, g, sparse J (rebuilt from `rebuild_combined_jac`), sparse H,
+   c_scaling (eq+ineq merged), all step deltas, `δ_w/δ_c` used at
+   iter 0, and `α_pr/α_du`.
+3. `examples/arki_ipopt_log_to_json.rs` — parses Ipopt's
+   `print_level=12` text log into the same schema, using `.col`/`.row`
+   sidecar files for `{xN}/{eN}` label → ripopt-slot mapping. Handles
+   Ipopt's "homogeneous vector, all elements have value V" short form
+   (used at iter 0 for z_L = z_U = v_L = v_U = 1.0). Picks
+   `jac_d_unscaled_matrix` since Ipopt wraps `jac_d` in a
+   `ScaledMatrix`. Picks the first `CompoundVector "delta"` for the
+   iter-0 step (post-perturbation solve).
+4. `examples/arki_diff.rs` — block ‖·‖_∞ table, top-K element-wise
+   mismatches per primal/constraint block, sparse-matrix block diff
+   (structural overlap + max|diff| at common entries), and a
+   probe-var focus printout.
+
+**Pipeline command**:
+```
+RIPOPT_IR_DUMP=/tmp/ripopt_iter0_arki0003.json target/release/ripopt \
+  benchmarks/mittelmann/nl/arki0003.nl max_iter=1 print_level=0
+target/release/examples/arki_ipopt_log_to_json \
+  /tmp/ipopt_arki0003_full.log \
+  benchmarks/mittelmann/nl/arki0003 \
+  /tmp/ipopt_iter0_arki0003.json
+target/release/examples/arki_diff \
+  /tmp/ripopt_iter0_arki0003.json \
+  /tmp/ipopt_iter0_arki0003.json
+```
+
+**Measured findings (rel = |a-b|/max(|a|,|b|))**:
+
+Block ‖·‖_∞ table — what matches and what doesn't:
+
+| Block      | ripopt   | ipopt    | rel       | Verdict |
+|------------|----------|----------|-----------|---------|
+| x          | 1.000e7  | 1.000e7  | 0         | ✅ exact |
+| x_l        | 1.430e4  | 1.430e4  | 7.0e-9    | ✅ matches modulo `bound_relax_factor=1e-8` |
+| x_u        | 1.000e5  | 1.000e5  | 1.0e-9    | ✅ same |
+| z_l, z_u   | 1.0      | 1.0      | 0         | ✅ exact (homogeneous init) |
+| v_l, v_u   | 1.0      | 1.0      | 0         | ✅ exact |
+| ∇f         | 1.0      | 1.0      | 0         | ✅ exact |
+| g          | 1.160e8  | 1.160e8  | 0         | (top-1 OK; **per-element diffs below**) |
+| **jac_vals** | **1.000e2** | **2.000e3** | **9.5e-1** | ❌ **20× off in many entries** |
+| hess_vals  | 8.71e-2  | 8.92e-2  | 2.4e-2    | ⚠ small max but **534 entries only_in_ripopt** |
+| Σ_x, Σ_s   | 1.0e2    | 1.0e2    | 1.0e-6    | ✅ same (1e-6 = bound_relax FP noise) |
+| c_scaling  | 1.0      | 1.0      | 0         | ✅ no scaling |
+| dx         | 4.999e7  | 4.999e7  | 2.2e-5    | (close at top, **8% gap at slot 30**) |
+| y_c        | 9.51e1   | 1.80e2   | 4.7e-1    | ❌ **initial y_c estimate diverges** |
+| y_d        | 1.22     | 1.80     | 3.2e-1    | ❌ **initial y_d estimate diverges** |
+| dy         | 4.59e3   | 4.39e3   | 4.3e-2    | (downstream of J + y_c) |
+
+**Smoking-gun #1 — Jacobian VALUES disagree at iter 0 with same x**:
+`jac_vals` rel=0.95. Sparsity matches exactly (10206 common, 0 only in
+either). Top-10 mismatches all show `ripopt=−1.000e2, ipopt=−2.000e3`
+(20× factor) at column 483 (`x1720`), 502 (`x1740`), 479, 478, 497,
+493, 486, 487, 476, 500. At the probe slot, **J[1962,1753]
+(`e2372/x1802`): ripopt=−100, ipopt=−1100** (11× factor).
+
+**Smoking-gun #2 — Constraint VALUES g(x_init) disagree at same x**:
+
+| index | AMPL row | ripopt   | ipopt    | rel  |
+|-------|----------|----------|----------|------|
+| 1875  | e2223    | -260.0   | -1601.0  | 0.84 |
+| 1933  | e2283    | +13.0    | 0.0      | 1.00 |
+| 1904  | e2253    | +13.0    | +1.3     | 0.90 |
+
+These three rows are constants in the linearized form (all `dx`
+displacements zero into their J-row), so the discrepancy is in the
+constraint-value evaluation itself, not in any derivative.
+
+**Smoking-gun #3 — Hessian sparsity divergence**: `common=1503,
+only_in_ripopt=534, only_in_ipopt=0`. Max |diff| at common entries is
+4.6e-2. Ripopt is reporting 534 zero or near-zero Hessian entries that
+Ipopt's ASL evaluator omits. Some are real value disagreements (e.g.,
+H[893,417] = +2.08e-2 vs −2.56e-2), not just sparsity-only zeros.
+
+**Verified vs inferred**:
+
+- **Measured**: at iter 0, with identical `x = x_init` and identical
+  bound multipliers (z_L = z_U = v_L = v_U = 1.0), ripopt and Ipopt
+  produce different J values, different g values, and different H
+  sparsity. ‖·‖_∞ tables and per-element diffs above. Files at
+  `/tmp/ripopt_iter0_arki0003.json`, `/tmp/ipopt_iter0_arki0003.json`,
+  `/tmp/arki_diff_report.txt`.
+- **Inferred (not yet verified)**: the J/g/H disagreement originates
+  in `src/nl/` (the pure-Rust .nl evaluator) — likely a specific
+  opcode (negation? `n2` vs `2`?), a constant-segment handling bug
+  (linear part of constraint?), or a `b`/`r`/`d` block being
+  consumed differently than ASL does. The factor-20× pattern at many
+  jac entries in column range 478–502 (`x1720..x1740`, all in the
+  same column band) suggests one shared multiplicative term or one
+  variable-segment is mis-evaluated.
+- **Inferred**: `y_c[389]` initial estimate divergence
+  (`95.13` vs `179.93`) and `y_d` divergence are downstream of the
+  J/g disagreement, since `least_squares_mult_init` solves
+  `J Jᵀ y = -∇f - z_L + z_U` — wrong J ⇒ wrong y.
+
+**Localization conclusion**: this is **not** a KKT, IPM,
+perturbation-handler, line-search, scaling, restoration, or
+filter bug. The four open candidates from A8.22 (H assembly,
+Jacobian col 1753, Σ_s coupling, FP-accumulation in elimination
+tree) are all **eliminated** — the divergence is upstream of the
+KKT system. Σ_x and Σ_s match, the linear solver gets the same
+inputs except for J/g/H, and the dx top-1 ‖·‖_∞ ratio (2.2e-5)
+is set entirely by the ‖dx‖_∞ entry on the bound-violating
+slot 1871 (which Ipopt has set with a tighter bound).
+
+The next-stage investigation has a clear target list:
+
+1. **Constraint value mismatch** (largest absolute signal,
+   simplest to localize):
+   - row `e2223` (slot 1875): -260 vs -1601 — find this row in
+     `arki0003.nl`, run ripopt's evaluator on it, compare against
+     `nl_grep` or a manual unwind.
+   - rows `e2283` (1933) and `e2253` (1904) — both show
+     small-integer outputs (+13) that suggest constant terms are
+     mishandled.
+2. **Jacobian factor-20× pattern**: cluster at `x1720..x1740`
+   range (cols 478–502) — find which constraint rows reference
+   these vars with a coefficient that ripopt halves or ipopt
+   doubles.
+3. **Hessian only-in-ripopt entries**: 534 phantom non-zeros —
+   likely a structural-zero detection issue in the autodiff
+   pass (e.g., emitting a Hessian entry for `0 * x[i] * x[j]`).
+
+**Refs**: `src/iter0_dump.rs` (schema, 150 lines);
+`src/ipm.rs:7014-7170` (ripopt-side dump emitter, env-gated);
+`examples/arki_ipopt_log_to_json.rs` (Ipopt log parser, ~1100 lines);
+`examples/arki_diff.rs` (block-wise differ, ~700 lines);
+`/tmp/arki_diff_report.txt` (full diff output).
+
+**Status**: arki0003 root cause is now localized to the **.nl
+evaluator** (`src/nl/`). The KKT-system / IPM hypothesis from A8.20–
+A8.23 is **falsified** at iter 0. Recommendation: investigate the .nl
+evaluator on the three constant-mismatch rows (e2223, e2283, e2253)
+first — their small-integer ripopt outputs (-260, +13, +13) vs
+Ipopt's varied outputs (-1601, 0, +1.3) point at a specific
+op-handling bug that should be reproducible on a 5-line unit test.
+
+### A8.24 — addendum: smoking-gun #2 retracted (2026-05-03, same day)
+
+**Trigger**: before writing a unit test, inspected the .nl parser
+directly for the three constant-mismatch rows.
+
+**Method**: pulled the `r` segment (constraint bounds) for rows
+1875/1904/1933 and the `x` segment (initial primal) for the
+referenced variables out of `benchmarks/mittelmann/nl/arki0003.nl`,
+then hand-evaluated.
+
+```
+$ grep -n '^r$' arki0003.nl    → line 3636
+$ awk '/^r$/{f=NR;next} f && NR<=f+2138 {print NR-f":"$0}' arki0003.nl | awk -F: 'NR==1876||NR==1905||NR==1934'
+1876:4 1341
+1905:4 11.700000000000001
+1934:4 13
+```
+
+Type-4 equalities with **non-zero RHS** (1341, 11.7, 13).
+
+```
+$ awk '/^x1751$/{n=1;next} n && ($1==894||$1==895||$1==905||$1==1813||$1==389||$1==1694) {print}' arki0003.nl
+389 13
+894 130
+895 130
+905 130
+1694 13
+1813 1300
+```
+
+Variables not listed in the `x` segment default to 0.
+
+**Hand-evaluation**:
+
+| row | linear formula | x_init substitution | ripopt g | ipopt g | ipopt = ripopt − r |
+|-----|---------------|--------------------|----------|---------|------|
+| 1875 / e2223 | −Σ_{894..905} x + x[1813]   | −12·130 + 1300        | −260 ✓ | −1601 | −260 − 1341 = **−1601** ✓ |
+| 1904 / e2253 | x[389] − x[1254] + x[1753]  | 13 − 0 + 0.01         | 13 ✓   | 1.3   | 13 − 11.7 = **1.3** ✓     |
+| 1933 / e2283 | −x[1284] + x[1694] + x[1783] | 0 + 13 + 0            | 13 ✓   | 0     | 13 − 13 = **0** ✓         |
+
+**Diagnosis**: ripopt's `.nl` evaluator is **correct** on these rows.
+The "mismatch" is a **representation convention difference** — Ipopt
+internally normalizes type-4 equalities to `g_internal(x) = f(x) − b`
+so the equation reads `g_internal = 0`. Ripopt keeps `g(x) = f(x)`
+and stores `g_l = g_u = b` as bounds. The Ipopt-log parser
+(`examples/arki_ipopt_log_to_json.rs`) dumps Ipopt's already-shifted
+`curr_c`/`curr_d`, ripopt's `iter0_dump` emits the unshifted form,
+and the differ compares apples to oranges on equality-with-RHS rows.
+
+**Verified vs inferred (revised)**:
+
+- **Measured**: g(x_init) for rows 1875/1904/1933 in ripopt matches
+  the .nl-file definition (J coefficients × x_init). Ipopt's reported
+  values match `(ripopt's g) − (r-segment RHS)`. Both are correct in
+  their own conventions.
+- **Falsified**: smoking-gun #2 ("constraint values disagree at same
+  x") from A8.24's main entry. No `.nl` evaluator bug on these rows.
+
+**Status of the other A8.24 findings (revised)**:
+
+1. **Jacobian factor-20× cluster (rows 1068–1094, cols 478–502)** —
+   still open, but suspect a similar runtime-scaling artifact rather
+   than parsing. Both `state.jac_c_vals/jac_d_vals` (ripopt) and
+   `jac_d_unscaled_matrix` (Ipopt) may carry NLP gradient-scaling
+   that the dumps don't strip. Next-step probe: read
+   `src/preprocessing/scaling*.rs` or wherever ripopt computes
+   `c_scaling/d_scaling` and check whether `state.jac_*_vals` is
+   pre- or post-scaling. Cross-check by setting
+   `nlp_scaling_method=none` on both sides and re-diffing.
+2. **Hessian 534 only_in_ripopt entries** — still genuine. There's
+   no equality-shift counterpart that produces phantom Hessian
+   entries (the linearized form is `0` for both sides on linear
+   constraints, and the Hessian-of-Lagrangian is just a sum of
+   constraint Hessians weighted by y). Likely a real autodiff
+   structural-zero detection issue. Investigate
+   `src/nl/autodiff.rs` — specifically the `hess_*` builder for
+   structural symmetry.
+3. **y_c initial 47% divergence** — should be downstream of the
+   shift convention only if the least-squares-mult-init formula
+   uses constraint values (it doesn't — it uses gradients). So this
+   is *not* explained by the convention difference and remains
+   genuinely open. Reread `src/ipm.rs` `least_squares_mult_init`
+   path against IpDefaultIterateInitializer.cpp.
+
+**Lessons (write to memory)**:
+
+- The differ at `examples/arki_diff.rs` was naive about
+  representation conventions. Before claiming a value mismatch,
+  check whether the two sides use the same normalization for
+  equality constraints (Ipopt: shift to g=0; ripopt: keep g=f(x)
+  and use bounds), bound multipliers (sign conventions), and slack
+  variables (Ipopt: c(x) − s = 0 with s ≥ 0; ripopt: same
+  internally but the dump may differ).
+- "Read the function before changing its callsite" extends to
+  "read the file format before claiming a value mismatch" — a
+  single grep of the `r` segment would have ruled out the bug
+  before writing a unit test.
+
+**Status**: smoking-gun #2 retracted. Open candidates reduced to
+(a) Jacobian-scaling convention check, (b) Hessian structural-zero
+detection, (c) `least_squares_mult_init` formulation. Recommendation
+unchanged — investigate the .nl evaluator's autodiff Hessian first
+since that's the only non-convention finding left.
+
+**Refs**: `benchmarks/mittelmann/nl/arki0003.nl:3636-...` (r segment);
+`benchmarks/mittelmann/nl/arki0003.nl:1884-...` (x segment);
+`src/nl/parser.rs:266-313` (r-segment parser, type 4 handler at
+:299-303).
+
+## A8.25 — Differ convention bridge + factor-20× retraction (2026-05-03)
+
+**Trigger**: user pushback on A8.24 — "even though it is technically
+correct it does not mean the right values are used in ripopt right? I
+would expect bit-wise equivalence, not within some operations
+equivalent". Investigated whether the Jacobian factor-20× cluster
+from A8.24 (rows 1068–1094, cols 478–502) is a real value mismatch or
+another dump-layer convention difference.
+
+**Method**: probe ripopt's `state.c_scaling[row]` for the rows in
+question and the Ipopt-side `c_scaling[row]` (which the log parser
+fills from `d scaling vector`):
+
+```
+$ python3 -c "..." (read both JSON dumps)
+[1068,418]  ripopt c_scal=5.0000e-02  ipopt c_scal=5.0000e-02
+            jac r=-9.9000e-02  i=-1.9800e+00  ratio i/r=20.0000
+[1075,425]  ripopt c_scal=5.0000e-02  ipopt c_scal=5.0000e-02
+            jac r=-9.9000e-02  i=-1.9800e+00  ratio i/r=20.0000
+... (10 of 10 rows show exact 20× = 1/c_scaling)
+```
+
+**Diagnosis (root cause)**: ripopt's iter-0 dump emits
+`state.jac_c_vals/jac_d_vals`, which `ScaledProblem::jacobian_values`
+(`src/ipm.rs:271-277`) populates as **post-NLP-scaling**:
+
+```rust
+fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
+    if !self.inner.jacobian_values(x, _new_x, vals) { return false; }
+    for (idx, &row) in self.jac_rows.iter().enumerate() {
+        vals[idx] *= self.g_scaling[row];   // <-- scaling baked in
+    }
+    true
+}
+```
+
+Ipopt's log dumps `jac_d_unscaled_matrix`, which is the underlying
+GenTMatrix **before** NLP scaling is applied (the NLP scaling is
+applied dynamically by `IpScaledMatrix` on each operation). So the
+two dumps are at **different abstraction layers** of the IPM state.
+
+The factor 20× = 1 / c_scaling[row] is exactly what you'd predict.
+
+**Bridge fix in `examples/arki_diff.rs`**: optional `--nl=<path>`
+flag. The differ now:
+
+1. Parses the .nl `r` segment for type-4 equality rows.
+2. Subtracts each rhs from ripopt-side `g[row]` so both dumps are in
+   shifted form (matching Ipopt's `c_x = f(x) − b` convention,
+   internally consistent with `state.c_x` per docstring at
+   `src/ipm.rs:1862`).
+3. Multiplies Ipopt-side `jac_vals[k]` by `i.c_scaling[row]` so both
+   dumps are in post-NLP-scaling form (matching ripopt's
+   `state.jac_*_vals` storage convention).
+
+**Re-run results (post-bridge)**:
+
+| Block       | Pre-bridge rel | Post-bridge rel | Verdict |
+|-------------|---------------:|-----------------:|---------|
+| g           | 0 (top match coincidental) | **1.9e-16** | ✅ bit-wise equal modulo FP |
+| jac_vals    | 9.5e-1 (95%)   | **1.4e-16**  | ✅ bit-wise equal modulo FP |
+| J[1962,1753] (probe) | -100 vs -1100 | -100 vs -100 (diff 1.4e-14) | ✅ |
+| x, grad_f, x_l/u, z_l/u, v_l/u, c_scaling, s | match | match | ✅ |
+| Σ_x, Σ_s    | 1e-6           | 1e-6         | ✅ bound_relax FP only |
+
+**Genuine bit-wise misalignments remaining at iter 0**:
+
+| Block      | rel    | Top entry detail                              |
+|------------|-------:|-----------------------------------------------|
+| `y_c[389]` | 0.4713 | ripopt=+95.131 vs ipopt=+179.929 (ratio 1.89) |
+| `y_c[11]`  | 0.8889 | ripopt=+0.442  vs ipopt=+3.980  (ratio 9.0)   |
+| `y_d[1514]` | 1.81  | ripopt=−0.570  vs ipopt=+0.460                |
+| `y_d[1662]` | 1.00  | ripopt=0       vs ipopt=+0.896                |
+| hess_vals (max diff) | 0.024 | + **534 entries only_in_ripopt** |
+| `dx[30..37]` | 6–8% | downstream of y_c (J^T y enters dual residual)|
+| `ds[359]`  | 2.1%   | downstream of dy                               |
+| `dz_l[1254]` | 0.029 | downstream of dx                              |
+
+**Status of A8.24's three open candidates (final)**:
+
+1. **Jacobian factor-20× cluster** — **RESOLVED**: dump-layer
+   convention difference (NLP-scaling), not a bit-wise drift. After
+   `i.c_scaling[row]` correction the Jacobian is bit-wise equal at
+   iter 0 (max |diff| 1.4e-14, rel 1.4e-16).
+2. **g[1875] et al. equality mismatches** — **RESOLVED** (A8.24
+   addendum): equality-RHS shift convention. After `r`-segment
+   subtraction the constraint vector is bit-wise equal (max |diff|
+   2.3e-13, rel 1.9e-16).
+3. **Hessian 534 only_in_ripopt + 2.4% rel** — **STILL OPEN**. No
+   convention-bridge has been applied for the Hessian; probably needs
+   the `obj_factor*obj_scaling + lambda*g_scaling` decomposition
+   handled. But 534 phantom non-zeros is more than a scaling
+   artifact — it's likely a real autodiff structural-zero issue.
+4. **y_c / y_d initial multiplier estimates** — **STILL OPEN**. The
+   `least_squares_mult_init` LSQ (`J Jᵀ y = -∇f - z_L + z_U`) uses
+   only quantities that we've now confirmed are bit-wise equal
+   between ripopt and Ipopt. So either (a) the LSQ formulation
+   differs (maybe ripopt regularizes the LSQ system differently
+   from Ipopt), or (b) ripopt and Ipopt use different LSQ-norm
+   conventions. y_c[389] ratio 1.89 doesn't match any single
+   constraint or variable scaling, suggesting a formulation-level
+   discrepancy rather than a scaling one.
+
+**Lessons (updated)**:
+
+- "Differ should be format-aware" — added explicit convention
+  bridges. Future iter-N dumps must apply the same bridges before
+  drawing any "ripopt and Ipopt disagree" conclusions.
+- The user's bit-wise standard is the right one; each "explained
+  away" mismatch must be backed by a verifiable transformation that
+  collapses the diff to FP noise. After applying the transformation,
+  the diff *did* collapse — confirming the explanation. If applying
+  the transformation had *not* collapsed the diff, the explanation
+  would have been wrong.
+
+**Concrete next-step recommendations**:
+
+1. Investigate `least_squares_mult_init` in `src/ipm.rs` against
+   `IpDefaultIterateInitializer.cpp:259-298` and `IpEqMultCalculator`
+   (Ipopt's LSQ helper). The y_c[389] = 1.89× factor is the
+   localizing signal.
+2. Build a Hessian convention bridge (multiply Ipopt's W by
+   `obj_factor` and per-row `lambda` correction) in
+   `examples/arki_diff.rs` and re-run. If 534 phantom entries
+   persist after the bridge, that's the real bug — likely in
+   `src/nl/autodiff.rs` Hessian sparsity emission.
+
+**Refs**: `examples/arki_diff.rs:117-180` (bridge fix);
+`src/ipm.rs:271-277` (ScaledProblem::jacobian_values);
+`src/ipm.rs:1860-1869` (set_g_combined docstring confirming
+ripopt's internal c_x is shifted, matching Ipopt's curr_c);
+`/tmp/arki_diff_v2.txt` (post-bridge diff output).
