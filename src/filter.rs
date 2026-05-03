@@ -222,6 +222,12 @@ impl Filter {
     /// 1. Determine step type (Armijo branch when `IsFtype && theta<=theta_min`,
     ///    sufficient-reduction otherwise)
     /// 2. Check filter acceptability
+    ///
+    /// Ipopt-alignment: the `obj_max_inc` divergence guard is **h-type-only**
+    /// per `IpFilterLSAcceptor.cpp:480-493`. Ipopt invokes that check from
+    /// inside `IsAcceptableToCurrentIterate`, which is itself only called
+    /// from the h-type (sufficient-reduction) branch at line 373. The
+    /// f-type/Armijo branch at line 361-371 never consults `obj_max_inc`.
     pub fn check_acceptability(
         &mut self,
         theta_current: f64,
@@ -237,30 +243,31 @@ impl Filter {
             return (false, false);
         }
 
-        // T3.4: obj_max_inc divergence guard
-        // (IpFilterLSAcceptor.cpp:478-493). Reject trials where the
-        // barrier objective is climbing faster than `10^obj_max_inc`
-        // relative to the current iterate's φ. Gated by
-        // `trial_phi > reference_phi`; otherwise this is a no-op.
-        if !self.passes_obj_max_inc(phi_current, phi_trial) {
-            self.last_rejection_due_to_filter = false;
-            return (false, false);
-        }
-
         // DEV-30: split IsFtype (pure) from the call-site theta_min gate
         // that selects the acceptance branch.
         let is_ft = self.is_ftype(theta_current, grad_phi_step, alpha);
         let armijo_holds = self.armijo_condition(phi_current, phi_trial, grad_phi_step, alpha);
 
         // Acceptance branch (IpFilterLSAcceptor.cpp:361-374):
-        //   if (IsFtype && theta <= theta_min)  Armijo
+        //   if (IsFtype && theta <= theta_min)  Armijo  (no obj_max_inc check)
         //   else                                 IsAcceptableToCurrentIterate
+        //                                        (obj_max_inc FIRST, then
+        //                                         sufficient theta-or-phi
+        //                                         reduction)
         let type_ok = if is_ft && theta_current <= self.theta_min {
+            // f-type/Armijo branch — Ipopt does NOT consult obj_max_inc here.
             armijo_holds
         } else {
-            // Sufficient reduction in theta or phi.
-            self.sufficient_infeasibility_reduction(theta_current, theta_trial)
-                || phi_trial <= phi_current - self.gamma_phi * theta_current
+            // h-type branch: mirror IsAcceptableToCurrentIterate
+            // (IpFilterLSAcceptor.cpp:471-499). The obj_max_inc divergence
+            // guard runs FIRST (line 480-493); only if it passes do we
+            // test the sufficient-reduction OR phi-reduction (line 497-498).
+            if !self.passes_obj_max_inc(phi_current, phi_trial) {
+                false
+            } else {
+                self.sufficient_infeasibility_reduction(theta_current, theta_trial)
+                    || phi_trial <= phi_current - self.gamma_phi * theta_current
+            }
         };
 
         if !type_ok {
@@ -407,10 +414,20 @@ impl Filter {
     /// Note: does NOT bump `theta_max` — Ipopt's `theta_max_` is initialized
     /// lazily once from the first reference theta and is never re-inflated
     /// at restoration entry.
+    ///
+    /// Ipopt-alignment: this mirrors `FilterLSAcceptor::PrepareRestoPhaseStart`
+    /// (`IpFilterLSAcceptor.cpp:898-901`), invoked when the line search hands
+    /// off to the restoration phase. ripopt invokes this from `ipm.rs` in the
+    /// `!step_accepted` branch at the entry to the restoration cascade
+    /// (search for `augment_for_restoration` in `src/ipm.rs`), so the
+    /// pre-restoration `(theta, phi)` margin entry is in the filter before
+    /// either the almost-feasible guard or the restoration solver runs.
     pub fn augment_for_restoration(&mut self, theta_current: f64, phi_current: f64) {
-        let guard_theta = (1.0 - self.gamma_theta) * theta_current;
-        let guard_phi = phi_current - self.gamma_phi * theta_current;
-        self.add(guard_theta, guard_phi);
+        // ripopt stores raw (theta, phi); is_acceptable applies the
+        // (gamma_theta, gamma_phi) offsets at compare time. Pre-baking the
+        // offsets here would double-apply them and hand the restoration
+        // kernel a strictly weaker entry than Ipopt's reference. Pass raw.
+        self.add(theta_current, phi_current);
     }
 
     /// Reset the filter (used when barrier parameter decreases).

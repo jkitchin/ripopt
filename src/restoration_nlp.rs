@@ -1,5 +1,6 @@
 use std::cell::Cell;
 
+use crate::filter::FilterEntry;
 use crate::problem::NlpProblem;
 
 /// NLP problem wrapper for the restoration phase.
@@ -45,6 +46,73 @@ pub struct RestorationNlp<'a> {
     p_init: Vec<f64>,
     /// Cached initial n values.
     n_init: Vec<f64>,
+    /// Parent NLP's max-bound-violation `||c(x_R) − π[g_l,g_u](c(x_R))||_∞`
+    /// at restoration entry. The early-exit hook compares the current
+    /// inner-iterate's parent violation against
+    /// `parent_kappa_resto · parent_theta_entry`.
+    /// `0.0` disables early exit (no parent target injected).
+    parent_theta_entry: f64,
+    /// Required infeasibility-reduction factor (Ipopt's
+    /// `required_infeasibility_reduction`, default 0.9). When the
+    /// parent's max-bound-violation falls to this fraction of the
+    /// entry value, the inner solve exits Optimal.
+    parent_kappa_resto: f64,
+    /// Cached parent constraint bounds (used by `resto_early_exit` to
+    /// recompute the parent max-bound-violation without going back
+    /// through the wrapper stack).
+    parent_g_l: Vec<f64>,
+    parent_g_u: Vec<f64>,
+    /// Optional acceptable tolerance for early exit
+    /// (`min(tol, constr_viol_tol)`); a parent violation below this
+    /// floor exits even if `kappa_resto` would not yet trigger.
+    parent_small_threshold: f64,
+    /// 1-norm of the parent's bound-violation at restoration entry —
+    /// used for the filter / sufficient-progress gates (Ipopt
+    /// `IpFilterLSAcceptor::IsAcceptableToCurrentIterate`,
+    /// IpFilterLSAcceptor.cpp:497-498). Distinct from
+    /// `parent_theta_entry` (max-norm) which feeds the κ_resto gate
+    /// (Ipopt `IpRestoConvCheck.cpp:184-190`).
+    parent_theta_entry_l1: f64,
+    /// Parent's `f(x_R)` at restoration entry. φ for the inner solve
+    /// is taken to be the original NLP objective only — matching
+    /// ripopt's existing post-restoration `classify_restoration_outcome`
+    /// metric (`src/ipm.rs:8562`); this keeps the inner early-exit
+    /// gate and the post-resto Success classifier consistent so the
+    /// parent never rejects a point the inner just exited on.
+    parent_phi_entry: f64,
+    /// Parent filter snapshot at restoration entry (Ipopt's parent
+    /// `FilterLSAcceptor`'s entry list, frozen for the duration of
+    /// the inner solve — `IpFilterLSAcceptor.cpp:497`).
+    parent_filter_entries: Vec<FilterEntry>,
+    /// Parent filter `theta_max` (envelope cap; rejects trials whose
+    /// 1-norm θ exceeds this).
+    parent_theta_max: f64,
+    /// Parent filter `gamma_theta` (sufficient-θ-reduction margin;
+    /// Ipopt default 1e-5).
+    parent_gamma_theta: f64,
+    /// Parent filter `gamma_phi` (sufficient-φ-reduction margin;
+    /// Ipopt default 1e-8).
+    parent_gamma_phi: f64,
+    /// Parent's curr_mu at restoration entry. Used to compute the
+    /// **barrier** φ_trial = f(x) − μ·Σ ln(slack) for the parent-filter
+    /// gate (D5 fix: matches `IpRestoConvCheck.cpp:193`'s use of
+    /// `orig_ip_cq->trial_barrier_obj()`). Without this the parent
+    /// filter would be tested with raw `f(x)` against entries that
+    /// store barrier-φ — a category mismatch that loosens the gate.
+    parent_mu_entry: f64,
+    /// Parent x lower bounds (n_orig). Finite entries contribute
+    /// `−μ·ln(x − x_l)` to the parent's barrier φ.
+    parent_x_l: Vec<f64>,
+    /// Parent x upper bounds (n_orig). Finite entries contribute
+    /// `−μ·ln(x_u − x)` to the parent's barrier φ.
+    parent_x_u: Vec<f64>,
+    /// `IpRestoFilterConvCheck::CheckConvergence` skips the early-exit
+    /// test on the very first inner iteration (Ipopt's
+    /// `first_resto_iter_` flag, IpRestoConvCheck.cpp:73-78); without
+    /// this guard the resto solve can declare success at iter 0
+    /// before the slack variables have moved. Cell so the immutable
+    /// `resto_early_exit(&self, ...)` hook can flip it.
+    first_iter_seen: Cell<bool>,
 }
 
 impl<'a> RestorationNlp<'a> {
@@ -167,7 +235,70 @@ impl<'a> RestorationNlp<'a> {
             diag_indices,
             p_init,
             n_init,
+            parent_theta_entry: 0.0,
+            parent_kappa_resto: 0.0,
+            parent_g_l: g_l,
+            parent_g_u: g_u,
+            parent_small_threshold: 0.0,
+            parent_theta_entry_l1: 0.0,
+            parent_phi_entry: 0.0,
+            parent_filter_entries: Vec::new(),
+            parent_theta_max: f64::INFINITY,
+            parent_gamma_theta: 1e-5,
+            parent_gamma_phi: 1e-8,
+            parent_mu_entry: mu_entry.max(0.0),
+            parent_x_l: Vec::new(),
+            parent_x_u: Vec::new(),
+            first_iter_seen: Cell::new(false),
         }
+    }
+
+    /// Inject the parent NLP's restoration-entry violation
+    /// `theta_entry` (max-norm bound-violation, used by the κ_resto
+    /// gate per `IpRestoConvCheck.cpp:184-190`), `theta_entry_l1`
+    /// (1-norm bound-violation, used by the filter and
+    /// sufficient-progress gates per
+    /// `IpFilterLSAcceptor.cpp:497-498`), `phi_entry` (parent's
+    /// `f(x_R)`), the required-reduction factor `kappa_resto`
+    /// (Ipopt's `required_infeasibility_reduction`, default 0.9), the
+    /// small-threshold floor (`min(tol, constr_viol_tol)`), the
+    /// parent filter parameters (`theta_max`, `gamma_theta`,
+    /// `gamma_phi`) and a snapshot of the parent's filter entries.
+    ///
+    /// Together these support the full
+    /// `IpRestoFilterConvCheck::TestOrigProgress`
+    /// (`IpRestoFilterConvCheck.cpp:53-80`) early-exit gate:
+    /// (1) skip on first inner iter; (2) max-norm κ_resto reduction;
+    /// (3) parent-filter acceptance; (4) sufficient progress on
+    /// (θ_entry, φ_entry).
+    pub fn set_parent_target(
+        &mut self,
+        theta_entry: f64,
+        theta_entry_l1: f64,
+        phi_entry: f64,
+        kappa_resto: f64,
+        small_threshold: f64,
+        theta_max: f64,
+        gamma_theta: f64,
+        gamma_phi: f64,
+        filter_entries: Vec<FilterEntry>,
+        mu_entry: f64,
+        x_l: Vec<f64>,
+        x_u: Vec<f64>,
+    ) {
+        self.parent_theta_entry = theta_entry.max(0.0);
+        self.parent_theta_entry_l1 = theta_entry_l1.max(0.0);
+        self.parent_phi_entry = phi_entry;
+        self.parent_kappa_resto = kappa_resto.max(0.0);
+        self.parent_small_threshold = small_threshold.max(0.0);
+        self.parent_theta_max = theta_max;
+        self.parent_gamma_theta = gamma_theta.max(0.0);
+        self.parent_gamma_phi = gamma_phi.max(0.0);
+        self.parent_filter_entries = filter_entries;
+        self.parent_mu_entry = mu_entry.max(0.0);
+        self.parent_x_l = x_l;
+        self.parent_x_u = x_u;
+        self.first_iter_seen.set(false);
     }
 
     /// Current η = η_factor · √μ, with μ tracked by `notify_mu`.
@@ -357,6 +488,141 @@ impl NlpProblem for RestorationNlp<'_> {
         if mu.is_finite() && mu >= 0.0 {
             self.current_mu.set(mu);
         }
+    }
+
+    /// Ipopt `IpRestoFilterConvCheck::TestOrigProgress`
+    /// (`IpRestoFilterConvCheck.cpp:53-80`,
+    /// `IpRestoConvCheck.cpp:71-248`): the inner solve exits early
+    /// when ALL of the following gates pass at the current inner
+    /// iterate `x_n`:
+    ///
+    /// 1. **Not first inner iter** — Ipopt's `first_resto_iter_`
+    ///    flag (IpRestoConvCheck.cpp:73-78) skips the test on iter 0
+    ///    so the slack variables have a chance to move.
+    /// 2. **κ_resto reduction (max-norm)** —
+    ///    `θ_max(x_n) ≤ max(κ_resto · θ_entry_max, small_threshold)`,
+    ///    Ipopt's primary `required_infeasibility_reduction` gate
+    ///    (`IpRestoConvCheck.cpp:184-190`).
+    /// 3. **Parent filter acceptance (1-norm θ, raw f as φ)** — the
+    ///    `(θ_l1, φ)` pair must not be dominated by any parent
+    ///    filter entry, mirroring `Filter::IsAcceptable`
+    ///    (`IpFilterLSAcceptor.cpp:497`).
+    /// 4. **Sufficient progress vs parent iterate** —
+    ///    `θ_l1(x_n) ≤ (1−γ_θ)·θ_entry_l1` OR
+    ///    `φ(x_n) − φ_entry ≤ −γ_φ · θ_entry_l1`, mirroring
+    ///    `IsAcceptableToCurrentIterate` (`IpFilterLSAcceptor.cpp:497-498`).
+    ///
+    /// The φ used here is the **parent barrier objective**
+    /// `φ(x) = f(x) − μ_parent · Σ ln(slack)` over finite x bounds
+    /// (D5 fix). This matches `IpRestoConvCheck.cpp:193`
+    /// (`orig_ip_cq->trial_barrier_obj()`); the parent filter stores
+    /// barrier-φ entries, so testing raw `f` against them was a
+    /// category mismatch. With μ_parent captured at restoration entry
+    /// the gate is consistent with the parent's filter semantics.
+    fn resto_early_exit(&self, x: &[f64]) -> bool {
+        let n = self.n_orig;
+        let m = self.m_orig;
+        if self.parent_theta_entry <= 0.0 || x.len() < n {
+            return false;
+        }
+        // Gate 1: skip on first inner iter (Ipopt first_resto_iter_).
+        if !self.first_iter_seen.get() {
+            self.first_iter_seen.set(true);
+            return false;
+        }
+
+        // Compute parent c(x_n).
+        let mut g = vec![0.0; m];
+        if m > 0 && !self.inner.constraints(&x[..n], true, &mut g) {
+            return false;
+        }
+        let mut max_viol = 0.0_f64;
+        let mut l1_viol = 0.0_f64;
+        for i in 0..m {
+            let lo = self.parent_g_l[i];
+            let hi = self.parent_g_u[i];
+            let v = if g[i] < lo {
+                lo - g[i]
+            } else if g[i] > hi {
+                g[i] - hi
+            } else {
+                0.0
+            };
+            if v > max_viol {
+                max_viol = v;
+            }
+            l1_viol += v;
+        }
+
+        // Gate 2: κ_resto reduction in max-norm.
+        let threshold_max = (self.parent_kappa_resto * self.parent_theta_entry)
+            .max(self.parent_small_threshold);
+        let gate_kappa = max_viol <= threshold_max;
+
+        // φ_trial = f(x_n) − μ_parent · Σ ln(slack) — parent barrier
+        // objective. D5 fix: the parent filter stores barrier-φ
+        // entries (`compute_barrier_phi` is the parent's metric); the
+        // raw `f(x)` would mismatch when slacks are tight.
+        let mut f_val = 0.0;
+        if !self.inner.objective(&x[..n], false, &mut f_val) || !f_val.is_finite() {
+            return false;
+        }
+        let mut phi_trial = f_val;
+        if self.parent_mu_entry > 0.0 {
+            let nb = self.parent_x_l.len().min(self.parent_x_u.len()).min(n);
+            for i in 0..nb {
+                if self.parent_x_l[i].is_finite() {
+                    let s = x[i] - self.parent_x_l[i];
+                    if s <= 0.0 {
+                        return false;
+                    }
+                    phi_trial -= self.parent_mu_entry * s.ln();
+                }
+                if self.parent_x_u[i].is_finite() {
+                    let s = self.parent_x_u[i] - x[i];
+                    if s <= 0.0 {
+                        return false;
+                    }
+                    phi_trial -= self.parent_mu_entry * s.ln();
+                }
+            }
+            if !phi_trial.is_finite() {
+                return false;
+            }
+        }
+
+        // Gate 3: parent filter acceptance on (θ_l1, φ).
+        let theta_entry_l1 = self.parent_theta_entry_l1;
+        let phi_entry = self.parent_phi_entry;
+        let gamma_theta = self.parent_gamma_theta;
+        let gamma_phi = self.parent_gamma_phi;
+        let gate_filter = if l1_viol.is_nan() || phi_trial.is_nan() {
+            false
+        } else if l1_viol > self.parent_theta_max {
+            false
+        } else {
+            !self.parent_filter_entries.iter().any(|e| {
+                l1_viol >= (1.0 - gamma_theta) * e.theta
+                    && phi_trial >= e.phi - gamma_phi * e.theta
+            })
+        };
+
+        // Gate 4: sufficient progress vs (θ_entry_l1, φ_entry).
+        let theta_progress = l1_viol <= (1.0 - gamma_theta) * theta_entry_l1;
+        let phi_progress = (phi_trial - phi_entry) <= -gamma_phi * theta_entry_l1;
+        let gate_progress = theta_progress || phi_progress;
+
+        let exit = gate_kappa && gate_filter && gate_progress;
+        if std::env::var("RIPOPT_TRACE_RESTO_EXIT").is_ok() {
+            eprintln!(
+                "  resto-exit-probe: max_viol={:.3e}/thr={:.3e} l1={:.3e}/entry_l1={:.3e} \
+                 phi={:.3e}/entry={:.3e} κ={} flt={} prog={} → exit={}",
+                max_viol, threshold_max, l1_viol, theta_entry_l1,
+                phi_trial, phi_entry,
+                gate_kappa, gate_filter, gate_progress, exit,
+            );
+        }
+        exit
     }
 }
 

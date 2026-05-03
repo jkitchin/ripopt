@@ -1100,8 +1100,10 @@ pub fn factor_with_inertia_correction(
 
         if std::env::var("RIPOPT_TRACE_PERTURB").is_ok() {
             eprintln!(
-                "  perturb-trace: dx={:.2e} dc={:.2e} -> inertia(+{}, -{}, 0:{}) target({}+, {}-, 0)",
-                dx, dc, positive, negative, zero, n, m
+                "  perturb-trace: dx={:.2e} dc={:.2e} -> inertia(+{}, -{}, 0:{}) target({}+, {}-, 0) | dw_last={:.2e} dc_last={:.2e} hess={:?} jac={:?} degen_iters={} mu={:.2e}",
+                dx, dc, positive, negative, zero, n, m,
+                params.delta_w_last, params.delta_c_last,
+                params.hess_degenerate, params.jac_degenerate, params.degen_iters, mu
             );
         }
         let exact_ok = positive == n && negative == m && zero == 0;
@@ -2433,7 +2435,7 @@ mod tests {
     /// κ_σ band [μ/(κ_σ·s), κ_σ·μ/s] = [3.3e-12, 3.3e8] contains 1.5,
     /// so v_L is unclamped. Σ_s = v_L/s = 5.0, (2,2) = -1/Σ_s = -0.2.
     #[test]
-    fn test_assemble_kkt_explicit_vL_within_kappa_sigma_band() {
+    fn test_assemble_kkt_explicit_v_l_within_kappa_sigma_band() {
         let n = 1;
         let hess_rows = vec![0]; let hess_cols = vec![0]; let hess_vals = vec![1.0];
         // Single inequality row → split J_d row 0 only.
@@ -2472,7 +2474,7 @@ mod tests {
     /// (2,2) ≈ -9e10. This guards against accidentally feeding zero v_L
     /// into the assembly without crashing the linear solve.
     #[test]
-    fn test_assemble_kkt_explicit_vL_zero_gets_kappa_sigma_floor() {
+    fn test_assemble_kkt_explicit_v_l_zero_gets_kappa_sigma_floor() {
         let n = 1;
         let hess_rows = vec![0]; let hess_cols = vec![0]; let hess_vals = vec![1.0];
         let jac_d_rows = vec![0]; let jac_d_cols = vec![0]; let jac_d_vals = vec![1.0];
@@ -2728,7 +2730,7 @@ mod tests {
         matrix.set(2, 1, 1e10);
         // (2,2) = 0 — equality block, no δ_c (T0.13 alignment).
 
-        let mut kkt = KktSystem {
+        let kkt = KktSystem {
             dim: 3, n, m,
             matrix: KktMatrix::Dense(matrix),
             rhs: vec![1.0, 1.0, 0.0],

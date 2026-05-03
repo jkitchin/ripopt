@@ -290,7 +290,7 @@ pub struct SolverOptions {
     pub max_wall_time: f64,
     /// Number of consecutive shortened steps before activating watchdog. Default: 10.
     pub watchdog_shortened_iter_trigger: usize,
-    /// Maximum trial iterations during watchdog mode. Default: 5.
+    /// Maximum trial iterations during watchdog mode. Default: 3 (Ipopt).
     pub watchdog_trial_iter_max: usize,
     /// KKT dimension threshold for switching to sparse solver.
     /// When n + m >= sparse_threshold, use sparse LDLT instead of dense.
@@ -328,20 +328,10 @@ pub struct SolverOptions {
     /// square-problem convention; ripopt's `RestorationPhase` enforces
     /// this automatically when `is_square`).
     pub kappa_resto: f64,
-    /// T3.12: enable Ipopt's `RestoFilterConvCheck::TestOrigProgress`
-    /// early-exit. When `true` (and the caller supplies the outer-NLP
-    /// barrier context: μ_outer, x_l, x_u, n_orig), the GN restoration
-    /// loop tests acceptability of `(θ_outer, φ_outer)` against the
-    /// outer filter after every successful trial step and exits early
-    /// on the first acceptable iterate. φ_outer here is the *outer*
-    /// barrier objective `f(x) − μ_outer · Σ log(slack_i)`, matching
-    /// `IpRestoFilterConvCheck.cpp:53-60` which reads `IpData().curr_mu()`
-    /// of the parent algorithm.
-    ///
-    /// Default: `true` (Ipopt-aligned). Set to `false` to fall back to
-    /// the pre-T3.12 ripopt behaviour where only the post-loop filter
-    /// check uses the raw objective.
-    pub restore_early_exit_outer_filter: bool,
+    /// Restoration proximity weight (Ipopt's `resto_proximity_weight`). The
+    /// restoration objective is min ρ·(p+n) + (η/2)·||D_R(x − x_R)||² with
+    /// η = `resto_proximity_weight` · √μ. Default: 1.0 (Ipopt 3.14).
+    pub resto_proximity_weight: f64,
     /// Enable preprocessing to eliminate fixed variables and redundant constraints.
     /// Default: true.
     pub enable_preprocessing: bool,
@@ -690,7 +680,9 @@ impl Default for SolverOptions {
             constraint_slack_barrier: true,
             max_wall_time: 0.0,
             watchdog_shortened_iter_trigger: 10,
-            watchdog_trial_iter_max: 5,
+            // Ipopt default `watchdog_trial_iter_max = 3`
+            // (`IpBacktrackingLineSearch.cpp:170-176`).
+            watchdog_trial_iter_max: 3,
             sparse_threshold: 110,
             barrier_tol_factor: 10.0,
             mu_allow_fast_monotone_decrease: true,
@@ -699,7 +691,7 @@ impl Default for SolverOptions {
             restoration_max_iter: 200,
             disable_nlp_restoration: false,
             kappa_resto: 0.9,
-            restore_early_exit_outer_filter: true,
+            resto_proximity_weight: 1.0,
             enable_preprocessing: true,
             detect_linear_constraints: true,
             hessian_approximation_lbfgs: false,
