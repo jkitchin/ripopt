@@ -184,7 +184,21 @@ impl Filter {
             && theta_current <= self.theta_min
     }
 
-    /// Check the Armijo sufficient decrease condition.
+    /// Tolerance-aware `<=` mirroring Ipopt's `Compare_le`
+    /// (`IpUtils.cpp:294-302`):
+    ///   `lhs - rhs <= 10 * eps * |bas_val|`.
+    /// Slightly more permissive than bare `<=` near the boundary; used
+    /// throughout `IpFilterLSAcceptor.cpp` (Armijo, sufficient-reduction,
+    /// h-type theta/phi tests).
+    #[inline]
+    fn compare_le(lhs: f64, rhs: f64, bas_val: f64) -> bool {
+        let mach_eps = f64::EPSILON;
+        lhs - rhs <= 10.0 * mach_eps * bas_val.abs()
+    }
+
+    /// Check the Armijo sufficient decrease condition. Mirrors Ipopt
+    /// `IpFilterLSAcceptor.cpp:445-447` (`ArmijoHolds`):
+    ///   `Compare_le(trial_barr - reference_barr, eta_phi * alpha * grad_phi, reference_barr)`.
     pub fn armijo_condition(
         &self,
         phi_current: f64,
@@ -192,17 +206,27 @@ impl Filter {
         grad_phi_step: f64,
         alpha: f64,
     ) -> bool {
-        phi_trial <= phi_current + self.eta_phi * alpha * grad_phi_step
+        Self::compare_le(
+            phi_trial - phi_current,
+            self.eta_phi * alpha * grad_phi_step,
+            phi_current,
+        )
     }
 
     /// Check if a trial point provides sufficient constraint reduction
-    /// compared to the current point.
+    /// compared to the current point. Mirrors the theta clause of
+    /// Ipopt `IpFilterLSAcceptor.cpp:497`:
+    ///   `Compare_le(trial_theta, (1 - gamma_theta) * reference_theta, reference_theta)`.
     pub fn sufficient_infeasibility_reduction(
         &self,
         theta_current: f64,
         theta_trial: f64,
     ) -> bool {
-        theta_trial <= (1.0 - self.gamma_theta) * theta_current
+        Self::compare_le(
+            theta_trial,
+            (1.0 - self.gamma_theta) * theta_current,
+            theta_current,
+        )
     }
 
     /// Check if a trial point is acceptable via either the filter or the
@@ -236,6 +260,7 @@ impl Filter {
         phi_trial: f64,
         grad_phi_step: f64,
         alpha: f64,
+        called_from_restoration: bool,
     ) -> (bool, bool) {
         // Reject if theta exceeds maximum or NaN
         if theta_trial > self.theta_max || theta_trial.is_nan() || phi_trial.is_nan() {
@@ -260,13 +285,19 @@ impl Filter {
         } else {
             // h-type branch: mirror IsAcceptableToCurrentIterate
             // (IpFilterLSAcceptor.cpp:471-499). The obj_max_inc divergence
-            // guard runs FIRST (line 480-493); only if it passes do we
-            // test the sufficient-reduction OR phi-reduction (line 497-498).
-            if !self.passes_obj_max_inc(phi_current, phi_trial) {
+            // guard runs FIRST (line 480-493) and is bypassed when
+            // `called_from_restoration` (post-restoration handoff); only
+            // if it passes do we test the sufficient-reduction OR
+            // phi-reduction (line 497-498), both via Compare_le.
+            if !self.passes_obj_max_inc(phi_current, phi_trial, called_from_restoration) {
                 false
             } else {
                 self.sufficient_infeasibility_reduction(theta_current, theta_trial)
-                    || phi_trial <= phi_current - self.gamma_phi * theta_current
+                    || Self::compare_le(
+                        phi_trial - phi_current,
+                        -self.gamma_phi * theta_current,
+                        phi_current,
+                    )
             }
         };
 
@@ -340,7 +371,21 @@ impl Filter {
     /// `trial_phi > reference_phi` *and*
     /// `log10(trial_phi - reference_phi) > obj_max_inc + basval`, where
     /// `basval = max(1.0, log10(|reference_phi|))`.
-    pub fn passes_obj_max_inc(&self, reference_phi: f64, trial_phi: f64) -> bool {
+    ///
+    /// Bypassed when `called_from_restoration`: Ipopt skips the guard
+    /// on the post-restoration handoff because the restoration phase is
+    /// allowed to leave the barrier objective much larger than the
+    /// pre-restoration reference (`IpFilterLSAcceptor.cpp:480` —
+    /// `if (!called_from_restoration && trial_barr > reference_barr_)`).
+    pub fn passes_obj_max_inc(
+        &self,
+        reference_phi: f64,
+        trial_phi: f64,
+        called_from_restoration: bool,
+    ) -> bool {
+        if called_from_restoration {
+            return true;
+        }
         if !(trial_phi > reference_phi) {
             return true;
         }
@@ -604,7 +649,7 @@ mod tests {
         let alpha = 1.0;
 
         let (accept, augment_required) = filter.check_acceptability(
-            theta_current, phi_current, theta_trial, phi_trial, grad_phi_step, alpha,
+            theta_current, phi_current, theta_trial, phi_trial, grad_phi_step, alpha, false,
         );
         assert!(accept, "Should be accepted via Armijo");
         // DEV-31: f-type accept (IsFtype && ArmijoHolds) → no filter augmentation.
@@ -624,7 +669,7 @@ mod tests {
         let alpha = 1.0;
 
         let (accept, augment_required) = filter.check_acceptability(
-            theta_current, phi_current, theta_trial, phi_trial, grad_phi_step, alpha,
+            theta_current, phi_current, theta_trial, phi_trial, grad_phi_step, alpha, false,
         );
         assert!(accept, "Should be accepted via filter mode");
         // DEV-31: h-type accept where IsFtype is false → must augment filter.
@@ -639,7 +684,7 @@ mod tests {
         filter.add(0.5, 5.0);
         // Trial point is worse than filter
         let (accept, _) = filter.check_acceptability(
-            1.0, 10.0, 0.6, 6.0, -0.01, 1.0,
+            1.0, 10.0, 0.6, 6.0, -0.01, 1.0, false,
         );
         assert!(!accept, "Should be rejected by filter");
     }
@@ -665,11 +710,11 @@ mod tests {
         assert!(!filter.is_acceptable(f64::NAN, 1.0));
         assert!(!filter.is_acceptable(1.0, f64::NAN));
         let (accept, _) = filter.check_acceptability(
-            1.0, 10.0, f64::NAN, 5.0, -1.0, 1.0,
+            1.0, 10.0, f64::NAN, 5.0, -1.0, 1.0, false,
         );
         assert!(!accept);
         let (accept2, _) = filter.check_acceptability(
-            1.0, 10.0, 0.5, f64::NAN, -1.0, 1.0,
+            1.0, 10.0, 0.5, f64::NAN, -1.0, 1.0, false,
         );
         assert!(!accept2);
     }
@@ -789,7 +834,7 @@ mod tests {
         let grad = -0.01; // weak descent, theta_current > theta_min -> h-type
         let alpha = 1.0;
         let (accept, augment_required) = filter.check_acceptability(
-            theta_current, phi_current, theta_trial, phi_trial, grad, alpha,
+            theta_current, phi_current, theta_trial, phi_trial, grad, alpha, false,
         );
         assert!(accept, "h-type phi-only reduction must be accepted");
         // DEV-31: h-type accept (IsFtype false) → augmentation required.
@@ -805,7 +850,7 @@ mod tests {
         let phi_current = 100.0;
         // Trial: theta equal (no sufficient reduction) and phi equal (no reduction)
         let (accept, _) = filter.check_acceptability(
-            theta_current, phi_current, 5.0, 100.0, -0.01, 1.0,
+            theta_current, phi_current, 5.0, 100.0, -0.01, 1.0, false,
         );
         assert!(!accept, "h-type with no reduction in either must reject");
     }
@@ -815,9 +860,9 @@ mod tests {
         // T3.4: when phi_trial <= phi_reference, the divergence guard
         // is a no-op (returns true).
         let filter = Filter::new(100.0);
-        assert!(filter.passes_obj_max_inc(10.0, 5.0), "decrease must pass");
-        assert!(filter.passes_obj_max_inc(10.0, 10.0), "equality must pass");
-        assert!(filter.passes_obj_max_inc(0.0, -1e6), "negative trial must pass");
+        assert!(filter.passes_obj_max_inc(10.0, 5.0, false), "decrease must pass");
+        assert!(filter.passes_obj_max_inc(10.0, 10.0, false), "equality must pass");
+        assert!(filter.passes_obj_max_inc(0.0, -1e6, false), "negative trial must pass");
     }
 
     #[test]
@@ -827,8 +872,8 @@ mod tests {
         //   log10(trial - 1) > 5 + 1 = 6  ⇔  trial - 1 > 1e6
         // So trial = 2 is fine (log10(1) = 0 <= 6), but trial = 1e7 + 1 fails.
         let filter = Filter::new(100.0);
-        assert!(filter.passes_obj_max_inc(1.0, 1e6 + 0.5), "below 1e6 increase must pass");
-        assert!(!filter.passes_obj_max_inc(1.0, 1e7 + 2.0), "above 10^6 increase must fail");
+        assert!(filter.passes_obj_max_inc(1.0, 1e6 + 0.5, false), "below 1e6 increase must pass");
+        assert!(!filter.passes_obj_max_inc(1.0, 1e7 + 2.0, false), "above 10^6 increase must fail");
     }
 
     #[test]
@@ -837,8 +882,8 @@ mod tests {
         // permitted increase scales with |ref|. With ref=1e3, basval=3,
         // permitted log10 increase = 5 + 3 = 8, ie up to 1e8 absolute.
         let filter = Filter::new(100.0);
-        assert!(filter.passes_obj_max_inc(1e3, 1e3 + 1e7), "1e7 increase must pass at ref=1e3");
-        assert!(!filter.passes_obj_max_inc(1e3, 1e3 + 1e9), "1e9 increase must fail at ref=1e3");
+        assert!(filter.passes_obj_max_inc(1e3, 1e3 + 1e7, false), "1e7 increase must pass at ref=1e3");
+        assert!(!filter.passes_obj_max_inc(1e3, 1e3 + 1e9, false), "1e9 increase must fail at ref=1e3");
     }
 
     #[test]
@@ -847,8 +892,8 @@ mod tests {
         // increase fail (basval >= 1 ⇒ log10(Δ) > 0+1=1 means Δ>10).
         let mut filter = Filter::new(100.0);
         filter.set_obj_max_inc(0.0);
-        assert!(filter.passes_obj_max_inc(1.0, 5.0), "Δ=4 < 10, still passes at obj_max_inc=0");
-        assert!(!filter.passes_obj_max_inc(1.0, 100.0), "Δ=99 > 10 must fail at obj_max_inc=0");
+        assert!(filter.passes_obj_max_inc(1.0, 5.0, false), "Δ=4 < 10, still passes at obj_max_inc=0");
+        assert!(!filter.passes_obj_max_inc(1.0, 100.0, false), "Δ=99 > 10 must fail at obj_max_inc=0");
     }
 
     #[test]
@@ -863,7 +908,7 @@ mod tests {
         let theta_trial = 0.1; // satisfies sufficient infeasibility reduction
         let phi_trial = 1e10; // log10(1e10 - 1) ≈ 10 >> 5 + 1 = 6 ⇒ reject
         let (accept, _) = filter.check_acceptability(
-            theta_current, phi_current, theta_trial, phi_trial, -0.01, 1.0,
+            theta_current, phi_current, theta_trial, phi_trial, -0.01, 1.0, false,
         );
         assert!(!accept, "obj_max_inc must reject blowup trial");
     }
@@ -881,7 +926,7 @@ mod tests {
         let grad = -100.0;
         let alpha = 1.0;
         let (accept, _) = filter.check_acceptability(
-            theta_current, phi_current, theta_trial, phi_trial, grad, alpha,
+            theta_current, phi_current, theta_trial, phi_trial, grad, alpha, false,
         );
         assert!(!accept, "Switching+failed-Armijo must reject (no h-type fallback)");
     }
@@ -1008,7 +1053,7 @@ mod tests {
         let theta_trial = 0.6;
         let phi_trial = 6.0;
         let (accept, _) = filter.check_acceptability(
-            theta_current, phi_current, theta_trial, phi_trial, -0.01, 1.0,
+            theta_current, phi_current, theta_trial, phi_trial, -0.01, 1.0, false,
         );
         assert!(!accept, "trial should be filter-rejected for the test");
         // Now invoke the post-acceptance hook; it consumes the

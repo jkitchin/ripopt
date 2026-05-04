@@ -2839,7 +2839,7 @@ fn run_line_search_loop<P: NlpProblem>(
             let suf_theta = filter.sufficient_infeasibility_reduction(theta_current, theta_trial);
             let suf_phi_rhs = phi_current - filter.gamma_phi() * theta_current;
             let suf_phi = phi_trial <= suf_phi_rhs;
-            let omi = filter.passes_obj_max_inc(phi_current, phi_trial);
+            let omi = filter.passes_obj_max_inc(phi_current, phi_trial, false);
             let in_filter = filter.is_acceptable(theta_trial, phi_trial);
             eprintln!(
                 "[probe] iter={} ls={} alpha={:.3e} gBD={:.6e} theta_curr={:.10e} theta_tr={:.10e} phi_curr={:.10e} phi_tr={:.10e} dphi={:.3e} dtheta={:.3e} entries={} is_ft={} armijo={} suf_theta={} suf_phi={} (rhs={:.10e}) omi={} in_filter={}",
@@ -2861,7 +2861,7 @@ fn run_line_search_loop<P: NlpProblem>(
             theta_trial,
             phi_trial,
             grad_phi_step,
-            alpha,
+            alpha, false,
         );
 
         // Watchdog full step (T2.21, spec §4): filter check still runs (Ipopt
@@ -4183,7 +4183,7 @@ fn attempt_soft_restoration<P: NlpProblem>(
     // pass, blocking the hard-restoration cascade on stalled iterates
     // (observed on arki0003 iters 110-115 with α≈1e-9).
     let (filter_ok, _) = filter.check_acceptability(
-        theta_current, phi_current, theta_trial, phi_trial, 0.0, alpha_p,
+        theta_current, phi_current, theta_trial, phi_trial, 0.0, alpha_p, false,
     );
     let pderror_trial = compute_pderror_e_mu(state, state.mu);
     let pderror_ok = pderror_trial <= 0.9999 * pderror_curr;
@@ -7757,7 +7757,7 @@ fn evaluate_soc_trial_and_check<P: NlpProblem>(
         theta_soc,
         phi_soc,
         grad_phi_step,
-        alpha,
+        alpha, false,
     );
 
     if acceptable {
@@ -12341,7 +12341,7 @@ mod tests {
 
         let (acceptable, _) = filter.check_acceptability(
             theta_current, phi_current, theta_trial, phi_trial,
-            grad_phi_step, 1.0,
+            grad_phi_step, 1.0, false,
         );
         assert!(acceptable, "trial must pass the filter for the test setup");
         let len_before = filter.len();
@@ -12350,7 +12350,7 @@ mod tests {
         let (acceptable_next, _) = filter.check_acceptability(
             theta_current, phi_current,
             theta_current * 0.95, phi_current,
-            grad_phi_step, 1.0,
+            grad_phi_step, 1.0, false,
         );
         assert!(acceptable_next,
             "filter must still accept near-θ_current iterates after watchdog");
