@@ -733,6 +733,17 @@ pub(crate) struct SolverState {
     pub hess_vals: Vec<f64>,
     /// Consecutive acceptable iterations.
     pub consecutive_acceptable: usize,
+    /// One-shot trigger: force `recalc_y` on the next post-step call,
+    /// bypassing the `recalc_y_feas_tol` gate. Set by
+    /// `apply_restoration_success` because the post-restoration y reset
+    /// (y := 0 when `constr_mult_reset_threshold = 0`, the Ipopt default)
+    /// requires an LS-y refresh before the next search direction; without
+    /// it, ∇ℒ = ∇f at the next iterate produces gigantic dz steps and
+    /// near-zero α_dual. Mirrors Ipopt's `recalc_y=yes` (default for
+    /// L-BFGS, `IpIpoptAlg.cpp:80-95`) which fires unconditionally —
+    /// ripopt keeps the feas_tol gate for the steady-state path and uses
+    /// this flag only as the post-restoration override.
+    pub recalc_y_pending: bool,
     /// Objective scaling factor (for NLP scaling / result unscaling).
     pub obj_scaling: f64,
     /// Equality-block constraint scaling factors `dc` (size n_c). Mirrors
@@ -1441,6 +1452,7 @@ impl SolverState {
             hess_cols,
             hess_vals: vec![0.0; hess_nnz],
             consecutive_acceptable: 0,
+            recalc_y_pending: false,
             obj_scaling: 1.0,
             c_scaling: vec![1.0; layout.n_c],
             d_scaling: vec![1.0; layout.n_d],
@@ -8170,6 +8182,17 @@ fn maybe_recalc_y_post_step(
         return;
     }
     let gate_on = options.recalc_y || lbfgs_mode;
+    // Post-restoration one-shot override: bypass the feas_tol gate.
+    // `apply_restoration_success` sets `recalc_y_pending = true` because
+    // the y := 0 reset (Ipopt default `constr_mult_reset_threshold = 0`)
+    // demands an LS-y refresh before the next search direction. The flag
+    // is consumed unconditionally here regardless of `gate_on` — the
+    // y-reset already happened and ∇ℒ = ∇f without this refresh.
+    if state.recalc_y_pending {
+        state.recalc_y_pending = false;
+        recompute_y_post_step_full_augmented(state, n, m);
+        return;
+    }
     if !gate_on {
         return;
     }
@@ -8334,6 +8357,13 @@ fn apply_restoration_success<P: NlpProblem>(
     // recommended over fine-grained per-write atag plumbing.
     state.bump_all_kkt_atags();
     state.factor_cache.invalidate();
+    // One-shot trigger for the next post-step recalc_y. The y reset above
+    // (zeroed by `recompute_y_after_restoration` when
+    // `constr_mult_reset_threshold ≤ 0`, the Ipopt default) leaves
+    // ∇ℒ = ∇f at the next iterate; the LS refresh is what makes this
+    // handoff usable. Mirrors Ipopt's `IpIpoptAlg.cpp:782-825` (default
+    // `recalc_y=yes` for L-BFGS, fired unconditionally).
+    state.recalc_y_pending = true;
     true
 }
 
@@ -10702,6 +10732,7 @@ mod tests {
             hess_cols: Vec::new(),
             hess_vals: Vec::new(),
             consecutive_acceptable: 0,
+            recalc_y_pending: false,
             obj_scaling: 1.0,
             // Test-only constructor uses an all-inequality layout (no
             // equalities) — n_c=0, n_d=m. c_scaling is empty.
