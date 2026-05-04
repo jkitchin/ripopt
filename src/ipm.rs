@@ -5197,8 +5197,19 @@ fn update_barrier_parameter_fixed_mode(
         let mut decreases = 0usize;
         let mut tiny_step = mu_state.tiny_step;
         loop {
-            let barrier_err = compute_barrier_error(state);
+            let (barrier_err, du_e, co_e, pr_e) =
+                compute_barrier_error_components(state);
             let solved = barrier_err <= options.barrier_tol_factor * state.mu;
+            if std::env::var("RIPOPT_TRACE_MU").is_ok() {
+                eprintln!(
+                    "ripopt: mu-gate iter={} mu={:.3e} E_mu={:.3e} (du={:.3e} co={:.3e} pr={:.3e}) thr={:.3e} solved={}",
+                    state.iter, state.mu, barrier_err, du_e, co_e, pr_e,
+                    options.barrier_tol_factor * state.mu, solved,
+                );
+                if state.iter % 50 == 0 || state.iter >= 495 {
+                    dump_compl_outliers(state);
+                }
+            }
             if !(solved || tiny_step) { break; }
             let new_mu = (options.mu_linear_decrease_factor * state.mu)
                 .min(state.mu.powf(options.mu_superlinear_decrease_power))
@@ -10516,6 +10527,55 @@ fn compute_avg_complementarity(state: &SolverState) -> f64 {
 /// large — exactly the dual-stagnation symptom seen on arki0003 where
 /// μ froze at lg(μ)=2.83e-3 for 500+ iterations.
 fn compute_barrier_error(state: &SolverState) -> f64 {
+    let (e, _, _, _) = compute_barrier_error_components(state);
+    e
+}
+
+/// Print the largest-magnitude complementarity outliers to stderr.
+/// For diagnostics only; gated on `RIPOPT_TRACE_COMPL`.
+fn dump_compl_outliers(state: &SolverState) {
+    if std::env::var("RIPOPT_TRACE_COMPL").is_err() {
+        return;
+    }
+    let mut entries: Vec<(f64, String)> = Vec::new();
+    for k in 0..state.bound_layout.n_x_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        let s = slack_xl(state, i);
+        let z = state.z_l_compressed[k];
+        let prod = s * z;
+        entries.push((prod.abs(), format!("xL[{}] s={:.3e} z={:.3e} s*z={:.3e}", i, s, z, prod)));
+    }
+    for k in 0..state.bound_layout.n_x_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        let s = slack_xu(state, i);
+        let z = state.z_u_compressed[k];
+        let prod = s * z;
+        entries.push((prod.abs(), format!("xU[{}] s={:.3e} z={:.3e} s*z={:.3e}", i, s, z, prod)));
+    }
+    for i in 0..state.m {
+        if state.g_l_at(i).is_finite() {
+            let s = slack_gl(state, i);
+            let z = state.v_l_at(i);
+            let prod = s * z;
+            entries.push((prod.abs(), format!("gL[{}] s={:.3e} z={:.3e} s*z={:.3e}", i, s, z, prod)));
+        }
+        if state.g_u_at(i).is_finite() {
+            let s = slack_gu(state, i);
+            let z = state.v_u_at(i);
+            let prod = s * z;
+            entries.push((prod.abs(), format!("gU[{}] s={:.3e} z={:.3e} s*z={:.3e}", i, s, z, prod)));
+        }
+    }
+    entries.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    eprintln!("ripopt: compl-outliers iter={} mu={:.3e} (top 5 by |s*z|):", state.iter, state.mu);
+    for (_, line) in entries.iter().take(5) {
+        eprintln!("  {}", line);
+    }
+}
+
+/// Same as `compute_barrier_error` but also returns the (dual_err,
+/// compl_err, primal_err) triple. Used for diagnostics.
+fn compute_barrier_error_components(state: &SolverState) -> (f64, f64, f64, f64) {
     // ∇L = ∇f + J^T y − z_l + z_u (un-damped; matches
     // `curr_grad_lag_x` at IpIpoptCalculatedQuantities.cpp:1993-2030)
     let mut grad_lag = state.grad_f.clone();
@@ -10567,7 +10627,8 @@ fn compute_barrier_error(state: &SolverState) -> f64 {
         &state.d_u(),
     );
 
-    dual_err.max(compl_err).max(primal_err)
+    let e = dual_err.max(compl_err).max(primal_err);
+    (e, dual_err, compl_err, primal_err)
 }
 
 
