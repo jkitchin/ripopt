@@ -8434,11 +8434,17 @@ fn attempt_nlp_restoration<P: NlpProblem>(
     // monotone across inner iterations.
     let rho = 1000.0;
 
-    // Ipopt's resto_mu = max(curr_mu, ||c(x_r)||_inf) (IpRestoIterateInitializer.cpp:58).
-    // Using a mu_init consistent with the current infeasibility makes the
-    // closed-form (p,n) init well-conditioned: when theta ≫ mu, the slacks
-    // would otherwise be pinned near 0 with enormous bound multipliers.
-    let c_inf = compute_primal_inf_max_at_state(state);
+    // Ipopt's resto_mu = max(curr_mu, ||c(x_r)||_inf, ||d(x_r) - s||_inf)
+    // per `IpRestoIterateInitializer.cpp:57-61`. The third term is the
+    // slack-coupling residual — without it, problems with significant
+    // inequality-constraint infeasibility (where d - s dominates over c)
+    // get a too-small inner mu, the closed-form (p_d, n_d) init is wrong
+    // by orders of magnitude, the FTB collapses α on the first inner
+    // step, and the inner IPM diverges → repeated parent-side restoration
+    // entries (the arki0003 cycling pattern). Use the internal-max form
+    // (`||c||_∞ ∪ ||d − s||_∞`) which mirrors Ipopt's
+    // `IpIpoptCalculatedQuantities::curr_primal_infeasibility(NORM_MAX)`.
+    let c_inf = compute_primal_inf_internal_max_at_state(state);
     let resto_mu = state.mu.max(c_inf);
 
     // Build restoration NLP using the same resto_mu for p/n quadratic init.
