@@ -7923,141 +7923,159 @@ fn attempt_soc_aug<P: NlpProblem>(
     None
 }
 
-/// Reset bound multipliers after restoration, matching Ipopt
-/// IpRestoMinC_1Nrm.cpp:374-419:
-///   1. Tentatively set z = mu/slack per bound (no element-wise clamp).
-///   2. If max(|z|) exceeds bound_mult_reset_threshold (1e3),
-///      *nuclear reset*: set ALL z_L, z_U to 1.0.
-///   3. Otherwise keep z = mu/slack as-is.
-/// An element-wise clamp at 1e3 leaves inf_du stuck at ~mu/slack - 1000
-/// when slack is tight — the least-squares y computed after can't absorb
-/// that. Returns whether the nuclear reset was triggered (for downstream
-/// v_L/v_U handling).
-/// T0.8: install resto-returned bound multipliers, clamped via the
-/// Ipopt κ_σ safeguard. For each finite bound, take the resto-NLP z
-/// for that variable (the original-x block of the resto solve) and
-/// apply the one-shot Newton step described in `IPOPT_ALGORITHM_SPEC.md`
-/// §7.8 / `IpRestoMinC_1Nrm.cpp:378-399`:
+/// Post-restoration bound-multiplier handoff aligned with Ipopt 3.14
+/// `MinC_1NrmRestorationPhase::PerformRestoration`
+/// (`IpRestoMinC_1Nrm.cpp:374-419`).
 ///
-///   δz_i = (μ - z_i·(s_trial - s_cur))/s_cur − z_i
+/// Treats the entire restoration progress in `(x, s)` as a single
+/// primal-dual Newton step:
 ///
-/// followed by a fraction-to-boundary step on z (τ ≈ 1 − μ, capped at
-/// 0.99) and the standard κ_σ ∈ \[μ/(κ_σ·s), κ_σ·μ/s\] safeguard at
-/// the new slack. `x_cur` is the pre-restoration x (used in s_cur) and
-/// `state.x` already holds x_trial at call time.
+///   δ_z = (μ − z_curr · trial_slack) / curr_slack − z_curr   (per bound)
 ///
-/// Bounds with no resto z (infinite x bound) are zeroed. The "nuclear
-/// reset" return value tracks whether the post-clamp z_max is above
-/// the watchdog threshold so the v-multiplier path mirrors the
-/// existing semantics.
-fn apply_kappa_sigma_clamp_to_resto_z(
+/// (Ipopt's `ComputeBoundMultiplierStep`, `IpRestoMinC_1Nrm.cpp:438-453`),
+/// applied to all four blocks `(z_L, z_U, v_L, v_U)` using the parent's
+/// **pre-restoration** multipliers and slacks (NOT the inner-resto NLP's
+/// z's — those solve a different stationarity).
+///
+/// A single `α_dual` is computed via `dual_frac_to_the_bound` across all
+/// four blocks (`IpRestoMinC_1Nrm.cpp:394-395`), then the step is applied
+/// to all four. If any post-step multiplier exceeds
+/// `bound_mult_reset_threshold` (Ipopt default 1e3, `IpRestoMinC_1Nrm.cpp:40`),
+/// **all four blocks are reset to 1.0** (lines 402-419 — the "nuclear
+/// reset"). Returns whether the nuclear reset fired (informational only;
+/// caller no longer branches on it).
+///
+/// `x_cur` and `s_cur` are the pre-restoration primal iterate / slack;
+/// `state.x` and `state.s` already hold the post-restoration trial at
+/// call time.
+fn update_bound_multipliers_after_restoration(
     state: &mut SolverState,
-    n: usize,
-    zl_resto: &[f64],
-    zu_resto: &[f64],
+    options: &SolverOptions,
     x_cur: &[f64],
+    s_cur: &[f64],
 ) -> bool {
-    let kappa_sigma = 1e10;
     let mu = state.mu.max(1e-20);
     let bound_mult_reset_threshold = 1000.0;
-    // Match Ipopt IpFilterLSAcceptor: τ_min = max(0.99, 1 − μ).
-    let tau = (1.0 - mu).max(0.99);
-    let mut z_max: f64 = 0.0;
-    let _ = n;
-    // Phase 6d.6: walk compressed bound storage; resto-NLP z is
-    // user-supplied full-`n`, indexed by the bound's full var idx.
-    for k in 0..state.bound_layout.n_x_l {
-        let i = state.bound_layout.x_l_to_full[k];
-        let s_cur = (x_cur[i] - state.x_l_at(i)).max(1e-12);
-        let s_trial = (state.x[i] - state.x_l_at(i)).max(1e-12);
-        let z_in = if i < zl_resto.len() { zl_resto[i].max(1e-20) } else { mu / s_cur };
-        let dz = (mu - z_in * (s_trial - s_cur)) / s_cur - z_in;
-        let alpha_d = if dz < 0.0 {
-            ((-tau * z_in) / dz).min(1.0).max(0.0)
-        } else {
-            1.0
-        };
-        let z_new = z_in + alpha_d * dz;
-        let z_lo = mu / (kappa_sigma * s_trial);
-        let z_hi = kappa_sigma * mu / s_trial;
-        state.z_l_compressed[k] = z_new.clamp(z_lo, z_hi);
-        z_max = z_max.max(state.z_l_compressed[k]);
-    }
-    for k in 0..state.bound_layout.n_x_u {
-        let i = state.bound_layout.x_u_to_full[k];
-        let s_cur = (state.x_u_at(i) - x_cur[i]).max(1e-12);
-        let s_trial = (state.x_u_at(i) - state.x[i]).max(1e-12);
-        let z_in = if i < zu_resto.len() { zu_resto[i].max(1e-20) } else { mu / s_cur };
-        let dz = (mu - z_in * (s_trial - s_cur)) / s_cur - z_in;
-        let alpha_d = if dz < 0.0 {
-            ((-tau * z_in) / dz).min(1.0).max(0.0)
-        } else {
-            1.0
-        };
-        let z_new = z_in + alpha_d * dz;
-        let z_lo = mu / (kappa_sigma * s_trial);
-        let z_hi = kappa_sigma * mu / s_trial;
-        state.z_u_compressed[k] = z_new.clamp(z_lo, z_hi);
-        z_max = z_max.max(state.z_u_compressed[k]);
-    }
-    z_max > bound_mult_reset_threshold
-}
+    let tau = (1.0 - mu).max(options.tau_min);
 
-fn reset_bound_multipliers_after_restoration(state: &mut SolverState, n: usize) -> bool {
-    let bound_mult_reset_threshold = 1000.0;
-    let mu_for_reset = state.mu;
-    let mut z_max: f64 = 0.0;
-    let _ = n;
-    // Phase 6d.6: walk compressed bound storage.
-    for k in 0..state.bound_layout.n_x_l {
+    let nx_l = state.bound_layout.n_x_l;
+    let nx_u = state.bound_layout.n_x_u;
+    let nd_l = state.d_bound_layout.n_d_l;
+    let nd_u = state.d_bound_layout.n_d_u;
+
+    let mut delta_zl = vec![0.0; nx_l];
+    let mut delta_zu = vec![0.0; nx_u];
+    let mut delta_vl = vec![0.0; nd_l];
+    let mut delta_vu = vec![0.0; nd_u];
+
+    // Ipopt's `ComputeBoundMultiplierStep` (`IpRestoMinC_1Nrm.cpp:438-453`):
+    //   delta_z = ((curr_slack - trial_slack)·curr_z + mu) / curr_slack - curr_z
+    // expanding the division:
+    //   = curr_z - curr_z·trial_slack/curr_slack + mu/curr_slack - curr_z
+    //   = (mu - curr_z·trial_slack) / curr_slack
+    // The two `curr_z` terms cancel; the closed form below matches.
+    for k in 0..nx_l {
         let i = state.bound_layout.x_l_to_full[k];
-        let slack = (state.x[i] - state.x_l_at(i)).max(1e-12);
-        state.z_l_compressed[k] = mu_for_reset / slack;
-        z_max = z_max.max(state.z_l_compressed[k]);
+        let s_curr = (x_cur[i] - state.x_l_at(i)).max(1e-12);
+        let s_trial = (state.x[i] - state.x_l_at(i)).max(1e-12);
+        let z_curr = state.z_l_compressed[k];
+        delta_zl[k] = (mu - z_curr * s_trial) / s_curr;
     }
-    for k in 0..state.bound_layout.n_x_u {
+    for k in 0..nx_u {
         let i = state.bound_layout.x_u_to_full[k];
-        let slack = (state.x_u_at(i) - state.x[i]).max(1e-12);
-        state.z_u_compressed[k] = mu_for_reset / slack;
-        z_max = z_max.max(state.z_u_compressed[k]);
+        let s_curr = (state.x_u_at(i) - x_cur[i]).max(1e-12);
+        let s_trial = (state.x_u_at(i) - state.x[i]).max(1e-12);
+        let z_curr = state.z_u_compressed[k];
+        delta_zu[k] = (mu - z_curr * s_trial) / s_curr;
     }
-    let nuclear_reset = z_max > bound_mult_reset_threshold;
+    for kc in 0..nd_l {
+        let k = state.d_bound_layout.d_l_to_full[kc];
+        let dl = state.d_l_compressed[kc];
+        let s_curr = (s_cur[k] - dl).max(1e-12);
+        let s_trial = (state.s[k] - dl).max(1e-12);
+        let v_curr = state.v_l_compressed[kc];
+        delta_vl[kc] = (mu - v_curr * s_trial) / s_curr;
+    }
+    for kc in 0..nd_u {
+        let k = state.d_bound_layout.d_u_to_full[kc];
+        let du = state.d_u_compressed[kc];
+        let s_curr = (du - s_cur[k]).max(1e-12);
+        let s_trial = (du - state.s[k]).max(1e-12);
+        let v_curr = state.v_u_compressed[kc];
+        delta_vu[kc] = (mu - v_curr * s_trial) / s_curr;
+    }
+
+    // Single α_dual via fraction-to-the-boundary across all four blocks.
+    let mut alpha_dual = 1.0_f64;
+    for k in 0..nx_l {
+        if delta_zl[k] < 0.0 {
+            alpha_dual = alpha_dual.min(-tau * state.z_l_compressed[k] / delta_zl[k]);
+        }
+    }
+    for k in 0..nx_u {
+        if delta_zu[k] < 0.0 {
+            alpha_dual = alpha_dual.min(-tau * state.z_u_compressed[k] / delta_zu[k]);
+        }
+    }
+    for kc in 0..nd_l {
+        if delta_vl[kc] < 0.0 {
+            alpha_dual = alpha_dual.min(-tau * state.v_l_compressed[kc] / delta_vl[kc]);
+        }
+    }
+    for kc in 0..nd_u {
+        if delta_vu[kc] < 0.0 {
+            alpha_dual = alpha_dual.min(-tau * state.v_u_compressed[kc] / delta_vu[kc]);
+        }
+    }
+    alpha_dual = alpha_dual.clamp(0.0, 1.0);
+
+    let mut max_mult: f64 = 0.0;
+    for k in 0..nx_l {
+        state.z_l_compressed[k] = (state.z_l_compressed[k] + alpha_dual * delta_zl[k]).max(0.0);
+        max_mult = max_mult.max(state.z_l_compressed[k]);
+    }
+    for k in 0..nx_u {
+        state.z_u_compressed[k] = (state.z_u_compressed[k] + alpha_dual * delta_zu[k]).max(0.0);
+        max_mult = max_mult.max(state.z_u_compressed[k]);
+    }
+    for kc in 0..nd_l {
+        state.v_l_compressed[kc] = (state.v_l_compressed[kc] + alpha_dual * delta_vl[kc]).max(0.0);
+        max_mult = max_mult.max(state.v_l_compressed[kc]);
+    }
+    for kc in 0..nd_u {
+        state.v_u_compressed[kc] = (state.v_u_compressed[kc] + alpha_dual * delta_vu[kc]).max(0.0);
+        max_mult = max_mult.max(state.v_u_compressed[kc]);
+    }
+
+    let nuclear_reset = max_mult > bound_mult_reset_threshold;
     if nuclear_reset {
-        for k in 0..state.bound_layout.n_x_l {
-            state.z_l_compressed[k] = 1.0;
-        }
-        for k in 0..state.bound_layout.n_x_u {
-            state.z_u_compressed[k] = 1.0;
-        }
+        for k in 0..nx_l { state.z_l_compressed[k] = 1.0; }
+        for k in 0..nx_u { state.z_u_compressed[k] = 1.0; }
+        for kc in 0..nd_l { state.v_l_compressed[kc] = 1.0; }
+        for kc in 0..nd_u { state.v_u_compressed[kc] = 1.0; }
     }
     nuclear_reset
 }
 
-/// Recompute y at the restored point via the augmented-saddle-point
-/// least-squares multiplier estimate, INCLUDING the reset z_L/z_U
-/// contribution. Otherwise any deviation between z_true = mu/slack
-/// (huge at tight slack) and the reset value (1.0) appears entirely
-/// in inf_du, driving a bad first Newton step.
+/// Post-restoration y handoff aligned with Ipopt 3.14
+/// `MinC_1NrmRestorationPhase::PerformRestoration`
+/// (`IpRestoMinC_1Nrm.cpp:421-422`), which calls
+/// `DefaultIterateInitializer::least_square_mults(...,
+/// constr_mult_reset_threshold_)`.
 ///
-/// Uses the Ipopt-exact augmented saddle-point system
-///   [ I   J^T ] [ r ] = [ grad_f - z_L + z_U ]
-///   [ J    0  ] [ y ]   [ 0                   ]
-/// (matches IpLeastSquareMults::CalculateMultipliers with W=0, δ=0).
-/// This is far better conditioned than the normal equations
-/// J*J^T*y = rhs when J is nearly rank-deficient (as happens on
-/// AC-OPF with gauge freedom — case30_ieee hits this at a
-/// post-restoration feasible iterate).
+/// In `IpDefaultIterateInitializer.cpp:685-738`, the LS branch fires
+/// only when the cap parameter (`constr_mult_reset_threshold` here) is
+/// `> 0.0`. With Ipopt's default `0.0`, the function falls through to
+/// `cpp:734-737` and **sets y_c = y_d = 0** unconditionally. That's the
+/// principled handoff: the resto inner y's solve a different
+/// stationarity (the L1 objective with p/n slacks), so they're
+/// meaningless to the parent; and a non-zero LS y computed at a
+/// poorly-scaled restored iterate biases the parent's first Newton
+/// direction — observed on arki0003 as a post-restoration dual-residual
+/// blow-up that re-triggers restoration.
 ///
-/// If the augmented solve fails or the result exceeds
-/// `constr_mult_init_max` (matching Ipopt
-/// DefaultIterateInitializer::least_square_mults), zero out y.
-/// LS y refresh after restoration entry. Uses the reduced 2-block
-/// system (no slack-multiplier coupling) and applies the
-/// `constr_mult_init_max` magnitude clamp as a robustness guard for
-/// the post-restoration handoff. This is ripopt-specific defense; Ipopt
-/// has no equivalent reset-time clamp because its restoration path
-/// hands back fresh y from `RestoIpoptNLP`. The post-step recalc_y
-/// uses `recompute_y_post_step_full_augmented` instead.
+/// With `threshold > 0`, we keep the LS estimate when
+/// `‖y_LS‖_∞ ≤ threshold` (matching `cpp:722-727`); otherwise zero.
 fn recompute_y_after_restoration(
     state: &mut SolverState,
     options: &SolverOptions,
@@ -8065,6 +8083,13 @@ fn recompute_y_after_restoration(
     m: usize,
 ) {
     if m == 0 {
+        return;
+    }
+    let threshold = options.constr_mult_reset_threshold;
+    if threshold <= 0.0 {
+        // Ipopt-default path: y = 0.
+        let y_zero = vec![0.0; m];
+        state.set_y_combined(&y_zero);
         return;
     }
     let g_l_combined_for_ls = state.g_l_combined();
@@ -8079,16 +8104,9 @@ fn recompute_y_after_restoration(
         Some(&z_l_full), Some(&z_u_full),
         None,
     );
-    // Post-restoration is semantically a "fresh initial iterate" handoff:
-    // Ipopt's `IpDefaultIterateInitializer::least_square_mults` (called
-    // by `SetInitialIterates` after the inner resto solver) zeros y when
-    // `linf_norm(y_LS) > constr_mult_init_max`. Keeping a stale pre-resto
-    // y here (from before x changed) leaves grad_lag = grad_f - J^T y_old
-    // inconsistent with the reset z, pinning ftb_du at ~1e-5 indefinitely
-    // — which is what we observed on arki0003 at iter 132+ before this fix.
     let y_zero;
     let y_to_set = match y_ls_result {
-        Some(ref y_ls) if linf_norm(y_ls) <= options.constr_mult_init_max => y_ls.as_slice(),
+        Some(ref y_ls) if linf_norm(y_ls) <= threshold => y_ls.as_slice(),
         _ => {
             y_zero = vec![0.0; m];
             y_zero.as_slice()
@@ -8174,37 +8192,6 @@ fn maybe_recalc_y_post_step(
     recompute_y_post_step_full_augmented(state, n, m);
 }
 
-/// Reset constraint-slack barrier multipliers v_L, v_U after restoration,
-/// mirroring the nuclear-reset semantics of bound multipliers. Equality
-/// constraints get v=0 (no slack barrier). For inequality constraints, if
-/// the bound-multiplier reset triggered the all-to-1.0 path, also reset v
-/// to 1.0; else use v = mu/slack uncapped.
-fn reset_constraint_slack_multipliers_after_restoration(
-    state: &mut SolverState,
-    m: usize,
-    nuclear_reset: bool,
-) {
-    // Phase 8d: walk compressed v_l/v_u storage directly. Each entry
-    // already corresponds to a d-row with the relevant finite slack
-    // bound, so the `is_finite` guard collapses.
-    let mu_r = state.mu;
-    let _ = m;
-    for kc in 0..state.d_bound_layout.n_d_l {
-        let k = state.d_bound_layout.d_l_to_full[kc];
-        let dl = state.d_l_compressed[kc];
-        let dx = state.d_x[k];
-        let slack = (dx - dl).max(1e-12);
-        state.v_l_compressed[kc] = if nuclear_reset { 1.0 } else { mu_r / slack };
-    }
-    for kc in 0..state.d_bound_layout.n_d_u {
-        let k = state.d_bound_layout.d_u_to_full[kc];
-        let du = state.d_u_compressed[kc];
-        let dx = state.d_x[k];
-        let slack = (du - dx).max(1e-12);
-        state.v_u_compressed[kc] = if nuclear_reset { 1.0 } else { mu_r / slack };
-    }
-}
-
 /// Apply post-restoration success handling: update state, reset multipliers, and mu.
 ///
 /// T0.9: the existing filter is NOT cleared (Ipopt
@@ -8278,6 +8265,14 @@ fn apply_restoration_success<P: NlpProblem>(
 
     let _ = evaluate_and_refresh_lbfgs(state, problem, lbfgs_state, linear_constraints, lbfgs_mode);
 
+    // Save the pre-restoration slack iterate so the bound-multiplier
+    // synthetic Newton step below has a `curr_slack_s` to reference
+    // (Ipopt's `IpCq().curr_slack_s_L/U`). After
+    // `initialize_slack_iterate` overwrites `state.s` to the new
+    // strictly-interior box around `d(x_new)`, the pre-resto slack is
+    // gone — capture it now.
+    let s_cur = state.s.clone();
+
     // Resync the inequality-slack iterate `s` to the post-restoration
     // `d(x_new)`, projected into the strictly-interior box
     // `(d_l + p_L, d_u − p_U)` (same `slack_bound_push` /
@@ -8293,19 +8288,20 @@ fn apply_restoration_success<P: NlpProblem>(
     // analogous slack push when handing the parent the recovered point.
     initialize_slack_iterate(state, m, options);
 
-    // T0.8 / spec §7.8: when the resto NLP returned bound multipliers,
-    // apply the one-shot Newton z update + α_d FTB + κ_σ clamp to
-    // those values (mirrors Ipopt main-phase init after
-    // RestoIpoptNLP::finalize_solution). Otherwise (Gauss-Newton path
-    // or missing z) fall back to the legacy μ/slack reset.
-    let nuclear_reset = if let Some((zl_resto, zu_resto)) = resto_z {
-        apply_kappa_sigma_clamp_to_resto_z(state, n, zl_resto, zu_resto, &x_cur)
-    } else {
-        reset_bound_multipliers_after_restoration(state, n)
-    };
+    // Ipopt-aligned bound-multiplier handoff: synthetic Newton step on
+    // (z_L, z_U, v_L, v_U) using the parent's pre-restoration multipliers
+    // and slacks, then a single dual fraction-to-the-boundary, then a
+    // nuclear reset to 1.0 if any multiplier exceeds 1e3. Mirrors
+    // `MinC_1NrmRestorationPhase::PerformRestoration`
+    // (`IpRestoMinC_1Nrm.cpp:374-419`). The previous κ_σ-clamp variant
+    // (which used the inner-resto z's instead of parent z's, and applied
+    // a κ_σ clamp Ipopt does not apply at this point) was responsible
+    // for inflating multipliers across repeated restoration cycles on
+    // arki0003. The `resto_z` parameter is now unused — Ipopt always
+    // bridges via the parent's z, never the inner-resto z.
+    let _ = resto_z;
+    let _ = update_bound_multipliers_after_restoration(state, options, &x_cur, &s_cur);
     recompute_y_after_restoration(state, options, n, m);
-
-    reset_constraint_slack_multipliers_after_restoration(state, m, nuclear_reset);
 
     // T0.9: do NOT clear the filter — Ipopt keeps the existing entries
     // (including the augmentation added at resto entry) so future
@@ -8545,7 +8541,7 @@ fn attempt_nlp_restoration<P: NlpProblem>(
     }
     // Compute theta_new using the SLACK-RESYNCED metric: pretend s has
     // already been updated to match d_new (which apply_restoration_success
-    // does shortly via reset_constraint_slack_multipliers_after_restoration).
+    // does shortly via update_bound_multipliers_after_restoration +
     // The pre-resto state.s reflects the OLD x_R's d_x, so leaving it stale
     // overstates ||d_new − s_old||_1 by exactly the constraint shift the
     // restoration just produced — penalising successful restorations whose
@@ -11315,80 +11311,83 @@ mod tests {
             .hessian_values(&x, true, 1.0, &[0.0], &mut buf1));
     }
 
-    /// Spec §7.8: when restoration leaves x unchanged (s_cur == s_trial),
-    /// the one-shot Newton step δz = μ/s − z drives z to μ/s exactly,
-    /// then κ_σ safeguards. Mirrors Ipopt IpRestoMinC_1Nrm.cpp:378-399.
+    /// Ipopt `MinC_1NrmRestorationPhase::PerformRestoration`
+    /// (`IpRestoMinC_1Nrm.cpp:374-419`): with no x step
+    /// (s_cur == s_trial), the synthetic Newton step
+    /// δz = (μ − z·s_trial)/s_curr drives `z + α·δz` to μ/s when α=1.
     #[test]
-    fn test_one_shot_newton_z_no_x_step_recovers_mu_slack() {
+    fn test_resto_handoff_no_x_step_recovers_mu_slack() {
         let mut state = minimal_state(1, 0);
         state.x = vec![1.1];
         set_variable_bounds(&mut state, vec![1.0], vec![f64::INFINITY]);
         state.mu = 0.01;
-        // s_cur = s_trial = 0.1; z_in = 0.5 → δz = μ/s − z = -0.4.
-        // α_d FTB: −0.99·0.5 / −0.4 = 1.2375 → clamp to α=1.
-        // z_new = 0.5 − 0.4 = 0.1 = μ/s. κ_σ band [1e-12, 1e9] → unchanged.
-        let zl_resto = vec![0.5];
-        let zu_resto = vec![0.0];
+        // Parent's pre-resto z lives in state.z_l_compressed.
+        state.z_l_compressed[0] = 0.5;
+        // s_cur = s_trial = 0.1; z=0.5 → δz = (0.01 − 0.05)/0.1 = −0.4.
+        // α_dual FTB: −0.99·0.5 / −0.4 = 1.2375 → clamp to 1.
+        // z_new = 0.5 + (−0.4) = 0.1 = μ/s.
+        let opts = SolverOptions::default();
         let x_cur = vec![1.1];
-        let nuclear = apply_kappa_sigma_clamp_to_resto_z(
-            &mut state, 1, &zl_resto, &zu_resto, &x_cur,
+        let s_cur: Vec<f64> = vec![];
+        let nuclear = update_bound_multipliers_after_restoration(
+            &mut state, &opts, &x_cur, &s_cur,
         );
         assert!((state.z_l_compressed[0] - 0.1).abs() < 1e-12,
-            "z_l should converge to μ/s = 0.1 via one-shot Newton, got {}",
+            "z_l should converge to μ/s = 0.1 via Newton step, got {}",
             state.z_l_compressed[0]);
-        assert_eq!(state.bound_layout.n_x_u, 0, "infinite x_u → no upper-side mirror");
-        assert!(!nuclear, "z_max=0.1 should not trigger nuclear-reset flag");
+        assert!(!nuclear, "z_max=0.1 should not trigger nuclear reset");
     }
 
-    /// Spec §7.8: a wildly large resto z must be clamped down by the
-    /// κ_σ upper band (κ_σ·μ/s_trial). With z huge and s_cur ≈ s_trial,
-    /// the Newton δz is large and negative; α_d FTB caps the step at
-    /// (1−τ)·z_in (~1% of original), then κ_σ takes over.
+    /// Ipopt `IpRestoMinC_1Nrm.cpp:402-419`: when the post-step max
+    /// multiplier exceeds `bound_mult_reset_threshold` (default 1e3),
+    /// **all four blocks (z_L, z_U, v_L, v_U) are reset to 1.0**. The
+    /// nuclear reset is the safety valve that prevents inflated parent
+    /// z's from poisoning the next factorization.
     #[test]
-    fn test_one_shot_newton_z_caps_huge_resto_z() {
+    fn test_resto_handoff_nuclear_reset_above_threshold() {
         let mut state = minimal_state(1, 0);
         state.x = vec![1.1];
         set_variable_bounds(&mut state, vec![1.0], vec![f64::INFINITY]);
         state.mu = 1e-6;
-        // s_cur=s_trial=0.1, μ=1e-6 → κ_σ upper = 1e10·1e-6/0.1 = 1e5.
-        // z_in=1e20: δz = μ/s − z = 1e-5 − 1e20 ≈ −1e20.
-        // α_d FTB: −0.99·1e20 / −1e20 = 0.99 → step = 0.99·(−1e20).
-        // z_new = 1e20·(1 − 0.99) = 1e18. κ_σ clamp → 1e5.
-        let zl_resto = vec![1.0e20];
-        let zu_resto = vec![0.0];
+        // Pre-resto z huge (1e10); s_cur=s_trial=0.1.
+        // δz = (1e-6 − 1e10·0.1)/0.1 = (1e-6 − 1e9)/0.1 ≈ −1e10.
+        // FTB: −0.99·1e10 / −1e10 = 0.99 → step = −0.99·1e10.
+        // z_new ≈ 1e10·(1 − 0.99) = 1e8 → above 1e3 → nuclear reset.
+        state.z_l_compressed[0] = 1.0e10;
+        let opts = SolverOptions::default();
         let x_cur = vec![1.1];
-        apply_kappa_sigma_clamp_to_resto_z(
-            &mut state, 1, &zl_resto, &zu_resto, &x_cur,
+        let s_cur: Vec<f64> = vec![];
+        let nuclear = update_bound_multipliers_after_restoration(
+            &mut state, &opts, &x_cur, &s_cur,
         );
-        let z_hi = 1e10 * 1e-6 / 0.1;
-        assert!((state.z_l_compressed[0] - z_hi).abs() / z_hi < 1e-12,
-            "z_l should be clamped to κ_σ·μ/s = {}, got {}", z_hi, state.z_l_compressed[0]);
+        assert!(nuclear, "z_new ≈ 1e8 should trigger nuclear reset");
+        assert_eq!(state.z_l_compressed[0], 1.0,
+            "nuclear reset must drive z_l to 1.0, got {}", state.z_l_compressed[0]);
     }
 
-    /// Spec §7.8: when restoration moves x toward the bound (s shrinks
-    /// from s_cur=0.5 to s_trial=0.1), the Newton step should bias z
-    /// upward to maintain z·s ≈ μ. Verify δz computation directly.
+    /// Ipopt `IpRestoMinC_1Nrm.cpp:438-453`: with an x step (s shrinks
+    /// from s_cur=0.5 to s_trial=0.1), the synthetic Newton uses both
+    /// s_curr and s_trial, not just one. Verify δz computation:
+    ///   δz = (μ − z·s_trial) / s_curr = (0.05 − 0.1·0.1) / 0.5
+    ///      = (0.05 − 0.01) / 0.5 = 0.08
+    /// δz > 0 → α_dual = 1 (no FTB cap needed). z_new = 0.1 + 0.08 = 0.18.
     #[test]
-    fn test_one_shot_newton_z_with_x_step_uses_s_cur_in_formula() {
+    fn test_resto_handoff_with_x_step_uses_both_slacks() {
         let mut state = minimal_state(1, 0);
-        // x moved from 1.5 (s=0.5) to 1.1 (s=0.1).
+        // Trial: x=1.1 → s_trial=0.1. Pre-resto: x_cur=1.5 → s_cur=0.5.
         state.x = vec![1.1];
         set_variable_bounds(&mut state, vec![1.0], vec![f64::INFINITY]);
         state.mu = 0.05;
-        // z_in = 0.1, s_cur = 0.5, s_trial = 0.1, μ = 0.05.
-        // δz = (μ − z·(s_trial−s_cur))/s_cur − z
-        //    = (0.05 − 0.1·(−0.4))/0.5 − 0.1
-        //    = (0.05 + 0.04)/0.5 − 0.1
-        //    = 0.18 − 0.1 = 0.08
-        // δz > 0 → α=1, z_new = 0.18. κ_σ band at s=0.1: [5e-12, 5e8] → kept.
-        let zl_resto = vec![0.1];
-        let zu_resto = vec![0.0];
+        state.z_l_compressed[0] = 0.1;
+        let opts = SolverOptions::default();
         let x_cur = vec![1.5];
-        apply_kappa_sigma_clamp_to_resto_z(
-            &mut state, 1, &zl_resto, &zu_resto, &x_cur,
+        let s_cur: Vec<f64> = vec![];
+        update_bound_multipliers_after_restoration(
+            &mut state, &opts, &x_cur, &s_cur,
         );
         assert!((state.z_l_compressed[0] - 0.18).abs() < 1e-12,
-            "z_l should be 0.18 from Newton step, got {}", state.z_l_compressed[0]);
+            "z_l should be 0.18 from synthetic Newton step, got {}",
+            state.z_l_compressed[0]);
     }
 
     /// Trivial 1-D NLP for filter-gating tests. Objective and

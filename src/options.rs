@@ -284,6 +284,25 @@ pub struct SolverOptions {
     pub least_squares_mult_init: bool,
     /// Maximum absolute value for LS multiplier init; if exceeded, fall back to zero. Default: 1000.0.
     pub constr_mult_init_max: f64,
+    /// Threshold for resetting equality / inequality multipliers after the
+    /// restoration phase (mirrors Ipopt 3.14's `constr_mult_reset_threshold`,
+    /// `IpRestoMinC_1Nrm.cpp:46-51`, default **0.0**).
+    ///
+    /// On a successful restoration exit, Ipopt calls
+    /// `DefaultIterateInitializer::least_square_mults` with this option as
+    /// the magnitude cap. The LS branch (`IpDefaultIterateInitializer.cpp:692`)
+    /// requires `cap > 0.0`; with the default 0.0 the function falls through
+    /// to the `else` branch (`cpp:734-737`) and **sets y_c = y_d = 0**.
+    ///
+    /// ripopt mirrors this: with `≤ 0.0`, `recompute_y_after_restoration`
+    /// zeros y unconditionally (no LS solve). Setting this >0 allows the
+    /// LS estimate to be kept when `‖y_LS‖_∞ ≤ threshold`. The Ipopt
+    /// default of 0.0 is the principled handoff because the resto inner
+    /// y's are meaningless to the parent (they solve a different
+    /// stationarity), and a non-zero LS y at a poorly-scaled restored
+    /// iterate biases the parent's first Newton direction — observed on
+    /// arki0003 as a post-restoration dual-residual blow-up.
+    pub constr_mult_reset_threshold: f64,
     /// Include constraint slack log-barriers in the filter merit function. Default: true.
     pub constraint_slack_barrier: bool,
     /// Maximum wall-clock time in seconds. 0.0 means no limit.
@@ -677,6 +696,7 @@ impl Default for SolverOptions {
             mu_allow_increase: true,
             least_squares_mult_init: true,
             constr_mult_init_max: 1000.0,
+            constr_mult_reset_threshold: 0.0,
             constraint_slack_barrier: true,
             max_wall_time: 0.0,
             watchdog_shortened_iter_trigger: 10,
