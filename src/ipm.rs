@@ -11038,7 +11038,8 @@ mod tests {
         assert_eq!(state.obj, 42.0);
         assert_eq!(snap.iteration, 7);
         assert_eq!(filter.entries().len(), 1);
-        assert!((filter.entries()[0].theta - 0.5).abs() < 1e-15);
+        // Stored corner per AugmentFilter: (1-γ_θ)·0.5.
+        assert!((filter.entries()[0].theta - (1.0 - 1e-5) * 0.5).abs() < 1e-15);
     }
 
     #[test]
@@ -11541,9 +11542,12 @@ mod tests {
         // Filter entries must be intact (no reset occurred).
         assert_eq!(filter.entries().len(), entries_before.len(),
             "filter must NOT be cleared on rejected resto (T0.9)");
-        assert!((filter.entries()[0].theta - 1.0).abs() < 1e-15,
+        // Stored corner per AugmentFilter: ((1-γ_θ)·1, 1 - γ_φ·1).
+        let theta_corner = (1.0 - 1e-5) * 1.0;
+        let phi_corner = 1.0 - 1e-8 * 1.0;
+        assert!((filter.entries()[0].theta - theta_corner).abs() < 1e-15,
             "pre-existing filter entry theta must persist");
-        assert!((filter.entries()[0].phi - 1.0).abs() < 1e-15,
+        assert!((filter.entries()[0].phi - phi_corner).abs() < 1e-15,
             "pre-existing filter entry phi must persist");
         // theta_max unchanged
         assert!((filter.theta_max() - theta_min_before).abs() < 1e-15);
@@ -11589,7 +11593,8 @@ mod tests {
         // T0.9: filter must NOT be cleared on success either.
         assert_eq!(filter.entries().len(), entries_before_len,
             "filter must retain entries on resto success (T0.9)");
-        assert!((filter.entries()[0].theta - 1.0).abs() < 1e-15);
+        // Stored corner per AugmentFilter: ((1-γ_θ)·1, ...).
+        assert!((filter.entries()[0].theta - (1.0 - 1e-5)).abs() < 1e-15);
     }
 
     #[test]

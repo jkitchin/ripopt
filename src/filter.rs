@@ -134,6 +134,16 @@ impl Filter {
 
     /// Check if a trial point (theta, phi) is acceptable to the filter.
     /// Returns true if the point is acceptable (not dominated by any filter entry).
+    ///
+    /// Mirrors Ipopt's `FilterEntry::Acceptable` (`IpFilter.hpp:39-58`):
+    /// trial is acceptable to an entry iff `trial_θ ≤ entry.θ` OR
+    /// `trial_φ ≤ entry.φ`. Equivalently, rejected iff trial is *strictly*
+    /// worse on BOTH coordinates. Boundary points (equal to the stored
+    /// corner) are accepted.
+    ///
+    /// The (gamma_theta, gamma_phi) margin is **not** applied here — it
+    /// is baked into the stored corner by `add` (see `AugmentFilter` at
+    /// `IpFilterLSAcceptor.cpp:297-308`).
     pub fn is_acceptable(&self, theta: f64, phi: f64) -> bool {
         if theta.is_nan() || phi.is_nan() {
             return false;
@@ -142,9 +152,9 @@ impl Filter {
             return false;
         }
         for entry in &self.entries {
-            if theta >= (1.0 - self.gamma_theta) * entry.theta
-                && phi >= entry.phi - self.gamma_phi * entry.theta
-            {
+            // Rejected iff strictly worse on BOTH coordinates (Ipopt
+            // FilterEntry::Acceptable returns true on the first `≤`).
+            if theta > entry.theta && phi > entry.phi {
                 return false;
             }
         }
@@ -403,14 +413,34 @@ impl Filter {
         self.obj_max_inc = value;
     }
 
-    /// Add a (theta, phi) pair to the filter.
-    pub fn add(&mut self, theta: f64, phi: f64) {
-        // Remove dominated entries
-        self.entries.retain(|e| {
-            !(theta <= (1.0 - self.gamma_theta) * e.theta
-                && phi <= e.phi - self.gamma_phi * e.theta)
+    /// Augment the filter with the corner derived from the current iterate
+    /// `(theta_current, phi_current)`. Stores the **margin-baked** corner
+    /// `((1 - γ_θ)·θ_curr, φ_curr - γ_φ·θ_curr)` exactly as Ipopt's
+    /// `FilterLSAcceptor::AugmentFilter` (`IpFilterLSAcceptor.cpp:297-308`):
+    /// ```cpp
+    /// Number phi_add   = reference_barr_  - gamma_phi_   * reference_theta_;
+    /// Number theta_add = (1. - gamma_theta_) * reference_theta_;
+    /// filter_.AddEntry(phi_add, theta_add, ...);
+    /// ```
+    /// Existing entries dominated by the new corner are removed, mirroring
+    /// `Filter::AddEntry` (`IpFilter.cpp:61-86`) which uses `Dominated`
+    /// (raw, non-strict, no margin).
+    ///
+    /// The margins live in the stored corner, **not** in the dominance
+    /// check — this is the inverse of the previous ripopt convention.
+    /// Both `is_acceptable` and the retain predicate now compare raw
+    /// values against raw stored corners, matching Ipopt byte-for-byte.
+    pub fn add(&mut self, theta_current: f64, phi_current: f64) {
+        let theta_add = (1.0 - self.gamma_theta) * theta_current;
+        let phi_add = phi_current - self.gamma_phi * theta_current;
+        // Remove dominated entries: new corner dominates `e` iff
+        // new ≤ e on BOTH coordinates (matches Ipopt `Dominated`).
+        self.entries
+            .retain(|e| !(theta_add <= e.theta && phi_add <= e.phi));
+        self.entries.push(FilterEntry {
+            theta: theta_add,
+            phi: phi_add,
         });
-        self.entries.push(FilterEntry { theta, phi });
     }
 
     /// Compute problem-dependent minimum step size for the line search (Ipopt formula).
@@ -468,10 +498,9 @@ impl Filter {
     /// pre-restoration `(theta, phi)` margin entry is in the filter before
     /// either the almost-feasible guard or the restoration solver runs.
     pub fn augment_for_restoration(&mut self, theta_current: f64, phi_current: f64) {
-        // ripopt stores raw (theta, phi); is_acceptable applies the
-        // (gamma_theta, gamma_phi) offsets at compare time. Pre-baking the
-        // offsets here would double-apply them and hand the restoration
-        // kernel a strictly weaker entry than Ipopt's reference. Pass raw.
+        // `add` prebakes `((1-γ_θ)·θ, φ-γ_φ·θ)` exactly as Ipopt's
+        // `AugmentFilter`, so the restoration entry matches the entry
+        // Ipopt's `PrepareRestoPhaseStart` produces.
         self.add(theta_current, phi_current);
     }
 
@@ -721,18 +750,30 @@ mod tests {
 
     #[test]
     fn test_filter_margin_boundary() {
-        // A point exactly at the boundary of the filter margin is rejected
-        // (strict-inequality semantics in is_acceptable).
+        // Ipopt-aligned semantics (IpFilterLSAcceptor.cpp:297-308 +
+        // IpFilter.hpp:39-58): `add` stores the margin-baked corner
+        // ((1-γ_θ)·θ, φ-γ_φ·θ); `is_acceptable` rejects iff trial is
+        // strictly worse on BOTH coordinates. Boundary points (equal to
+        // the stored corner) are ACCEPTED.
         let mut filter = Filter::new(100.0);
         filter.add(1.0, 1.0);
-        // gamma_theta = 1e-5, gamma_phi = 1e-8
-        // Boundary: theta >= (1 - 1e-5) * 1.0 = 0.99999 AND phi >= 1.0 - 1e-8 * 1.0
-        let theta_boundary = 0.99999;
-        let phi_boundary = 1.0 - 1e-8;
-        assert!(!filter.is_acceptable(theta_boundary, phi_boundary),
-            "At-boundary point should be rejected (dominated)");
-        // Just inside the margin (sufficient improvement in theta): accepted
-        assert!(filter.is_acceptable(theta_boundary - 1e-6, phi_boundary));
+        // Stored corner: (0.99999, 1.0 - 1e-8). Trial exactly at the
+        // corner: rejected condition is `θ > 0.99999 AND φ > 1.0-1e-8`.
+        // Equality on either coordinate ⇒ acceptable.
+        let theta_corner = (1.0 - 1e-5) * 1.0;
+        let phi_corner = 1.0 - 1e-8 * 1.0;
+        assert!(
+            filter.is_acceptable(theta_corner, phi_corner),
+            "Point at corner is acceptable (Ipopt uses non-strict ≤)"
+        );
+        // Strictly worse on both coordinates: rejected.
+        let eps = 1e-12;
+        assert!(
+            !filter.is_acceptable(theta_corner + eps, phi_corner + eps),
+            "Strictly worse on both coordinates must be rejected"
+        );
+        // Improvement in theta only: accepted regardless of phi.
+        assert!(filter.is_acceptable(theta_corner - 1e-6, phi_corner + 1.0));
     }
 
     #[test]
