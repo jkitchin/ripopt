@@ -6873,6 +6873,79 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             // Phase 9c.5: same for compressed d_l/d_u → length n_d.
             let d_l_full = state.d_l();
             let d_u_full = state.d_u();
+
+            // RIPOPT_RHS_PROBE=ITER,VAR: dump component breakdown of
+            // the augmented-system x-row at `var` AT iter `ITER`,
+            // before any linear-solver scaling. Mirrors the formulas
+            // in src/kkt_aug.rs build_outer_rhs (lines 296-344) and
+            // fold_aug_rhs (lines 435-468). Used to localize whether
+            // the catastrophic dx[var] at iter 110 originates in the
+            // RHS itself (assembly) or downstream in the matrix solve.
+            if let Ok(spec) = std::env::var("RIPOPT_RHS_PROBE") {
+                let mut parts = spec.split(',');
+                let want_iter: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+                let want_var:  usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                if state.iter == want_iter && want_var < n {
+                    let i = want_var;
+                    let xi = state.x[i];
+                    let xli = x_l_full[i];
+                    let xui = x_u_full[i];
+                    let l_fin = xli.is_finite();
+                    let u_fin = xui.is_finite();
+                    let s_l = if l_fin { (xi - xli).max(1e-20) } else { f64::INFINITY };
+                    let s_u = if u_fin { (xui - xi).max(1e-20) } else { f64::INFINITY };
+                    let zli = if l_fin { z_l_full[i] } else { 0.0 };
+                    let zui = if u_fin { z_u_full[i] } else { 0.0 };
+                    // J^T y at column i.
+                    let mut jty_i = 0.0_f64;
+                    for k in 0..state.jac_c_rows.len() {
+                        if state.jac_c_cols[k] == i {
+                            jty_i += state.jac_c_vals[k] * state.y_c[state.jac_c_rows[k]];
+                        }
+                    }
+                    for k in 0..state.jac_d_rows.len() {
+                        if state.jac_d_cols[k] == i {
+                            jty_i += state.jac_d_vals[k] * state.y_d[state.jac_d_rows[k]];
+                        }
+                    }
+                    let kappa_d = options.kappa_d;
+                    let kd_term = if kappa_d > 0.0 && (l_fin ^ u_fin) {
+                        if l_fin { kappa_d * state.mu } else { -kappa_d * state.mu }
+                    } else { 0.0 };
+                    // build_outer_rhs convention: rhs_x = grad_f + J^T y - z_L + z_U + κ_d
+                    let mut rhs_x_i = state.grad_f[i] + jty_i + kd_term;
+                    if l_fin { rhs_x_i -= zli; }
+                    if u_fin { rhs_x_i += zui; }
+                    let rhs_z_l_i = if l_fin { zli * s_l - state.mu } else { 0.0 };
+                    let rhs_z_u_i = if u_fin { zui * s_u - state.mu } else { 0.0 };
+                    // fold_aug_rhs convention: aug[i] = -rhs_x - rhs_z_L/s_l + rhs_z_U/s_u.
+                    let mut aug_i = -rhs_x_i;
+                    if l_fin { aug_i -= rhs_z_l_i / s_l; }
+                    if u_fin { aug_i += rhs_z_u_i / s_u; }
+                    let mut sigma_x_i = 0.0_f64;
+                    if l_fin { sigma_x_i += zli / s_l; }
+                    if u_fin { sigma_x_i += zui / s_u; }
+                    let mu_over_sl = if l_fin { state.mu / s_l } else { 0.0 };
+                    let mu_over_su = if u_fin { state.mu / s_u } else { 0.0 };
+                    eprintln!(
+                        "[rhs-probe] iter={} var={} mu={:.3e}\n  \
+                         x={:+.6e} x_l={:+.3e} x_u={:+.3e} s_l={:.3e} s_u={:.3e}\n  \
+                         grad_f={:+.6e} J^T y={:+.6e} z_L={:.6e} z_U={:.6e} kd={:+.3e}\n  \
+                         rhs_x = grad_f + Jty - z_L + z_U + kd = {:+.6e}\n  \
+                         rhs_z_L = z_L*s_l - mu = {:+.6e}   rhs_z_U = z_U*s_u - mu = {:+.6e}\n  \
+                         mu/s_L={:.3e} mu/s_U={:.3e}\n  \
+                         aug_rhs[var] = -rhs_x - rhs_z_L/s_L + rhs_z_U/s_U = {:+.6e}\n  \
+                         Sigma_x[var] = z_L/s_l + z_U/s_u = {:.6e}",
+                        state.iter, i, state.mu,
+                        xi, xli, xui, s_l, s_u,
+                        state.grad_f[i], jty_i, zli, zui, kd_term,
+                        rhs_x_i, rhs_z_l_i, rhs_z_u_i,
+                        mu_over_sl, mu_over_su,
+                        aug_i, sigma_x_i,
+                    );
+                }
+            }
+
             match crate::kkt_aug::aug_step_from_state(
                 n, &state.grad_f,
                 &state.hess_rows, &state.hess_cols, &state.hess_vals,
@@ -7501,6 +7574,29 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         }
 
         track_post_step_acceptable(&mut state, options);
+
+        // RIPOPT_FILTER_DUMP=lo,hi: dump full filter contents at end of
+        // each iter in [lo, hi]. Diagnostic for arki0003 iter-110
+        // divergence — compares ripopt's filter set to Ipopt's
+        // print_level=12 output to localize missing augmentations.
+        if let Ok(spec) = std::env::var("RIPOPT_FILTER_DUMP") {
+            let mut parts = spec.split(',');
+            let lo: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let hi: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+            if state.iter >= lo && state.iter <= hi {
+                let entries = filter.entries();
+                eprintln!(
+                    "[filter-dump] iter={} n_entries={} resets={}",
+                    state.iter, entries.len(), filter.n_filter_resets(),
+                );
+                for (idx, e) in entries.iter().enumerate() {
+                    eprintln!(
+                        "  filter[{}] theta={:.10e} phi={:.10e}",
+                        idx, e.theta, e.phi,
+                    );
+                }
+            }
+        }
 
         // A8.6+ dual-divergence trace: env-gated per-iter snapshot of
         // the dual state. Set RIPOPT_TRACE_DUAL=1 to log ‖y‖_∞,
@@ -9652,6 +9748,41 @@ fn install_step_directions(
     // compressed mirrors; the combined storage was dropped.
     state.dv_l_compressed = state.d_bound_layout.project_l(&dv_l);
     state.dv_u_compressed = state.d_bound_layout.project_u(&dv_u);
+    // RIPOPT_DX_PROBE=iter,var: dump dx[var], dz_l/u[var], slacks, and
+    // norms after the main step is installed. Used to compare KKT
+    // direction precision across linear-solver backends (feral vs rmumps)
+    // — see docs/A8_FOLLOWUP_arki0003.md "2026-05-04 trace" follow-up.
+    if let Ok(spec) = std::env::var("RIPOPT_DX_PROBE") {
+        let mut parts = spec.split(',');
+        let want_iter: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+        let want_var: usize  = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        if state.iter == want_iter && want_var < state.dx.len() {
+            let xv = state.x[want_var];
+            let xl = state.x_l_at(want_var);
+            let xu = state.x_u_at(want_var);
+            let sl = if xl.is_finite() { xv - xl } else { f64::INFINITY };
+            let su = if xu.is_finite() { xu - xv } else { f64::INFINITY };
+            let dz_l_v = state.bound_layout.full_to_x_l[want_var]
+                .map(|k| state.dz_l_compressed[k]).unwrap_or(0.0);
+            let dz_u_v = state.bound_layout.full_to_x_u[want_var]
+                .map(|k| state.dz_u_compressed[k]).unwrap_or(0.0);
+            let z_l_v = state.bound_layout.full_to_x_l[want_var]
+                .map(|k| state.z_l_compressed[k]).unwrap_or(0.0);
+            let z_u_v = state.bound_layout.full_to_x_u[want_var]
+                .map(|k| state.z_u_compressed[k]).unwrap_or(0.0);
+            let dx_inf = state.dx.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+            let dyc_inf = state.dy_c.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+            let dyd_inf = state.dy_d.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+            eprintln!(
+                "[dx-probe] iter={} mu={:.3e} var={} x={:.6e} sl={:.3e} su={:.3e} \
+                 dx={:+.6e} z_L={:.3e} z_U={:.3e} dz_L={:+.3e} dz_U={:+.3e} \
+                 |dx|_inf={:.3e} |dy_c|_inf={:.3e} |dy_d|_inf={:.3e}",
+                state.iter, state.mu, want_var, xv, sl, su,
+                state.dx[want_var], z_l_v, z_u_v, dz_l_v, dz_u_v,
+                dx_inf, dyc_inf, dyd_inf,
+            );
+        }
+    }
 }
 
 /// L-infinity norm of `J^T * c_violation`, where `c_violation` is the

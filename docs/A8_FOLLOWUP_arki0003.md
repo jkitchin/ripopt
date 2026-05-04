@@ -1905,3 +1905,624 @@ flag. The differ now:
 `src/ipm.rs:1860-1869` (set_g_combined docstring confirming
 ripopt's internal c_x is shifted, matching Ipopt's curr_c);
 `/tmp/arki_diff_v2.txt` (post-bridge diff output).
+
+## 2026-05-04 forward-walk: iter 110 LS no-movement accept
+
+**Setup**: forward-walk row-by-row comparison of ripopt vs Ipopt
+(`/tmp/ripopt_iters.txt`, `/tmp/ipopt_iters.txt`). Iters 0-110 are
+bit-identical to printed precision (obj, inf_pr, inf_du, lg(mu)).
+
+**Divergence at iter 110→111**:
+
+| iter | ripopt obj/pr/du | ipopt obj/pr/du | tag |
+|------|------------------|------------------|-----|
+| 110  | 1.195e7 / 3.12e5 / 3.57e6 | same | h 1 |
+| 111  | (ripopt) 1.195e7 / 3.12e5 / 3.57e6 | (ipopt 111r) 1.195e7 / 3.12e5 / 1.00e3 | R 4 |
+| 114  | (ripopt) 1.195e7 / 3.12e5 / 3.57e6 | (ipopt) 5.0e6 / 2.87e3 / 1.02 | h 1 |
+
+Ipopt enters restoration at iter 110→111 (`R` tag, `ls=4`), runs 3
+restoration iters (111r-113r), and emerges at iter 114 with feasibility
+improved 100× and objective dropped 60%. **Ripopt continues normal
+LS at iter 110→111** and never recovers — it accumulates ~390
+no-progress iterates before MaxIter at 500.
+
+### Root cause: variable 533 barrier trap
+
+At iter 110, variable index 533 (`x = x_U = 1341.0`, slack
+`x_U - x = 8.31e-5`) dominates the gradient/step calculation:
+
+```
+[gBD] iter=110 ∇f·dx=+6.65e4 (xb)·dx=-2.69e6 (sb)·ds=+1.08e6  TOTAL=-1.54e6
+[gBD-top] iter=110 top_i=533 side=U term=-1.15e6 slack=8.31e-5 dx=-953.1
+[gBD-zmu] iter=110 top_i=533 z_U=776 dz_U=-8.90e9
+```
+
+Single-variable contribution: `+μ/slack · dx = +1203 × (-953) ≈ -1.15e6`,
+which alone accounts for 75% of `grad_phi_step = -1.54e6`. The
+huge `|gBD|` then collapses Ipopt's `alpha_min` formula:
+
+```
+alpha_min = α_min_frac × γ_φ × theta / |gBD|
+          = 0.05 × 1e-8 × 3.92e5 / 1.54e6
+          = 1.27e-10                          (ripopt observed value)
+```
+
+With `alpha_min = 1.27e-10` and `alpha_p_max = 2.519e-6` (FTB-clipped
+by `dz_U[533] = -8.9e9`), the LS would tolerate ~14 backtracks before
+exiting. But:
+
+```
+[probe] iter=110 ls=0 alpha=2.519e-6 gBD=-1.544e6
+        theta_curr=3.921e5 theta_tr=3.921e5  (Δθ=-0.99)
+        phi_curr=1.195e7   phi_tr=1.195e7    (Δφ=-18.3)
+        is_ft=true armijo=true suf_phi=true in_filter=true → ACCEPT
+```
+
+The first trial passes f-type Armijo trivially: `phi_trial - phi_current
+= -18.3 <= η_φ·α·gBD = -3.89e-4`. Relative movement is `|Δθ|/θ = 2.5e-6`
+— effectively zero. **The iterate barely moves but the LS reports
+"step accepted".**
+
+Ipopt at the same juncture rejects 4 backtrack trials (alphas
+~5e-6 → 3.14e-7) and enters restoration. The mechanism is not
+visible in the printed log but is one of:
+  (a) Ipopt's `alpha_p_max` at iter 110 is ~5e-6 (not 2.5e-6) AND
+      `alpha_min` is much larger (~6e-7), so `alpha_p_max/alpha_min`
+      is small and 4 backtracks suffice to exit.
+  (b) Ipopt's filter contains additional entries that ripopt is
+      missing, dominating the iter 110→111 trial.
+  (c) Ipopt's `gBD` magnitude differs because dx[533] is smaller
+      (small precision differences in KKT solve at iter 110 that
+      forward-walk to printed precision didn't catch).
+
+### Why kappa_sigma doesn't help
+
+Default `kappa_sigma=1e10`. With μ=0.1, the per-bound clamp is
+`z·s ∈ [1e-11, 1e9]`. At iter 110, `z_U[533]·s_U[533] = 776 × 8.3e-5
+= 0.0644` — well inside the band. Kappa_sigma is not designed to
+catch this case.
+
+### Why mu-update gate never fires
+
+Companion observation (commit `e8dff73`): `RIPOPT_TRACE_MU` shows
+`E_mu` never approaches `barrier_tol_factor × mu = 1.0`. Best
+observed `E_mu = 3.92e3` at iter 357 (gap 3920×), dominated by the
+complementarity component (`co=1.11e5` terminal).
+
+The `co` outliers are exactly the bound slacks for variables
+`xL[1663-1697]` and `xL[1688-1700]` — same family as variable 533,
+all sitting at scale 1e6-1e7 with `z`-multipliers near 1.
+
+### Action items (forward-walk)
+
+1. **Filter divergence diagnostic**: instrument ripopt to dump filter
+   entry list at iters 100-110, run Ipopt with high print_level to
+   extract its filter entries, and diff. If hypothesis (b) is correct,
+   ripopt is failing to augment the filter at one or more h-type
+   accepts in the iter 100-110 range.
+
+2. **Step-size precision diagnostic**: Add a finer probe that compares
+   `dx`, `dz_U[533]`, and `alpha_p_max` at iter 110 between ripopt and
+   Ipopt with full FP precision. Requires a custom Ipopt trace patch.
+
+3. **No-movement restoration trigger** (ripopt-specific guardrail):
+   if a step is accepted with relative iterate movement
+   `||x_trial - x|| / max(||x||, 1) < 1e-6` AND constraint violation
+   `theta > 1e-2`, force restoration entry on the next iter. This
+   mirrors Ipopt's `DetectTinyStep` (BacktrackingLineSearch.cpp:1219)
+   but with the `cviol < 1e-4` gate inverted — Ipopt's gate is for
+   "stuck at infeasible local min of theta", ours would be for
+   "stuck in barrier trap at high theta".
+
+**Refs**: `/tmp/arki_lsdec.out`, `/tmp/arki_gbd.out`,
+`/tmp/arki_lsprobe.out`, `/tmp/arki_probe.out`,
+`/tmp/ipopt_arki_full.out`; `src/filter.rs:422` (compute_alpha_min);
+`src/ipm.rs:2076` (barrier_directional_derivative);
+`src/ipm.rs:2814` (LS alpha_min check);
+`ref/Ipopt/src/Algorithm/IpBacktrackingLineSearch.cpp:1219`
+(DetectTinyStep).
+
+## 2026-05-04 follow-up: filter contents are NOT the divergence driver
+
+**Setup**: ran Ipopt with `print_level=12` on arki0003 (max_iter=115),
+extracted filter contents at iter 110→111 LS time. Compared against
+`RIPOPT_FILTER_DUMP=109,111` output from ripopt.
+
+**Filter sizes essentially identical**:
+- Ripopt iter 110: 76 entries, last entry `(theta=3.9221e5, phi=1.1945e7)`
+- Ipopt  iter 110: 76 entries, last entry `(theta=3.9220e5, phi=1.19454e7, iter=109)`
+
+The off-by-1 at iter 109 vs 110 in entry counts is consistent with
+augmentation-cycle timing. Entry contents agree to within Ipopt's
+gamma-correction (`(phi - γ_φ·θ, (1-γ_θ)·θ)`); ripopt currently
+augments raw `(theta_current, phi_current)` per `src/ipm.rs:2892`.
+
+**Filter is NOT the divergence driver.** Hypothesis (b) from the
+previous section is **disproved**.
+
+## True root cause: search direction sign at iter 110
+
+Comparing the iter-110 LS internals between Ipopt and ripopt at the
+same iterate:
+
+```
+ripopt: phi_curr=1.19450e7  gBD=-1.544e6  (descent direction)
+        first trial alpha=2.519e-6 → phi_tr=1.19449e7 (Δφ=-18.3)
+        Armijo passes trivially, ACCEPT
+
+ipopt:  phi_ref =1.19454e7  gBD=+1.252e7  (NOT a descent direction)
+        first trial alpha=2.515e-6 → phi_tr=1.19456e7 (Δφ=+14.1)
+        Sufficient reduction FAILS
+        backtracks: 1.26e-6, 6.29e-7 → both fail
+        Soft restoration step at 8.63e-8 → fails
+        Restoration phase entry (R 4)
+```
+
+**Same iterate to printed precision; opposite-sign `grad_phi_step`.**
+
+This means **ripopt's `dx` at iter 110 differs from Ipopt's `dx`** in
+a way that flips the directional derivative sign. The breakdown
+attribution:
+
+```
+ripopt gBD = ∇f·dx + (xb)·dx + (sb)·ds
+           = +6.65e4 + (-2.69e6) + (+1.08e6) = -1.54e6
+```
+
+The `(xb)·dx` term is dominated by **variable 533** alone:
+- `x[533] = x_U[533] = 1341.0`, `slack=8.31e-5`, `μ/slack = +1203`
+- `dx[533] = -953` → contribution `= -1.15e6` (75% of `(xb)·dx`)
+
+If `dx[533]` were O(10) (Ipopt's plausible value), the variable-533
+contribution shrinks to O(-12000), and `(xb)·dx ≈ -1.54e6 + 1.15e6
+= -0.39e6`. Total `gBD ≈ +6.65e4 - 0.39e6 + 1.08e6 = +7.6e5` — same
+sign as Ipopt's `+1.25e7`, much closer in magnitude.
+
+**The KKT solve at iter 110 is producing a wildly different `dx[533]`**
+between ripopt (using feral) and Ipopt (using MA27/MUMPS). The
+inverted-sign gBD then hands the LS a fake "descent direction" that
+admits no-movement trials.
+
+### Action items (KKT precision)
+
+1. **Compare KKT residuals at iter 110** between ripopt and Ipopt.
+   Dump `r_x` and `r_c` before linear solve in both. If residuals
+   match but `dx` differs, the linear solver / regularization is the
+   culprit. If residuals differ, the bug is upstream in residual
+   assembly.
+
+2. **Try ripopt with rmumps backend** at iter 110 to isolate the
+   linear-solver effect. If MUMPS produces dx[533] closer to Ipopt's,
+   feral is the source of precision loss; if MUMPS reproduces the
+   same dx[533]=-953, the issue is in regularization or the residual.
+
+3. **Check delta_w / delta_c regularization at iter 110**. A near-bound
+   variable with σ = z/s = 776/8.3e-5 ≈ 9.4e6 contributes a huge
+   diagonal entry to the W matrix; without sufficient regularization,
+   the linear solve is ill-conditioned and `dx[533]` becomes noise.
+   Compare ripopt's δ_w at iter 110 against Ipopt's `lg(rg) = -1.6`
+   (i.e., δ_w ≈ 2.5e-2).
+
+**Refs**: this section's evidence at line ~75 of Ipopt's iter 110→111
+filter dump; `src/ipm.rs:2892` (raw augmentation); ripopt
+`grad_phi_step` breakdown at `src/ipm.rs:2076`.
+
+## 2026-05-04 trace: full-run mu and |y_d| trajectory
+
+Source: /tmp/arki_probe.out (ripopt MaxIter=500, RIPOPT_*_PROBE
+on, baseline feral backend).
+
+**mu pinned for entire 500-iter run**: outer lg(mu) stays at -1.0
+(μ=0.1) for every non-restoration iter. The only non-(-1.0) μ
+values are the inner restoration iters (lg(mu) ∈ {5.4, 5.2, 5.1,
+4.8, 4.7, 4.4, 4.3, 4.0, 3.6, 3.5, 3.1}) — these are the
+restoration NLP's own μ, not the parent's. The mu-update gate
+fires zero times across the entire run (consistent with prior
+RIPOPT_TRACE_MU finding: 488 evaluations, 0 fires, closest E_μ
+ever gets to threshold is 3.92e3 / 1.0 = 3920×).
+
+**|y_d| does not "shrink"** — it explodes then gets reset by the
+restoration handoff:
+
+| iter |  obj   | inf_pr |   |y_c|   |  |y_d|   |   |z_L|   |  |z_U|   |
+|-----:|-------:|-------:|--------:|---------:|---------:|---------:|
+|    0 | 0      |1.16e8  | 1.80e2  |  1.80e0  |  1.00e0  |  1.00e0  |
+|   24 |        |        | 2.16e2  |  3.46e1  |          |          |
+|   99 |        |        | 3.08e6  |  1.85e6  |          |          |
+|  124 | 1.20e7 |2.81e5  | 4.58e7  |  2.72e7  |  3.52e7  |  3.53e7  |
+|  126 | 1.20e7 |2.80e5  | 4.63e7  |  2.74e7  |  3.66e7  |  3.68e7  |
+|*resto*|       |        |         |          |          |          |
+|  127 | 1.19e7 |2.39e5  | 0.00e0  |  0.00e0  |  1.00e0  |  1.00e0  |
+|  128 | 1.19e7 |2.39e5  | 1.30e1  |  1.90e2  |  1.01e0  |  1.00e0  |
+|  299 | 5.6e1  |        | 5.57e1  |  5.55e1  |          |          |
+|  499 | 1.0e6  |7.43e1  | 8.13e2  |  3.25e2  |  1.02e2  |  2.68e3  |
+
+The iter-127 row is the post-restoration handoff:
+- y reset to 0 by `recompute_y_after_restoration` (Ipopt-default
+  `constr_mult_reset_threshold=0.0`, `src/ipm.rs:8123-8128`)
+- z reset to 1 by `update_bound_multipliers_after_restoration`'s
+  nuclear-reset branch (any multiplier > 1e3 → 1.0,
+  `src/ipm.rs:8328`) — fires because pre-resto |z|=3.5e7 > 1e3
+- mu carried over from pre-resto (state.mu.max(mu_min) =
+  max(0.1, 1e-11) = 0.1, `src/ipm.rs:8354`)
+
+After the reset, iters 128→499 stay stuck because the bound
+slacks at xL[1663-1700] sit at scale 1e6-1e7, and the reset z=1
+gives complementarity products s·z ≈ 1e7 — which the μ=0.1
+target cannot drive down. The barrier-error gate evaluates 488×,
+fires 0×.
+
+### What this confirms
+
+**The post-restoration handoff is correct against Ipopt 3.14.**
+The doc-comment at `src/ipm.rs:8095-8150` documents the exact
+match: `constr_mult_reset_threshold=0.0` is Ipopt's published
+default, and the nuclear z-reset for |z|>1e3 is the documented
+Ipopt behavior at `IpRestoMinC_1Nrm.cpp:374-419`. The handoff is
+doing the right thing **given catastrophically inflated
+multipliers**.
+
+### What this does NOT explain
+
+The handoff is downstream of the real bug. From the prior
+forward-walk: ripopt and Ipopt are **bit-identical for iters 0-110**.
+Ipopt enters restoration at iter 110 (matching the iter-110 LS
+divergence section above); ripopt continues normal stepping
+until iter 126 because the iter-110 LS accepted on an
+inverted-sign gBD (variable 533 barrier trap).
+
+Over iters 111-126, ripopt's solver takes 16 tiny steps that
+inflate the multipliers from O(1e3) to O(1e7). The nuclear
+reset at iter 127 is then unavoidable, and from there the run is
+dead.
+
+**The handoff is not the bug. Iter 110 is the bug.** Fixing
+iter 110 (so ripopt enters restoration at the same iter as
+Ipopt, with multipliers still O(1e3)) would let the handoff
+return to z=1 — but with bound slacks of O(1e3) instead of
+O(1e7), so s·z ≈ 1e3 vs μ=1e-1 ratio ~ 1e4 instead of 1e8,
+which is recoverable in O(20) outer iters as Ipopt demonstrates
+(iter 114 → 318 in 204 iters).
+
+### Follow-up
+
+The KKT-precision follow-up at the end of "2026-05-04 follow-up:
+filter contents are NOT the divergence driver" remains the
+correct next probe. Specifically: dump KKT residuals (r_x, r_c)
+and dx[533], dz_U[533] at iter 110 with the feral backend, then
+repeat with rmumps to isolate the linear-solver effect.
+
+**Refs**: /tmp/arki_probe.out (full trace);
+src/ipm.rs:8095-8372 (post-resto handoff); prior section
+"2026-05-04 follow-up: filter contents are NOT the divergence
+driver" (gBD sign inversion at iter 110).
+
+## 2026-05-04 KKT direction probe at iters 105-111 (var 533)
+
+Source: `RIPOPT_DX_PROBE=ITER,VAR` env-gated probe in
+`install_step_directions` at `src/ipm.rs:9678` (added this session).
+
+Trajectory of var 533 (the variable identified earlier as the
+barrier-trap source) across iters 105-111:
+
+| iter | x[533] | s_U     | dx[533]   | z_U[533] | dz_U[533] | \|dy_d\|∞ |
+|-----:|-------:|--------:|----------:|---------:|----------:|----------:|
+|  105 |   1341 | 1.11e-4 | +2.94e-5  |  2.68e5  | -1.96e5   |  8.31e6   |
+|  106 |   1341 | 1.03e-4 | +1.07e-4  |  1.37e5  | +5.98e3   |  3.82e6   |
+|  107 |   1341 | 8.69e-5 | +2.38e-5  |  1.43e5  | -1.02e5   |  1.12e7   |
+|  108 |   1341 | 8.09e-5 | +5.06e-5  |  1.22e5  | -4.46e4   |  2.72e6   |
+|  109 |   1341 | 7.98e-5 | -1.48e-2  |  7.76e4  | -1.45e7   |  1.44e7   |
+|  110 |   1341 | 8.31e-5 | **-9.53e2** | 7.76e2 | **-8.90e9** | **3.13e10** |
+|  111 |   1341 | 2.48e-3 | -1.34e3   |  7.76e0  | -4.19e6   |  3.06e12  |
+
+### Three quantitative findings
+
+**(A) z_U[533] decays at exactly the FTB floor.** At iters
+109→110 and 110→111, z_U drops by a factor of 100 each iter:
+7.76e4 → 7.76e2 → 7.76e0. With Ipopt's default `tau_min=0.99`,
+the dual fraction-to-boundary cap is `(1−τ)=0.01` — i.e., z can
+drop to at most 1% of its previous value per step. The exact 100×
+ratio means FTB is binding twice consecutively on this component.
+
+**(B) dz_U formula is consistent.** The augmented-system
+recovery `dz_U = -(z_U/s_U)·dx_U + μ/s_U − z_U` evaluates at
+iter 110 to `-(776/8.31e-5)·(953) + 0.1/8.31e-5 − 776 = −8.90e9`
+— an exact match to the probe's dz_U=-8.897e9. So the
+catastrophic dz_U is a faithful consequence of the catastrophic
+`dx[533]=-953`, not a bug in the dz recovery code.
+
+**(C) The catastrophic step is dx[533] itself.** At iters 105-108
+the KKT solve produced dx[533] in the range +1e-5 to +1e-4
+(microscopic, sane for a variable pinned at its upper bound).
+At iter 109 the magnitude jumps to -1.48e-2 (still small but
+sign flipped — moving away from U). At iter 110 it explodes to
+**-9.53e2** — a 71% relative move on a bound-pinned variable.
+
+### Cross-backend comparison was inconclusive
+
+`cargo build --release --no-default-features --features "rmumps faer"` and rerun:
+**rmumps backend exits at iter 0** with "Numerical Difficulties
+Encountered" — different early-iter behavior, so apples-to-apples
+iter-110 comparison wasn't possible. The iter-0 KKT failure is a
+separate backend issue worth investigating but does not bear on
+the iter-110 question.
+
+### What this means
+
+The bug is **upstream of the linear solve**. dx[533]=-953 is the
+solver's faithful response to whatever the iter-110 KKT RHS row
+533 demands — most likely a large dual residual (∇_x L)_533 that
+the linear solve translates into a large step. With z_U[533]=776
+and the barrier-term µ/s_U=1203 already fighting each other, any
+imbalance in the gradient or J^T y assembly at row 533 will
+produce a large dx and cascade into the dz_U=-O(z·dx/s)
+catastrophe.
+
+This narrows the next probe sharply: dump the KKT system's
+**RHS row 533** (the dual residual for var 533) at iters 109 and
+110, plus the diagonal Schur entry at row 533 (which controls
+how an RHS becomes a dx). If the RHS jumps by a factor of 1e4
+between iters 109 and 110, the bug is in residual assembly. If
+the RHS is smooth but the diagonal collapses, the bug is in the
+Hessian/regularization at that row.
+
+### Follow-up (this replaces the prior KKT-residual action item)
+
+1. **Dump RHS row 533 and diagonal at iters 109-110.** Add an
+   env-gated probe inside `assemble_kkt_from_state` (or wherever
+   the RHS is finalized, `src/ipm.rs:4606`) that prints
+   `rhs[533]` and the assembled diagonal Schur at row 533.
+2. **Also dump `state.grad_f[533]`, `(J^T y)_533`, `z_L[533]`,
+   `z_U[533]`, and `mu/s_L`, `mu/s_U`** at the same iters. The
+   four gradient components compose `r_x[533]`; whichever
+   component spikes is the source.
+3. **Compare iter-109 vs iter-110 component breakdowns.** A
+   single component that jumps by O(1e3) between consecutive
+   iters is the bug.
+
+**Refs**: `src/ipm.rs:9678` (probe site);
+`/tmp/arki_probe.out` (existing iter-N-probe output for context).
+
+## 2026-05-04 RESOLUTION: missing linear-system equilibration
+
+### What was wrong
+
+The augmented KKT system at iter 110 has rows that span 9+ orders of
+magnitude in scale. Variable 533 sits at `x = x_U = 1341` with
+`s_U = 8.31e-5`, giving `Σ_U = z_U/s_U ≈ 9.4e6` — a single diagonal
+entry that is 7+ orders larger than typical Hessian rows. Without
+row/column equilibration, the LDLᵀ factorization loses precision on
+that row. The IR loop cannot recover because the residual it iterates
+on is itself measured in the unscaled coordinate system.
+
+The faithful symptom: `dx[533] = -953` (a 71% relative move on a
+bound-pinned variable), which propagates via the dz recovery formula
+into `dz_U = -8.9e9` and `|dy_d|∞ = 3.13e10`. Probe code path:
+`src/ipm.rs:9675-9710` (RIPOPT_DX_PROBE).
+
+### What Ipopt does that ripopt was not
+
+Ipopt 3.14 has a `linear_system_scaling` option. Defaults by linear
+solver:
+
+  - MA27: `mc19` (Curtis-Reid iterative scaling)
+  - MA57: `slack-based`
+  - MUMPS: `none` (the only backend ripopt previously parroted)
+
+Confirmed by the ipopt-expert agent reading the Ipopt source.
+
+ripopt's main aug-path (`aug_step_from_state` in `src/kkt_aug.rs`)
+had **no equilibration at all** — the existing
+`kkt::factor_with_inertia_correction` had a `use_scaling` gate but it
+defaulted off and was only triggered as a failure-recovery fallback.
+
+### The fix (env-gated, working)
+
+`src/kkt_aug.rs:1050-1080`: added Ruiz equilibration around the
+factor/IR-solve. Calls `kkt::ruiz_equilibrate(&mut aug.matrix, &mut
+aug_rhs)` to compute symmetric `D · A · D` row/column scaling on the
+augmented matrix, scales the RHS in place, and unscales the solution
+after IR. Gated on `RIPOPT_RUIZ_AUG=1` for now.
+
+### Before/after on arki0003 (full run, max_iter=500)
+
+| metric                | baseline (no scaling) | RIPOPT_RUIZ_AUG=1   | Ipopt MA27 (ref) |
+|-----------------------|-----------------------|---------------------|------------------|
+| terminal status       | MaxIter               | MaxIter             | Optimal (318)    |
+| terminal obj          | 9.09e5                | **3.7952233e3**     | 3.7952233e3      |
+| terminal lg(mu)       | -1.0 (pinned)         | **-8.6**            | -                |
+| iter-110 dx[533]      | -953                  | **-24.7**           | (sane)           |
+| iter-110 x[533]       | 1341 (= x_U)          | **22.6 (interior)** | -                |
+| iter-110 dz_U[533]    | -8.9e9                | **-1.5e-4**         | -                |
+| iter-110 \|dy_d\|∞    | 3.13e10               | **663**             | -                |
+
+The objective matches Ipopt's converged value to printed precision.
+The remaining gap to "Optimal" status is dual feasibility:
+`inf_du = 1.75e7` (scaled) at iter 499, which prevents formal
+convergence at MaxIter — possibly resolvable with more iters or with
+`s_d` residual-scaling alignment.
+
+### Open work for the resume point
+
+1. **Promote `RIPOPT_RUIZ_AUG` env-gate to a real `SolverOptions`
+   field** (e.g., `linear_system_scaling: enum { None, Ruiz }` in
+   `src/options.rs`). Mirror Ipopt's `linear_system_scaling` option
+   semantics. Default value is the open question — see (2).
+
+2. **Default value decision needs a benchmark sweep.** Two reasonable
+   defaults:
+     - `None` (matches Ipopt's MUMPS-default; opt-in fix; zero
+       regression risk on the existing CUTEst suite)
+     - `Ruiz` (closer in spirit to Ipopt's MA27 default since `feral`
+       is a direct factorization, not iterative; fixes arki0003 out
+       of the box; needs benchmark sweep to confirm no per-iter
+       overhead regressions on currently-converging problems)
+   Recommendation: ship the option with `None` default first, run
+   `make benchmark` with `Ruiz`, flip the default in a follow-up
+   commit if the suite is clean.
+
+3. **Investigate residual dual infeasibility** with Ruiz on. With
+   the fix arki0003 reaches the right objective but `inf_du` stays
+   at 1.75e7 (scaled). Likely candidates: (a) `s_d` residual
+   normalization is being computed in unscaled coordinates and the
+   convergence test sees a bigger number than it should; (b) the IR
+   tolerance needs to be tightened in scaled coordinates; (c) just
+   needs more iterations.
+
+4. **Diagnose rmumps backend iter-0 NumericalDifficulties** on
+   arki0003. Cross-backend comparison was inconclusive because the
+   rmumps build exits before iter 1 on this problem. Separate issue,
+   not a blocker for the equilibration fix.
+
+5. **Decide whether to keep the diagnostic probes long-term.** The
+   `RIPOPT_FILTER_DUMP` (`src/ipm.rs:7505-7525`) and
+   `RIPOPT_DX_PROBE` (`src/ipm.rs:9675-9710`) probes added during
+   this investigation are env-gated (zero cost when off) and were
+   useful — recommend keeping until the Ruiz fix is fully promoted
+   and the residual dual-inf issue is resolved.
+
+### Files touched in this session
+
+  - `src/kkt_aug.rs:1050-1080` — Ruiz equilibration hook (env-gated).
+  - `src/ipm.rs:7505-7525` — `RIPOPT_FILTER_DUMP` env-gated diag.
+  - `src/ipm.rs:9675-9710` — `RIPOPT_DX_PROBE` env-gated diag.
+  - `examples/arki_probe2.rs` — env-controlled max_iter for probes.
+  - `docs/A8_FOLLOWUP_arki0003.md` — this document (5 appended
+    sections).
+
+### How to reproduce the fix
+
+```
+cargo build --release --example arki_probe2
+RIPOPT_RUIZ_AUG=1 RIPOPT_MAX_ITER=500 \
+  cargo run --release --example arki_probe2 > /tmp/arki_ruiz.out 2>&1
+grep -E '^[ ]*(0|100|200|300|400|499)\b' /tmp/arki_ruiz.out | tail -20
+```
+
+Expected terminal obj ≈ 3.795e3 (matches Ipopt). Without
+`RIPOPT_RUIZ_AUG=1`: terminal obj ≈ 9.09e5.
+
+## 2026-05-04 RESOLUTION REVISION: Ruiz reverted, real root cause is iter-110 LS acceptance
+
+The "Ruiz fix" above was reverted in a later iteration of this session.
+While it does produce the right terminal objective, it masks the actual
+bug rather than fixing it. With Ruiz on, ripopt's trajectory diverges
+from Ipopt's much earlier than iter 110 (e.g. obj at iter 105 = 3.97e5
+with Ruiz vs 1.19e7 bit-identical-with-Ipopt without Ruiz). The
+Ruiz-perturbed trajectory happens to converge but is not aligned with
+Ipopt's iterate path.
+
+### The iter-109 → 110 → 111 chain (root cause)
+
+Verified via env-gated probes (`RIPOPT_RHS_PROBE`, `RIPOPT_DX_PROBE`)
+in baseline ripopt (no Ruiz):
+
+**Iter 109 entry** for variable 533 (both bounds finite):
+- `x = x_U = 1341`, `s_U = 8.0e-5`, `s_L = 1341` (lower bound at -1e-8 floor)
+- `z_U = 7.76e4`, `z_L = 7.5e-5`
+- `z_U·s_U = 6.2` vs target `μ = 0.1` → 60× above target
+- `Sigma_x[533] = z_U/s_U = 9.72e8`
+- `J^T y = -9.6e4`, `grad_f = 0` (var not in objective)
+- `aug_rhs[533] = +9.77e4`
+- KKT solve produces `dx[533] = -0.015` (sane), `dz_U[533] = -1.45e7` (huge negative)
+
+**FTB binding at iter 109→110**: dual fraction-to-boundary `(1−τ_min)
+= 0.01` caps z_U descent. `α_du = (z_U − floor)/|dz_U| = (7.76e4 −
+776)/1.45e7 = 5.30e-3`, taking `z_U` from 7.76e4 to **exactly 776**
+(100× drop, FTB-saturated).
+
+**Iter 110 entry** for variable 533:
+- `s_U = 8.31e-5` (barely changed), `z_U = 776`
+- `Sigma_x[533] = z_U/s_U = 9.33e6` (collapsed 100× from 9.72e8)
+- `aug_rhs[533] = +9.46e4` (basically unchanged)
+- KKT solve produces `dx[533] = -953` (catastrophic, dominated by
+  off-diagonal H/J^T couplings since the diagonal is now 100× weaker)
+- `dz_U[533] = -8.9e9`
+
+**Iter 110 LS acceptance** (the actual bug):
+The KKT-derived FTB caps `α_p_max = 2.519e-6` (clipped by the huge
+dz_U). Ripopt's first LS trial:
+```
+α=2.519e-6 gBD=-1.544e6 Δφ=-18.3 Δθ=-0.99
+is_ft=true armijo=true suf_phi=true in_filter=true → ACCEPT
+```
+The trial moves the iterate by essentially nothing (`Δθ/θ = 2.5e-6`,
+~0.0001%) but Armijo passes because `Δφ = -18.3` is "very negative"
+relative to `η_φ·α·gBD = 1e-4 · 2.5e-6 · (-1.5e6) = -3.86e-4`.
+
+**Ipopt at the same iter rejects 4 backtracks then enters
+restoration.** Verified via earlier forward-walk diff in the section
+"2026-05-04 follow-up: filter contents are NOT the divergence
+driver". Both solvers are bit-identical to printed precision through
+iter 110, so the entry state for iter 110's LS is identical — the
+divergence is purely in LS acceptance.
+
+### What Ipopt does NOT do (verified via ipopt-expert agent)
+
+1. **Ipopt has no `kappa_sigma`-based clamp at iter 109's z_U.**
+   Default `kappa_sigma = 1e10` (`IpIpoptAlg.cpp:71-79`) gives clamp
+   range `[μ/(κσ·s), κσ·μ/s] = [1.25e-7, 1.25e13]`. `z_U = 7.76e4`
+   sits well inside. Ipopt is also not clamping here.
+
+2. **Ipopt has no "α_p_max small → restoration" trigger.**
+   `DetectTinyStep` (`IpBacktrackingLineSearch.cpp:1219-1279`) has
+   the OPPOSITE semantics: when `max|dx_i|/(1+|x_i|) ≤ 2.2e-15` and
+   constraint violation ≤ 1e-4, it ACCEPTS the FTB step unchecked
+   and bypasses the LS. It does not enter restoration. Restoration
+   is only entered when `α_primal ≤ α_min` AND no trial passed
+   (`IpBacktrackingLineSearch.cpp:740`).
+
+3. **Ipopt has no Sigma-collapse monitoring.** `curr_sigma_x`
+   (`IpIpoptCalculatedQuantities.cpp:3501-3525`) computes Sigma
+   lazily without comparison to prior iter.
+
+So Ipopt's restoration entry at iter 110 must be coming from **trial
+rejection by filter/Armijo on the very first trial**, not from any
+α-magnitude or Sigma-collapse guard.
+
+### The real divergence (open question)
+
+**Why does ripopt's first LS trial at iter 110 pass Armijo+filter
+when Ipopt's same trial gets rejected?**
+
+The candidate diff targets per ipopt-expert:
+- (a) `phi` (barrier objective) trial computation
+  — `IpIpoptCalculatedQuantities::trial_barrier_obj`
+- (b) `gBD = grad_phi^T · d` directional derivative
+  — `IpFilterLSAcceptor::CalcBarrierObjDerivative` (eqn 19)
+- (c) `alpha_min` formula (γθ, γφ, δ exponents)
+  — `IpFilterLSAcceptor.cpp:454-468`
+- (d) Filter contents — does ripopt's filter at iter 110 contain the
+  entries Ipopt's does that would reject this trial?
+
+The next concrete probe: run Ipopt on arki0003 with `print_level=12`
+to capture iter 110 first-trial values for `Δφ`, `gBD`, `α_min`, and
+filter membership; then diff against ripopt's existing probe outputs.
+If the values disagree, the disagreement IS the bug.
+
+### What was reverted in this session
+
+- `src/kkt_aug.rs`: the `RIPOPT_RUIZ_AUG` env-gated Ruiz hook (lines
+  1052-1080 of the prior diff). Removed because it masks the real
+  iter-110 LS acceptance bug rather than fixing it.
+
+### What was kept
+
+- `src/ipm.rs`: env-gated diagnostic probes that helped localize this
+  finding and remain useful for the next iteration:
+    - `RIPOPT_FILTER_DUMP=lo,hi` (filter contents per iter)
+    - `RIPOPT_DX_PROBE=ITER,VAR` (post-solve dx/dz dump)
+    - `RIPOPT_RHS_PROBE=ITER,VAR` (pre-solve aug-RHS component
+      breakdown)
+- `examples/arki_probe2.rs`: env-controlled `RIPOPT_MAX_ITER`.
+
+### Resume point: Task #18
+
+The next session should focus on task #18: diff ripopt vs Ipopt LS
+acceptance at iter 110 first trial. The ipopt-expert's recommendation
+(file:line citations in the agent transcript) is the starting point.
+
+**Key insight**: with Ruiz reverted, ripopt is once again bit-identical
+to Ipopt through iter 110. So the iter-110 LS acceptance test runs on
+identical input state in both solvers. Any difference in Δφ, gBD, or
+α_min is a bug in ripopt's implementation of those formulas.
