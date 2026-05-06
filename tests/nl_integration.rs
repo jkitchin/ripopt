@@ -467,6 +467,119 @@ fn nl_auxiliary_preprocessing_gate_fixture_matches_fallback() {
     );
 }
 
+struct Issue23Fixture {
+    name: &'static str,
+    nl: &'static str,
+}
+
+#[derive(Debug)]
+struct Issue23Metrics {
+    status: SolveStatus,
+    objective: f64,
+    constraint_violation: f64,
+    fallback: Option<String>,
+    iterations: usize,
+}
+
+fn solve_issue23_fixture(
+    fixture: &Issue23Fixture,
+    enable_preprocessing: bool,
+) -> (NlProblem, SolveResult) {
+    let data = parse_nl_file(fixture.nl).expect("parse issue-23 fixture");
+    let problem = NlProblem::from_nl_data(data).expect("build issue-23 fixture");
+    let options = SolverOptions {
+        print_level: 0,
+        enable_preprocessing,
+        early_stall_timeout: 0.0,
+        max_iter: 500,
+        tol: 1e-8,
+        ..SolverOptions::default()
+    };
+    let result = ripopt::solve(&problem, &options);
+    (problem, result)
+}
+
+fn issue23_metrics(problem: &NlProblem, result: &SolveResult) -> Issue23Metrics {
+    Issue23Metrics {
+        status: result.status,
+        objective: result.objective,
+        constraint_violation: max_constraint_violation(problem, &result.x),
+        fallback: result.diagnostics.fallback_used.clone(),
+        iterations: result.iterations,
+    }
+}
+
+#[test]
+fn nl_issue_23_executable_incidence_fixtures_compare_preprocessing() {
+    let fixtures = [
+        Issue23Fixture {
+            name: "tutorial_flow_density",
+            nl: include_str!("fixtures/issue_23/tutorial_flow_density.nl"),
+        },
+        Issue23Fixture {
+            name: "tutorial_flow_density_perturbed",
+            nl: include_str!("fixtures/issue_23/tutorial_flow_density_perturbed.nl"),
+        },
+    ];
+
+    for fixture in fixtures {
+        let (pre_problem, pre_result) = solve_issue23_fixture(&fixture, true);
+        let (fallback_problem, fallback_result) = solve_issue23_fixture(&fixture, false);
+        let preprocessed = issue23_metrics(&pre_problem, &pre_result);
+        let fallback = issue23_metrics(&fallback_problem, &fallback_result);
+
+        eprintln!(
+            "issue 23 {name}: preprocessing={preprocessed:?}, no_preprocessing={fallback:?}",
+            name = fixture.name
+        );
+
+        assert_eq!(
+            preprocessed.status,
+            SolveStatus::Optimal,
+            "{} preprocessing should solve",
+            fixture.name
+        );
+        assert_eq!(
+            fallback.status,
+            SolveStatus::Optimal,
+            "{} no-preprocessing path should solve",
+            fixture.name
+        );
+        assert!(
+            preprocessed.constraint_violation <= 1e-8,
+            "{} preprocessing full-space violation too large: {}",
+            fixture.name,
+            preprocessed.constraint_violation
+        );
+        assert!(
+            fallback.constraint_violation <= 1e-8,
+            "{} no-preprocessing full-space violation too large: {}",
+            fixture.name,
+            fallback.constraint_violation
+        );
+        assert_eq!(
+            preprocessed.fallback.as_deref(),
+            None,
+            "{} auxiliary preprocessing should not fall back",
+            fixture.name
+        );
+        assert!(
+            preprocessed.iterations <= fallback.iterations,
+            "{} preprocessing iterations {} should not exceed no-preprocessing {}",
+            fixture.name,
+            preprocessed.iterations,
+            fallback.iterations
+        );
+        assert!(
+            (preprocessed.objective - fallback.objective).abs() <= 1e-8,
+            "{} objective mismatch: preprocessing {} vs no-preprocessing {}",
+            fixture.name,
+            preprocessed.objective,
+            fallback.objective
+        );
+    }
+}
+
 fn max_constraint_violation<P: NlpProblem>(problem: &P, x: &[f64]) -> f64 {
     let m = problem.num_constraints();
     if m == 0 {

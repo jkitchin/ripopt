@@ -1,5 +1,6 @@
 /target
 __pycache__/
+.venv/
 
 # Build/install logs
 *.log
