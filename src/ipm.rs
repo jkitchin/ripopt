@@ -1706,6 +1706,43 @@ fn auxiliary_preprocessing_options(
     Some(attempt_opts)
 }
 
+fn auxiliary_reduced_solve_options(
+    options: &SolverOptions,
+    preprocess_opts: &SolverOptions,
+    reduced: &crate::auxiliary_preprocessing::AuxiliaryReducedProblem<'_>,
+    prep: &crate::preprocessing::PreprocessedProblem<'_>,
+    solve_start: Instant,
+) -> Option<SolverOptions> {
+    let mut reduced_opts = preprocess_opts.clone();
+    reduced_opts.enable_preprocessing = false;
+    reduced_opts.warm_start = false;
+    reduced_opts.warm_start_y = None;
+    reduced_opts.warm_start_z_l = None;
+    reduced_opts.warm_start_z_u = None;
+    let aux_x_scaling = options
+        .user_x_scaling
+        .as_ref()
+        .and_then(|scaling| reduced.reduced_x_scaling(scaling));
+    reduced_opts.user_x_scaling = aux_x_scaling
+        .as_ref()
+        .and_then(|scaling| prep.reduced_x_scaling(scaling));
+    let aux_g_scaling = options
+        .user_g_scaling
+        .as_ref()
+        .and_then(|scaling| reduced.reduced_g_scaling(scaling));
+    reduced_opts.user_g_scaling = aux_g_scaling
+        .as_ref()
+        .and_then(|scaling| prep.reduced_g_scaling(scaling));
+    if preprocess_opts.max_wall_time > 0.0 {
+        let remaining = preprocess_opts.max_wall_time - solve_start.elapsed().as_secs_f64();
+        if remaining <= 0.1 {
+            return None;
+        }
+        reduced_opts.max_wall_time = remaining;
+    }
+    Some(reduced_opts)
+}
+
 /// Auxiliary preprocessing attempt: solve block-triangular equality
 /// subsystems first, remove the solved auxiliary variables and equality rows,
 /// then run the existing preprocessing wrapper on the auxiliary-reduced
@@ -1790,33 +1827,11 @@ fn try_auxiliary_preprocessed_solve<P: NlpProblem>(
         );
     }
 
-    let mut reduced_opts = preprocess_opts.clone();
-    reduced_opts.enable_preprocessing = false;
-    reduced_opts.warm_start = false;
-    reduced_opts.warm_start_y = None;
-    reduced_opts.warm_start_z_l = None;
-    reduced_opts.warm_start_z_u = None;
-    let aux_x_scaling = options
-        .user_x_scaling
-        .as_ref()
-        .and_then(|scaling| reduced.reduced_x_scaling(scaling));
-    reduced_opts.user_x_scaling = aux_x_scaling
-        .as_ref()
-        .and_then(|scaling| prep.reduced_x_scaling(scaling));
-    let aux_g_scaling = options
-        .user_g_scaling
-        .as_ref()
-        .and_then(|scaling| reduced.reduced_g_scaling(scaling));
-    reduced_opts.user_g_scaling = aux_g_scaling
-        .as_ref()
-        .and_then(|scaling| prep.reduced_g_scaling(scaling));
-    if preprocess_opts.max_wall_time > 0.0 {
-        let remaining = preprocess_opts.max_wall_time - solve_start.elapsed().as_secs_f64();
-        if remaining <= 0.1 {
-            return AuxiliaryPreprocessAttempt::Failed;
-        }
-        reduced_opts.max_wall_time = remaining;
-    }
+    let Some(reduced_opts) =
+        auxiliary_reduced_solve_options(options, &preprocess_opts, &reduced, &prep, solve_start)
+    else {
+        return AuxiliaryPreprocessAttempt::Failed;
+    };
 
     let nested_result = solve(&prep, &reduced_opts);
     let auxiliary_result = prep.unmap_solution(&nested_result);
@@ -1837,6 +1852,134 @@ fn try_auxiliary_preprocessed_solve<P: NlpProblem>(
         rip_log!(
             "ripopt: Auxiliary-reduced solve failed ({:?}), retrying without auxiliary preprocessing",
             result.status,
+        );
+    }
+    AuxiliaryPreprocessAttempt::Failed
+}
+
+/// Auxiliary postsolve attempt: remove objective/inequality-independent
+/// equality recovery variables before the main solve, solve the reduced main
+/// NLP, then recover the removed variables from the equality subsystem in the
+/// context of the reduced solution.
+fn try_auxiliary_postsolve_solve<P: NlpProblem>(
+    problem: &P,
+    options: &SolverOptions,
+    solve_start: Instant,
+) -> AuxiliaryPreprocessAttempt {
+    let problem_dyn = problem as &dyn NlpProblem;
+    let candidates =
+        crate::auxiliary_preprocessing::find_postsolve_candidates(problem_dyn, options.auxiliary_tol);
+    if candidates.is_empty() {
+        return AuxiliaryPreprocessAttempt::NoCandidates;
+    }
+
+    let Some(preprocess_opts) = auxiliary_preprocessing_options(options, solve_start) else {
+        return AuxiliaryPreprocessAttempt::Failed;
+    };
+
+    let mut x_context = vec![0.0; problem.num_variables()];
+    problem.initial_point(&mut x_context);
+    let reduced =
+        match crate::auxiliary_preprocessing::AuxiliaryReducedProblem::new(problem_dyn, &candidates, x_context.clone())
+        {
+            Ok(reduced) if reduced.did_reduce() => reduced,
+            Ok(_) => return AuxiliaryPreprocessAttempt::Failed,
+            Err(err) => {
+                if options.print_level >= 5 {
+                    rip_log!("ripopt: Auxiliary postsolve skipped after reduction failure: {:?}", err);
+                }
+                return AuxiliaryPreprocessAttempt::Failed;
+            }
+        };
+
+    if options.print_level >= 5 {
+        rip_log!(
+            "ripopt: Auxiliary postsolve reduced problem: {} recovery vars, {} recovery constraints ({}x{} -> {}x{})",
+            reduced.num_fixed(),
+            reduced.num_removed_constraints(),
+            problem.num_variables(),
+            problem.num_constraints(),
+            reduced.num_variables(),
+            reduced.num_constraints(),
+        );
+    }
+
+    let prep = crate::preprocessing::PreprocessedProblem::new(&reduced as &dyn NlpProblem, options.bound_push);
+    if options.print_level >= 5 && prep.did_reduce() {
+        rip_log!(
+            "ripopt: Auxiliary postsolve nested preprocessing reduced problem: {} fixed vars, {} redundant constraints ({}x{} -> {}x{})",
+            prep.num_fixed(), prep.num_redundant(),
+            reduced.num_variables(), reduced.num_constraints(),
+            prep.num_variables(), prep.num_constraints(),
+        );
+    }
+
+    let Some(reduced_opts) =
+        auxiliary_reduced_solve_options(options, &preprocess_opts, &reduced, &prep, solve_start)
+    else {
+        return AuxiliaryPreprocessAttempt::Failed;
+    };
+
+    let nested_result = solve(&prep, &reduced_opts);
+    let auxiliary_result = prep.unmap_solution(&nested_result);
+    if !matches!(auxiliary_result.status, SolveStatus::Optimal) {
+        if options.print_level >= 5 {
+            rip_log!(
+                "ripopt: Auxiliary-postsolve reduced solve failed ({:?}), retrying without auxiliary postsolve",
+                auxiliary_result.status,
+            );
+        }
+        return AuxiliaryPreprocessAttempt::Failed;
+    }
+
+    let partial = reduced.unmap_solution_with_options(&auxiliary_result, options);
+    x_context = partial.x;
+    let outcome = match crate::auxiliary_preprocessing::solve_auxiliary_blocks_from(
+        problem_dyn,
+        &candidates,
+        &preprocess_opts,
+        solve_start,
+        &mut x_context,
+    ) {
+        Ok(outcome) if outcome.blocks_solved > 0 => outcome,
+        Ok(_) => return AuxiliaryPreprocessAttempt::Failed,
+        Err(err) => {
+            if options.print_level >= 5 {
+                rip_log!("ripopt: Auxiliary postsolve recovery failed: {:?}", err);
+            }
+            return AuxiliaryPreprocessAttempt::Failed;
+        }
+    };
+
+    if options.print_level >= 5 {
+        rip_log!(
+            "ripopt: Auxiliary postsolve recovered {} block(s), max residual {:.2e}",
+            outcome.blocks_solved,
+            outcome.max_residual,
+        );
+    }
+
+    let recovered_reduced =
+        match crate::auxiliary_preprocessing::AuxiliaryReducedProblem::new(problem_dyn, &candidates, outcome.x)
+        {
+            Ok(reduced) => reduced,
+            Err(err) => {
+                if options.print_level >= 5 {
+                    rip_log!("ripopt: Auxiliary postsolve skipped after recovery validation failure: {:?}", err);
+                }
+                return AuxiliaryPreprocessAttempt::Failed;
+            }
+        };
+    let mut result = recovered_reduced.unmap_solution_with_options(&auxiliary_result, options);
+    if let Some(validation) = validate_full_space_result(problem_dyn, &result, options) {
+        result.objective = validation.objective;
+        result.constraint_values = validation.constraints;
+        result.diagnostics.final_primal_inf = validation.primal_inf;
+        return AuxiliaryPreprocessAttempt::Solved(result);
+    }
+    if options.print_level >= 5 {
+        rip_log!(
+            "ripopt: Auxiliary-postsolve result validation failed, retrying without auxiliary postsolve"
         );
     }
     AuxiliaryPreprocessAttempt::Failed
@@ -1880,8 +2023,9 @@ fn try_standard_preprocessed_solve<P: NlpProblem>(
     None
 }
 
-/// Run preprocessing (auxiliary equality-block reduction first, otherwise
-/// fixed-variable and redundant-constraint elimination)
+/// Run preprocessing (presolve auxiliary equality-block reduction, postsolve
+/// auxiliary equality recovery, then fixed-variable and redundant-constraint
+/// elimination)
 /// and, if it reduces the problem, recursively `solve` the smaller problem
 /// then unmap the solution. Returns `Some(result)` only when the
 /// preprocessed solve reaches `Optimal`; otherwise returns `None` so the
@@ -1899,10 +2043,15 @@ fn try_preprocessed_solve<P: NlpProblem>(
         return None;
     }
 
-    match try_auxiliary_preprocessed_solve(problem, options, solve_start) {
+    if let AuxiliaryPreprocessAttempt::Solved(result) =
+        try_auxiliary_preprocessed_solve(problem, options, solve_start)
+    {
+        return Some(result);
+    }
+
+    match try_auxiliary_postsolve_solve(problem, options, solve_start) {
         AuxiliaryPreprocessAttempt::Solved(result) => Some(result),
-        AuxiliaryPreprocessAttempt::Failed => None,
-        AuxiliaryPreprocessAttempt::NoCandidates => {
+        AuxiliaryPreprocessAttempt::Failed | AuxiliaryPreprocessAttempt::NoCandidates => {
             try_standard_preprocessed_solve(problem, options, solve_start)
         }
     }

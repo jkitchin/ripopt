@@ -1107,6 +1107,112 @@ fn preprocessing_disabled_bypasses_auxiliary_preprocessing_in_solve() {
     assert!((result.x[1] - 2.0).abs() < 1e-5, "x={:?}", result.x);
 }
 
+struct PostsolveRecoveryProblem {
+    full_constraint_hessian_seen: Cell<bool>,
+}
+
+impl NlpProblem for PostsolveRecoveryProblem {
+    fn num_variables(&self) -> usize { 3 }
+    fn num_constraints(&self) -> usize { 1 }
+
+    fn bounds(&self, x_l: &mut [f64], x_u: &mut [f64]) {
+        x_l[0] = f64::NEG_INFINITY;
+        x_u[0] = f64::INFINITY;
+        x_l[1] = f64::NEG_INFINITY;
+        x_u[1] = f64::INFINITY;
+        x_l[2] = 4.0;
+        x_u[2] = 4.0;
+    }
+
+    fn constraint_bounds(&self, g_l: &mut [f64], g_u: &mut [f64]) {
+        g_l[0] = 0.0;
+        g_u[0] = 0.0;
+    }
+
+    fn initial_point(&self, x0: &mut [f64]) {
+        x0[0] = 0.5;
+        x0[1] = 0.0;
+        x0[2] = 4.0;
+    }
+
+    fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+        *obj = (x[0] - 3.0) * (x[0] - 3.0) + (x[2] - 4.0) * (x[2] - 4.0);
+        true
+    }
+
+    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
+        grad[0] = 2.0 * (x[0] - 3.0);
+        grad[1] = 0.0;
+        grad[2] = 2.0 * (x[2] - 4.0);
+        true
+    }
+
+    fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
+        g[0] = x[1] - x[0] * x[0];
+        true
+    }
+
+    fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+        (vec![0, 0], vec![0, 1])
+    }
+
+    fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
+        vals[0] = -2.0 * x[0];
+        vals[1] = 1.0;
+        true
+    }
+
+    fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+        (vec![0, 2], vec![0, 2])
+    }
+
+    fn hessian_values(
+        &self,
+        _x: &[f64],
+        _new_x: bool,
+        obj_factor: f64,
+        lambda: &[f64],
+        vals: &mut [f64],
+    ) -> bool {
+        if lambda.first().copied().unwrap_or(0.0).abs() > 1e-12 {
+            self.full_constraint_hessian_seen.set(true);
+        }
+        vals[0] = 2.0 * obj_factor - 2.0 * lambda.first().copied().unwrap_or(0.0);
+        vals[1] = 2.0 * obj_factor;
+        true
+    }
+}
+
+#[test]
+fn auxiliary_postsolve_recovers_equality_variable_after_reduced_solve() {
+    let problem = PostsolveRecoveryProblem {
+        full_constraint_hessian_seen: Cell::new(false),
+    };
+    let options = SolverOptions {
+        print_level: 0,
+        enable_preprocessing: true,
+        enable_al_fallback: false,
+        enable_sqp_fallback: false,
+        max_iter: 200,
+        tol: 1e-8,
+        ..SolverOptions::default()
+    };
+
+    let result = ripopt::solve(&problem, &options);
+
+    assert_eq!(result.status, SolveStatus::Optimal, "result={result:?}");
+    assert!((result.x[0] - 3.0).abs() < 1e-6, "x={:?}", result.x);
+    assert!((result.x[1] - 9.0).abs() < 1e-6, "x={:?}", result.x);
+    assert!((result.x[2] - 4.0).abs() < 1e-12, "x={:?}", result.x);
+    assert!(result.constraint_values[0].abs() < 1e-8);
+    assert_eq!(result.constraint_multipliers.len(), 1);
+    assert_eq!(result.bound_multipliers_lower.len(), 3);
+    assert!(
+        !problem.full_constraint_hessian_seen.get(),
+        "postsolve path should remove the recovery row from the main reduced solve"
+    );
+}
+
 #[derive(Debug)]
 struct AuxiliaryGateMetrics {
     status: SolveStatus,

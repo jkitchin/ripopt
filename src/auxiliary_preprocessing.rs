@@ -1208,6 +1208,52 @@ pub(crate) fn find_presolve_candidates(
         .collect()
 }
 
+#[allow(dead_code)]
+pub(crate) fn find_postsolve_candidates(
+    problem: &dyn NlpProblem,
+    tol: f64,
+) -> Vec<PresolveCandidate> {
+    let incidence = EqualityIncidence::from_problem(problem, tol);
+    if incidence.row_global.is_empty() {
+        return Vec::new();
+    }
+
+    let objective_independent = objective_independent_variables(problem, tol);
+    let inequality_coupled = variables_in_inequality_rows(problem, tol);
+    let selected_vars: Vec<_> = incidence
+        .var_adj_rows
+        .iter()
+        .enumerate()
+        .filter_map(|(var, rows)| {
+            (!rows.is_empty()
+                && objective_independent.get(var).copied().unwrap_or(false)
+                && !inequality_coupled.get(var).copied().unwrap_or(true))
+            .then_some(var)
+        })
+        .collect();
+    if selected_vars.is_empty() {
+        return Vec::new();
+    }
+
+    let mut selected_row = vec![false; incidence.row_adj_vars.len()];
+    for &var in &selected_vars {
+        for &row in &incidence.var_adj_rows[var] {
+            selected_row[row] = true;
+        }
+    }
+    let selected_rows: Vec<_> = selected_row
+        .iter()
+        .enumerate()
+        .filter_map(|(row, &selected)| selected.then_some(row))
+        .collect();
+
+    incidence
+        .connected_components(&selected_rows, &selected_vars)
+        .into_iter()
+        .filter_map(|component| postsolve_candidate_from_component(&incidence, component))
+        .collect()
+}
+
 fn presolve_candidate_from_component(
     incidence: &EqualityIncidence,
     component: EqualityBlock,
@@ -1225,6 +1271,26 @@ fn presolve_candidate_from_component(
     if !is_closed_equality_component(incidence, &local_rows, &component.vars) {
         return None;
     }
+
+    incidence
+        .block_triangular_decomposition(&local_rows, &component.vars)
+        .ok()
+        .map(|blocks| PresolveCandidate { blocks })
+}
+
+fn postsolve_candidate_from_component(
+    incidence: &EqualityIncidence,
+    component: EqualityBlock,
+) -> Option<PresolveCandidate> {
+    if component.rows.len() != component.vars.len() || component.rows.is_empty() {
+        return None;
+    }
+
+    let local_rows: Vec<_> = component
+        .rows
+        .iter()
+        .map(|&row| incidence.row_local_for_global[row])
+        .collect::<Option<_>>()?;
 
     incidence
         .block_triangular_decomposition(&local_rows, &component.vars)
@@ -1264,6 +1330,163 @@ fn is_closed_equality_component(
     })
 }
 
+fn variables_in_inequality_rows(problem: &dyn NlpProblem, tol: f64) -> Vec<bool> {
+    let n = problem.num_variables();
+    let m = problem.num_constraints();
+    let mut coupled = vec![false; n];
+    if n == 0 || m == 0 {
+        return coupled;
+    }
+
+    let mut g_l = vec![0.0; m];
+    let mut g_u = vec![0.0; m];
+    problem.constraint_bounds(&mut g_l, &mut g_u);
+
+    let (jac_rows, jac_cols) = problem.jacobian_structure();
+    for (&row, &col) in jac_rows.iter().zip(jac_cols.iter()) {
+        if row >= m || col >= n {
+            continue;
+        }
+        if !is_equality_bound(g_l[row], g_u[row], tol) {
+            coupled[col] = true;
+        }
+    }
+    coupled
+}
+
+fn objective_independent_variables(problem: &dyn NlpProblem, tol: f64) -> Vec<bool> {
+    let n = problem.num_variables();
+    let mut independent = vec![false; n];
+    if n == 0 {
+        return independent;
+    }
+
+    let mut x_l = vec![0.0; n];
+    let mut x_u = vec![0.0; n];
+    problem.bounds(&mut x_l, &mut x_u);
+
+    let mut x0 = vec![0.0; n];
+    problem.initial_point(&mut x0);
+
+    let mut obj0 = 0.0;
+    if !problem.objective(&x0, true, &mut obj0) || !obj0.is_finite() {
+        return independent;
+    }
+
+    let mut grad0 = vec![0.0; n];
+    if !problem.gradient(&x0, true, &mut grad0) {
+        return independent;
+    }
+
+    let grad_all = perturb_all_variables(&x0, &x_l, &x_u).and_then(|x_probe| {
+        let mut grad = vec![0.0; n];
+        problem
+            .gradient(&x_probe, true, &mut grad)
+            .then_some(grad)
+    });
+
+    let tol = tol.max(1e-10);
+    for var in 0..n {
+        if !near_zero(grad0[var], tol) {
+            continue;
+        }
+        if grad_all
+            .as_ref()
+            .is_some_and(|grad| !near_zero(grad[var], tol))
+        {
+            continue;
+        }
+
+        let Some(x_var) = perturb_single_variable(&x0, &x_l, &x_u, var) else {
+            continue;
+        };
+        let mut obj_var = 0.0;
+        if !problem.objective(&x_var, true, &mut obj_var) || !obj_var.is_finite() {
+            continue;
+        }
+        let obj_scale = obj0.abs().max(obj_var.abs()).max(1.0);
+        if (obj_var - obj0).abs() > tol * obj_scale {
+            continue;
+        }
+
+        let mut grad_var = vec![0.0; n];
+        if !problem.gradient(&x_var, true, &mut grad_var) || !near_zero(grad_var[var], tol) {
+            continue;
+        }
+
+        independent[var] = true;
+    }
+    independent
+}
+
+fn near_zero(value: f64, tol: f64) -> bool {
+    value.is_finite() && value.abs() <= tol
+}
+
+fn perturb_all_variables(x: &[f64], x_l: &[f64], x_u: &[f64]) -> Option<Vec<f64>> {
+    let mut out = x.to_vec();
+    let mut changed = false;
+    for i in 0..x.len() {
+        if let Some(value) = perturbed_value(x[i], x_l[i], x_u[i]) {
+            out[i] = value;
+            changed = true;
+        }
+    }
+    changed.then_some(out)
+}
+
+fn perturb_single_variable(
+    x: &[f64],
+    x_l: &[f64],
+    x_u: &[f64],
+    var: usize,
+) -> Option<Vec<f64>> {
+    let value = perturbed_value(x[var], x_l[var], x_u[var])?;
+    let mut out = x.to_vec();
+    out[var] = value;
+    Some(out)
+}
+
+fn perturbed_value(x: f64, lower: f64, upper: f64) -> Option<f64> {
+    if !x.is_finite() {
+        return None;
+    }
+    let scale = x.abs().max(1.0);
+    let min_disp = 1e-4 * scale;
+    let delta = 1.0 + 0.1 * x.abs();
+
+    for candidate in [x + delta, x - delta] {
+        if candidate_is_usable(candidate, x, lower, upper, min_disp) {
+            return Some(candidate);
+        }
+    }
+
+    if lower.is_finite() && upper.is_finite() && upper > lower {
+        for candidate in [
+            0.5 * (lower + upper),
+            lower + 0.25 * (upper - lower),
+            upper - 0.25 * (upper - lower),
+        ] {
+            if candidate_is_usable(candidate, x, lower, upper, min_disp) {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+fn candidate_is_usable(candidate: f64, x: f64, lower: f64, upper: f64, min_disp: f64) -> bool {
+    candidate.is_finite()
+        && (!lower.is_finite() || candidate >= lower)
+        && (!upper.is_finite() || candidate <= upper)
+        && (candidate - x).abs() >= min_disp
+}
+
+fn is_equality_bound(lower: f64, upper: f64, tol: f64) -> bool {
+    lower.is_finite() && upper.is_finite() && (lower - upper).abs() <= tol
+}
+
 #[derive(Debug, Clone, Copy)]
 enum BipartiteNode {
     Row(usize),
@@ -1285,7 +1508,7 @@ impl EqualityIncidence {
         let mut row_global = Vec::new();
         let mut row_local_for_global = vec![None; m_orig];
         for i in 0..m_orig {
-            if g_l[i].is_finite() && g_u[i].is_finite() && (g_l[i] - g_u[i]).abs() <= tol {
+            if is_equality_bound(g_l[i], g_u[i], tol) {
                 row_local_for_global[i] = Some(row_global.len());
                 row_global.push(i);
             }
@@ -4471,6 +4694,59 @@ mod tests {
                 }],
             }]
         );
+    }
+
+    #[test]
+    fn find_postsolve_candidates_allows_recovery_row_with_main_variable() {
+        let bounds = equality_bounds(1);
+        let problem = graph_problem_with_objective(2, &bounds, &[(0, 0), (0, 1)], &[0]);
+
+        let candidates = find_postsolve_candidates(&problem, TOL);
+
+        assert_eq!(
+            candidates,
+            vec![PresolveCandidate {
+                blocks: vec![EqualityBlock {
+                    rows: vec![0],
+                    vars: vec![1],
+                }],
+            }]
+        );
+    }
+
+    #[test]
+    fn find_postsolve_candidates_rejects_objective_dependent_variable() {
+        let bounds = equality_bounds(1);
+        let problem = graph_problem_with_objective(2, &bounds, &[(0, 1)], &[1]);
+
+        let candidates = find_postsolve_candidates(&problem, TOL);
+
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn find_postsolve_candidates_rejects_inequality_coupled_variable() {
+        let problem = graph_problem_with_objective(
+            2,
+            &[(0.0, 0.0), (0.0, 1.0)],
+            &[(0, 0), (0, 1), (1, 1)],
+            &[0],
+        );
+
+        let candidates = find_postsolve_candidates(&problem, TOL);
+
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn find_postsolve_candidates_rejects_ambiguous_feasibility_system() {
+        let bounds = equality_bounds(2);
+        let problem =
+            graph_problem_with_objective(2, &bounds, &[(0, 0), (0, 1), (1, 0), (1, 1)], &[0]);
+
+        let candidates = find_postsolve_candidates(&problem, TOL);
+
+        assert!(candidates.is_empty());
     }
 
     #[test]
