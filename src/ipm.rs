@@ -10635,33 +10635,6 @@ fn compute_avg_complementarity(state: &SolverState) -> f64 {
     }
 }
 
-/// Barrier-subproblem optimality error E_μ(x, λ, z), the gate that
-/// `update_barrier_parameter_fixed_mode` checks against
-/// `barrier_tol_factor * mu` to decide whether the current subproblem
-/// is "solved" enough to decrement μ. Mirrors Ipopt's
-/// `IpoptCalculatedQuantities::curr_barrier_error()`
-/// (`IpIpoptCalculatedQuantities.cpp:3148-3196`):
-///
-///   E_μ = max( ‖∇L‖_∞ / s_d,
-///              ‖c‖_∞,
-///              max_i |slack_i · z_i − μ| / s_c )
-///
-/// where `s_d`, `s_c` are the L1-mean multiplier scalings from
-/// `ComputeOptimalityErrorScaling` (`IpIpoptCalculatedQuantities.cpp:3663-3700`,
-/// `s_max = 100`). All three components use the L∞ norm; only s_d/s_c
-/// internally average over multiplier counts.
-///
-/// The previous ripopt implementation used L1/n on the dual term and
-/// the L1 mean on complementarity (instead of L∞), and added a
-/// `du_floor = 0.1 * unscaled_du` heuristic that had no Ipopt analogue
-/// and prevented μ from decreasing whenever NLP-level dual_inf was
-/// large — exactly the dual-stagnation symptom seen on arki0003 where
-/// μ froze at lg(μ)=2.83e-3 for 500+ iterations.
-fn compute_barrier_error(state: &SolverState) -> f64 {
-    let (e, _, _, _) = compute_barrier_error_components(state);
-    e
-}
-
 /// Print the largest-magnitude complementarity outliers to stderr.
 /// For diagnostics only; gated on `RIPOPT_TRACE_COMPL`.
 fn dump_compl_outliers(state: &SolverState) {
@@ -10704,8 +10677,23 @@ fn dump_compl_outliers(state: &SolverState) {
     }
 }
 
-/// Same as `compute_barrier_error` but also returns the (dual_err,
-/// compl_err, primal_err) triple. Used for diagnostics.
+/// Barrier-subproblem optimality error E_μ(x, λ, z), the gate that
+/// `update_barrier_parameter_fixed_mode` checks against
+/// `barrier_tol_factor * mu` to decide whether the current subproblem
+/// is "solved" enough to decrement μ. Mirrors Ipopt's
+/// `IpoptCalculatedQuantities::curr_barrier_error()`
+/// (`IpIpoptCalculatedQuantities.cpp:3148-3196`):
+///
+///   E_μ = max( ‖∇L‖_∞ / s_d,
+///              ‖c‖_∞,
+///              max_i |slack_i · z_i − μ| / s_c )
+///
+/// where `s_d`, `s_c` are the L1-mean multiplier scalings from
+/// `ComputeOptimalityErrorScaling` (`IpIpoptCalculatedQuantities.cpp:3663-3700`,
+/// `s_max = 100`). All three components use the L∞ norm; only s_d/s_c
+/// internally average over multiplier counts.
+///
+/// Returns `(E_μ, dual_err, compl_err, primal_err)` for diagnostics.
 fn compute_barrier_error_components(state: &SolverState) -> (f64, f64, f64, f64) {
     // ∇L = ∇f + J^T y − z_l + z_u (un-damped; matches
     // `curr_grad_lag_x` at IpIpoptCalculatedQuantities.cpp:1993-2030)
