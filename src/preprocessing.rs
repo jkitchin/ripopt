@@ -6,6 +6,7 @@
 //! - Variable bounds tightened from single-variable linear constraints
 
 use crate::problem::NlpProblem;
+use crate::reduction_frame::{ReductionFrame, RemovedMultiplierRecovery};
 use crate::result::SolveResult;
 
 /// NLP problem wrapper that eliminates fixed variables and redundant constraints.
@@ -14,14 +15,13 @@ use crate::result::SolveResult;
 /// when called from inside the generic `solve<P>`.
 pub struct PreprocessedProblem<'a> {
     inner: &'a dyn NlpProblem,
+    frame: ReductionFrame,
     n_orig: usize,
     m_orig: usize,
     /// Reduced variable index -> original variable index
     var_map: Vec<usize>,
     /// Reduced constraint index -> original constraint index
     constr_map: Vec<usize>,
-    /// Full-size vector with fixed values filled in (NaN for free variables)
-    fixed_values: Vec<f64>,
     /// Original variable index -> reduced variable index (None if fixed)
     _orig_to_reduced_var: Vec<Option<usize>>,
     /// Remapped Jacobian sparsity
@@ -396,13 +396,22 @@ impl<'a> PreprocessedProblem<'a> {
             }
         }
 
+        let frame = ReductionFrame::new(
+            n,
+            m,
+            var_map.clone(),
+            constr_map.clone(),
+            fixed_values.clone(),
+            RemovedMultiplierRecovery::None,
+        );
+
         PreprocessedProblem {
             inner,
+            frame,
             n_orig: n,
             m_orig: m,
             var_map,
             constr_map,
-            fixed_values,
             _orig_to_reduced_var: orig_to_reduced_var,
             jac_rows: jac_rows_new,
             jac_cols: jac_cols_new,
@@ -431,74 +440,25 @@ impl<'a> PreprocessedProblem<'a> {
     }
 
     pub(crate) fn reduced_x_scaling(&self, scaling: &[f64]) -> Option<Vec<f64>> {
-        if scaling.len() != self.n_orig {
-            return None;
-        }
-        Some(self.var_map.iter().map(|&orig| scaling[orig]).collect())
+        self.frame.reduced_x_scaling(scaling)
     }
 
     pub(crate) fn reduced_g_scaling(&self, scaling: &[f64]) -> Option<Vec<f64>> {
-        if scaling.len() != self.m_orig {
-            return None;
-        }
-        Some(self.constr_map.iter().map(|&orig| scaling[orig]).collect())
+        self.frame.reduced_g_scaling(scaling)
+    }
+
+    pub(crate) fn reduction_frame(&self) -> &ReductionFrame {
+        &self.frame
     }
 
     /// Build a full-size x vector from a reduced x vector.
     fn expand_x(&self, x_reduced: &[f64]) -> Vec<f64> {
-        let mut x_full = self.fixed_values.clone();
-        for (red_i, &orig_i) in self.var_map.iter().enumerate() {
-            x_full[orig_i] = x_reduced[red_i];
-        }
-        x_full
+        self.frame.expand_x(x_reduced)
     }
 
     /// Map the solution from the reduced problem back to the original problem dimensions.
     pub fn unmap_solution(&self, reduced: &SolveResult) -> SolveResult {
-        let n = self.n_orig;
-        let m = self.m_orig;
-
-        // Expand x
-        let x_full = self.expand_x(&reduced.x);
-
-        // Expand bound multipliers
-        let mut z_l_full = vec![0.0; n];
-        let mut z_u_full = vec![0.0; n];
-        for (red_i, &orig_i) in self.var_map.iter().enumerate() {
-            z_l_full[orig_i] = reduced.bound_multipliers_lower[red_i];
-            z_u_full[orig_i] = reduced.bound_multipliers_upper[red_i];
-        }
-
-        // Expand constraint multipliers and values
-        let mut y_full = vec![0.0; m];
-        let mut g_full = vec![0.0; m];
-
-        // Evaluate original constraints at the full solution
-        if m > 0 {
-            let _ = self.inner.constraints(&x_full, true, &mut g_full);
-        }
-
-        for (red_i, &orig_i) in self.constr_map.iter().enumerate() {
-            if red_i < reduced.constraint_multipliers.len() {
-                y_full[orig_i] = reduced.constraint_multipliers[red_i];
-            }
-        }
-
-        // Recompute objective at full solution
-        let mut obj = 0.0;
-        let _ = self.inner.objective(&x_full, true, &mut obj);
-
-        SolveResult {
-            x: x_full,
-            objective: obj,
-            constraint_multipliers: y_full,
-            bound_multipliers_lower: z_l_full,
-            bound_multipliers_upper: z_u_full,
-            constraint_values: g_full,
-            status: reduced.status,
-            iterations: reduced.iterations,
-            diagnostics: reduced.diagnostics.clone(),
-        }
+        self.frame.unmap_solution(self.inner, reduced)
     }
 }
 

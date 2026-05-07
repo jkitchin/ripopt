@@ -90,6 +90,7 @@ pub mod nl;
 pub mod options;
 pub mod preprocessing;
 pub mod problem;
+pub(crate) mod reduction_frame;
 pub mod restoration;
 pub mod restoration_nlp;
 pub mod result;
