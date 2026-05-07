@@ -1111,6 +1111,9 @@ fn auxiliary_solver_options(
 ) -> Option<SolverOptions> {
     let mut aux_options = options.clone();
     aux_options.enable_preprocessing = false;
+    // Keep top-level preprocessing diagnostics visible without dumping every
+    // internal block solve when the user asks for verbose solver output.
+    aux_options.print_level = 0;
     aux_options.warm_start = false;
     aux_options.warm_start_y = None;
     aux_options.warm_start_z_l = None;

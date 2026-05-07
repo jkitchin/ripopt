@@ -7188,28 +7188,39 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 let i = state.bound_layout.x_u_to_full[k];
                 grad_lag[i] += state.z_u_compressed[k];
             }
-            let (gl_idx, gl_inf) = grad_lag.iter().enumerate().fold(
-                (0usize, 0.0f64),
-                |(ai, av), (i, &v)| if v.abs() > av { (i, v.abs()) } else { (ai, av) },
-            );
-            let x_l_fin = state.x_l_at(gl_idx).is_finite();
-            let x_u_fin = state.x_u_at(gl_idx).is_finite();
             let x_inf = state.x.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
-            rip_log!(
-                "ripopt: iter0-probe: |grad_f|_inf={:.3e}@var{}, |J^T y|_inf={:.3e}, |y|_inf={:.3e}, |z_L|_inf={:.3e}, |z_U|_inf={:.3e}, sum|y|={:.3e}, sum|z_L|={:.3e}, sum|z_U|={:.3e}, |x|_inf={:.3e}, n={} m={}",
-                gf_inf, gf_inf_idx, jty_inf, y_inf, zl_inf, zu_inf, y_sum, zl_sum, zu_sum, x_inf, state.n, state.m
-            );
-            // Phase 6d.3: gl_idx may or may not have a compressed slot.
-            let zl_at_gl = state.bound_layout.full_to_x_l[gl_idx]
-                .map(|k| state.z_l_compressed[k])
-                .unwrap_or(0.0);
-            let zu_at_gl = state.bound_layout.full_to_x_u[gl_idx]
-                .map(|k| state.z_u_compressed[k])
-                .unwrap_or(0.0);
-            rip_log!(
-                "ripopt: iter0-probe: |grad_lag|_inf={:.3e}@var{} (grad_f={:.3e}, J^T y={:.3e}, z_L={:.3e}, z_U={:.3e}, x_l_fin={}, x_u_fin={}, obj_scaling={:.3e})",
-                gl_inf, gl_idx, state.grad_f[gl_idx], jty[gl_idx], zl_at_gl, zu_at_gl, x_l_fin, x_u_fin, state.obj_scaling
-            );
+            if state.n == 0 {
+                rip_log!(
+                    "ripopt: iter0-probe: |grad_f|_inf={:.3e}@var-, |J^T y|_inf={:.3e}, |y|_inf={:.3e}, |z_L|_inf={:.3e}, |z_U|_inf={:.3e}, sum|y|={:.3e}, sum|z_L|={:.3e}, sum|z_U|={:.3e}, |x|_inf={:.3e}, n={} m={}",
+                    gf_inf, jty_inf, y_inf, zl_inf, zu_inf, y_sum, zl_sum, zu_sum, x_inf, state.n, state.m
+                );
+                rip_log!(
+                    "ripopt: iter0-probe: |grad_lag|_inf=0.000e0@var- (empty variable space, obj_scaling={:.3e})",
+                    state.obj_scaling
+                );
+            } else {
+                let (gl_idx, gl_inf) = grad_lag.iter().enumerate().fold(
+                    (0usize, 0.0f64),
+                    |(ai, av), (i, &v)| if v.abs() > av { (i, v.abs()) } else { (ai, av) },
+                );
+                let x_l_fin = state.x_l_at(gl_idx).is_finite();
+                let x_u_fin = state.x_u_at(gl_idx).is_finite();
+                rip_log!(
+                    "ripopt: iter0-probe: |grad_f|_inf={:.3e}@var{}, |J^T y|_inf={:.3e}, |y|_inf={:.3e}, |z_L|_inf={:.3e}, |z_U|_inf={:.3e}, sum|y|={:.3e}, sum|z_L|={:.3e}, sum|z_U|={:.3e}, |x|_inf={:.3e}, n={} m={}",
+                    gf_inf, gf_inf_idx, jty_inf, y_inf, zl_inf, zu_inf, y_sum, zl_sum, zu_sum, x_inf, state.n, state.m
+                );
+                // Phase 6d.3: gl_idx may or may not have a compressed slot.
+                let zl_at_gl = state.bound_layout.full_to_x_l[gl_idx]
+                    .map(|k| state.z_l_compressed[k])
+                    .unwrap_or(0.0);
+                let zu_at_gl = state.bound_layout.full_to_x_u[gl_idx]
+                    .map(|k| state.z_u_compressed[k])
+                    .unwrap_or(0.0);
+                rip_log!(
+                    "ripopt: iter0-probe: |grad_lag|_inf={:.3e}@var{} (grad_f={:.3e}, J^T y={:.3e}, z_L={:.3e}, z_U={:.3e}, x_l_fin={}, x_u_fin={}, obj_scaling={:.3e})",
+                    gl_inf, gl_idx, state.grad_f[gl_idx], jty[gl_idx], zl_at_gl, zu_at_gl, x_l_fin, x_u_fin, state.obj_scaling
+                );
+            }
 
             // Per-component multiplier dump for diffing against Ipopt's
             // file_print_level=8 output (curr_y_c / curr_y_d / curr_z_L /
@@ -11772,6 +11783,66 @@ mod tests {
         }
     }
 
+    struct AuxEliminatesAllProblem;
+
+    impl NlpProblem for AuxEliminatesAllProblem {
+        fn num_variables(&self) -> usize { 1 }
+        fn num_constraints(&self) -> usize { 1 }
+
+        fn bounds(&self, x_l: &mut [f64], x_u: &mut [f64]) {
+            x_l[0] = f64::NEG_INFINITY;
+            x_u[0] = f64::INFINITY;
+        }
+
+        fn constraint_bounds(&self, g_l: &mut [f64], g_u: &mut [f64]) {
+            g_l[0] = 0.0;
+            g_u[0] = 0.0;
+        }
+
+        fn initial_point(&self, x0: &mut [f64]) {
+            x0[0] = 0.0;
+        }
+
+        fn objective(&self, _x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+            *obj = 0.0;
+            true
+        }
+
+        fn gradient(&self, _x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
+            grad[0] = 0.0;
+            true
+        }
+
+        fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
+            g[0] = x[0] - 2.0;
+            true
+        }
+
+        fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            (vec![0], vec![0])
+        }
+
+        fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
+            vals[0] = 1.0;
+            true
+        }
+
+        fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            (Vec::new(), Vec::new())
+        }
+
+        fn hessian_values(
+            &self,
+            _x: &[f64],
+            _new_x: bool,
+            _obj_factor: f64,
+            _lambda: &[f64],
+            _vals: &mut [f64],
+        ) -> bool {
+            true
+        }
+    }
+
     unsafe extern "C" fn capture_log(msg: *const c_char, user_data: *mut c_void) {
         let logs = &mut *(user_data as *mut Vec<String>);
         logs.push(CStr::from_ptr(msg).to_string_lossy().into_owned());
@@ -11924,6 +11995,24 @@ mod tests {
             "expected auxiliary preprocessing logs at print_level 5: {:?}",
             verbose
         );
+    }
+
+    #[test]
+    fn verbose_auxiliary_preprocessing_handles_empty_reduced_problem() {
+        let problem = AuxEliminatesAllProblem;
+        let options = SolverOptions {
+            print_level: 5,
+            enable_preprocessing: true,
+            max_iter: 100,
+            ..SolverOptions::default()
+        };
+
+        let result = try_preprocessed_solve(&problem, &options, Instant::now())
+            .expect("auxiliary preprocessing should solve the reduced empty problem");
+
+        assert_eq!(result.status, SolveStatus::Optimal);
+        assert!((result.x[0] - 2.0).abs() < 1e-10);
+        assert!(result.diagnostics.final_primal_inf < 1e-10);
     }
 
     /// Phase 3f test helper: replace the constraint bounds on a
