@@ -1578,9 +1578,13 @@ pub(crate) fn find_postsolve_candidates_with_diagnostics(
 
     let mut candidates = Vec::new();
     for component in components {
-        if let Some(candidate) =
-            postsolve_candidate_from_component(&incidence, component, &mut diagnostics)
-        {
+        if let Some(candidate) = postsolve_candidate_from_component(
+            &incidence,
+            component,
+            &objective_independent,
+            &inequality_coupled,
+            &mut diagnostics,
+        ) {
             candidates.push(candidate);
         }
     }
@@ -1683,6 +1687,8 @@ fn classify_auxiliary_coupling(
 fn postsolve_candidate_from_component(
     incidence: &EqualityIncidence,
     component: EqualityBlock,
+    objective_independent: &[bool],
+    inequality_coupled: &[bool],
     diagnostics: &mut AuxiliaryCandidateDiagnostics,
 ) -> Option<PresolveCandidate> {
     if component.rows.is_empty() || component.vars.is_empty() {
@@ -1715,6 +1721,10 @@ fn postsolve_candidate_from_component(
     if is_closed_equality_component(incidence, &local_rows, &component.vars) {
         diagnostics.closed_components += 1;
     }
+
+    let coupling =
+        classify_auxiliary_coupling(&component, objective_independent, inequality_coupled);
+    diagnostics.record_coupling_class(coupling);
 
     match incidence.block_triangular_decomposition(&local_rows, &component.vars) {
         Ok(blocks) => {
@@ -5171,7 +5181,8 @@ mod tests {
         let bounds = equality_bounds(1);
         let problem = graph_problem_with_objective(2, &bounds, &[(0, 0), (0, 1)], &[0]);
 
-        let candidates = find_postsolve_candidates(&problem, TOL);
+        let (candidates, diagnostics) =
+            find_postsolve_candidates_with_diagnostics(&problem, TOL);
 
         assert_eq!(
             candidates,
@@ -5182,6 +5193,10 @@ mod tests {
                 }],
             }]
         );
+        assert_eq!(diagnostics.pure_equality_candidates, 1);
+        assert_eq!(diagnostics.objective_coupled_candidates, 0);
+        assert_eq!(diagnostics.inequality_coupled_candidates, 0);
+        assert_eq!(diagnostics.objective_and_inequality_coupled_candidates, 0);
     }
 
     #[test]
