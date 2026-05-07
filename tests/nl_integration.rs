@@ -523,6 +523,7 @@ fn nl_issue_23_executable_incidence_fixtures_compare_preprocessing() {
         let (fallback_problem, fallback_result) = solve_issue23_fixture(&fixture, false);
         let preprocessed = issue23_metrics(&pre_problem, &pre_result);
         let fallback = issue23_metrics(&fallback_problem, &fallback_result);
+        let presolve = &pre_result.diagnostics.preprocessing.presolve;
 
         eprintln!(
             "issue 23 {name}: preprocessing={preprocessed:?}, no_preprocessing={fallback:?}",
@@ -572,6 +573,35 @@ fn nl_issue_23_executable_incidence_fixtures_compare_preprocessing() {
             fixture.name,
             preprocessed.objective,
             fallback.objective
+        );
+        assert!(presolve.attempted, "{} should profile presolve", fixture.name);
+        assert!(presolve.solved, "{} should solve via presolve", fixture.name);
+        assert!(
+            presolve.candidates > 0,
+            "{} should report auxiliary candidates",
+            fixture.name
+        );
+        assert!(
+            presolve.auxiliary_blocks_solved > 0,
+            "{} should report auxiliary block solves",
+            fixture.name
+        );
+        assert_eq!(presolve.original_variables, pre_problem.num_variables());
+        assert_eq!(presolve.original_constraints, pre_problem.num_constraints());
+        assert!(
+            presolve.reduced_variables < presolve.original_variables,
+            "{} should report variable reduction",
+            fixture.name
+        );
+        assert!(
+            presolve.removed_constraints > 0,
+            "{} should report constraint reduction",
+            fixture.name
+        );
+        assert!(
+            !presolve.accepted_block_sizes.is_empty(),
+            "{} should report accepted block sizes",
+            fixture.name
         );
     }
 }
@@ -1054,6 +1084,22 @@ fn cli_writes_validated_json_report() {
 
     // Options are echoed back so the run can be reproduced.
     assert_eq!(v["options"]["print_level"], 0);
+    assert!(
+        v["diagnostics"]["preprocessing"].is_object(),
+        "JSON report should include preprocessing diagnostics"
+    );
+    assert_eq!(
+        v["diagnostics"]["preprocessing"]["presolve"]["attempted"],
+        true
+    );
+    assert_eq!(
+        v["diagnostics"]["preprocessing"]["standard"]["attempted"],
+        true
+    );
+    assert_eq!(
+        v["diagnostics"]["preprocessing"]["standard"]["did_reduce"],
+        false
+    );
 
     let _ = std::fs::remove_file(&tmp);
     let _ = std::fs::remove_file(&json_path);

@@ -480,6 +480,7 @@ Key options (all have Ipopt-matching defaults):
 - `constraint_values` -- constraint values g(x*)
 - `status` -- one of: `Optimal`, `Infeasible`, `LocalInfeasibility`, `MaxIterations`, `NumericalError`, `Unbounded`, `RestorationFailed`, `InternalError`
 - `iterations` -- number of IPM iterations
+- `diagnostics` -- `SolverDiagnostics`, including residuals, timing/evaluation counters, fallback information, and nested `diagnostics.preprocessing` phase data. The same diagnostics object is included in CLI JSON reports.
 
 ## C API
 

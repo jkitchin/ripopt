@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::convergence::{self, ConvergenceInfo, ConvergenceStatus};
@@ -82,7 +83,10 @@ use crate::options::SolverOptions;
 use crate::problem::NlpProblem;
 use crate::trace;
 use crate::restoration_nlp::RestorationNlp;
-use crate::result::{SolveResult, SolverDiagnostics, SolveStatus};
+use crate::result::{
+    AuxiliaryPreprocessingDiagnostics, PreprocessingDiagnostics, PreprocessingRejectionCount,
+    SolveResult, SolverDiagnostics, SolveStatus, StandardPreprocessingDiagnostics,
+};
 use crate::warmstart::WarmStartInitializer;
 use crate::logging::rip_log;
 
@@ -2237,6 +2241,67 @@ enum AuxiliaryPreprocessAttempt {
     Failed,
 }
 
+fn copy_auxiliary_candidate_diagnostics(
+    target: &mut AuxiliaryPreprocessingDiagnostics,
+    candidate_count: usize,
+    diagnostics: &crate::auxiliary_preprocessing::AuxiliaryCandidateDiagnostics,
+) {
+    target.equality_rows = diagnostics.equality_rows;
+    target.incident_variables = diagnostics.incident_variables;
+    target.connected_components = diagnostics.connected_components;
+    target.square_components = diagnostics.square_components;
+    target.closed_components = diagnostics.closed_components;
+    target.candidates = candidate_count;
+    target.pure_equality_candidates = diagnostics.pure_equality_candidates;
+    target.objective_coupled_candidates = diagnostics.objective_coupled_candidates;
+    target.inequality_coupled_candidates = diagnostics.inequality_coupled_candidates;
+    target.objective_and_inequality_coupled_candidates =
+        diagnostics.objective_and_inequality_coupled_candidates;
+    target.btd_blocks = diagnostics.btd_blocks;
+    target.rank_accepted_blocks = diagnostics.rank_accepted_blocks;
+    target.rejected_blocks = diagnostics.rejected_blocks();
+    target.accepted_block_sizes = diagnostics.accepted_block_sizes();
+    target.incidence_time_secs = diagnostics.incidence_time_secs;
+    target.structural_analysis_time_secs = diagnostics.structural_analysis_time_secs;
+    target.candidate_filter_time_secs = diagnostics.candidate_filter_time_secs;
+
+    let mut rejection_counts = BTreeMap::<String, usize>::new();
+    for rejection in &diagnostics.rejections {
+        *rejection_counts
+            .entry(rejection.reason.label().to_string())
+            .or_insert(0) += 1;
+    }
+    target.rejection_counts = rejection_counts
+        .into_iter()
+        .map(|(reason, count)| PreprocessingRejectionCount { reason, count })
+        .collect();
+}
+
+fn copy_auxiliary_solve_outcome(
+    target: &mut AuxiliaryPreprocessingDiagnostics,
+    outcome: &crate::auxiliary_preprocessing::AuxiliarySolveOutcome,
+) {
+    target.auxiliary_blocks_solved = outcome.blocks_solved;
+    target.auxiliary_max_residual = outcome.max_residual;
+    target.auxiliary_iterations = outcome.total_iterations;
+    target.auxiliary_wall_time_secs = outcome.total_wall_time_secs;
+    target.auxiliary_obj_evals = outcome.total_obj_evals;
+    target.auxiliary_grad_evals = outcome.total_grad_evals;
+    target.auxiliary_constr_evals = outcome.total_constr_evals;
+    target.auxiliary_jac_evals = outcome.total_jac_evals;
+    target.auxiliary_hess_evals = outcome.total_hess_evals;
+}
+
+fn finish_auxiliary_diagnostics(
+    target: &mut AuxiliaryPreprocessingDiagnostics,
+    candidate_count: usize,
+    diagnostics: &crate::auxiliary_preprocessing::AuxiliaryCandidateDiagnostics,
+    started: Instant,
+) {
+    copy_auxiliary_candidate_diagnostics(target, candidate_count, diagnostics);
+    target.total_time_secs += started.elapsed().as_secs_f64();
+}
+
 struct FullSpaceValidation {
     objective: f64,
     constraints: Vec<f64>,
@@ -2402,17 +2467,25 @@ fn try_auxiliary_preprocessed_solve<P: NlpProblem>(
     problem: &P,
     options: &SolverOptions,
     solve_start: Instant,
+    phase: &mut AuxiliaryPreprocessingDiagnostics,
 ) -> AuxiliaryPreprocessAttempt {
+    phase.attempted = true;
+    phase.original_variables = problem.num_variables();
+    phase.original_constraints = problem.num_constraints();
+    let phase_start = Instant::now();
     let problem_dyn = problem as &dyn NlpProblem;
+    let candidate_start = Instant::now();
     let (candidates, mut diagnostics) =
         crate::auxiliary_preprocessing::find_presolve_candidates_with_diagnostics(
             problem_dyn,
             options.auxiliary_tol,
         );
+    phase.candidate_detection_time_secs += candidate_start.elapsed().as_secs_f64();
     if candidates.is_empty() {
         if options.print_level >= 5 && diagnostics.equality_rows > 0 {
             diagnostics.log_verbose("Auxiliary preprocessing");
         }
+        finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
         return AuxiliaryPreprocessAttempt::NoCandidates;
     }
 
@@ -2424,9 +2497,12 @@ fn try_auxiliary_preprocessed_solve<P: NlpProblem>(
         if options.print_level >= 5 {
             diagnostics.log_verbose("Auxiliary preprocessing");
         }
+        phase.failed = true;
+        finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
         return AuxiliaryPreprocessAttempt::Failed;
     };
 
+    let auxiliary_solve_start = Instant::now();
     let outcome =
         match crate::auxiliary_preprocessing::solve_auxiliary_blocks(
             problem_dyn,
@@ -2444,6 +2520,9 @@ fn try_auxiliary_preprocessed_solve<P: NlpProblem>(
                 if options.print_level >= 5 {
                     diagnostics.log_verbose("Auxiliary preprocessing");
                 }
+                phase.auxiliary_solve_time_secs += auxiliary_solve_start.elapsed().as_secs_f64();
+                phase.failed = true;
+                finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
                 return AuxiliaryPreprocessAttempt::Failed;
             }
             Err(err) => {
@@ -2452,9 +2531,14 @@ fn try_auxiliary_preprocessed_solve<P: NlpProblem>(
                     diagnostics.log_verbose("Auxiliary preprocessing");
                     rip_log!("ripopt: Auxiliary preprocessing skipped after failure: {:?}", err);
                 }
+                phase.auxiliary_solve_time_secs += auxiliary_solve_start.elapsed().as_secs_f64();
+                phase.failed = true;
+                finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
                 return AuxiliaryPreprocessAttempt::Failed;
             }
         };
+    phase.auxiliary_solve_time_secs += auxiliary_solve_start.elapsed().as_secs_f64();
+    copy_auxiliary_solve_outcome(phase, &outcome);
     let blocks_solved = outcome.blocks_solved;
     let max_residual = outcome.max_residual;
 
@@ -2466,14 +2550,21 @@ fn try_auxiliary_preprocessed_solve<P: NlpProblem>(
         );
     }
 
+    let reduction_start = Instant::now();
     let reduced =
         match crate::auxiliary_preprocessing::AuxiliaryReducedProblem::new(problem_dyn, &candidates, outcome.x)
         {
             Ok(reduced) if reduced.did_reduce() => {
                 diagnostics.record_rank_accepted_candidates(&candidates);
+                phase.reduction_build_time_secs += reduction_start.elapsed().as_secs_f64();
+                phase.reduced_variables = reduced.num_variables();
+                phase.reduced_constraints = reduced.num_constraints();
+                phase.removed_variables = reduced.num_fixed();
+                phase.removed_constraints = reduced.num_removed_constraints();
                 reduced
             }
             Ok(_) => {
+                phase.reduction_build_time_secs += reduction_start.elapsed().as_secs_f64();
                 diagnostics.reject_global(
                     crate::auxiliary_preprocessing::AuxiliaryRejectionReason::ReductionDidNotRemoveAnything,
                     None,
@@ -2481,14 +2572,19 @@ fn try_auxiliary_preprocessed_solve<P: NlpProblem>(
                 if options.print_level >= 5 {
                     diagnostics.log_verbose("Auxiliary preprocessing");
                 }
+                phase.failed = true;
+                finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
                 return AuxiliaryPreprocessAttempt::Failed;
             }
             Err(err) => {
+                phase.reduction_build_time_secs += reduction_start.elapsed().as_secs_f64();
                 diagnostics.record_auxiliary_error(&err, options.auxiliary_tol);
                 if options.print_level >= 5 {
                     diagnostics.log_verbose("Auxiliary preprocessing");
                     rip_log!("ripopt: Auxiliary preprocessing skipped after reduction failure: {:?}", err);
                 }
+                phase.failed = true;
+                finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
                 return AuxiliaryPreprocessAttempt::Failed;
             }
         };
@@ -2506,7 +2602,13 @@ fn try_auxiliary_preprocessed_solve<P: NlpProblem>(
         );
     }
 
+    let nested_preprocessing_start = Instant::now();
     let prep = crate::preprocessing::PreprocessedProblem::new(&reduced as &dyn NlpProblem, options.bound_push);
+    phase.nested_preprocessing_time_secs += nested_preprocessing_start.elapsed().as_secs_f64();
+    phase.nested_reduced_variables = prep.num_variables();
+    phase.nested_reduced_constraints = prep.num_constraints();
+    phase.nested_fixed_variables = prep.num_fixed();
+    phase.nested_redundant_constraints = prep.num_redundant();
     if options.print_level >= 5 && prep.did_reduce() {
         rip_log!(
             "ripopt: Auxiliary nested preprocessing reduced problem: {} fixed vars, {} redundant constraints ({}x{} -> {}x{})",
@@ -2526,20 +2628,31 @@ fn try_auxiliary_preprocessed_solve<P: NlpProblem>(
         if options.print_level >= 5 {
             diagnostics.log_verbose("Auxiliary preprocessing");
         }
+        phase.failed = true;
+        finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
         return AuxiliaryPreprocessAttempt::Failed;
     };
 
+    let reduced_solve_start = Instant::now();
     let nested_result = solve(&prep, &reduced_opts);
+    phase.reduced_solve_time_secs += reduced_solve_start.elapsed().as_secs_f64();
+    let unmap_start = Instant::now();
     let stack = crate::reduction_frame::ReductionStack::new()
         .push(prep.reduction_frame(), &reduced as &dyn NlpProblem)
         .push(reduced.reduction_frame(), problem_dyn);
     let mut result = stack.unmap_solution_with_options(&nested_result, Some(options));
+    phase.unmap_time_secs += unmap_start.elapsed().as_secs_f64();
     if matches!(result.status, SolveStatus::Optimal) {
-        if let Some(validation) = validate_full_space_result(problem_dyn, &result, options) {
+        let validation_start = Instant::now();
+        let validation = validate_full_space_result(problem_dyn, &result, options);
+        phase.full_space_validation_time_secs += validation_start.elapsed().as_secs_f64();
+        if let Some(validation) = validation {
             result.objective = validation.objective;
             result.constraint_values = validation.constraints;
             result.diagnostics.final_primal_inf = validation.primal_inf;
             result.diagnostics.final_dual_inf = validation.dual_inf;
+            phase.solved = true;
+            finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
             return AuxiliaryPreprocessAttempt::Solved(result);
         }
         diagnostics.reject_global(
@@ -2567,6 +2680,8 @@ fn try_auxiliary_preprocessed_solve<P: NlpProblem>(
             );
         }
     }
+    phase.failed = true;
+    finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
     AuxiliaryPreprocessAttempt::Failed
 }
 
@@ -2578,17 +2693,25 @@ fn try_auxiliary_postsolve_solve<P: NlpProblem>(
     problem: &P,
     options: &SolverOptions,
     solve_start: Instant,
+    phase: &mut AuxiliaryPreprocessingDiagnostics,
 ) -> AuxiliaryPreprocessAttempt {
+    phase.attempted = true;
+    phase.original_variables = problem.num_variables();
+    phase.original_constraints = problem.num_constraints();
+    let phase_start = Instant::now();
     let problem_dyn = problem as &dyn NlpProblem;
+    let candidate_start = Instant::now();
     let (candidates, mut diagnostics) =
         crate::auxiliary_preprocessing::find_postsolve_candidates_with_diagnostics(
             problem_dyn,
             options.auxiliary_tol,
         );
+    phase.candidate_detection_time_secs += candidate_start.elapsed().as_secs_f64();
     if candidates.is_empty() {
         if options.print_level >= 5 && diagnostics.equality_rows > 0 {
             diagnostics.log_verbose("Auxiliary postsolve");
         }
+        finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
         return AuxiliaryPreprocessAttempt::NoCandidates;
     }
 
@@ -2600,19 +2723,28 @@ fn try_auxiliary_postsolve_solve<P: NlpProblem>(
         if options.print_level >= 5 {
             diagnostics.log_verbose("Auxiliary postsolve");
         }
+        phase.failed = true;
+        finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
         return AuxiliaryPreprocessAttempt::Failed;
     };
 
     let mut x_context = vec![0.0; problem.num_variables()];
     problem.initial_point(&mut x_context);
+    let reduction_start = Instant::now();
     let reduced =
         match crate::auxiliary_preprocessing::AuxiliaryReducedProblem::new(problem_dyn, &candidates, x_context.clone())
         {
             Ok(reduced) if reduced.did_reduce() => {
                 diagnostics.record_rank_accepted_candidates(&candidates);
+                phase.reduction_build_time_secs += reduction_start.elapsed().as_secs_f64();
+                phase.reduced_variables = reduced.num_variables();
+                phase.reduced_constraints = reduced.num_constraints();
+                phase.removed_variables = reduced.num_fixed();
+                phase.removed_constraints = reduced.num_removed_constraints();
                 reduced
             }
             Ok(_) => {
+                phase.reduction_build_time_secs += reduction_start.elapsed().as_secs_f64();
                 diagnostics.reject_global(
                     crate::auxiliary_preprocessing::AuxiliaryRejectionReason::ReductionDidNotRemoveAnything,
                     None,
@@ -2620,14 +2752,19 @@ fn try_auxiliary_postsolve_solve<P: NlpProblem>(
                 if options.print_level >= 5 {
                     diagnostics.log_verbose("Auxiliary postsolve");
                 }
+                phase.failed = true;
+                finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
                 return AuxiliaryPreprocessAttempt::Failed;
             }
             Err(err) => {
+                phase.reduction_build_time_secs += reduction_start.elapsed().as_secs_f64();
                 diagnostics.record_auxiliary_error(&err, options.auxiliary_tol);
                 if options.print_level >= 5 {
                     diagnostics.log_verbose("Auxiliary postsolve");
                     rip_log!("ripopt: Auxiliary postsolve skipped after reduction failure: {:?}", err);
                 }
+                phase.failed = true;
+                finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
                 return AuxiliaryPreprocessAttempt::Failed;
             }
         };
@@ -2645,7 +2782,13 @@ fn try_auxiliary_postsolve_solve<P: NlpProblem>(
         );
     }
 
+    let nested_preprocessing_start = Instant::now();
     let prep = crate::preprocessing::PreprocessedProblem::new(&reduced as &dyn NlpProblem, options.bound_push);
+    phase.nested_preprocessing_time_secs += nested_preprocessing_start.elapsed().as_secs_f64();
+    phase.nested_reduced_variables = prep.num_variables();
+    phase.nested_reduced_constraints = prep.num_constraints();
+    phase.nested_fixed_variables = prep.num_fixed();
+    phase.nested_redundant_constraints = prep.num_redundant();
     if options.print_level >= 5 && prep.did_reduce() {
         rip_log!(
             "ripopt: Auxiliary postsolve nested preprocessing reduced problem: {} fixed vars, {} redundant constraints ({}x{} -> {}x{})",
@@ -2665,13 +2808,19 @@ fn try_auxiliary_postsolve_solve<P: NlpProblem>(
         if options.print_level >= 5 {
             diagnostics.log_verbose("Auxiliary postsolve");
         }
+        phase.failed = true;
+        finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
         return AuxiliaryPreprocessAttempt::Failed;
     };
 
+    let reduced_solve_start = Instant::now();
     let nested_result = solve(&prep, &reduced_opts);
+    phase.reduced_solve_time_secs += reduced_solve_start.elapsed().as_secs_f64();
+    let unmap_start = Instant::now();
     let standard_stack = crate::reduction_frame::ReductionStack::new()
         .push(prep.reduction_frame(), &reduced as &dyn NlpProblem);
     let auxiliary_result = standard_stack.unmap_solution_with_options(&nested_result, Some(options));
+    phase.unmap_time_secs += unmap_start.elapsed().as_secs_f64();
     if !matches!(auxiliary_result.status, SolveStatus::Optimal) {
         diagnostics.reject_global(
             crate::auxiliary_preprocessing::AuxiliaryRejectionReason::AuxiliarySolveFailure {
@@ -2686,14 +2835,19 @@ fn try_auxiliary_postsolve_solve<P: NlpProblem>(
                 auxiliary_result.status,
             );
         }
+        phase.failed = true;
+        finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
         return AuxiliaryPreprocessAttempt::Failed;
     }
 
+    let unmap_start = Instant::now();
     let partial_stack = crate::reduction_frame::ReductionStack::new()
         .push(prep.reduction_frame(), &reduced as &dyn NlpProblem)
         .push(reduced.reduction_frame(), problem_dyn);
     let partial = partial_stack.unmap_solution_with_options(&nested_result, Some(options));
+    phase.unmap_time_secs += unmap_start.elapsed().as_secs_f64();
     x_context = partial.x;
+    let recovery_solve_start = Instant::now();
     let outcome = match crate::auxiliary_preprocessing::solve_auxiliary_blocks_from(
         problem_dyn,
         &candidates,
@@ -2710,6 +2864,9 @@ fn try_auxiliary_postsolve_solve<P: NlpProblem>(
             if options.print_level >= 5 {
                 diagnostics.log_verbose("Auxiliary postsolve");
             }
+            phase.recovery_solve_time_secs += recovery_solve_start.elapsed().as_secs_f64();
+            phase.failed = true;
+            finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
             return AuxiliaryPreprocessAttempt::Failed;
         }
         Err(err) => {
@@ -2718,9 +2875,14 @@ fn try_auxiliary_postsolve_solve<P: NlpProblem>(
                 diagnostics.log_verbose("Auxiliary postsolve");
                 rip_log!("ripopt: Auxiliary postsolve recovery failed: {:?}", err);
             }
+            phase.recovery_solve_time_secs += recovery_solve_start.elapsed().as_secs_f64();
+            phase.failed = true;
+            finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
             return AuxiliaryPreprocessAttempt::Failed;
         }
     };
+    phase.recovery_solve_time_secs += recovery_solve_start.elapsed().as_secs_f64();
+    copy_auxiliary_solve_outcome(phase, &outcome);
 
     if options.print_level >= 5 {
         rip_log!(
@@ -2730,28 +2892,42 @@ fn try_auxiliary_postsolve_solve<P: NlpProblem>(
         );
     }
 
+    let reduction_start = Instant::now();
     let recovered_reduced =
         match crate::auxiliary_preprocessing::AuxiliaryReducedProblem::new(problem_dyn, &candidates, outcome.x)
         {
-            Ok(reduced) => reduced,
+            Ok(reduced) => {
+                phase.reduction_build_time_secs += reduction_start.elapsed().as_secs_f64();
+                reduced
+            }
             Err(err) => {
+                phase.reduction_build_time_secs += reduction_start.elapsed().as_secs_f64();
                 diagnostics.record_auxiliary_error(&err, options.auxiliary_tol);
                 if options.print_level >= 5 {
                     diagnostics.log_verbose("Auxiliary postsolve");
                     rip_log!("ripopt: Auxiliary postsolve skipped after recovery validation failure: {:?}", err);
                 }
+                phase.failed = true;
+                finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
                 return AuxiliaryPreprocessAttempt::Failed;
             }
         };
+    let unmap_start = Instant::now();
     let recovered_stack = crate::reduction_frame::ReductionStack::new()
         .push(prep.reduction_frame(), &reduced as &dyn NlpProblem)
         .push(recovered_reduced.reduction_frame(), problem_dyn);
     let mut result = recovered_stack.unmap_solution_with_options(&nested_result, Some(options));
-    if let Some(validation) = validate_full_space_result(problem_dyn, &result, options) {
+    phase.unmap_time_secs += unmap_start.elapsed().as_secs_f64();
+    let validation_start = Instant::now();
+    let validation = validate_full_space_result(problem_dyn, &result, options);
+    phase.full_space_validation_time_secs += validation_start.elapsed().as_secs_f64();
+    if let Some(validation) = validation {
         result.objective = validation.objective;
         result.constraint_values = validation.constraints;
         result.diagnostics.final_primal_inf = validation.primal_inf;
         result.diagnostics.final_dual_inf = validation.dual_inf;
+        phase.solved = true;
+        finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
         return AuxiliaryPreprocessAttempt::Solved(result);
     }
     diagnostics.reject_global(
@@ -2764,6 +2940,8 @@ fn try_auxiliary_postsolve_solve<P: NlpProblem>(
             "ripopt: Auxiliary-postsolve result validation failed, retrying without auxiliary postsolve"
         );
     }
+    phase.failed = true;
+    finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
     AuxiliaryPreprocessAttempt::Failed
 }
 
@@ -2780,11 +2958,20 @@ fn try_auxiliary_postsolve_solve<P: NlpProblem>(
 fn try_standard_preprocessed_solve<P: NlpProblem>(
     problem: &P,
     options: &SolverOptions,
+    diagnostics: &mut StandardPreprocessingDiagnostics,
 ) -> Option<SolveResult> {
     let make_parameter = matches!(
         options.fixed_variable_treatment,
         FixedVariableTreatment::MakeParameter
     );
+    if !options.enable_preprocessing && !make_parameter {
+        return None;
+    }
+    diagnostics.attempted = true;
+    diagnostics.original_variables = problem.num_variables();
+    diagnostics.original_constraints = problem.num_constraints();
+    let total_start = Instant::now();
+    let construction_start = Instant::now();
     let prep = if options.enable_preprocessing {
         crate::preprocessing::PreprocessedProblem::new(
             problem as &dyn NlpProblem,
@@ -2796,11 +2983,18 @@ fn try_standard_preprocessed_solve<P: NlpProblem>(
         // Ipopt 3.14's `TNLPAdapter` behavior.
         crate::preprocessing::PreprocessedProblem::new_fixed_only(problem as &dyn NlpProblem)
     } else {
-        return None;
+        unreachable!("standard preprocessing precondition checked above");
     };
+    diagnostics.construction_time_secs += construction_start.elapsed().as_secs_f64();
+    diagnostics.reduced_variables = prep.num_variables();
+    diagnostics.reduced_constraints = prep.num_constraints();
+    diagnostics.fixed_variables = prep.num_fixed();
+    diagnostics.redundant_constraints = prep.num_redundant();
     if !prep.did_reduce() {
+        diagnostics.total_time_secs += total_start.elapsed().as_secs_f64();
         return None;
     }
+    diagnostics.did_reduce = true;
     if options.print_level >= 5 {
         rip_log!(
             "ripopt: Preprocessing reduced problem: {} fixed vars, {} redundant constraints ({}x{} -> {}x{})",
@@ -2811,8 +3005,14 @@ fn try_standard_preprocessed_solve<P: NlpProblem>(
     }
     let mut prep_opts = options.clone();
     prep_opts.enable_preprocessing = false;
+    let reduced_solve_start = Instant::now();
     let reduced_result = solve(&prep, &prep_opts);
-    Some(prep.unmap_solution(&reduced_result))
+    diagnostics.reduced_solve_time_secs += reduced_solve_start.elapsed().as_secs_f64();
+    let unmap_start = Instant::now();
+    let result = prep.unmap_solution(&reduced_result);
+    diagnostics.unmap_time_secs += unmap_start.elapsed().as_secs_f64();
+    diagnostics.total_time_secs += total_start.elapsed().as_secs_f64();
+    Some(result)
 }
 
 /// Run preprocessing (presolve auxiliary equality-block reduction, postsolve
@@ -2826,22 +3026,33 @@ fn try_preprocessed_solve<P: NlpProblem>(
     problem: &P,
     options: &SolverOptions,
     solve_start: Instant,
+    diagnostics: &mut PreprocessingDiagnostics,
 ) -> Option<SolveResult> {
     if options.enable_preprocessing {
         if let AuxiliaryPreprocessAttempt::Solved(result) =
-            try_auxiliary_preprocessed_solve(problem, options, solve_start)
+            try_auxiliary_preprocessed_solve(
+                problem,
+                options,
+                solve_start,
+                &mut diagnostics.presolve,
+            )
         {
             return Some(result);
         }
 
         if let AuxiliaryPreprocessAttempt::Solved(result) =
-            try_auxiliary_postsolve_solve(problem, options, solve_start)
+            try_auxiliary_postsolve_solve(
+                problem,
+                options,
+                solve_start,
+                &mut diagnostics.postsolve,
+            )
         {
             return Some(result);
         }
     }
 
-    try_standard_preprocessed_solve(problem, options)
+    try_standard_preprocessed_solve(problem, options, &mut diagnostics.standard)
 }
 
 /// Compute the accepted step length and resulting θ for one Gauss–Newton
@@ -2913,10 +3124,19 @@ fn solve_inner<P: NlpProblem>(
     options: &SolverOptions,
     solve_start: Instant,
 ) -> SolveResult {
-    if let Some(result) = try_preprocessed_solve(problem, options, solve_start) {
+    let mut preprocessing_diagnostics = PreprocessingDiagnostics::default();
+    if let Some(mut result) =
+        try_preprocessed_solve(problem, options, solve_start, &mut preprocessing_diagnostics)
+    {
+        result.diagnostics.preprocessing = preprocessing_diagnostics;
+        result.diagnostics.wall_time_secs = solve_start.elapsed().as_secs_f64();
+        if options.print_level >= 4 {
+            print_final_summary(&result);
+        }
         return result;
     }
     let mut result = solve_ipm(problem, options);
+    result.diagnostics.preprocessing = preprocessing_diagnostics;
     result.diagnostics.wall_time_secs = solve_start.elapsed().as_secs_f64();
     if options.print_level >= 4 {
         print_final_summary(&result);
@@ -11861,7 +12081,8 @@ mod tests {
             capture_log,
             &mut logs as *mut Vec<String> as *mut c_void,
         )));
-        let _ = try_preprocessed_solve(&problem, &options, Instant::now());
+        let mut diagnostics = PreprocessingDiagnostics::default();
+        let _ = try_preprocessed_solve(&problem, &options, Instant::now(), &mut diagnostics);
         crate::logging::set_log_callback(None);
         logs
     }
@@ -11874,7 +12095,8 @@ mod tests {
             ..SolverOptions::default()
         };
 
-        let result = try_preprocessed_solve(&problem, &options, Instant::now());
+        let mut diagnostics = PreprocessingDiagnostics::default();
+        let result = try_preprocessed_solve(&problem, &options, Instant::now(), &mut diagnostics);
 
         assert!(result.is_none());
     }
@@ -11968,7 +12190,8 @@ mod tests {
             ..SolverOptions::default()
         };
 
-        let result = try_preprocessed_solve(&problem, &options, Instant::now())
+        let mut diagnostics = PreprocessingDiagnostics::default();
+        let result = try_preprocessed_solve(&problem, &options, Instant::now(), &mut diagnostics)
             .expect("auxiliary preprocessing should solve");
 
         assert_eq!(result.status, SolveStatus::Optimal);
@@ -11978,6 +12201,10 @@ mod tests {
         assert_eq!(result.constraint_values.len(), 1);
         assert!(result.constraint_values[0].abs() < 1e-8);
         assert!(result.diagnostics.final_primal_inf < 1e-8);
+        assert!(diagnostics.presolve.solved);
+        assert!(diagnostics.presolve.total_time_secs > 0.0);
+        assert_eq!(diagnostics.presolve.auxiliary_blocks_solved, 1);
+        assert_eq!(diagnostics.presolve.removed_variables, 1);
     }
 
     #[test]
@@ -12007,12 +12234,16 @@ mod tests {
             ..SolverOptions::default()
         };
 
-        let result = try_preprocessed_solve(&problem, &options, Instant::now())
+        let mut diagnostics = PreprocessingDiagnostics::default();
+        let result = try_preprocessed_solve(&problem, &options, Instant::now(), &mut diagnostics)
             .expect("auxiliary preprocessing should solve the reduced empty problem");
 
         assert_eq!(result.status, SolveStatus::Optimal);
         assert!((result.x[0] - 2.0).abs() < 1e-10);
         assert!(result.diagnostics.final_primal_inf < 1e-10);
+        assert!(diagnostics.presolve.solved);
+        assert_eq!(diagnostics.presolve.reduced_variables, 0);
+        assert_eq!(diagnostics.presolve.reduced_constraints, 0);
     }
 
     /// Phase 3f test helper: replace the constraint bounds on a

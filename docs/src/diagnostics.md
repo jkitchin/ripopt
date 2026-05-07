@@ -1,6 +1,9 @@
 # Diagnostics
 
-`SolverDiagnostics` captures structured data about solver behavior. It is available at `result.diagnostics` and printed to stderr when `print_level >= 5`.
+`SolverDiagnostics` captures structured data about solver behavior. It is
+available at `result.diagnostics`; the compact summary below is printed to
+stderr when `print_level >= 5`. Structured JSON reports include the full
+diagnostics object, including preprocessing details.
 
 ## Diagnostic block format
 
@@ -40,6 +43,50 @@ soc_corrections: 0
 | `watchdog_activations` | Watchdog triggered by consecutive short steps |
 | `soc_corrections` | Second-order corrections accepted |
 | `fallback_used` | Which fallback succeeded, if any (`lbfgs_hessian`, `augmented_lagrangian`, `sqp`, `slack`) |
+| `preprocessing` | Nested diagnostics for auxiliary presolve, auxiliary postsolve, and standard preprocessing |
+
+## Preprocessing Diagnostics
+
+`diagnostics.preprocessing` is always present in `SolveResult` and in CLI JSON
+reports written with `ripopt problem.nl -o report.json`. It has three nested
+objects:
+
+| Object | Meaning |
+|---|---|
+| `preprocessing.presolve` | Auxiliary equality-block reduction attempted before the main solve |
+| `preprocessing.postsolve` | Auxiliary equality-block reduction followed by recovery after a reduced solve |
+| `preprocessing.standard` | Fixed-variable and redundant-constraint preprocessing |
+
+The auxiliary objects, `presolve` and `postsolve`, report both timing and
+structural data:
+
+| Field | Meaning |
+|---|---|
+| `attempted`, `solved`, `failed` | Whether the phase ran, solved the problem, or rejected/fell back |
+| `total_time_secs` | Total wall-clock time spent in that preprocessing phase |
+| `candidate_detection_time_secs` | End-to-end candidate search time |
+| `incidence_time_secs` | Time spent building equality incidence data |
+| `structural_analysis_time_secs` | Time spent on components, matching, Dulmage-Mendelsohn, and block-triangular analysis |
+| `candidate_filter_time_secs` | Time spent rejecting objective- or inequality-coupled variables |
+| `auxiliary_solve_time_secs` | Presolve time spent solving accepted auxiliary blocks |
+| `recovery_solve_time_secs` | Postsolve time spent recovering eliminated variables |
+| `reduction_build_time_secs` | Time spent wrapping the reduced problem |
+| `nested_preprocessing_time_secs` | Time spent running standard preprocessing on the auxiliary-reduced problem |
+| `reduced_solve_time_secs` | Time spent solving the reduced problem |
+| `unmap_time_secs` | Time spent mapping reduced solutions back to the original space |
+| `full_space_validation_time_secs` | Time spent recomputing objective, constraints, and residuals on the original problem |
+| `equality_rows`, `incident_variables`, `connected_components` | Size of the equality-incidence structure examined |
+| `candidates`, `btd_blocks`, `accepted_block_sizes` | Accepted auxiliary candidate and block structure |
+| `rejected_blocks`, `rejection_counts` | Rejection totals grouped by reason |
+| `auxiliary_blocks_solved`, `auxiliary_iterations`, `auxiliary_*_evals` | Work performed by internal auxiliary solves |
+| `original_*`, `reduced_*`, `removed_*`, `nested_*` | Original, reduced, removed, and nested standard-preprocessing dimensions |
+
+The standard object reports `attempted`, `did_reduce`, `total_time_secs`,
+`construction_time_secs`, `reduced_solve_time_secs`, `unmap_time_secs`,
+original/reduced dimensions, `fixed_variables`, and `redundant_constraints`.
+Use these fields to separate "preprocessing found no useful structure" from
+"preprocessing reduced the model but the overhead exceeded the iteration
+savings."
 
 ## Interpreting the diagnostics
 
