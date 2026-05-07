@@ -26,6 +26,30 @@ pub(crate) struct PresolveCandidate {
 }
 
 #[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuxiliaryCouplingClass {
+    PureEquality,
+    ObjectiveCoupled,
+    InequalityCoupled,
+    ObjectiveAndInequalityCoupled,
+}
+
+impl AuxiliaryCouplingClass {
+    fn label(self) -> &'static str {
+        match self {
+            Self::PureEquality => "pure equality",
+            Self::ObjectiveCoupled => "objective-coupled",
+            Self::InequalityCoupled => "inequality-coupled",
+            Self::ObjectiveAndInequalityCoupled => "objective-and-inequality-coupled",
+        }
+    }
+
+    fn is_coupled(self) -> bool {
+        !matches!(self, Self::PureEquality)
+    }
+}
+
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AuxiliarySolveOutcome {
     pub(crate) x: Vec<f64>,
@@ -84,6 +108,7 @@ pub(crate) enum AuxiliaryRejectionReason {
     EvaluationFailure,
     TimeBudgetExceeded,
     InvalidBlock { reason: &'static str },
+    CoupledAuxiliaryBlock { coupling: AuxiliaryCouplingClass },
     FullSpaceValidationFailure,
     ReductionDidNotRemoveAnything,
     NoBlocksSolved,
@@ -102,6 +127,7 @@ impl AuxiliaryRejectionReason {
             Self::EvaluationFailure => "evaluation failure",
             Self::TimeBudgetExceeded => "time budget exceeded",
             Self::InvalidBlock { .. } => "invalid block",
+            Self::CoupledAuxiliaryBlock { .. } => "coupled auxiliary block",
             Self::FullSpaceValidationFailure => "full-space validation failure",
             Self::ReductionDidNotRemoveAnything => "reduction did not remove anything",
             Self::NoBlocksSolved => "no blocks solved",
@@ -127,6 +153,10 @@ pub(crate) struct AuxiliaryCandidateDiagnostics {
     pub(crate) closed_components: usize,
     pub(crate) btd_blocks: usize,
     pub(crate) rank_accepted_blocks: usize,
+    pub(crate) pure_equality_candidates: usize,
+    pub(crate) objective_coupled_candidates: usize,
+    pub(crate) inequality_coupled_candidates: usize,
+    pub(crate) objective_and_inequality_coupled_candidates: usize,
     pub(crate) accepted_blocks: Vec<EqualityBlock>,
     pub(crate) rejections: Vec<AuxiliaryRejection>,
 }
@@ -159,6 +189,17 @@ impl AuxiliaryCandidateDiagnostics {
     fn record_accepted_blocks(&mut self, blocks: &[EqualityBlock]) {
         self.btd_blocks += blocks.len();
         self.accepted_blocks.extend(blocks.iter().cloned());
+    }
+
+    fn record_coupling_class(&mut self, coupling: AuxiliaryCouplingClass) {
+        match coupling {
+            AuxiliaryCouplingClass::PureEquality => self.pure_equality_candidates += 1,
+            AuxiliaryCouplingClass::ObjectiveCoupled => self.objective_coupled_candidates += 1,
+            AuxiliaryCouplingClass::InequalityCoupled => self.inequality_coupled_candidates += 1,
+            AuxiliaryCouplingClass::ObjectiveAndInequalityCoupled => {
+                self.objective_and_inequality_coupled_candidates += 1;
+            }
+        }
     }
 
     pub(crate) fn record_rank_accepted_candidates(&mut self, candidates: &[PresolveCandidate]) {
@@ -273,12 +314,16 @@ impl AuxiliaryCandidateDiagnostics {
 
     pub(crate) fn log_verbose(&self, label: &str) {
         rip_log!(
-            "ripopt: {label} diagnostics: equality_rows={}, incident_variables={}, connected_components={}, square_components={}, closed_components={}, btd_blocks={}, rank_accepted_blocks={}, rejected_blocks={}",
+            "ripopt: {label} diagnostics: equality_rows={}, incident_variables={}, connected_components={}, square_components={}, closed_components={}, pure_equality_candidates={}, objective_coupled_candidates={}, inequality_coupled_candidates={}, objective_and_inequality_coupled_candidates={}, btd_blocks={}, rank_accepted_blocks={}, rejected_blocks={}",
             self.equality_rows,
             self.incident_variables,
             self.connected_components,
             self.square_components,
             self.closed_components,
+            self.pure_equality_candidates,
+            self.objective_coupled_candidates,
+            self.inequality_coupled_candidates,
+            self.objective_and_inequality_coupled_candidates,
             self.btd_blocks,
             self.rank_accepted_blocks,
             self.rejected_blocks(),
@@ -1453,6 +1498,8 @@ pub(crate) fn find_presolve_candidates_with_diagnostics(
         .enumerate()
         .filter_map(|(var, rows)| (!rows.is_empty()).then_some(var))
         .collect();
+    let objective_independent = objective_independent_variables(problem, tol);
+    let inequality_coupled = variables_in_inequality_rows(problem, tol);
 
     let components = incidence
         .connected_components(&selected_rows, &selected_vars)
@@ -1462,9 +1509,13 @@ pub(crate) fn find_presolve_candidates_with_diagnostics(
 
     let mut candidates = Vec::new();
     for component in components {
-        if let Some(candidate) =
-            presolve_candidate_from_component(&incidence, component, &mut diagnostics)
-        {
+        if let Some(candidate) = presolve_candidate_from_component(
+            &incidence,
+            component,
+            &objective_independent,
+            &inequality_coupled,
+            &mut diagnostics,
+        ) {
             candidates.push(candidate);
         }
     }
@@ -1539,6 +1590,8 @@ pub(crate) fn find_postsolve_candidates_with_diagnostics(
 fn presolve_candidate_from_component(
     incidence: &EqualityIncidence,
     component: EqualityBlock,
+    objective_independent: &[bool],
+    inequality_coupled: &[bool],
     diagnostics: &mut AuxiliaryCandidateDiagnostics,
 ) -> Option<PresolveCandidate> {
     if component.rows.is_empty() || component.vars.is_empty() {
@@ -1578,6 +1631,21 @@ fn presolve_candidate_from_component(
     }
     diagnostics.closed_components += 1;
 
+    let coupling =
+        classify_auxiliary_coupling(&component, objective_independent, inequality_coupled);
+    diagnostics.record_coupling_class(coupling);
+    if coupling.is_coupled() {
+        diagnostics.reject_block(
+            component,
+            AuxiliaryRejectionReason::CoupledAuxiliaryBlock { coupling },
+            Some(format!(
+                "coupling={}, default presolve policy accepts only pure equality auxiliary blocks",
+                coupling.label()
+            )),
+        );
+        return None;
+    }
+
     match incidence.block_triangular_decomposition(&local_rows, &component.vars) {
         Ok(blocks) => {
             diagnostics.record_accepted_blocks(&blocks);
@@ -1587,6 +1655,28 @@ fn presolve_candidate_from_component(
             diagnostics.record_btd_error(component, err);
             None
         }
+    }
+}
+
+fn classify_auxiliary_coupling(
+    block: &EqualityBlock,
+    objective_independent: &[bool],
+    inequality_coupled: &[bool],
+) -> AuxiliaryCouplingClass {
+    let objective = block
+        .vars
+        .iter()
+        .any(|&var| !objective_independent.get(var).copied().unwrap_or(false));
+    let inequality = block
+        .vars
+        .iter()
+        .any(|&var| inequality_coupled.get(var).copied().unwrap_or(true));
+
+    match (objective, inequality) {
+        (false, false) => AuxiliaryCouplingClass::PureEquality,
+        (true, false) => AuxiliaryCouplingClass::ObjectiveCoupled,
+        (false, true) => AuxiliaryCouplingClass::InequalityCoupled,
+        (true, true) => AuxiliaryCouplingClass::ObjectiveAndInequalityCoupled,
     }
 }
 
@@ -3465,7 +3555,18 @@ mod tests {
     #[test]
     fn auxiliary_solve_updates_full_vector_between_triangular_blocks() {
         let problem = TriangularAuxProblem;
-        let candidates = find_presolve_candidates(&problem, TOL);
+        let candidates = vec![PresolveCandidate {
+            blocks: vec![
+                EqualityBlock {
+                    rows: vec![0],
+                    vars: vec![0],
+                },
+                EqualityBlock {
+                    rows: vec![1],
+                    vars: vec![1],
+                },
+            ],
+        }];
         let options = quiet_aux_options();
 
         let outcome =
@@ -3505,7 +3606,12 @@ mod tests {
     #[test]
     fn auxiliary_solve_stops_when_outer_wall_time_is_exhausted() {
         let problem = TriangularAuxProblem;
-        let candidates = find_presolve_candidates(&problem, TOL);
+        let candidates = vec![PresolveCandidate {
+            blocks: vec![EqualityBlock {
+                rows: vec![0],
+                vars: vec![0],
+            }],
+        }];
         let mut options = quiet_aux_options();
         options.max_wall_time = 0.01;
         let expired_start = std::time::Instant::now() - std::time::Duration::from_secs(1);
@@ -5002,37 +5108,61 @@ mod tests {
     }
 
     #[test]
-    fn find_candidates_allows_candidate_variables_in_objective_terms() {
+    fn find_candidates_rejects_objective_coupled_variables_by_default() {
         let bounds = equality_bounds(1);
         let problem = graph_problem_with_objective(2, &bounds, &[(0, 1)], &[1]);
 
-        let candidates = find_presolve_candidates(&problem, TOL);
+        let (candidates, diagnostics) = find_presolve_candidates_with_diagnostics(&problem, TOL);
 
+        assert!(candidates.is_empty());
+        assert_eq!(diagnostics.pure_equality_candidates, 0);
+        assert_eq!(diagnostics.objective_coupled_candidates, 1);
+        assert_eq!(diagnostics.inequality_coupled_candidates, 0);
+        assert_eq!(diagnostics.objective_and_inequality_coupled_candidates, 0);
         assert_eq!(
-            candidates,
-            vec![PresolveCandidate {
-                blocks: vec![EqualityBlock {
-                    rows: vec![0],
-                    vars: vec![1],
-                }],
-            }]
+            diagnostics.rejections[0].reason,
+            AuxiliaryRejectionReason::CoupledAuxiliaryBlock {
+                coupling: AuxiliaryCouplingClass::ObjectiveCoupled,
+            }
         );
     }
 
     #[test]
-    fn find_candidates_allows_candidate_variables_in_inequality_rows() {
+    fn find_candidates_rejects_inequality_coupled_variables_by_default() {
         let problem = graph_problem(2, &[(0.0, 0.0), (0.0, 1.0)], &[(0, 1), (1, 1)]);
 
-        let candidates = find_presolve_candidates(&problem, TOL);
+        let (candidates, diagnostics) = find_presolve_candidates_with_diagnostics(&problem, TOL);
 
+        assert!(candidates.is_empty());
+        assert_eq!(diagnostics.pure_equality_candidates, 0);
+        assert_eq!(diagnostics.objective_coupled_candidates, 0);
+        assert_eq!(diagnostics.inequality_coupled_candidates, 1);
+        assert_eq!(diagnostics.objective_and_inequality_coupled_candidates, 0);
         assert_eq!(
-            candidates,
-            vec![PresolveCandidate {
-                blocks: vec![EqualityBlock {
-                    rows: vec![0],
-                    vars: vec![1],
-                }],
-            }]
+            diagnostics.rejections[0].reason,
+            AuxiliaryRejectionReason::CoupledAuxiliaryBlock {
+                coupling: AuxiliaryCouplingClass::InequalityCoupled,
+            }
+        );
+    }
+
+    #[test]
+    fn find_candidates_rejects_objective_and_inequality_coupled_variables_by_default() {
+        let problem =
+            graph_problem_with_objective(2, &[(0.0, 0.0), (0.0, 1.0)], &[(0, 1), (1, 1)], &[1]);
+
+        let (candidates, diagnostics) = find_presolve_candidates_with_diagnostics(&problem, TOL);
+
+        assert!(candidates.is_empty());
+        assert_eq!(diagnostics.pure_equality_candidates, 0);
+        assert_eq!(diagnostics.objective_coupled_candidates, 0);
+        assert_eq!(diagnostics.inequality_coupled_candidates, 0);
+        assert_eq!(diagnostics.objective_and_inequality_coupled_candidates, 1);
+        assert_eq!(
+            diagnostics.rejections[0].reason,
+            AuxiliaryRejectionReason::CoupledAuxiliaryBlock {
+                coupling: AuxiliaryCouplingClass::ObjectiveAndInequalityCoupled,
+            }
         );
     }
 
@@ -5166,6 +5296,10 @@ mod tests {
         assert_eq!(diagnostics.connected_components, 1);
         assert_eq!(diagnostics.square_components, 1);
         assert_eq!(diagnostics.closed_components, 1);
+        assert_eq!(diagnostics.pure_equality_candidates, 1);
+        assert_eq!(diagnostics.objective_coupled_candidates, 0);
+        assert_eq!(diagnostics.inequality_coupled_candidates, 0);
+        assert_eq!(diagnostics.objective_and_inequality_coupled_candidates, 0);
         assert_eq!(diagnostics.btd_blocks, 3);
         assert_eq!(diagnostics.rank_accepted_blocks, 3);
         assert_eq!(
