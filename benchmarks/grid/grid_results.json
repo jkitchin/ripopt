@@ -7,7 +7,7 @@
     "status": "Optimal",
     "objective": 5812.643016981305,
     "iterations": 10,
-    "solve_time": 0.001772292
+    "solve_time": 0.000767625
   },
   {
     "solver": "ipopt",
@@ -17,7 +17,7 @@
     "status": "Optimal",
     "objective": 5812.642934996067,
     "iterations": 10,
-    "solve_time": 0.005873917
+    "solve_time": 0.002431625
   },
   {
     "solver": "ripopt",
@@ -27,7 +27,7 @@
     "status": "Optimal",
     "objective": 17551.890927682114,
     "iterations": 20,
-    "solve_time": 0.003114791
+    "solve_time": 0.001424666
   },
   {
     "solver": "ipopt",
@@ -37,7 +37,7 @@
     "status": "Optimal",
     "objective": 17551.8908990633,
     "iterations": 15,
-    "solve_time": 0.006692916
+    "solve_time": 0.003394417
   },
   {
     "solver": "ripopt",
@@ -47,7 +47,7 @@
     "status": "Optimal",
     "objective": 2178.0804208038203,
     "iterations": 14,
-    "solve_time": 0.011437333
+    "solve_time": 0.006896542
   },
   {
     "solver": "ipopt",
@@ -57,7 +57,7 @@
     "status": "Optimal",
     "objective": 2178.080406411837,
     "iterations": 11,
-    "solve_time": 0.010756708
+    "solve_time": 0.008293792
   },
   {
     "solver": "ripopt",
@@ -67,7 +67,7 @@
     "status": "Optimal",
     "objective": 8208.5154586033,
     "iterations": 19,
-    "solve_time": 0.033904541
+    "solve_time": 0.032204833
   },
   {
     "solver": "ipopt",
@@ -77,6 +77,6 @@
     "status": "Optimal",
     "objective": 8208.515425007794,
     "iterations": 14,
-    "solve_time": 0.05154075
+    "solve_time": 0.054517625
   }
 ]
