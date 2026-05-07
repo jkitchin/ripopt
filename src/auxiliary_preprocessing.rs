@@ -72,6 +72,250 @@ pub(crate) enum BlockTriangularizationError {
 }
 
 #[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AuxiliaryRejectionReason {
+    EmptyComponent,
+    NonSquareComponent { rows: usize, vars: usize },
+    NonClosedComponent,
+    RankDeficiency { rank: usize, expected: usize },
+    BoundActiveAuxiliaryVariable,
+    AuxiliarySolveFailure { status: SolveStatus },
+    ResidualFailure,
+    EvaluationFailure,
+    TimeBudgetExceeded,
+    InvalidBlock { reason: &'static str },
+    FullSpaceValidationFailure,
+    ReductionDidNotRemoveAnything,
+    NoBlocksSolved,
+}
+
+impl AuxiliaryRejectionReason {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::EmptyComponent => "empty component",
+            Self::NonSquareComponent { .. } => "non-square component",
+            Self::NonClosedComponent => "non-closed component",
+            Self::RankDeficiency { .. } => "rank deficiency",
+            Self::BoundActiveAuxiliaryVariable => "bound-active auxiliary variable",
+            Self::AuxiliarySolveFailure { .. } => "auxiliary solve failure",
+            Self::ResidualFailure => "residual failure",
+            Self::EvaluationFailure => "evaluation failure",
+            Self::TimeBudgetExceeded => "time budget exceeded",
+            Self::InvalidBlock { .. } => "invalid block",
+            Self::FullSpaceValidationFailure => "full-space validation failure",
+            Self::ReductionDidNotRemoveAnything => "reduction did not remove anything",
+            Self::NoBlocksSolved => "no blocks solved",
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AuxiliaryRejection {
+    pub(crate) block: Option<EqualityBlock>,
+    pub(crate) reason: AuxiliaryRejectionReason,
+    pub(crate) detail: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AuxiliaryCandidateDiagnostics {
+    pub(crate) equality_rows: usize,
+    pub(crate) incident_variables: usize,
+    pub(crate) connected_components: usize,
+    pub(crate) square_components: usize,
+    pub(crate) closed_components: usize,
+    pub(crate) btd_blocks: usize,
+    pub(crate) rank_accepted_blocks: usize,
+    pub(crate) accepted_blocks: Vec<EqualityBlock>,
+    pub(crate) rejections: Vec<AuxiliaryRejection>,
+}
+
+impl AuxiliaryCandidateDiagnostics {
+    fn from_incidence(incidence: &EqualityIncidence) -> Self {
+        Self {
+            equality_rows: incidence.row_global.len(),
+            incident_variables: incidence
+                .var_adj_rows
+                .iter()
+                .filter(|rows| !rows.is_empty())
+                .count(),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn rejected_blocks(&self) -> usize {
+        self.rejections.len()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn accepted_block_sizes(&self) -> Vec<(usize, usize)> {
+        self.accepted_blocks
+            .iter()
+            .map(|block| (block.rows.len(), block.vars.len()))
+            .collect()
+    }
+
+    fn record_accepted_blocks(&mut self, blocks: &[EqualityBlock]) {
+        self.btd_blocks += blocks.len();
+        self.accepted_blocks.extend(blocks.iter().cloned());
+    }
+
+    pub(crate) fn record_rank_accepted_candidates(&mut self, candidates: &[PresolveCandidate]) {
+        self.rank_accepted_blocks = candidates
+            .iter()
+            .map(|candidate| candidate.blocks.len())
+            .sum();
+    }
+
+    fn reject_block(
+        &mut self,
+        block: EqualityBlock,
+        reason: AuxiliaryRejectionReason,
+        detail: Option<String>,
+    ) {
+        self.rejections.push(AuxiliaryRejection {
+            block: Some(block),
+            reason,
+            detail,
+        });
+    }
+
+    pub(crate) fn reject_global(
+        &mut self,
+        reason: AuxiliaryRejectionReason,
+        detail: Option<String>,
+    ) {
+        self.rejections.push(AuxiliaryRejection {
+            block: None,
+            reason,
+            detail,
+        });
+    }
+
+    pub(crate) fn record_auxiliary_error(&mut self, err: &AuxiliarySolveError, tol: f64) {
+        match err {
+            AuxiliarySolveError::InvalidBlock { block, reason } => self.reject_block(
+                block.clone(),
+                AuxiliaryRejectionReason::InvalidBlock { reason: *reason },
+                Some((*reason).to_string()),
+            ),
+            AuxiliarySolveError::EvaluationFailed { block } => self.reject_block(
+                block.clone(),
+                AuxiliaryRejectionReason::EvaluationFailure,
+                None,
+            ),
+            AuxiliarySolveError::TimeBudgetExceeded { blocks_solved } => self.reject_global(
+                AuxiliaryRejectionReason::TimeBudgetExceeded,
+                Some(format!("blocks_solved={blocks_solved}")),
+            ),
+            AuxiliarySolveError::BlockSolveFailed {
+                block,
+                status,
+                residual,
+            } => {
+                let solved = matches!(status, SolveStatus::Optimal | SolveStatus::Acceptable);
+                if solved {
+                    self.reject_block(
+                        block.clone(),
+                        AuxiliaryRejectionReason::ResidualFailure,
+                        Some(format!(
+                            "status={status:?}, residual={residual:.2e}, auxiliary_tol={tol:.2e}"
+                        )),
+                    );
+                } else {
+                    self.reject_block(
+                        block.clone(),
+                        AuxiliaryRejectionReason::AuxiliarySolveFailure { status: *status },
+                        Some(format!("status={status:?}, residual={residual:.2e}")),
+                    );
+                }
+            }
+            AuxiliarySolveError::RankDeficientBlock {
+                block,
+                rank,
+                expected,
+            } => self.reject_block(
+                block.clone(),
+                AuxiliaryRejectionReason::RankDeficiency {
+                    rank: *rank,
+                    expected: *expected,
+                },
+                Some(format!("rank={rank}, expected={expected}")),
+            ),
+        }
+    }
+
+    fn record_btd_error(&mut self, block: EqualityBlock, err: BlockTriangularizationError) {
+        match err {
+            BlockTriangularizationError::NonSquare { rows, vars } => self.reject_block(
+                block,
+                AuxiliaryRejectionReason::NonSquareComponent { rows, vars },
+                Some(format!("rows={rows}, vars={vars}")),
+            ),
+            BlockTriangularizationError::ImperfectMatching {
+                unmatched_rows,
+                unmatched_vars,
+            } => {
+                let expected = block.rows.len().min(block.vars.len());
+                let missing = unmatched_rows.len().max(unmatched_vars.len());
+                let rank = expected.saturating_sub(missing);
+                self.reject_block(
+                    block,
+                    AuxiliaryRejectionReason::RankDeficiency { rank, expected },
+                    Some(format!(
+                        "structural matching failed, unmatched_rows={unmatched_rows:?}, unmatched_vars={unmatched_vars:?}"
+                    )),
+                );
+            }
+        }
+    }
+
+    pub(crate) fn log_verbose(&self, label: &str) {
+        rip_log!(
+            "ripopt: {label} diagnostics: equality_rows={}, incident_variables={}, connected_components={}, square_components={}, closed_components={}, btd_blocks={}, rank_accepted_blocks={}, rejected_blocks={}",
+            self.equality_rows,
+            self.incident_variables,
+            self.connected_components,
+            self.square_components,
+            self.closed_components,
+            self.btd_blocks,
+            self.rank_accepted_blocks,
+            self.rejected_blocks(),
+        );
+        if !self.accepted_blocks.is_empty() {
+            rip_log!(
+                "ripopt: {label} accepted block sizes: {:?}",
+                self.accepted_block_sizes()
+            );
+            for block in &self.accepted_blocks {
+                rip_log!(
+                    "ripopt: {label} accepted block rows={:?} vars={:?}",
+                    block.rows,
+                    block.vars,
+                );
+            }
+        }
+        for rejection in &self.rejections {
+            let location = match &rejection.block {
+                Some(block) => format!("rows={:?} vars={:?}", block.rows, block.vars),
+                None => "global".to_string(),
+            };
+            match &rejection.detail {
+                Some(detail) => rip_log!(
+                    "ripopt: {label} rejected {location}: {} ({detail})",
+                    rejection.reason.label()
+                ),
+                None => rip_log!(
+                    "ripopt: {label} rejected {location}: {}",
+                    rejection.reason.label()
+                ),
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct EqualityIncidence {
     pub(crate) n_vars: usize,
@@ -1188,9 +1432,18 @@ pub(crate) fn find_presolve_candidates(
     problem: &dyn NlpProblem,
     tol: f64,
 ) -> Vec<PresolveCandidate> {
+    find_presolve_candidates_with_diagnostics(problem, tol).0
+}
+
+#[allow(dead_code)]
+pub(crate) fn find_presolve_candidates_with_diagnostics(
+    problem: &dyn NlpProblem,
+    tol: f64,
+) -> (Vec<PresolveCandidate>, AuxiliaryCandidateDiagnostics) {
     let incidence = EqualityIncidence::from_problem(problem, tol);
+    let mut diagnostics = AuxiliaryCandidateDiagnostics::from_incidence(&incidence);
     if incidence.row_global.is_empty() {
-        return Vec::new();
+        return (Vec::new(), diagnostics);
     }
 
     let selected_rows: Vec<_> = (0..incidence.row_adj_vars.len()).collect();
@@ -1201,11 +1454,21 @@ pub(crate) fn find_presolve_candidates(
         .filter_map(|(var, rows)| (!rows.is_empty()).then_some(var))
         .collect();
 
-    incidence
+    let components = incidence
         .connected_components(&selected_rows, &selected_vars)
         .into_iter()
-        .filter_map(|component| presolve_candidate_from_component(&incidence, component))
-        .collect()
+        .collect::<Vec<_>>();
+    diagnostics.connected_components = components.len();
+
+    let mut candidates = Vec::new();
+    for component in components {
+        if let Some(candidate) =
+            presolve_candidate_from_component(&incidence, component, &mut diagnostics)
+        {
+            candidates.push(candidate);
+        }
+    }
+    (candidates, diagnostics)
 }
 
 #[allow(dead_code)]
@@ -1213,9 +1476,18 @@ pub(crate) fn find_postsolve_candidates(
     problem: &dyn NlpProblem,
     tol: f64,
 ) -> Vec<PresolveCandidate> {
+    find_postsolve_candidates_with_diagnostics(problem, tol).0
+}
+
+#[allow(dead_code)]
+pub(crate) fn find_postsolve_candidates_with_diagnostics(
+    problem: &dyn NlpProblem,
+    tol: f64,
+) -> (Vec<PresolveCandidate>, AuxiliaryCandidateDiagnostics) {
     let incidence = EqualityIncidence::from_problem(problem, tol);
+    let mut diagnostics = AuxiliaryCandidateDiagnostics::from_incidence(&incidence);
     if incidence.row_global.is_empty() {
-        return Vec::new();
+        return (Vec::new(), diagnostics);
     }
 
     let objective_independent = objective_independent_variables(problem, tol);
@@ -1232,7 +1504,7 @@ pub(crate) fn find_postsolve_candidates(
         })
         .collect();
     if selected_vars.is_empty() {
-        return Vec::new();
+        return (Vec::new(), diagnostics);
     }
 
     let mut selected_row = vec![false; incidence.row_adj_vars.len()];
@@ -1247,20 +1519,48 @@ pub(crate) fn find_postsolve_candidates(
         .filter_map(|(row, &selected)| selected.then_some(row))
         .collect();
 
-    incidence
+    let components = incidence
         .connected_components(&selected_rows, &selected_vars)
         .into_iter()
-        .filter_map(|component| postsolve_candidate_from_component(&incidence, component))
-        .collect()
+        .collect::<Vec<_>>();
+    diagnostics.connected_components = components.len();
+
+    let mut candidates = Vec::new();
+    for component in components {
+        if let Some(candidate) =
+            postsolve_candidate_from_component(&incidence, component, &mut diagnostics)
+        {
+            candidates.push(candidate);
+        }
+    }
+    (candidates, diagnostics)
 }
 
 fn presolve_candidate_from_component(
     incidence: &EqualityIncidence,
     component: EqualityBlock,
+    diagnostics: &mut AuxiliaryCandidateDiagnostics,
 ) -> Option<PresolveCandidate> {
-    if component.rows.len() != component.vars.len() || component.rows.is_empty() {
+    if component.rows.is_empty() || component.vars.is_empty() {
+        diagnostics.reject_block(component, AuxiliaryRejectionReason::EmptyComponent, None);
         return None;
     }
+    if component.rows.len() != component.vars.len() {
+        diagnostics.reject_block(
+            component.clone(),
+            AuxiliaryRejectionReason::NonSquareComponent {
+                rows: component.rows.len(),
+                vars: component.vars.len(),
+            },
+            Some(format!(
+                "rows={}, vars={}",
+                component.rows.len(),
+                component.vars.len()
+            )),
+        );
+        return None;
+    }
+    diagnostics.square_components += 1;
 
     let local_rows: Vec<_> = component
         .rows
@@ -1269,22 +1569,52 @@ fn presolve_candidate_from_component(
         .collect::<Option<_>>()?;
 
     if !is_closed_equality_component(incidence, &local_rows, &component.vars) {
+        diagnostics.reject_block(
+            component,
+            AuxiliaryRejectionReason::NonClosedComponent,
+            None,
+        );
         return None;
     }
+    diagnostics.closed_components += 1;
 
-    incidence
-        .block_triangular_decomposition(&local_rows, &component.vars)
-        .ok()
-        .map(|blocks| PresolveCandidate { blocks })
+    match incidence.block_triangular_decomposition(&local_rows, &component.vars) {
+        Ok(blocks) => {
+            diagnostics.record_accepted_blocks(&blocks);
+            Some(PresolveCandidate { blocks })
+        }
+        Err(err) => {
+            diagnostics.record_btd_error(component, err);
+            None
+        }
+    }
 }
 
 fn postsolve_candidate_from_component(
     incidence: &EqualityIncidence,
     component: EqualityBlock,
+    diagnostics: &mut AuxiliaryCandidateDiagnostics,
 ) -> Option<PresolveCandidate> {
-    if component.rows.len() != component.vars.len() || component.rows.is_empty() {
+    if component.rows.is_empty() || component.vars.is_empty() {
+        diagnostics.reject_block(component, AuxiliaryRejectionReason::EmptyComponent, None);
         return None;
     }
+    if component.rows.len() != component.vars.len() {
+        diagnostics.reject_block(
+            component.clone(),
+            AuxiliaryRejectionReason::NonSquareComponent {
+                rows: component.rows.len(),
+                vars: component.vars.len(),
+            },
+            Some(format!(
+                "rows={}, vars={}",
+                component.rows.len(),
+                component.vars.len()
+            )),
+        );
+        return None;
+    }
+    diagnostics.square_components += 1;
 
     let local_rows: Vec<_> = component
         .rows
@@ -1292,10 +1622,20 @@ fn postsolve_candidate_from_component(
         .map(|&row| incidence.row_local_for_global[row])
         .collect::<Option<_>>()?;
 
-    incidence
-        .block_triangular_decomposition(&local_rows, &component.vars)
-        .ok()
-        .map(|blocks| PresolveCandidate { blocks })
+    if is_closed_equality_component(incidence, &local_rows, &component.vars) {
+        diagnostics.closed_components += 1;
+    }
+
+    match incidence.block_triangular_decomposition(&local_rows, &component.vars) {
+        Ok(blocks) => {
+            diagnostics.record_accepted_blocks(&blocks);
+            Some(PresolveCandidate { blocks })
+        }
+        Err(err) => {
+            diagnostics.record_btd_error(component, err);
+            None
+        }
+    }
 }
 
 fn is_closed_equality_component(
@@ -4778,5 +5118,77 @@ mod tests {
                 ],
             }]
         );
+    }
+
+    #[test]
+    fn presolve_diagnostics_reports_rejected_non_square_component() {
+        let bounds = equality_bounds(1);
+        let problem = graph_problem(2, &bounds, &[(0, 0), (0, 1)]);
+
+        let (candidates, diagnostics) = find_presolve_candidates_with_diagnostics(&problem, TOL);
+
+        assert!(candidates.is_empty());
+        assert_eq!(diagnostics.equality_rows, 1);
+        assert_eq!(diagnostics.incident_variables, 2);
+        assert_eq!(diagnostics.connected_components, 1);
+        assert_eq!(diagnostics.square_components, 0);
+        assert_eq!(diagnostics.closed_components, 0);
+        assert_eq!(diagnostics.btd_blocks, 0);
+        assert_eq!(diagnostics.rejected_blocks(), 1);
+        assert_eq!(
+            diagnostics.rejections[0],
+            AuxiliaryRejection {
+                block: Some(EqualityBlock {
+                    rows: vec![0],
+                    vars: vec![0, 1],
+                }),
+                reason: AuxiliaryRejectionReason::NonSquareComponent { rows: 1, vars: 2 },
+                detail: Some("rows=1, vars=2".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn presolve_diagnostics_records_btd_block_counts_and_sizes() {
+        let problem = graph_problem(
+            3,
+            &[(0.0, 1.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)],
+            &[(1, 0), (2, 0), (2, 1), (3, 1), (3, 2)],
+        );
+
+        let (candidates, mut diagnostics) =
+            find_presolve_candidates_with_diagnostics(&problem, TOL);
+        diagnostics.record_rank_accepted_candidates(&candidates);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(diagnostics.equality_rows, 3);
+        assert_eq!(diagnostics.incident_variables, 3);
+        assert_eq!(diagnostics.connected_components, 1);
+        assert_eq!(diagnostics.square_components, 1);
+        assert_eq!(diagnostics.closed_components, 1);
+        assert_eq!(diagnostics.btd_blocks, 3);
+        assert_eq!(diagnostics.rank_accepted_blocks, 3);
+        assert_eq!(
+            diagnostics.accepted_block_sizes(),
+            vec![(1, 1), (1, 1), (1, 1)]
+        );
+        assert_eq!(
+            diagnostics.accepted_blocks,
+            vec![
+                EqualityBlock {
+                    rows: vec![1],
+                    vars: vec![0],
+                },
+                EqualityBlock {
+                    rows: vec![2],
+                    vars: vec![1],
+                },
+                EqualityBlock {
+                    rows: vec![3],
+                    vars: vec![2],
+                },
+            ]
+        );
+        assert!(diagnostics.rejections.is_empty());
     }
 }

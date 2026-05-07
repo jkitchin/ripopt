@@ -1801,13 +1801,26 @@ fn try_auxiliary_preprocessed_solve<P: NlpProblem>(
     solve_start: Instant,
 ) -> AuxiliaryPreprocessAttempt {
     let problem_dyn = problem as &dyn NlpProblem;
-    let candidates =
-        crate::auxiliary_preprocessing::find_presolve_candidates(problem_dyn, options.auxiliary_tol);
+    let (candidates, mut diagnostics) =
+        crate::auxiliary_preprocessing::find_presolve_candidates_with_diagnostics(
+            problem_dyn,
+            options.auxiliary_tol,
+        );
     if candidates.is_empty() {
+        if options.print_level >= 5 && diagnostics.equality_rows > 0 {
+            diagnostics.log_verbose("Auxiliary preprocessing");
+        }
         return AuxiliaryPreprocessAttempt::NoCandidates;
     }
 
     let Some(preprocess_opts) = auxiliary_preprocessing_options(options, solve_start) else {
+        diagnostics.reject_global(
+            crate::auxiliary_preprocessing::AuxiliaryRejectionReason::TimeBudgetExceeded,
+            Some("preprocessing slice could not leave fallback time".to_string()),
+        );
+        if options.print_level >= 5 {
+            diagnostics.log_verbose("Auxiliary preprocessing");
+        }
         return AuxiliaryPreprocessAttempt::Failed;
     };
 
@@ -1820,9 +1833,20 @@ fn try_auxiliary_preprocessed_solve<P: NlpProblem>(
         )
         {
             Ok(outcome) if outcome.blocks_solved > 0 => outcome,
-            Ok(_) => return AuxiliaryPreprocessAttempt::Failed,
-            Err(err) => {
+            Ok(_) => {
+                diagnostics.reject_global(
+                    crate::auxiliary_preprocessing::AuxiliaryRejectionReason::NoBlocksSolved,
+                    None,
+                );
                 if options.print_level >= 5 {
+                    diagnostics.log_verbose("Auxiliary preprocessing");
+                }
+                return AuxiliaryPreprocessAttempt::Failed;
+            }
+            Err(err) => {
+                diagnostics.record_auxiliary_error(&err, options.auxiliary_tol);
+                if options.print_level >= 5 {
+                    diagnostics.log_verbose("Auxiliary preprocessing");
                     rip_log!("ripopt: Auxiliary preprocessing skipped after failure: {:?}", err);
                 }
                 return AuxiliaryPreprocessAttempt::Failed;
@@ -1842,10 +1866,24 @@ fn try_auxiliary_preprocessed_solve<P: NlpProblem>(
     let reduced =
         match crate::auxiliary_preprocessing::AuxiliaryReducedProblem::new(problem_dyn, &candidates, outcome.x)
         {
-            Ok(reduced) if reduced.did_reduce() => reduced,
-            Ok(_) => return AuxiliaryPreprocessAttempt::Failed,
-            Err(err) => {
+            Ok(reduced) if reduced.did_reduce() => {
+                diagnostics.record_rank_accepted_candidates(&candidates);
+                reduced
+            }
+            Ok(_) => {
+                diagnostics.reject_global(
+                    crate::auxiliary_preprocessing::AuxiliaryRejectionReason::ReductionDidNotRemoveAnything,
+                    None,
+                );
                 if options.print_level >= 5 {
+                    diagnostics.log_verbose("Auxiliary preprocessing");
+                }
+                return AuxiliaryPreprocessAttempt::Failed;
+            }
+            Err(err) => {
+                diagnostics.record_auxiliary_error(&err, options.auxiliary_tol);
+                if options.print_level >= 5 {
+                    diagnostics.log_verbose("Auxiliary preprocessing");
                     rip_log!("ripopt: Auxiliary preprocessing skipped after reduction failure: {:?}", err);
                 }
                 return AuxiliaryPreprocessAttempt::Failed;
@@ -1853,6 +1891,7 @@ fn try_auxiliary_preprocessed_solve<P: NlpProblem>(
         };
 
     if options.print_level >= 5 {
+        diagnostics.log_verbose("Auxiliary preprocessing");
         rip_log!(
             "ripopt: Auxiliary preprocessing reduced problem: {} fixed vars, {} removed constraints ({}x{} -> {}x{})",
             reduced.num_fixed(),
@@ -1877,6 +1916,13 @@ fn try_auxiliary_preprocessed_solve<P: NlpProblem>(
     let Some(reduced_opts) =
         auxiliary_reduced_solve_options(options, &preprocess_opts, &reduced, &prep, solve_start)
     else {
+        diagnostics.reject_global(
+            crate::auxiliary_preprocessing::AuxiliaryRejectionReason::TimeBudgetExceeded,
+            Some("reduced solve slice could not leave fallback time".to_string()),
+        );
+        if options.print_level >= 5 {
+            diagnostics.log_verbose("Auxiliary preprocessing");
+        }
         return AuxiliaryPreprocessAttempt::Failed;
     };
 
@@ -1891,16 +1937,30 @@ fn try_auxiliary_preprocessed_solve<P: NlpProblem>(
             result.diagnostics.final_dual_inf = validation.dual_inf;
             return AuxiliaryPreprocessAttempt::Solved(result);
         }
+        diagnostics.reject_global(
+            crate::auxiliary_preprocessing::AuxiliaryRejectionReason::FullSpaceValidationFailure,
+            None,
+        );
         if options.print_level >= 5 {
+            diagnostics.log_verbose("Auxiliary preprocessing");
             rip_log!(
                 "ripopt: Auxiliary-reduced result validation failed, retrying without auxiliary preprocessing"
             );
         }
-    } else if options.print_level >= 5 {
-        rip_log!(
-            "ripopt: Auxiliary-reduced solve failed ({:?}), retrying without auxiliary preprocessing",
-            result.status,
+    } else {
+        diagnostics.reject_global(
+            crate::auxiliary_preprocessing::AuxiliaryRejectionReason::AuxiliarySolveFailure {
+                status: result.status,
+            },
+            Some("auxiliary-reduced solve did not converge".to_string()),
         );
+        if options.print_level >= 5 {
+            diagnostics.log_verbose("Auxiliary preprocessing");
+            rip_log!(
+                "ripopt: Auxiliary-reduced solve failed ({:?}), retrying without auxiliary preprocessing",
+                result.status,
+            );
+        }
     }
     AuxiliaryPreprocessAttempt::Failed
 }
@@ -1915,13 +1975,26 @@ fn try_auxiliary_postsolve_solve<P: NlpProblem>(
     solve_start: Instant,
 ) -> AuxiliaryPreprocessAttempt {
     let problem_dyn = problem as &dyn NlpProblem;
-    let candidates =
-        crate::auxiliary_preprocessing::find_postsolve_candidates(problem_dyn, options.auxiliary_tol);
+    let (candidates, mut diagnostics) =
+        crate::auxiliary_preprocessing::find_postsolve_candidates_with_diagnostics(
+            problem_dyn,
+            options.auxiliary_tol,
+        );
     if candidates.is_empty() {
+        if options.print_level >= 5 && diagnostics.equality_rows > 0 {
+            diagnostics.log_verbose("Auxiliary postsolve");
+        }
         return AuxiliaryPreprocessAttempt::NoCandidates;
     }
 
     let Some(preprocess_opts) = auxiliary_preprocessing_options(options, solve_start) else {
+        diagnostics.reject_global(
+            crate::auxiliary_preprocessing::AuxiliaryRejectionReason::TimeBudgetExceeded,
+            Some("postsolve slice could not leave fallback time".to_string()),
+        );
+        if options.print_level >= 5 {
+            diagnostics.log_verbose("Auxiliary postsolve");
+        }
         return AuxiliaryPreprocessAttempt::Failed;
     };
 
@@ -1930,10 +2003,24 @@ fn try_auxiliary_postsolve_solve<P: NlpProblem>(
     let reduced =
         match crate::auxiliary_preprocessing::AuxiliaryReducedProblem::new(problem_dyn, &candidates, x_context.clone())
         {
-            Ok(reduced) if reduced.did_reduce() => reduced,
-            Ok(_) => return AuxiliaryPreprocessAttempt::Failed,
-            Err(err) => {
+            Ok(reduced) if reduced.did_reduce() => {
+                diagnostics.record_rank_accepted_candidates(&candidates);
+                reduced
+            }
+            Ok(_) => {
+                diagnostics.reject_global(
+                    crate::auxiliary_preprocessing::AuxiliaryRejectionReason::ReductionDidNotRemoveAnything,
+                    None,
+                );
                 if options.print_level >= 5 {
+                    diagnostics.log_verbose("Auxiliary postsolve");
+                }
+                return AuxiliaryPreprocessAttempt::Failed;
+            }
+            Err(err) => {
+                diagnostics.record_auxiliary_error(&err, options.auxiliary_tol);
+                if options.print_level >= 5 {
+                    diagnostics.log_verbose("Auxiliary postsolve");
                     rip_log!("ripopt: Auxiliary postsolve skipped after reduction failure: {:?}", err);
                 }
                 return AuxiliaryPreprocessAttempt::Failed;
@@ -1941,6 +2028,7 @@ fn try_auxiliary_postsolve_solve<P: NlpProblem>(
         };
 
     if options.print_level >= 5 {
+        diagnostics.log_verbose("Auxiliary postsolve");
         rip_log!(
             "ripopt: Auxiliary postsolve reduced problem: {} recovery vars, {} recovery constraints ({}x{} -> {}x{})",
             reduced.num_fixed(),
@@ -1965,13 +2053,27 @@ fn try_auxiliary_postsolve_solve<P: NlpProblem>(
     let Some(reduced_opts) =
         auxiliary_reduced_solve_options(options, &preprocess_opts, &reduced, &prep, solve_start)
     else {
+        diagnostics.reject_global(
+            crate::auxiliary_preprocessing::AuxiliaryRejectionReason::TimeBudgetExceeded,
+            Some("postsolve reduced solve slice could not leave fallback time".to_string()),
+        );
+        if options.print_level >= 5 {
+            diagnostics.log_verbose("Auxiliary postsolve");
+        }
         return AuxiliaryPreprocessAttempt::Failed;
     };
 
     let nested_result = solve(&prep, &reduced_opts);
     let auxiliary_result = prep.unmap_solution(&nested_result);
     if !matches!(auxiliary_result.status, SolveStatus::Optimal) {
+        diagnostics.reject_global(
+            crate::auxiliary_preprocessing::AuxiliaryRejectionReason::AuxiliarySolveFailure {
+                status: auxiliary_result.status,
+            },
+            Some("auxiliary-postsolve reduced solve did not converge".to_string()),
+        );
         if options.print_level >= 5 {
+            diagnostics.log_verbose("Auxiliary postsolve");
             rip_log!(
                 "ripopt: Auxiliary-postsolve reduced solve failed ({:?}), retrying without auxiliary postsolve",
                 auxiliary_result.status,
@@ -1990,9 +2092,20 @@ fn try_auxiliary_postsolve_solve<P: NlpProblem>(
         &mut x_context,
     ) {
         Ok(outcome) if outcome.blocks_solved > 0 => outcome,
-        Ok(_) => return AuxiliaryPreprocessAttempt::Failed,
-        Err(err) => {
+        Ok(_) => {
+            diagnostics.reject_global(
+                crate::auxiliary_preprocessing::AuxiliaryRejectionReason::NoBlocksSolved,
+                None,
+            );
             if options.print_level >= 5 {
+                diagnostics.log_verbose("Auxiliary postsolve");
+            }
+            return AuxiliaryPreprocessAttempt::Failed;
+        }
+        Err(err) => {
+            diagnostics.record_auxiliary_error(&err, options.auxiliary_tol);
+            if options.print_level >= 5 {
+                diagnostics.log_verbose("Auxiliary postsolve");
                 rip_log!("ripopt: Auxiliary postsolve recovery failed: {:?}", err);
             }
             return AuxiliaryPreprocessAttempt::Failed;
@@ -2012,7 +2125,9 @@ fn try_auxiliary_postsolve_solve<P: NlpProblem>(
         {
             Ok(reduced) => reduced,
             Err(err) => {
+                diagnostics.record_auxiliary_error(&err, options.auxiliary_tol);
                 if options.print_level >= 5 {
+                    diagnostics.log_verbose("Auxiliary postsolve");
                     rip_log!("ripopt: Auxiliary postsolve skipped after recovery validation failure: {:?}", err);
                 }
                 return AuxiliaryPreprocessAttempt::Failed;
@@ -2026,7 +2141,12 @@ fn try_auxiliary_postsolve_solve<P: NlpProblem>(
         result.diagnostics.final_dual_inf = validation.dual_inf;
         return AuxiliaryPreprocessAttempt::Solved(result);
     }
+    diagnostics.reject_global(
+        crate::auxiliary_preprocessing::AuxiliaryRejectionReason::FullSpaceValidationFailure,
+        None,
+    );
     if options.print_level >= 5 {
+        diagnostics.log_verbose("Auxiliary postsolve");
         rip_log!(
             "ripopt: Auxiliary-postsolve result validation failed, retrying without auxiliary postsolve"
         );
