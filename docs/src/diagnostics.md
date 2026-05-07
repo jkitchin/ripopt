@@ -63,7 +63,7 @@ structural data:
 | Field | Meaning |
 |---|---|
 | `attempted`, `solved`, `failed` | Whether the phase ran, solved the problem, or rejected/fell back |
-| `skipped`, `skip_reason` | Whether a no-op/cost gate skipped the phase before auxiliary solves, and why |
+| `skipped`, `skip_reason` | Whether the phase returned to the normal solve path before auxiliary solves, and why; examples include no accepted candidates, no-op gates, and cost gates |
 | `total_time_secs` | Total wall-clock time spent in that preprocessing phase |
 | `candidate_detection_time_secs` | End-to-end candidate search time |
 | `incidence_time_secs` | Time spent building equality incidence data |

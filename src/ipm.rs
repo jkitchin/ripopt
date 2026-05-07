@@ -2244,6 +2244,7 @@ enum AuxiliaryPreprocessAttempt {
 const AUXILIARY_COST_GATE_MIN_PROBLEM_SIZE: usize = 1_000;
 const AUXILIARY_COST_GATE_MIN_CANDIDATES: usize = 64;
 const AUXILIARY_COST_GATE_MIN_BLOCKS: usize = 128;
+const AUXILIARY_COST_GATE_MAX_REMOVAL_FRACTION: f64 = 0.25;
 
 fn copy_auxiliary_candidate_diagnostics(
     target: &mut AuxiliaryPreprocessingDiagnostics,
@@ -2322,6 +2323,25 @@ fn predicted_auxiliary_reduction(
     (rows.len(), vars.len(), blocks)
 }
 
+fn predicted_auxiliary_removal_fraction(
+    problem_variables: usize,
+    problem_constraints: usize,
+    predicted_vars: usize,
+    predicted_rows: usize,
+) -> f64 {
+    let variable_fraction = if problem_variables > 0 {
+        predicted_vars as f64 / problem_variables as f64
+    } else {
+        0.0
+    };
+    let constraint_fraction = if problem_constraints > 0 {
+        predicted_rows as f64 / problem_constraints as f64
+    } else {
+        0.0
+    };
+    variable_fraction.min(constraint_fraction)
+}
+
 fn auxiliary_candidate_skip_reason(
     problem_variables: usize,
     problem_constraints: usize,
@@ -2339,17 +2359,25 @@ fn auxiliary_candidate_skip_reason(
     }
 
     let problem_size = problem_variables + problem_constraints;
+    let predicted_removal_fraction = predicted_auxiliary_removal_fraction(
+        problem_variables,
+        problem_constraints,
+        predicted_vars,
+        predicted_rows,
+    );
     if problem_size >= AUXILIARY_COST_GATE_MIN_PROBLEM_SIZE
         && candidates.len() >= AUXILIARY_COST_GATE_MIN_CANDIDATES
         && predicted_blocks >= AUXILIARY_COST_GATE_MIN_BLOCKS
+        && predicted_removal_fraction < AUXILIARY_COST_GATE_MAX_REMOVAL_FRACTION
     {
         return Some((
             crate::auxiliary_preprocessing::AuxiliaryRejectionReason::CostGate,
             format!(
-                "{} candidate group(s), {predicted_blocks} auxiliary block(s), predicted removal {} variable(s)/{} constraint(s), problem size {}x{}",
+                "{} candidate group(s), {predicted_blocks} auxiliary block(s), predicted removal {} variable(s)/{} constraint(s) ({:.1}% of dimensions), problem size {}x{}",
                 candidates.len(),
                 predicted_vars,
                 predicted_rows,
+                100.0 * predicted_removal_fraction,
                 problem_variables,
                 problem_constraints,
             ),
@@ -12412,6 +12440,16 @@ mod tests {
         );
         assert!(skip.1.contains("106 candidate group"));
         assert!(skip.1.contains("278 auxiliary block"));
+    }
+
+    #[test]
+    fn auxiliary_cost_gate_allows_large_useful_many_block_reduction() {
+        let useful_many_block_shape = candidate_shape(900, 900);
+
+        assert!(
+            auxiliary_candidate_skip_reason(1_000, 1_000, &useful_many_block_shape).is_none(),
+            "large many-block reductions that remove most dimensions should be attempted"
+        );
     }
 
     #[test]
