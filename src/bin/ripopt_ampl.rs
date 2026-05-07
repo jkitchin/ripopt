@@ -140,7 +140,7 @@ fn print_help() {
     println!("    constr_viol_tol=<float>              Constraint violation tolerance [1e-4]");
     println!("    dual_inf_tol=<float>                 Dual infeasibility tolerance [1.0]");
     println!("    compl_inf_tol=<float>                Complementarity tolerance [1e-4]");
-    println!("    auxiliary_tol=<float>                Residual tolerance for internal auxiliary equality solves [1e-8]");
+    println!("    auxiliary_tol=<float>                Residual tolerance for internal auxiliary equality solves/recovery [1e-8]");
     println!();
     println!("  Barrier Parameter");
     println!("    mu_init=<float>                      Initial barrier parameter [0.1]");
@@ -199,7 +199,7 @@ fn print_help() {
     println!("    enable_lbfgs_hessian_fallback=<bool> Retry with L-BFGS Hessian [yes]");
     println!();
     println!("  Preprocessing & Diagnostics");
-    println!("    enable_preprocessing=<bool>          Internal auxiliary equality solves, fixed vars, redundancies [yes]");
+    println!("    enable_preprocessing=<bool>          Internal auxiliary equality solves/recovery, fixed vars, redundancies [yes]");
     println!("    proactive_infeasibility_detection=<bool> Early infeasibility detection [no]");
     println!("    print_level=<int>                    Verbosity: 0=silent, 5=verbose [5]");
     println!("    early_stall_timeout=<float>          Max seconds for first 3 iters (0=off) [120.0]");

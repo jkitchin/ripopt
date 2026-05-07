@@ -1641,6 +1641,7 @@ struct FullSpaceValidation {
     objective: f64,
     constraints: Vec<f64>,
     primal_inf: f64,
+    dual_inf: f64,
 }
 
 fn validate_full_space_result(
@@ -1683,10 +1684,56 @@ fn validate_full_space_result(
         return None;
     }
 
+    let mut grad = vec![0.0; n];
+    if !problem.gradient(&result.x, true, &mut grad) || grad.iter().any(|value| !value.is_finite())
+    {
+        return None;
+    }
+
+    let (jac_rows, jac_cols) = problem.jacobian_structure();
+    if jac_rows.len() != jac_cols.len() {
+        return None;
+    }
+    let mut jac_vals = vec![0.0; jac_rows.len()];
+    if !problem.jacobian_values(&result.x, true, &mut jac_vals)
+        || jac_vals.iter().any(|value| !value.is_finite())
+    {
+        return None;
+    }
+    for (&row, &col) in jac_rows.iter().zip(jac_cols.iter()) {
+        if row >= m || col >= n {
+            return None;
+        }
+    }
+    if result
+        .constraint_multipliers
+        .iter()
+        .chain(result.bound_multipliers_lower.iter())
+        .chain(result.bound_multipliers_upper.iter())
+        .any(|value| !value.is_finite())
+    {
+        return None;
+    }
+
+    let dual_inf = convergence::dual_infeasibility(
+        &grad,
+        &jac_rows,
+        &jac_cols,
+        &jac_vals,
+        &result.constraint_multipliers,
+        &result.bound_multipliers_lower,
+        &result.bound_multipliers_upper,
+        n,
+    );
+    if !dual_inf.is_finite() || dual_inf > options.dual_inf_tol {
+        return None;
+    }
+
     Some(FullSpaceValidation {
         objective,
         constraints,
         primal_inf,
+        dual_inf,
     })
 }
 
@@ -1841,6 +1888,7 @@ fn try_auxiliary_preprocessed_solve<P: NlpProblem>(
             result.objective = validation.objective;
             result.constraint_values = validation.constraints;
             result.diagnostics.final_primal_inf = validation.primal_inf;
+            result.diagnostics.final_dual_inf = validation.dual_inf;
             return AuxiliaryPreprocessAttempt::Solved(result);
         }
         if options.print_level >= 5 {
@@ -1975,6 +2023,7 @@ fn try_auxiliary_postsolve_solve<P: NlpProblem>(
         result.objective = validation.objective;
         result.constraint_values = validation.constraints;
         result.diagnostics.final_primal_inf = validation.primal_inf;
+        result.diagnostics.final_dual_inf = validation.dual_inf;
         return AuxiliaryPreprocessAttempt::Solved(result);
     }
     if options.print_level >= 5 {
@@ -10900,10 +10949,90 @@ mod tests {
         SolveResult {
             x: vec![x],
             objective: f64::NAN,
-            constraint_multipliers: vec![0.0],
+            constraint_multipliers: vec![-2.0 * x],
             bound_multipliers_lower: vec![0.0],
             bound_multipliers_upper: vec![0.0],
             constraint_values: vec![f64::NAN],
+            status: SolveStatus::Optimal,
+            iterations: 0,
+            diagnostics: SolverDiagnostics::default(),
+        }
+    }
+
+    struct FalsePositivePostsolveProblem;
+
+    impl NlpProblem for FalsePositivePostsolveProblem {
+        fn num_variables(&self) -> usize { 2 }
+        fn num_constraints(&self) -> usize { 1 }
+
+        fn bounds(&self, x_l: &mut [f64], x_u: &mut [f64]) {
+            x_l.fill(f64::NEG_INFINITY);
+            x_u.fill(f64::INFINITY);
+        }
+
+        fn constraint_bounds(&self, g_l: &mut [f64], g_u: &mut [f64]) {
+            g_l[0] = 0.0;
+            g_u[0] = 0.0;
+        }
+
+        fn initial_point(&self, x0: &mut [f64]) {
+            x0[0] = 0.5;
+            x0[1] = 0.0;
+        }
+
+        fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+            *obj = (x[0] - 2.0) * (x[0] - 2.0)
+                + 100.0 * x[1] * x[1] * (x[1] - 1.0) * (x[1] - 1.0);
+            true
+        }
+
+        fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
+            grad[0] = 2.0 * (x[0] - 2.0);
+            grad[1] = 200.0 * x[1] * (x[1] - 1.0) * (2.0 * x[1] - 1.0);
+            true
+        }
+
+        fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
+            g[0] = x[1] - x[0];
+            true
+        }
+
+        fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            (vec![0, 0], vec![0, 1])
+        }
+
+        fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
+            vals[0] = -1.0;
+            vals[1] = 1.0;
+            true
+        }
+
+        fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            (vec![0, 1], vec![0, 1])
+        }
+
+        fn hessian_values(
+            &self,
+            x: &[f64],
+            _new_x: bool,
+            obj_factor: f64,
+            _lambda: &[f64],
+            vals: &mut [f64],
+        ) -> bool {
+            vals[0] = 2.0 * obj_factor;
+            vals[1] = obj_factor * (1200.0 * x[1] * x[1] - 1200.0 * x[1] + 200.0);
+            true
+        }
+    }
+
+    fn false_positive_postsolve_result() -> SolveResult {
+        SolveResult {
+            x: vec![2.0, 2.0],
+            objective: 400.0,
+            constraint_multipliers: vec![-1200.0],
+            bound_multipliers_lower: vec![0.0, 0.0],
+            bound_multipliers_upper: vec![0.0, 0.0],
+            constraint_values: vec![0.0],
             status: SolveStatus::Optimal,
             iterations: 0,
             diagnostics: SolverDiagnostics::default(),
@@ -11046,6 +11175,24 @@ mod tests {
         assert_eq!(validation.constraints.len(), 1);
         assert!((validation.constraints[0] - 1.00005).abs() < 1e-12);
         assert!((validation.primal_inf - 5e-5).abs() < 1e-12);
+        assert!(validation.dual_inf < 1e-12);
+    }
+
+    #[test]
+    fn full_space_validation_rejects_postsolve_objective_probe_false_positive() {
+        let problem = FalsePositivePostsolveProblem;
+        let options = SolverOptions {
+            dual_inf_tol: 1.0,
+            ..SolverOptions::default()
+        };
+        let result = false_positive_postsolve_result();
+
+        let validation = validate_full_space_result(&problem, &result, &options);
+
+        assert!(
+            validation.is_none(),
+            "postsolve candidates with large full-space stationarity residual must fall back"
+        );
     }
 
     #[test]
