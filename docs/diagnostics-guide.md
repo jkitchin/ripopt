@@ -64,6 +64,7 @@ fields are:
 | Field | Meaning |
 |---|---|
 | `attempted`, `solved`, `failed` | Whether the phase ran, solved through preprocessing, or rejected/fell back |
+| `skipped`, `skip_reason` | Whether a no-op/cost gate skipped the phase before auxiliary solves, and why |
 | `total_time_secs` | Total wall-clock time spent in the phase |
 | `candidate_detection_time_secs` | Candidate search time, including incidence, filtering, and structural analysis |
 | `incidence_time_secs` | Time spent constructing equality-incidence data |
@@ -91,7 +92,9 @@ When preprocessing is slower than the no-preprocessing solve, compare
 `wall_time_secs` with the phase totals. High `candidate_detection_time_secs`
 points to structural overhead; high `auxiliary_solve_time_secs` or
 `recovery_solve_time_secs` points to internal block solves; high
-`reduced_solve_time_secs` means the reduced NLP itself still dominates.
+`reduced_solve_time_secs` means the reduced NLP itself still dominates. If
+`skipped` is true, `skip_reason` records the no-op or conservative cost gate
+that returned to the normal solve path before auxiliary block solves.
 
 ## Reading the diagnostics
 

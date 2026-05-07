@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use crate::convergence::{self, ConvergenceInfo, ConvergenceStatus};
@@ -2241,6 +2241,10 @@ enum AuxiliaryPreprocessAttempt {
     Failed,
 }
 
+const AUXILIARY_COST_GATE_MIN_PROBLEM_SIZE: usize = 1_000;
+const AUXILIARY_COST_GATE_MIN_CANDIDATES: usize = 64;
+const AUXILIARY_COST_GATE_MIN_BLOCKS: usize = 128;
+
 fn copy_auxiliary_candidate_diagnostics(
     target: &mut AuxiliaryPreprocessingDiagnostics,
     candidate_count: usize,
@@ -2300,6 +2304,81 @@ fn finish_auxiliary_diagnostics(
 ) {
     copy_auxiliary_candidate_diagnostics(target, candidate_count, diagnostics);
     target.total_time_secs += started.elapsed().as_secs_f64();
+}
+
+fn predicted_auxiliary_reduction(
+    candidates: &[crate::auxiliary_preprocessing::PresolveCandidate],
+) -> (usize, usize, usize) {
+    let mut rows = BTreeSet::new();
+    let mut vars = BTreeSet::new();
+    let mut blocks = 0;
+    for candidate in candidates {
+        for block in &candidate.blocks {
+            blocks += 1;
+            rows.extend(block.rows.iter().copied());
+            vars.extend(block.vars.iter().copied());
+        }
+    }
+    (rows.len(), vars.len(), blocks)
+}
+
+fn auxiliary_candidate_skip_reason(
+    problem_variables: usize,
+    problem_constraints: usize,
+    candidates: &[crate::auxiliary_preprocessing::PresolveCandidate],
+) -> Option<(crate::auxiliary_preprocessing::AuxiliaryRejectionReason, String)> {
+    let (predicted_rows, predicted_vars, predicted_blocks) =
+        predicted_auxiliary_reduction(candidates);
+    if predicted_rows == 0 || predicted_vars == 0 {
+        return Some((
+            crate::auxiliary_preprocessing::AuxiliaryRejectionReason::NoOpGate,
+            format!(
+                "predicted reduction removes {predicted_vars} variable(s) and {predicted_rows} constraint(s)"
+            ),
+        ));
+    }
+
+    let problem_size = problem_variables + problem_constraints;
+    if problem_size >= AUXILIARY_COST_GATE_MIN_PROBLEM_SIZE
+        && candidates.len() >= AUXILIARY_COST_GATE_MIN_CANDIDATES
+        && predicted_blocks >= AUXILIARY_COST_GATE_MIN_BLOCKS
+    {
+        return Some((
+            crate::auxiliary_preprocessing::AuxiliaryRejectionReason::CostGate,
+            format!(
+                "{} candidate group(s), {predicted_blocks} auxiliary block(s), predicted removal {} variable(s)/{} constraint(s), problem size {}x{}",
+                candidates.len(),
+                predicted_vars,
+                predicted_rows,
+                problem_variables,
+                problem_constraints,
+            ),
+        ));
+    }
+
+    None
+}
+
+fn skip_auxiliary_phase(
+    label: &str,
+    target: &mut AuxiliaryPreprocessingDiagnostics,
+    candidate_count: usize,
+    diagnostics: &mut crate::auxiliary_preprocessing::AuxiliaryCandidateDiagnostics,
+    reason: crate::auxiliary_preprocessing::AuxiliaryRejectionReason,
+    detail: String,
+    started: Instant,
+    options: &SolverOptions,
+) -> AuxiliaryPreprocessAttempt {
+    let reason_label = reason.label();
+    diagnostics.reject_global(reason, Some(detail.clone()));
+    target.skipped = true;
+    target.skip_reason = Some(format!("{reason_label}: {detail}"));
+    if options.print_level >= 5 {
+        diagnostics.log_verbose(label);
+        rip_log!("ripopt: {label} skipped by {reason_label}: {detail}");
+    }
+    finish_auxiliary_diagnostics(target, candidate_count, diagnostics, started);
+    AuxiliaryPreprocessAttempt::NoCandidates
 }
 
 struct FullSpaceValidation {
@@ -2482,11 +2561,31 @@ fn try_auxiliary_preprocessed_solve<P: NlpProblem>(
         );
     phase.candidate_detection_time_secs += candidate_start.elapsed().as_secs_f64();
     if candidates.is_empty() {
+        phase.skipped = true;
+        phase.skip_reason = Some("no accepted auxiliary candidates".to_string());
         if options.print_level >= 5 && diagnostics.equality_rows > 0 {
             diagnostics.log_verbose("Auxiliary preprocessing");
+            rip_log!("ripopt: Auxiliary preprocessing skipped: no accepted auxiliary candidates");
         }
         finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
         return AuxiliaryPreprocessAttempt::NoCandidates;
+    }
+
+    if let Some((reason, detail)) = auxiliary_candidate_skip_reason(
+        problem.num_variables(),
+        problem.num_constraints(),
+        &candidates,
+    ) {
+        return skip_auxiliary_phase(
+            "Auxiliary preprocessing",
+            phase,
+            candidates.len(),
+            &mut diagnostics,
+            reason,
+            detail,
+            phase_start,
+            options,
+        );
     }
 
     let Some(preprocess_opts) = auxiliary_preprocessing_options(options, solve_start) else {
@@ -2708,11 +2807,31 @@ fn try_auxiliary_postsolve_solve<P: NlpProblem>(
         );
     phase.candidate_detection_time_secs += candidate_start.elapsed().as_secs_f64();
     if candidates.is_empty() {
+        phase.skipped = true;
+        phase.skip_reason = Some("no accepted auxiliary postsolve candidates".to_string());
         if options.print_level >= 5 && diagnostics.equality_rows > 0 {
             diagnostics.log_verbose("Auxiliary postsolve");
+            rip_log!("ripopt: Auxiliary postsolve skipped: no accepted auxiliary candidates");
         }
         finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
         return AuxiliaryPreprocessAttempt::NoCandidates;
+    }
+
+    if let Some((reason, detail)) = auxiliary_candidate_skip_reason(
+        problem.num_variables(),
+        problem.num_constraints(),
+        &candidates,
+    ) {
+        return skip_auxiliary_phase(
+            "Auxiliary postsolve",
+            phase,
+            candidates.len(),
+            &mut diagnostics,
+            reason,
+            detail,
+            phase_start,
+            options,
+        );
     }
 
     let Some(preprocess_opts) = auxiliary_preprocessing_options(options, solve_start) else {
@@ -12063,6 +12182,99 @@ mod tests {
         }
     }
 
+    struct ManyIndependentAuxiliaryBlocksProblem {
+        total_variables: usize,
+        equality_blocks: usize,
+    }
+
+    impl NlpProblem for ManyIndependentAuxiliaryBlocksProblem {
+        fn num_variables(&self) -> usize { self.total_variables }
+        fn num_constraints(&self) -> usize { self.equality_blocks }
+
+        fn bounds(&self, x_l: &mut [f64], x_u: &mut [f64]) {
+            x_l.fill(f64::NEG_INFINITY);
+            x_u.fill(f64::INFINITY);
+        }
+
+        fn constraint_bounds(&self, g_l: &mut [f64], g_u: &mut [f64]) {
+            for row in 0..self.equality_blocks {
+                g_l[row] = 0.0;
+                g_u[row] = 0.0;
+            }
+        }
+
+        fn initial_point(&self, x0: &mut [f64]) {
+            x0.fill(0.0);
+        }
+
+        fn objective(&self, _x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+            *obj = 0.0;
+            true
+        }
+
+        fn gradient(&self, _x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
+            grad.fill(0.0);
+            true
+        }
+
+        fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
+            for row in 0..self.equality_blocks {
+                g[row] = x[row] - 1.0;
+            }
+            true
+        }
+
+        fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            (
+                (0..self.equality_blocks).collect(),
+                (0..self.equality_blocks).collect(),
+            )
+        }
+
+        fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
+            vals.fill(1.0);
+            true
+        }
+
+        fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            (Vec::new(), Vec::new())
+        }
+
+        fn hessian_values(
+            &self,
+            _x: &[f64],
+            _new_x: bool,
+            _obj_factor: f64,
+            _lambda: &[f64],
+            _vals: &mut [f64],
+        ) -> bool {
+            true
+        }
+    }
+
+    fn candidate_shape(
+        candidate_count: usize,
+        block_count: usize,
+    ) -> Vec<crate::auxiliary_preprocessing::PresolveCandidate> {
+        let mut candidates = Vec::new();
+        let mut next = 0;
+        for candidate_index in 0..candidate_count {
+            let remaining_candidates = candidate_count - candidate_index;
+            let remaining_blocks = block_count - next;
+            let blocks_this_candidate = remaining_blocks.div_ceil(remaining_candidates);
+            let mut blocks = Vec::new();
+            for _ in 0..blocks_this_candidate {
+                blocks.push(crate::auxiliary_preprocessing::EqualityBlock {
+                    rows: vec![next],
+                    vars: vec![next],
+                });
+                next += 1;
+            }
+            candidates.push(crate::auxiliary_preprocessing::PresolveCandidate { blocks });
+        }
+        candidates
+    }
+
     unsafe extern "C" fn capture_log(msg: *const c_char, user_data: *mut c_void) {
         let logs = &mut *(user_data as *mut Vec<String>);
         logs.push(CStr::from_ptr(msg).to_string_lossy().into_owned());
@@ -12076,7 +12288,7 @@ mod tests {
             max_iter: 100,
             ..SolverOptions::default()
         };
-        let mut logs = Vec::new();
+        let mut logs: Vec<String> = Vec::new();
         crate::logging::set_log_callback(Some((
             capture_log,
             &mut logs as *mut Vec<String> as *mut c_void,
@@ -12178,6 +12390,99 @@ mod tests {
         let attempt_opts = auxiliary_preprocessing_options(&options, Instant::now());
 
         assert!(attempt_opts.is_none());
+    }
+
+    #[test]
+    fn auxiliary_cost_gate_matches_known_preprocessing_shapes() {
+        let issue_23 = candidate_shape(1, 13);
+        assert!(auxiliary_candidate_skip_reason(19, 19, &issue_23).is_none());
+
+        let gaslib11_steady = candidate_shape(2, 52);
+        assert!(auxiliary_candidate_skip_reason(204, 200, &gaslib11_steady).is_none());
+
+        let gaslib40_steady = candidate_shape(16, 86);
+        assert!(auxiliary_candidate_skip_reason(1694, 1682, &gaslib40_steady).is_none());
+
+        let gaslib11_dynamic_shape = candidate_shape(106, 278);
+        let skip = auxiliary_candidate_skip_reason(2542, 2492, &gaslib11_dynamic_shape)
+            .expect("large many-block dynamic gas shape should trip the cost gate");
+        assert_eq!(
+            skip.0.label(),
+            crate::auxiliary_preprocessing::AuxiliaryRejectionReason::CostGate.label()
+        );
+        assert!(skip.1.contains("106 candidate group"));
+        assert!(skip.1.contains("278 auxiliary block"));
+    }
+
+    #[test]
+    fn auxiliary_cost_gate_skips_many_blocks_before_auxiliary_solves() {
+        let problem = ManyIndependentAuxiliaryBlocksProblem {
+            total_variables: 1_000,
+            equality_blocks: 130,
+        };
+        let options = SolverOptions {
+            print_level: 0,
+            enable_preprocessing: true,
+            max_iter: 100,
+            ..SolverOptions::default()
+        };
+
+        let mut phase = AuxiliaryPreprocessingDiagnostics::default();
+        let attempt =
+            try_auxiliary_preprocessed_solve(&problem, &options, Instant::now(), &mut phase);
+
+        assert!(matches!(attempt, AuxiliaryPreprocessAttempt::NoCandidates));
+        assert!(phase.skipped);
+        assert!(
+            phase
+                .skip_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("cost gate")),
+            "skip_reason={:?}",
+            phase.skip_reason
+        );
+        assert_eq!(phase.candidates, 130);
+        assert_eq!(phase.btd_blocks, 130);
+        assert_eq!(phase.auxiliary_blocks_solved, 0);
+        assert_eq!(phase.auxiliary_iterations, 0);
+        assert_eq!(phase.auxiliary_solve_time_secs, 0.0);
+        assert!(
+            phase
+                .rejection_counts
+                .iter()
+                .any(|entry| entry.reason == "cost gate" && entry.count == 1),
+            "rejection_counts={:?}",
+            phase.rejection_counts
+        );
+    }
+
+    #[test]
+    fn auxiliary_cost_gate_logs_verbose_skip_reason() {
+        let problem = ManyIndependentAuxiliaryBlocksProblem {
+            total_variables: 1_000,
+            equality_blocks: 130,
+        };
+        let options = SolverOptions {
+            print_level: 5,
+            enable_preprocessing: true,
+            max_iter: 100,
+            ..SolverOptions::default()
+        };
+
+        let mut logs: Vec<String> = Vec::new();
+        crate::logging::set_log_callback(Some((
+            capture_log,
+            &mut logs as *mut Vec<String> as *mut c_void,
+        )));
+        let mut phase = AuxiliaryPreprocessingDiagnostics::default();
+        let _ = try_auxiliary_preprocessed_solve(&problem, &options, Instant::now(), &mut phase);
+        crate::logging::set_log_callback(None);
+
+        assert!(
+            logs.iter()
+                .any(|line| line.contains("Auxiliary preprocessing skipped by cost gate")),
+            "logs={logs:?}"
+        );
     }
 
     #[test]

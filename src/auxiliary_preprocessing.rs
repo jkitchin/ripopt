@@ -121,6 +121,8 @@ pub(crate) enum AuxiliaryRejectionReason {
     FullSpaceValidationFailure,
     ReductionDidNotRemoveAnything,
     NoBlocksSolved,
+    NoOpGate,
+    CostGate,
 }
 
 impl AuxiliaryRejectionReason {
@@ -143,6 +145,8 @@ impl AuxiliaryRejectionReason {
             Self::FullSpaceValidationFailure => "full-space validation failure",
             Self::ReductionDidNotRemoveAnything => "reduction did not remove anything",
             Self::NoBlocksSolved => "no blocks solved",
+            Self::NoOpGate => "no-op gate",
+            Self::CostGate => "cost gate",
         }
     }
 }
