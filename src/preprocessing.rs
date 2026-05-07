@@ -45,7 +45,21 @@ const FIXED_TOL: f64 = 1e-10;
 
 impl<'a> PreprocessedProblem<'a> {
     /// Analyze and build the preprocessed problem wrapper.
+    /// Performs fixed-var elimination, single-variable-linear-constraint
+    /// bound tightening, and redundant-constraint detection.
     pub fn new(inner: &'a dyn NlpProblem, bound_push: f64) -> Self {
+        Self::with_options(inner, bound_push, false)
+    }
+
+    /// Build a wrapper that only eliminates fixed variables.
+    /// Mirrors Ipopt 3.14's `fixed_variable_treatment = make_parameter`,
+    /// which removes fixed vars from the working problem without performing
+    /// bound tightening or redundant-constraint detection.
+    pub fn new_fixed_only(inner: &'a dyn NlpProblem) -> Self {
+        Self::with_options(inner, 0.0, true)
+    }
+
+    fn with_options(inner: &'a dyn NlpProblem, bound_push: f64, fixed_only: bool) -> Self {
         let n = inner.num_variables();
         let m = inner.num_constraints();
 
@@ -82,6 +96,9 @@ impl<'a> PreprocessedProblem<'a> {
         let jac_nnz = inner_jac_rows.len();
 
         'bound_tightening: {
+        if fixed_only {
+            break 'bound_tightening;
+        }
         if m > 0 && jac_nnz > 0 {
             let mut x0 = vec![0.0; n];
             inner.initial_point(&mut x0);
@@ -221,6 +238,9 @@ impl<'a> PreprocessedProblem<'a> {
         let mut constr_map: Vec<usize> = (0..m).collect();
 
         'redundancy: {
+        if fixed_only {
+            break 'redundancy;
+        }
         if m > 1 && jac_nnz > 0 {
             let mut x0 = vec![0.0; n];
             inner.initial_point(&mut x0);
@@ -681,6 +701,20 @@ mod tests {
         assert_eq!(prep.num_constraints(), 1);
 
         // Check variable mapping: var_map should be [0, 2]
+        assert_eq!(prep.var_map, vec![0, 2]);
+    }
+
+    #[test]
+    fn test_new_fixed_only_skips_redundancy_and_tightening() {
+        // `new_fixed_only` (Ipopt make_parameter mode) eliminates fixed
+        // vars but skips bound tightening + redundant-constraint detection.
+        let prob = FixedVarProblem;
+        let prep = PreprocessedProblem::new_fixed_only(&prob as &dyn NlpProblem);
+
+        assert!(prep.did_reduce());
+        assert_eq!(prep.num_fixed(), 1);
+        assert_eq!(prep.num_redundant(), 0); // redundancy pass skipped
+        assert_eq!(prep.num_variables(), 2);
         assert_eq!(prep.var_map, vec![0, 2]);
     }
 

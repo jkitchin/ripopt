@@ -56,7 +56,6 @@ impl NlpProblem for Rosenbrock {
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
     fn hessian_values(&self, _x: &[f64], _new_x: bool, _: f64, _: &[f64], _: &mut [f64]) -> bool {
         unreachable!("Hessian should not be called in limited-memory mode");
-        true
     }
 }
 
@@ -187,20 +186,16 @@ fn main() {
     println!("  Expected:   ~(1.0, 4.743, 3.821, 1.379) with f* ≈ 17.014");
     println!();
 
-    // --- Example 3: Automatic fallback ---
-    println!("=== Example 3: Automatic L-BFGS Hessian fallback ===");
-    println!("  The solver automatically retries with L-BFGS Hessian when the");
-    println!("  exact-Hessian IPM fails. This is enabled by default.");
-    println!("  (enable_lbfgs_hessian_fallback = true)");
+    // --- Example 3: Default (exact-Hessian) mode ---
+    println!("=== Example 3: Default exact-Hessian mode ===");
+    println!("  In v0.8+, ripopt does not auto-retry with L-BFGS when the");
+    println!("  exact-Hessian IPM fails — set hessian_approximation_lbfgs");
+    println!("  manually to switch modes (matches Ipopt 3.14 behaviour).");
     println!();
 
-    // Use the Rosenbrock with exact Hessian (default mode)
-    // The exact Hessian path works fine, so the fallback won't activate.
-    // But if you provide a bad Hessian, it will:
     let result = ripopt::solve(
         &Rosenbrock,
         &SolverOptions {
-            // Default: exact Hessian first, L-BFGS fallback if it fails
             print_level: 0,
             ..SolverOptions::default()
         },
@@ -209,6 +204,5 @@ fn main() {
         "  Default mode: status={:?}, obj={:.6e}",
         result.status, result.objective
     );
-    println!("  (Fallback not needed — exact Hessian path works.)");
     println!("  To force L-BFGS mode: set hessian_approximation_lbfgs = true");
 }

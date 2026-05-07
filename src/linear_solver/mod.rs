@@ -6,6 +6,12 @@ pub mod multifrontal;
 pub mod iterative;
 #[cfg(feature = "rmumps")]
 pub mod hybrid;
+#[cfg(feature = "feral")]
+pub mod feral_direct;
+#[cfg(feature = "feral")]
+pub mod feral_iterative;
+#[cfg(feature = "feral")]
+pub mod feral_hybrid;
 #[cfg(feature = "faer")]
 pub mod sparse;
 
@@ -34,10 +40,21 @@ impl fmt::Display for Inertia {
 }
 
 /// Error from a linear solver.
+///
+/// T3.34: `WrongInertia` is distinct from `SingularMatrix` to match Ipopt's
+/// `ESymSolverStatus` (SUCCESS / SINGULAR / WRONG_INERTIA). The IPM's
+/// perturbation handler escalates `delta_w`/`delta_c` differently for the
+/// two cases — singular triggers a fresh factor with bumped delta_c; wrong
+/// inertia triggers a delta_w escalation. Collapsing them into one variant
+/// loses that signal.
 #[derive(Debug, Clone)]
 pub enum SolverError {
     /// Matrix is structurally singular (e.g., zero row).
     SingularMatrix,
+    /// Factorization succeeded but inertia does not match the expected
+    /// (n positive, m negative, 0 zero) signature for an augmented KKT
+    /// system. Carries the actual inertia so callers can log/diagnose.
+    WrongInertia { actual: Inertia },
     /// Numerical failure during factorization.
     NumericalFailure(String),
     /// Dimension mismatch.
@@ -51,6 +68,7 @@ impl fmt::Display for SolverError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SolverError::SingularMatrix => write!(f, "singular matrix"),
+            SolverError::WrongInertia { actual } => write!(f, "wrong inertia: {}", actual),
             SolverError::NumericalFailure(msg) => write!(f, "numerical failure: {}", msg),
             SolverError::DimensionMismatch { expected, got } => {
                 write!(f, "dimension mismatch: expected {}, got {}", expected, got)
@@ -563,6 +581,33 @@ impl KktMatrix {
     }
 }
 
+/// Diagnostic snapshot from the most recent factorization. T3.38: lets
+/// the IPM log/inspect implementation-defined factorization quality
+/// signals (delayed pivots, 2x2 blocks, fill, scaling info, resolved
+/// algorithm), without baking those into the trait surface.
+///
+/// All fields are `Option`-typed so backends that cannot report a
+/// given quantity simply return `None` for it.
+#[derive(Debug, Clone, Default)]
+pub struct FactorDiagnostics {
+    /// Number of delayed pivots (Bunch-Kaufman pivots that could not
+    /// be eliminated in their natural supernode and were pushed to a
+    /// parent / column-swap path).
+    pub n_delayed: Option<usize>,
+    /// Number of 2x2 pivot blocks selected during BK factorization.
+    pub n_2x2: Option<usize>,
+    /// Non-zeros in the factor L (post-fill).
+    pub factor_nnz: Option<usize>,
+    /// Smallest diagonal entry (in absolute value) of D.
+    pub min_diagonal: Option<f64>,
+    /// One-line, human-readable description of the scaling that was
+    /// applied (e.g. `"Identity"`, `"InfNorm"`, `"MC64"`).
+    pub scaling_info: Option<String>,
+    /// Backend-specific name of the algorithm that was actually
+    /// resolved (e.g. `"multifrontal"`, `"supernodal-ldlt"`).
+    pub resolved_method: Option<String>,
+}
+
 /// Trait for linear solvers used within the IPM.
 pub trait LinearSolver {
     /// Factor the symmetric matrix. Returns inertia if the solver can compute it.
@@ -571,6 +616,36 @@ pub trait LinearSolver {
     /// Solve the system using the most recent factorization.
     /// Reads rhs and writes the solution into `solution`.
     fn solve(&mut self, rhs: &[f64], solution: &mut [f64]) -> Result<(), SolverError>;
+
+    /// Batched multi-RHS backsolve with the most recent factorization.
+    ///
+    /// `rhs` and `solution` are column-major `n × nrhs` buffers of length
+    /// `n * nrhs`. The default impl loops single-RHS solves; backends like
+    /// feral override to share workspace and supernode traversal across
+    /// columns (feral F1.1 `solve_sparse_many`). Use when several RHSes
+    /// against the same factor are known up front (QF oracle, Gondzio).
+    fn solve_many(
+        &mut self,
+        rhs: &[f64],
+        nrhs: usize,
+        solution: &mut [f64],
+    ) -> Result<(), SolverError> {
+        if nrhs == 0 {
+            return Ok(());
+        }
+        let n = rhs.len() / nrhs;
+        if rhs.len() != n * nrhs || solution.len() != n * nrhs {
+            return Err(SolverError::DimensionMismatch {
+                expected: n * nrhs,
+                got: rhs.len().min(solution.len()),
+            });
+        }
+        for c in 0..nrhs {
+            let off = c * n;
+            self.solve(&rhs[off..off + n], &mut solution[off..off + n])?;
+        }
+        Ok(())
+    }
 
     /// Whether this solver can report inertia.
     fn provides_inertia(&self) -> bool;
@@ -586,6 +661,22 @@ pub trait LinearSolver {
     /// Matches Ipopt's IncreaseQuality() / MUMPS pivtol escalation.
     fn increase_quality(&mut self) -> bool {
         false
+    }
+
+    /// Diagnostic snapshot from the most recent factorization. Default
+    /// returns an empty struct; backends fill in the fields they can
+    /// surface.
+    fn last_factor_diagnostics(&self) -> FactorDiagnostics {
+        FactorDiagnostics::default()
+    }
+
+    /// Estimate kappa_1(A) = ||A||_1 * ||A^{-1}||_1 using the Hager-Higham
+    /// power iteration on the cached factorization (feral F2.1). Returns
+    /// `None` if the backend does not implement the estimator. Cost is
+    /// 3-5 backsolves plus an O(nnz) pass — call on demand from logging
+    /// or diagnostics paths, not every iteration.
+    fn estimate_condition_1norm(&mut self) -> Option<f64> {
+        None
     }
 }
 

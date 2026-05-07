@@ -29,6 +29,50 @@ pub struct Filter {
     eta_phi: f64,
     /// Small constant delta for filter margin.
     delta: f64,
+    /// Maximum permitted log10 increase in the barrier objective per step,
+    /// used by the `obj_max_inc` divergence guard (Ipopt default `5.0`,
+    /// `IpFilterLSAcceptor.cpp:132-139`). The trial is rejected when
+    /// `trial_phi > reference_phi` *and* `log10(trial_phi - reference_phi)
+    /// > obj_max_inc + basval`, where
+    /// `basval = max(1.0, log10(|reference_phi|))`. Exact mirror of
+    /// `IpFilterLSAcceptor.cpp:478-493`.
+    obj_max_inc: f64,
+    /// T3.5: line-search minimum step multiplier. Ipopt's
+    /// `alpha_min_frac` (default `0.05`, `IpFilterLSAcceptor.cpp:113,
+    /// 222, 468`). Multiplies the final `min` of the gamma_theta /
+    /// gamma_phi / switching-condition terms in `compute_alpha_min`.
+    alpha_min_frac: f64,
+    /// Whether `set_theta_min_from_initial` has already seeded
+    /// `theta_max`/`theta_min` from the initial constraint violation.
+    /// Mirrors Ipopt's lazy-init sentinel (theta_max_ < 0.0) at
+    /// IpFilterLSAcceptor.cpp:325-339: once seeded, the bounds are
+    /// fixed for the rest of the solve.
+    theta_init_set: bool,
+    /// T3.10: tracks whether the most recent rejected line-search trial
+    /// (since the last accepted step) was rejected by the filter
+    /// dominance test. Mirrors Ipopt's `last_rejection_due_to_filter_`
+    /// (`IpFilterLSAcceptor.cpp:380, 397`).
+    last_rejection_due_to_filter: bool,
+    /// T3.10: counts consecutive accepted steps whose preceding line
+    /// search ended with a filter-based rejection.
+    count_successive_filter_rejections: u32,
+    /// T3.10: how many filter resets have already fired this solve.
+    /// Capped at `max_filter_resets` to prevent runaway clearing.
+    n_filter_resets: u32,
+    /// T3.10: number of consecutive filter rejections that triggers a
+    /// reset (Ipopt option `filter_reset_trigger`, default 5).
+    filter_reset_trigger: u32,
+    /// T3.10: maximum number of times the filter may be reset across
+    /// the solve (Ipopt option `max_filter_resets`, default 5; 0
+    /// disables the heuristic). Mirrors `IpFilterLSAcceptor.cpp:142,
+    /// 230, 407-414`.
+    max_filter_resets: u32,
+    /// DEV-36: `theta_min_fact` (Ipopt default 1e-4). Used by
+    /// `set_theta_min_from_initial` to seed `theta_min` once.
+    theta_min_fact: f64,
+    /// DEV-36: `theta_max_fact` (Ipopt default 1e4). Used by
+    /// `set_theta_min_from_initial` to seed `theta_max` once.
+    theta_max_fact: f64,
 }
 
 impl Filter {
@@ -44,23 +88,62 @@ impl Filter {
             s_phi: 2.3,
             eta_phi: 1e-8,
             delta: 1.0,
+            obj_max_inc: 5.0,
+            alpha_min_frac: 0.05,
+            theta_init_set: false,
+            last_rejection_due_to_filter: false,
+            count_successive_filter_rejections: 0,
+            n_filter_resets: 0,
+            filter_reset_trigger: 5,
+            max_filter_resets: 5,
+            theta_min_fact: 1e-4,
+            theta_max_fact: 1e4,
         }
     }
 
-    /// Initialize theta_min and theta_max based on constraint violation.
+    /// DEV-36: plumb the Ipopt `theta_min_fact` / `theta_max_fact`
+    /// options. Called before `set_theta_min_from_initial`.
+    pub fn set_theta_factors(&mut self, theta_min_fact: f64, theta_max_fact: f64) {
+        self.theta_min_fact = theta_min_fact;
+        self.theta_max_fact = theta_max_fact;
+    }
+
+    /// Initialize `theta_min` and `theta_max` from the initial constraint
+    /// violation. This is a one-shot operation — subsequent calls are
+    /// no-ops, mirroring Ipopt's IpFilterLSAcceptor.cpp:325-339 which
+    /// seeds these bounds once at the first acceptability check (when the
+    /// `theta_max_ < 0.0` sentinel is still set) and never resets them.
+    /// Resetting on every μ change lets the filter envelope grow over
+    /// time and admits iterates earlier filter entries had rejected.
     ///
-    /// NOTE: Ipopt sets these ONCE from the initial theta (IpFilterLSAcceptor.cpp:325-336).
-    /// ripopt currently re-computes them after each filter reset because the solver takes
-    /// more iterations than Ipopt, causing theta to bounce near the switching threshold.
-    /// This is a workaround — the proper fix is to improve search direction quality so
-    /// the solver converges faster (matching Ipopt's ~20 iterations vs current ~164).
+    /// T3.3: floor is `1.0`, matching Ipopt
+    /// `IpFilterLSAcceptor.cpp:325-335`'s `Max(Number(1.0), reference_theta_)`.
+    /// The previous `1e-4` floor produced 10⁴× tighter theta_max on
+    /// near-feasible starts (`theta_init = 1e-6` → `theta_max = 1.0`
+    /// instead of Ipopt's `1e4`), rejecting trial points Ipopt would
+    /// accept.
     pub fn set_theta_min_from_initial(&mut self, theta_init: f64) {
-        self.theta_min = 1e-4 * theta_init.max(1e-4);
-        self.theta_max = 1e4 * theta_init.max(1e-4);
+        if self.theta_init_set {
+            return;
+        }
+        let floor = theta_init.max(1.0);
+        self.theta_min = self.theta_min_fact * floor;
+        self.theta_max = self.theta_max_fact * floor;
+        self.theta_init_set = true;
     }
 
     /// Check if a trial point (theta, phi) is acceptable to the filter.
     /// Returns true if the point is acceptable (not dominated by any filter entry).
+    ///
+    /// Mirrors Ipopt's `FilterEntry::Acceptable` (`IpFilter.hpp:39-58`):
+    /// trial is acceptable to an entry iff `trial_θ ≤ entry.θ` OR
+    /// `trial_φ ≤ entry.φ`. Equivalently, rejected iff trial is *strictly*
+    /// worse on BOTH coordinates. Boundary points (equal to the stored
+    /// corner) are accepted.
+    ///
+    /// The (gamma_theta, gamma_phi) margin is **not** applied here — it
+    /// is baked into the stored corner by `add` (see `AugmentFilter` at
+    /// `IpFilterLSAcceptor.cpp:297-308`).
     pub fn is_acceptable(&self, theta: f64, phi: f64) -> bool {
         if theta.is_nan() || phi.is_nan() {
             return false;
@@ -69,36 +152,63 @@ impl Filter {
             return false;
         }
         for entry in &self.entries {
-            if theta >= (1.0 - self.gamma_theta) * entry.theta
-                && phi >= entry.phi - self.gamma_phi * entry.theta
-            {
+            // Rejected iff strictly worse on BOTH coordinates (Ipopt
+            // FilterEntry::Acceptable returns true on the first `≤`).
+            if theta > entry.theta && phi > entry.phi {
                 return false;
             }
         }
         true
     }
 
-    /// Check the switching condition: whether we should use the objective (phi)
-    /// criterion instead of the filter.
+    /// Pure Ipopt `IsFtype` (`IpFilterLSAcceptor.cpp:273-295`):
+    /// `gradBarrTDelta < 0  &&  alpha * (-gradBarrTDelta)^s_phi > delta * theta^s_theta`.
     ///
-    /// Returns true if the current constraint violation is small enough and the
-    /// directional derivative indicates sufficient objective decrease.
+    /// DEV-30: this **does not** include the `theta <= theta_min` gate.
+    /// In Ipopt that gate is applied at the call sites in
+    /// `CheckAcceptabilityOfTrialPoint` (line 361-362), but the
+    /// augmentation logic in `UpdateForNextIteration` (line 881-895)
+    /// uses pure `IsFtype` *without* the theta_min gate. Bundling the
+    /// two over-augments the filter on h-type accepts that came from
+    /// theta>theta_min trials with a still-good Armijo decrease.
+    pub fn is_ftype(&self, theta_current: f64, grad_phi_step: f64, alpha: f64) -> bool {
+        grad_phi_step < 0.0
+            && alpha * (-grad_phi_step).powf(self.s_phi)
+                > self.delta * theta_current.powf(self.s_theta)
+    }
+
+    /// Combined Ipopt switching gate: `IsFtype(alpha) && theta <= theta_min`.
+    /// This is the gate at `IpFilterLSAcceptor.cpp:361-362` that selects
+    /// the Armijo branch in `CheckAcceptabilityOfTrialPoint`.
+    ///
+    /// DEV-30: factored as `is_ftype(...) && theta_current <= theta_min`.
     pub fn switching_condition(
         &self,
         theta_current: f64,
         grad_phi_step: f64,
         alpha: f64,
     ) -> bool {
-        // Ipopt switching condition: alpha makes this depend on step length,
-        // so as alpha shrinks during backtracking, we properly fall back to
-        // h-type (constraint reduction) acceptance.
-        grad_phi_step < 0.0
-            && theta_current < self.theta_min
-            && alpha * (-grad_phi_step).powf(self.s_phi)
-                > self.delta * theta_current.powf(self.s_theta)
+        // DEV-24: `<= theta_min` (non-strict) matches Ipopt
+        // IpFilterLSAcceptor.cpp:362.
+        self.is_ftype(theta_current, grad_phi_step, alpha)
+            && theta_current <= self.theta_min
     }
 
-    /// Check the Armijo sufficient decrease condition.
+    /// Tolerance-aware `<=` mirroring Ipopt's `Compare_le`
+    /// (`IpUtils.cpp:294-302`):
+    ///   `lhs - rhs <= 10 * eps * |bas_val|`.
+    /// Slightly more permissive than bare `<=` near the boundary; used
+    /// throughout `IpFilterLSAcceptor.cpp` (Armijo, sufficient-reduction,
+    /// h-type theta/phi tests).
+    #[inline]
+    fn compare_le(lhs: f64, rhs: f64, bas_val: f64) -> bool {
+        let mach_eps = f64::EPSILON;
+        lhs - rhs <= 10.0 * mach_eps * bas_val.abs()
+    }
+
+    /// Check the Armijo sufficient decrease condition. Mirrors Ipopt
+    /// `IpFilterLSAcceptor.cpp:445-447` (`ArmijoHolds`):
+    ///   `Compare_le(trial_barr - reference_barr, eta_phi * alpha * grad_phi, reference_barr)`.
     pub fn armijo_condition(
         &self,
         phi_current: f64,
@@ -106,75 +216,231 @@ impl Filter {
         grad_phi_step: f64,
         alpha: f64,
     ) -> bool {
-        phi_trial <= phi_current + self.eta_phi * alpha * grad_phi_step
+        Self::compare_le(
+            phi_trial - phi_current,
+            self.eta_phi * alpha * grad_phi_step,
+            phi_current,
+        )
     }
 
     /// Check if a trial point provides sufficient constraint reduction
-    /// compared to the current point.
+    /// compared to the current point. Mirrors the theta clause of
+    /// Ipopt `IpFilterLSAcceptor.cpp:497`:
+    ///   `Compare_le(trial_theta, (1 - gamma_theta) * reference_theta, reference_theta)`.
     pub fn sufficient_infeasibility_reduction(
         &self,
         theta_current: f64,
         theta_trial: f64,
     ) -> bool {
-        theta_trial <= (1.0 - self.gamma_theta) * theta_current
+        Self::compare_le(
+            theta_trial,
+            (1.0 - self.gamma_theta) * theta_current,
+            theta_current,
+        )
     }
 
     /// Check if a trial point is acceptable via either the filter or the
     /// sufficient decrease conditions (Armijo or constraint reduction).
     ///
-    /// Returns (acceptable, use_switching) where:
+    /// Returns (acceptable, augment_required) where:
     /// - acceptable: whether the step should be accepted
-    /// - use_switching: whether the switching condition was used (affects filter update)
+    /// - augment_required: per Ipopt `UpdateForNextIteration`
+    ///   (`IpFilterLSAcceptor.cpp:881-895`), the filter must be
+    ///   augmented iff `!IsFtype(alpha) || !ArmijoHolds(alpha)`.
+    ///   DEV-31: the augmentation gate uses pure `IsFtype` *without*
+    ///   the `theta <= theta_min` clause; bundling them over-augments
+    ///   when a step was accepted via h-type but happened to satisfy
+    ///   IsFtype + Armijo at the accepted alpha.
     ///
     /// Follows Ipopt's structure (IpFilterLSAcceptor.cpp:311-437):
-    /// 1. Determine step type (f-type via switching/Armijo, or h-type via reduction)
+    /// 1. Determine step type (Armijo branch when `IsFtype && theta<=theta_min`,
+    ///    sufficient-reduction otherwise)
     /// 2. Check filter acceptability
-    /// When the switching condition holds, the step is purely f-type — no h-type fallback.
+    ///
+    /// Ipopt-alignment: the `obj_max_inc` divergence guard is **h-type-only**
+    /// per `IpFilterLSAcceptor.cpp:480-493`. Ipopt invokes that check from
+    /// inside `IsAcceptableToCurrentIterate`, which is itself only called
+    /// from the h-type (sufficient-reduction) branch at line 373. The
+    /// f-type/Armijo branch at line 361-371 never consults `obj_max_inc`.
     pub fn check_acceptability(
-        &self,
+        &mut self,
         theta_current: f64,
         phi_current: f64,
         theta_trial: f64,
         phi_trial: f64,
         grad_phi_step: f64,
         alpha: f64,
+        called_from_restoration: bool,
     ) -> (bool, bool) {
         // Reject if theta exceeds maximum or NaN
         if theta_trial > self.theta_max || theta_trial.is_nan() || phi_trial.is_nan() {
+            self.last_rejection_due_to_filter = false;
             return (false, false);
         }
 
-        // Determine step type and check type-specific condition
-        let (type_ok, is_switching) = if self.switching_condition(theta_current, grad_phi_step, alpha) {
-            // f-type: Armijo on barrier objective. No h-type fallback.
-            (self.armijo_condition(phi_current, phi_trial, grad_phi_step, alpha), true)
+        // DEV-30: split IsFtype (pure) from the call-site theta_min gate
+        // that selects the acceptance branch.
+        let is_ft = self.is_ftype(theta_current, grad_phi_step, alpha);
+        let armijo_holds = self.armijo_condition(phi_current, phi_trial, grad_phi_step, alpha);
+
+        // Acceptance branch (IpFilterLSAcceptor.cpp:361-374):
+        //   if (IsFtype && theta <= theta_min)  Armijo  (no obj_max_inc check)
+        //   else                                 IsAcceptableToCurrentIterate
+        //                                        (obj_max_inc FIRST, then
+        //                                         sufficient theta-or-phi
+        //                                         reduction)
+        let type_ok = if is_ft && theta_current <= self.theta_min {
+            // f-type/Armijo branch — Ipopt does NOT consult obj_max_inc here.
+            armijo_holds
         } else {
-            // h-type: sufficient decrease in theta or phi
-            let ok = self.sufficient_infeasibility_reduction(theta_current, theta_trial)
-                || phi_trial <= phi_current - self.gamma_phi * theta_current;
-            (ok, false)
+            // h-type branch: mirror IsAcceptableToCurrentIterate
+            // (IpFilterLSAcceptor.cpp:471-499). The obj_max_inc divergence
+            // guard runs FIRST (line 480-493) and is bypassed when
+            // `called_from_restoration` (post-restoration handoff); only
+            // if it passes do we test the sufficient-reduction OR
+            // phi-reduction (line 497-498), both via Compare_le.
+            if !self.passes_obj_max_inc(phi_current, phi_trial, called_from_restoration) {
+                false
+            } else {
+                self.sufficient_infeasibility_reduction(theta_current, theta_trial)
+                    || Self::compare_le(
+                        phi_trial - phi_current,
+                        -self.gamma_phi * theta_current,
+                        phi_current,
+                    )
+            }
         };
 
         if !type_ok {
+            self.last_rejection_due_to_filter = false;
             return (false, false);
         }
 
         // Check filter acceptability
         if !self.is_acceptable(theta_trial, phi_trial) {
+            self.last_rejection_due_to_filter = true;
             return (false, false);
         }
 
-        (true, is_switching)
+        // DEV-31: augmentation gate is pure `!IsFtype || !ArmijoHolds`
+        // (IpFilterLSAcceptor.cpp:885-886). No theta_min clause.
+        let augment_required = !is_ft || !armijo_holds;
+        (true, augment_required)
     }
 
-    /// Add a (theta, phi) pair to the filter.
-    pub fn add(&mut self, theta: f64, phi: f64) {
-        // Remove dominated entries
-        self.entries.retain(|e| {
-            !(theta <= (1.0 - self.gamma_theta) * e.theta
-                && phi <= e.phi - self.gamma_phi * e.theta)
+    /// T3.10: handle the post-acceptance bookkeeping of the
+    /// filter-reset heuristic. Mirrors Ipopt's
+    /// `IpFilterLSAcceptor.cpp:407-434` block run when a trial point
+    /// passes both the sufficient-reduction test and the filter
+    /// dominance test. Increments the consecutive-filter-rejection
+    /// counter when the most-recent rejected trial in this iteration's
+    /// backtracking sequence was filter-caused; clears the counter
+    /// otherwise. When the counter hits `filter_reset_trigger` and the
+    /// per-solve cap `max_filter_resets` has not been reached, wipes
+    /// the filter entries and returns `true`. (`theta_max`/`theta_min`/
+    /// `gamma_*`/`eta_phi` are NOT touched — only the entry list is
+    /// cleared, matching `IpFilter::Clear`.)
+    pub fn note_acceptance(&mut self) -> bool {
+        if self.max_filter_resets == 0 || self.n_filter_resets >= self.max_filter_resets {
+            self.last_rejection_due_to_filter = false;
+            return false;
+        }
+        let triggered = if self.last_rejection_due_to_filter {
+            self.count_successive_filter_rejections += 1;
+            if self.count_successive_filter_rejections >= self.filter_reset_trigger {
+                self.entries.clear();
+                self.count_successive_filter_rejections = 0;
+                self.n_filter_resets += 1;
+                true
+            } else {
+                false
+            }
+        } else {
+            self.count_successive_filter_rejections = 0;
+            false
+        };
+        self.last_rejection_due_to_filter = false;
+        triggered
+    }
+
+    /// Plumb the T3.10 reset-trigger parameters from `SolverOptions`.
+    pub fn set_filter_reset_options(&mut self, trigger: u32, max_resets: u32) {
+        self.filter_reset_trigger = trigger.max(1);
+        self.max_filter_resets = max_resets;
+    }
+
+    /// Diagnostic accessor: how many filter resets have already fired.
+    pub fn n_filter_resets(&self) -> u32 {
+        self.n_filter_resets
+    }
+
+    /// T3.4: Ipopt's `obj_max_inc` divergence guard
+    /// (`IpFilterLSAcceptor.cpp:478-493`). Returns `true` when the trial
+    /// is acceptable on the divergence criterion (which includes the
+    /// case `trial_phi <= reference_phi`); returns `false` only when
+    /// `trial_phi > reference_phi` *and*
+    /// `log10(trial_phi - reference_phi) > obj_max_inc + basval`, where
+    /// `basval = max(1.0, log10(|reference_phi|))`.
+    ///
+    /// Bypassed when `called_from_restoration`: Ipopt skips the guard
+    /// on the post-restoration handoff because the restoration phase is
+    /// allowed to leave the barrier objective much larger than the
+    /// pre-restoration reference (`IpFilterLSAcceptor.cpp:480` —
+    /// `if (!called_from_restoration && trial_barr > reference_barr_)`).
+    pub fn passes_obj_max_inc(
+        &self,
+        reference_phi: f64,
+        trial_phi: f64,
+        called_from_restoration: bool,
+    ) -> bool {
+        if called_from_restoration {
+            return true;
+        }
+        if !(trial_phi > reference_phi) {
+            return true;
+        }
+        let basval = if reference_phi.abs() > 10.0 {
+            reference_phi.abs().log10()
+        } else {
+            1.0
+        };
+        (trial_phi - reference_phi).log10() <= self.obj_max_inc + basval
+    }
+
+    /// Override the `obj_max_inc` default (5.0). Allows tests and the
+    /// IPM driver to plumb `SolverOptions::obj_max_inc` through.
+    pub fn set_obj_max_inc(&mut self, value: f64) {
+        self.obj_max_inc = value;
+    }
+
+    /// Augment the filter with the corner derived from the current iterate
+    /// `(theta_current, phi_current)`. Stores the **margin-baked** corner
+    /// `((1 - γ_θ)·θ_curr, φ_curr - γ_φ·θ_curr)` exactly as Ipopt's
+    /// `FilterLSAcceptor::AugmentFilter` (`IpFilterLSAcceptor.cpp:297-308`):
+    /// ```cpp
+    /// Number phi_add   = reference_barr_  - gamma_phi_   * reference_theta_;
+    /// Number theta_add = (1. - gamma_theta_) * reference_theta_;
+    /// filter_.AddEntry(phi_add, theta_add, ...);
+    /// ```
+    /// Existing entries dominated by the new corner are removed, mirroring
+    /// `Filter::AddEntry` (`IpFilter.cpp:61-86`) which uses `Dominated`
+    /// (raw, non-strict, no margin).
+    ///
+    /// The margins live in the stored corner, **not** in the dominance
+    /// check — this is the inverse of the previous ripopt convention.
+    /// Both `is_acceptable` and the retain predicate now compare raw
+    /// values against raw stored corners, matching Ipopt byte-for-byte.
+    pub fn add(&mut self, theta_current: f64, phi_current: f64) {
+        let theta_add = (1.0 - self.gamma_theta) * theta_current;
+        let phi_add = phi_current - self.gamma_phi * theta_current;
+        // Remove dominated entries: new corner dominates `e` iff
+        // new ≤ e on BOTH coordinates (matches Ipopt `Dominated`).
+        self.entries
+            .retain(|e| !(theta_add <= e.theta && phi_add <= e.phi));
+        self.entries.push(FilterEntry {
+            theta: theta_add,
+            phi: phi_add,
         });
-        self.entries.push(FilterEntry { theta, phi });
     }
 
     /// Compute problem-dependent minimum step size for the line search (Ipopt formula).
@@ -184,35 +450,58 @@ impl Filter {
     /// - When gradBarrTDelta >= 0 (no descent): alpha_min = alpha_min_frac * gamma_theta
     /// - When gradBarrTDelta < 0: alpha_min from filter parameters
     pub fn compute_alpha_min(&self, theta_current: f64, grad_phi_step: f64) -> f64 {
-        let alpha_min_frac = 0.05; // Ipopt default
+        // Ipopt formula (`IpFilterLSAcceptor.cpp:450-469`):
+        //   alpha_min = gamma_theta
+        //   if gBD < 0:
+        //     alpha_min = min(alpha_min, gamma_phi*theta/(-gBD))
+        //     if theta <= theta_min:
+        //       alpha_min = min(alpha_min, delta*theta^s_theta/(-gBD)^s_phi)
+        //   return alpha_min_frac * alpha_min
+        // No further floor — Ipopt does not apply a `Max(epsilon, ...)` clamp.
         if grad_phi_step >= 0.0 {
             // No barrier descent direction (common for feasibility problems with obj=0).
-            // Ipopt uses gamma_theta here, not epsilon — this triggers restoration after
-            // ~12 backtracking steps instead of ~50.
-            return alpha_min_frac * self.gamma_theta;
+            // Falls back to gamma_theta; restoration triggers after ~13 halvings at the
+            // default alpha_min_frac=0.05.
+            return self.alpha_min_frac * self.gamma_theta;
         }
         let neg_gphi = -grad_phi_step;
-        let term1 = self.gamma_theta;
-        let term2 = self.gamma_phi * theta_current / neg_gphi;
-        let mut alpha_min = alpha_min_frac * term1.min(term2);
+        let mut inner = self.gamma_theta.min(self.gamma_phi * theta_current / neg_gphi);
         if theta_current <= self.theta_min {
-            let term3 =
-                self.delta * theta_current.powf(self.s_theta) / neg_gphi.powf(self.s_phi);
-            alpha_min = alpha_min.min(alpha_min_frac * term3);
+            inner = inner.min(
+                self.delta * theta_current.powf(self.s_theta) / neg_gphi.powf(self.s_phi),
+            );
         }
-        alpha_min.max(1e-15)
+        self.alpha_min_frac * inner
+    }
+
+    /// Set the `alpha_min_frac` line-search step multiplier. Mirrors Ipopt
+    /// 3.14 `alpha_min_frac` (default `0.05`, `IpFilterLSAcceptor.cpp:113`).
+    pub fn set_alpha_min_frac(&mut self, value: f64) {
+        self.alpha_min_frac = value;
     }
 
     /// Augment the filter at restoration entry (Ipopt's PrepareRestoPhaseStart,
-    /// IpFilterLSAcceptor.cpp:898-901). Adds an entry at
-    /// (phi - gamma_phi*theta, (1 - gamma_theta)*theta) so the restored iterate
-    /// cannot hand back a point "as bad or worse" than the pre-restoration one.
-    /// Also bumps theta_max.
+    /// IpFilterLSAcceptor.cpp:898-901 → AugmentFilter() at :297-308). Adds an
+    /// entry at (phi - gamma_phi*theta, (1 - gamma_theta)*theta) so the
+    /// restored iterate cannot hand back a point "as bad or worse" than the
+    /// pre-restoration one.
+    ///
+    /// Note: does NOT bump `theta_max` — Ipopt's `theta_max_` is initialized
+    /// lazily once from the first reference theta and is never re-inflated
+    /// at restoration entry.
+    ///
+    /// Ipopt-alignment: this mirrors `FilterLSAcceptor::PrepareRestoPhaseStart`
+    /// (`IpFilterLSAcceptor.cpp:898-901`), invoked when the line search hands
+    /// off to the restoration phase. ripopt invokes this from `ipm.rs` in the
+    /// `!step_accepted` branch at the entry to the restoration cascade
+    /// (search for `augment_for_restoration` in `src/ipm.rs`), so the
+    /// pre-restoration `(theta, phi)` margin entry is in the filter before
+    /// either the almost-feasible guard or the restoration solver runs.
     pub fn augment_for_restoration(&mut self, theta_current: f64, phi_current: f64) {
-        self.theta_max = self.theta_max.max(1e4 * theta_current.max(1e-4));
-        let guard_theta = (1.0 - self.gamma_theta) * theta_current;
-        let guard_phi = phi_current - self.gamma_phi * theta_current;
-        self.add(guard_theta, guard_phi);
+        // `add` prebakes `((1-γ_θ)·θ, φ-γ_φ·θ)` exactly as Ipopt's
+        // `AugmentFilter`, so the restoration entry matches the entry
+        // Ipopt's `PrepareRestoPhaseStart` produces.
+        self.add(theta_current, phi_current);
     }
 
     /// Reset the filter (used when barrier parameter decreases).
@@ -388,11 +677,12 @@ mod tests {
         let grad_phi_step = -100.0; // Strong descent
         let alpha = 1.0;
 
-        let (accept, switching) = filter.check_acceptability(
-            theta_current, phi_current, theta_trial, phi_trial, grad_phi_step, alpha,
+        let (accept, augment_required) = filter.check_acceptability(
+            theta_current, phi_current, theta_trial, phi_trial, grad_phi_step, alpha, false,
         );
         assert!(accept, "Should be accepted via Armijo");
-        assert!(switching, "Should use switching condition");
+        // DEV-31: f-type accept (IsFtype && ArmijoHolds) → no filter augmentation.
+        assert!(!augment_required, "f-type accept must not augment filter");
     }
 
     #[test]
@@ -407,11 +697,12 @@ mod tests {
         let grad_phi_step = -0.01; // Weak descent
         let alpha = 1.0;
 
-        let (accept, switching) = filter.check_acceptability(
-            theta_current, phi_current, theta_trial, phi_trial, grad_phi_step, alpha,
+        let (accept, augment_required) = filter.check_acceptability(
+            theta_current, phi_current, theta_trial, phi_trial, grad_phi_step, alpha, false,
         );
         assert!(accept, "Should be accepted via filter mode");
-        assert!(!switching, "Should NOT use switching");
+        // DEV-31: h-type accept where IsFtype is false → must augment filter.
+        assert!(augment_required, "h-type accept must augment filter");
     }
 
     #[test]
@@ -422,7 +713,7 @@ mod tests {
         filter.add(0.5, 5.0);
         // Trial point is worse than filter
         let (accept, _) = filter.check_acceptability(
-            1.0, 10.0, 0.6, 6.0, -0.01, 1.0,
+            1.0, 10.0, 0.6, 6.0, -0.01, 1.0, false,
         );
         assert!(!accept, "Should be rejected by filter");
     }
@@ -444,33 +735,45 @@ mod tests {
 
     #[test]
     fn test_filter_rejects_nan() {
-        let filter = Filter::new(100.0);
+        let mut filter = Filter::new(100.0);
         assert!(!filter.is_acceptable(f64::NAN, 1.0));
         assert!(!filter.is_acceptable(1.0, f64::NAN));
         let (accept, _) = filter.check_acceptability(
-            1.0, 10.0, f64::NAN, 5.0, -1.0, 1.0,
+            1.0, 10.0, f64::NAN, 5.0, -1.0, 1.0, false,
         );
         assert!(!accept);
         let (accept2, _) = filter.check_acceptability(
-            1.0, 10.0, 0.5, f64::NAN, -1.0, 1.0,
+            1.0, 10.0, 0.5, f64::NAN, -1.0, 1.0, false,
         );
         assert!(!accept2);
     }
 
     #[test]
     fn test_filter_margin_boundary() {
-        // A point exactly at the boundary of the filter margin is rejected
-        // (strict-inequality semantics in is_acceptable).
+        // Ipopt-aligned semantics (IpFilterLSAcceptor.cpp:297-308 +
+        // IpFilter.hpp:39-58): `add` stores the margin-baked corner
+        // ((1-γ_θ)·θ, φ-γ_φ·θ); `is_acceptable` rejects iff trial is
+        // strictly worse on BOTH coordinates. Boundary points (equal to
+        // the stored corner) are ACCEPTED.
         let mut filter = Filter::new(100.0);
         filter.add(1.0, 1.0);
-        // gamma_theta = 1e-5, gamma_phi = 1e-8
-        // Boundary: theta >= (1 - 1e-5) * 1.0 = 0.99999 AND phi >= 1.0 - 1e-8 * 1.0
-        let theta_boundary = 0.99999;
-        let phi_boundary = 1.0 - 1e-8;
-        assert!(!filter.is_acceptable(theta_boundary, phi_boundary),
-            "At-boundary point should be rejected (dominated)");
-        // Just inside the margin (sufficient improvement in theta): accepted
-        assert!(filter.is_acceptable(theta_boundary - 1e-6, phi_boundary));
+        // Stored corner: (0.99999, 1.0 - 1e-8). Trial exactly at the
+        // corner: rejected condition is `θ > 0.99999 AND φ > 1.0-1e-8`.
+        // Equality on either coordinate ⇒ acceptable.
+        let theta_corner = (1.0 - 1e-5) * 1.0;
+        let phi_corner = 1.0 - 1e-8 * 1.0;
+        assert!(
+            filter.is_acceptable(theta_corner, phi_corner),
+            "Point at corner is acceptable (Ipopt uses non-strict ≤)"
+        );
+        // Strictly worse on both coordinates: rejected.
+        let eps = 1e-12;
+        assert!(
+            !filter.is_acceptable(theta_corner + eps, phi_corner + eps),
+            "Strictly worse on both coordinates must be rejected"
+        );
+        // Improvement in theta only: accepted regardless of phi.
+        assert!(filter.is_acceptable(theta_corner - 1e-6, phi_corner + 1.0));
     }
 
     #[test]
@@ -508,16 +811,19 @@ mod tests {
         filter.set_theta_min_from_initial(10.0); // theta_min = 1e-3
         let theta_current = 1e-4; // <= theta_min
         let grad = -1.0;
-        // alpha_min without term3 = 0.05 * min(1e-5, 1e-8 * 1e-4 / 1) = 0.05 * 1e-12 = 5e-14
-        // term3 = delta * theta^s_theta / |grad|^s_phi = 1.0 * (1e-4)^1.1 / 1.0^2.3 ≈ 5.01e-5
-        // alpha_min with term3 = min(5e-14, 0.05*5.01e-5=2.51e-6) -> 5e-14
-        // The small theta/grad case is dominated by term2; confirm we don't violate the floor.
+        // alpha_min = 0.05 * min(gamma_theta=1e-5, gamma_phi*theta/|grad|=1e-12, term3≈5.01e-5)
+        //           = 0.05 * 1e-12 = 5e-14
+        // T3.5: no `.max(1e-15)` floor — Ipopt does not clamp.
         let alpha_min = filter.compute_alpha_min(theta_current, grad);
-        assert!(alpha_min >= 1e-15, "alpha_min floor not enforced, got {}", alpha_min);
-        // Now use a much steeper descent so term2 grows and term3 becomes the binding term.
+        let expected = 0.05 * 1e-12;
+        assert!((alpha_min - expected).abs() < 1e-25,
+            "alpha_min should be 0.05*term2 = 5e-14, got {}", alpha_min);
+        // Now use a much steeper descent so term2 grows and term1 becomes the binding term.
         let alpha_min_steep = filter.compute_alpha_min(theta_current, -1e-10);
-        // With very small |grad|, term2 = 1e-8 * 1e-4 / 1e-10 = 1e-2; term3 bounded by term1 first
-        assert!(alpha_min_steep >= 1e-15);
+        // term1=1e-5, term2=1e-8*1e-4/1e-10=1e-2, term3 huge → inner = term1 = 1e-5
+        let expected_steep = 0.05 * 1e-5;
+        assert!((alpha_min_steep - expected_steep).abs() < 1e-15,
+            "steep-grad alpha_min should be 0.05*gamma_theta = 5e-7, got {}", alpha_min_steep);
     }
 
     #[test]
@@ -540,16 +846,15 @@ mod tests {
     fn test_augment_for_restoration_adds_entry() {
         let mut filter = Filter::new(100.0);
         let initial_theta_max = filter.theta_max();
-        let theta = 50.0; // Large enough to bump theta_max
+        let theta = 50.0;
         let phi = 10.0;
         filter.augment_for_restoration(theta, phi);
         // Should have added an entry at ((1-gamma_theta)*theta, phi - gamma_phi*theta)
         assert_eq!(filter.len(), 1);
-        // theta_max should be bumped to at least 1e4 * theta
-        assert!(filter.theta_max() >= 1e4 * theta,
-            "theta_max not bumped: {} < {}", filter.theta_max(), 1e4 * theta);
-        assert!(filter.theta_max() >= initial_theta_max,
-            "augmentation should not shrink theta_max");
+        // Ipopt's PrepareRestoPhaseStart only adds the margin entry; theta_max
+        // is initialized lazily once and is not re-inflated at restoration entry.
+        assert_eq!(filter.theta_max(), initial_theta_max,
+            "augment_for_restoration must not mutate theta_max");
         // A point worse than the guard should be rejected
         assert!(!filter.is_acceptable(theta, phi));
     }
@@ -569,11 +874,12 @@ mod tests {
         let phi_trial = 50.0;
         let grad = -0.01; // weak descent, theta_current > theta_min -> h-type
         let alpha = 1.0;
-        let (accept, switching) = filter.check_acceptability(
-            theta_current, phi_current, theta_trial, phi_trial, grad, alpha,
+        let (accept, augment_required) = filter.check_acceptability(
+            theta_current, phi_current, theta_trial, phi_trial, grad, alpha, false,
         );
         assert!(accept, "h-type phi-only reduction must be accepted");
-        assert!(!switching);
+        // DEV-31: h-type accept (IsFtype false) → augmentation required.
+        assert!(augment_required);
     }
 
     #[test]
@@ -585,9 +891,67 @@ mod tests {
         let phi_current = 100.0;
         // Trial: theta equal (no sufficient reduction) and phi equal (no reduction)
         let (accept, _) = filter.check_acceptability(
-            theta_current, phi_current, 5.0, 100.0, -0.01, 1.0,
+            theta_current, phi_current, 5.0, 100.0, -0.01, 1.0, false,
         );
         assert!(!accept, "h-type with no reduction in either must reject");
+    }
+
+    #[test]
+    fn test_obj_max_inc_passes_when_trial_le_reference() {
+        // T3.4: when phi_trial <= phi_reference, the divergence guard
+        // is a no-op (returns true).
+        let filter = Filter::new(100.0);
+        assert!(filter.passes_obj_max_inc(10.0, 5.0, false), "decrease must pass");
+        assert!(filter.passes_obj_max_inc(10.0, 10.0, false), "equality must pass");
+        assert!(filter.passes_obj_max_inc(0.0, -1e6, false), "negative trial must pass");
+    }
+
+    #[test]
+    fn test_obj_max_inc_rejects_huge_increase_small_reference() {
+        // T3.4: with reference_phi = 1.0 (so |ref| <= 10 → basval = 1),
+        // and obj_max_inc = 5 (default), the inequality is
+        //   log10(trial - 1) > 5 + 1 = 6  ⇔  trial - 1 > 1e6
+        // So trial = 2 is fine (log10(1) = 0 <= 6), but trial = 1e7 + 1 fails.
+        let filter = Filter::new(100.0);
+        assert!(filter.passes_obj_max_inc(1.0, 1e6 + 0.5, false), "below 1e6 increase must pass");
+        assert!(!filter.passes_obj_max_inc(1.0, 1e7 + 2.0, false), "above 10^6 increase must fail");
+    }
+
+    #[test]
+    fn test_obj_max_inc_basval_scales_with_large_reference() {
+        // T3.4: when |reference_phi| > 10, basval = log10(|ref|), so the
+        // permitted increase scales with |ref|. With ref=1e3, basval=3,
+        // permitted log10 increase = 5 + 3 = 8, ie up to 1e8 absolute.
+        let filter = Filter::new(100.0);
+        assert!(filter.passes_obj_max_inc(1e3, 1e3 + 1e7, false), "1e7 increase must pass at ref=1e3");
+        assert!(!filter.passes_obj_max_inc(1e3, 1e3 + 1e9, false), "1e9 increase must fail at ref=1e3");
+    }
+
+    #[test]
+    fn test_obj_max_inc_set_obj_max_inc_setter() {
+        // T3.4: tightening the cap to 0.0 makes any strictly positive
+        // increase fail (basval >= 1 ⇒ log10(Δ) > 0+1=1 means Δ>10).
+        let mut filter = Filter::new(100.0);
+        filter.set_obj_max_inc(0.0);
+        assert!(filter.passes_obj_max_inc(1.0, 5.0, false), "Δ=4 < 10, still passes at obj_max_inc=0");
+        assert!(!filter.passes_obj_max_inc(1.0, 100.0, false), "Δ=99 > 10 must fail at obj_max_inc=0");
+    }
+
+    #[test]
+    fn test_check_acceptability_obj_max_inc_blocks_blowup() {
+        // T3.4 end-to-end: a trial that would otherwise pass via h-type
+        // (theta sufficient reduction) is rejected when phi explodes
+        // beyond the obj_max_inc cap.
+        let mut filter = Filter::new(1e10);
+        filter.set_theta_min_from_initial(10.0);
+        let theta_current = 5.0;
+        let phi_current = 1.0;
+        let theta_trial = 0.1; // satisfies sufficient infeasibility reduction
+        let phi_trial = 1e10; // log10(1e10 - 1) ≈ 10 >> 5 + 1 = 6 ⇒ reject
+        let (accept, _) = filter.check_acceptability(
+            theta_current, phi_current, theta_trial, phi_trial, -0.01, 1.0, false,
+        );
+        assert!(!accept, "obj_max_inc must reject blowup trial");
     }
 
     #[test]
@@ -603,9 +967,95 @@ mod tests {
         let grad = -100.0;
         let alpha = 1.0;
         let (accept, _) = filter.check_acceptability(
-            theta_current, phi_current, theta_trial, phi_trial, grad, alpha,
+            theta_current, phi_current, theta_trial, phi_trial, grad, alpha, false,
         );
         assert!(!accept, "Switching+failed-Armijo must reject (no h-type fallback)");
+    }
+
+    #[test]
+    fn test_set_theta_min_from_initial_is_one_shot() {
+        // T0.7: theta_max/theta_min must be seeded ONCE from the initial
+        // constraint violation and never reset, mirroring Ipopt
+        // IpFilterLSAcceptor.cpp:325-339. Repeated calls (as happens on
+        // every μ change in ripopt) must be ignored — otherwise the
+        // filter envelope grows over time and admits iterates earlier
+        // filter entries had rejected.
+        let mut filter = Filter::new(100.0);
+        // First call: theta_init = 0.5. T3.3 floor is `Max(1.0, theta_init)`
+        // (IpFilterLSAcceptor.cpp:325-335), so theta_max = 1e4 * 1.0 = 1e4.
+        filter.set_theta_min_from_initial(0.5);
+        let theta_max_init = filter.theta_max();
+        assert!((theta_max_init - 1e4).abs() < 1e-9,
+            "first init: theta_max should be 1e4 * max(1.0, 0.5) = 1e4, got {}", theta_max_init);
+
+        // Simulate the μ-update path that previously called
+        // set_theta_min_from_initial again with a (possibly different) theta.
+        // The reset_filter_with_current_theta helper used to do this on every
+        // μ change — now it is a no-op for the bounds.
+        filter.reset();
+        filter.set_theta_min_from_initial(1e-6); // would have shrunk theta_max to 1.0 before T0.7
+        assert!((filter.theta_max() - theta_max_init).abs() < 1e-12,
+            "T0.7: theta_max must remain seeded at the initial value across resets, got {}",
+            filter.theta_max());
+
+        // Even an enormous theta should not bump theta_max via this path
+        // (augmentation during restoration is a separate, intentional path).
+        filter.set_theta_min_from_initial(1e10);
+        assert!((filter.theta_max() - theta_max_init).abs() < 1e-12,
+            "T0.7: subsequent calls must be ignored, got {}", filter.theta_max());
+    }
+
+    #[test]
+    fn test_alpha_min_frac_is_configurable() {
+        // T3.5: alpha_min_frac is plumbed from SolverOptions, not hard-coded.
+        let mut filter = Filter::new(100.0);
+        // Default
+        let baseline = filter.compute_alpha_min(1.0, -2.0);
+        // term1=1e-5, term2=1e-8*1.0/2=5e-9 → inner=5e-9 → 0.05 * 5e-9 = 2.5e-10
+        assert!((baseline - 2.5e-10).abs() < 1e-20);
+        // Half the multiplier → half the result
+        filter.set_alpha_min_frac(0.025);
+        let halved = filter.compute_alpha_min(1.0, -2.0);
+        assert!((halved - 1.25e-10).abs() < 1e-20,
+            "alpha_min should scale linearly with alpha_min_frac, got {}", halved);
+    }
+
+    #[test]
+    fn test_alpha_min_no_floor_clamp() {
+        // T3.5: Ipopt has no `Max(epsilon, ...)` clamp on the returned
+        // alpha_min. Confirm tiny but positive values pass through.
+        let mut filter = Filter::new(100.0);
+        // theta=1e-12, grad=-1.0 → term2 = 1e-8 * 1e-12 / 1 = 1e-20
+        // → inner = min(1e-5, 1e-20) = 1e-20 (theta below theta_min default 1e-4*1.0=1e-4
+        //   but term3 = 1*(1e-12)^1.1/1^2.3 = 7.94e-14 > 1e-20)
+        // Result: 0.05 * 1e-20 = 5e-22, well below the old 1e-15 clamp.
+        filter.set_theta_min_from_initial(1.0);
+        let alpha_min = filter.compute_alpha_min(1e-12, -1.0);
+        assert!(alpha_min < 1e-15,
+            "expected sub-1e-15 alpha_min, old code would have clamped to 1e-15, got {}",
+            alpha_min);
+        assert!(alpha_min > 0.0, "alpha_min must remain positive, got {}", alpha_min);
+    }
+
+    #[test]
+    fn test_set_theta_min_from_initial_floor_is_one() {
+        // T3.3: floor must be Max(1.0, theta_init), matching Ipopt
+        // IpFilterLSAcceptor.cpp:325-335. On a near-feasible start with
+        // theta_init = 1e-6 the previous 1e-4 floor produced
+        // theta_max = 1e4 * 1e-4 = 1.0, which was 10⁴× tighter than
+        // Ipopt's 1e4. The new floor of 1.0 yields theta_max = 1e4.
+        let mut filter = Filter::new(100.0);
+        filter.set_theta_min_from_initial(1e-6);
+        assert!((filter.theta_max() - 1e4).abs() < 1e-9,
+            "near-feasible start: theta_max should be 1e4, got {}", filter.theta_max());
+        assert!((filter.theta_min - 1e-4).abs() < 1e-12,
+            "near-feasible start: theta_min should be 1e-4, got {}", filter.theta_min);
+
+        // For theta_init >= 1.0 the floor passes through unchanged.
+        let mut filter2 = Filter::new(100.0);
+        filter2.set_theta_min_from_initial(7.5);
+        assert!((filter2.theta_max() - 7.5e4).abs() < 1e-6,
+            "theta_init=7.5: theta_max should be 7.5e4, got {}", filter2.theta_max());
     }
 
     #[test]
@@ -623,5 +1073,115 @@ mod tests {
         let alpha2 = fraction_to_boundary(&s2, &ds2, tau);
         // alpha = -tau * s / ds = 0.99 * 0.01 / 1.0 = 0.0099
         assert!((alpha2 - 0.0099).abs() < 1e-12);
+    }
+
+    /// T3.10 helper: simulate one full iteration where a single trial step
+    /// was rejected by the filter dominance test (and not by Armijo /
+    /// obj_max_inc / theta_max). The post-acceptance hook in `ipm.rs`
+    /// runs on the *next* iteration's accepted step, so we mark the bit
+    /// directly here.
+    fn simulate_filter_rejected_iter(filter: &mut Filter) -> bool {
+        // Force a check_acceptability call that fails the filter test.
+        // Add a dominating entry, then offer a worse trial that still
+        // satisfies sufficient-reduction (h-type theta drop) so we hit
+        // the filter branch (not the type_ok branch). Bound checks pass.
+        filter.add(0.5, 5.0);
+        let theta_current = 1.0;
+        let phi_current = 10.0;
+        // Trial: theta_trial < theta_current * (1-gamma_theta) so h-type
+        // sufficient_infeasibility_reduction passes. But (theta_trial,
+        // phi_trial) is dominated by the (0.5, 5.0) filter entry.
+        let theta_trial = 0.6;
+        let phi_trial = 6.0;
+        let (accept, _) = filter.check_acceptability(
+            theta_current, phi_current, theta_trial, phi_trial, -0.01, 1.0, false,
+        );
+        assert!(!accept, "trial should be filter-rejected for the test");
+        // Now invoke the post-acceptance hook; it consumes the
+        // last_rejection_due_to_filter flag.
+        filter.note_acceptance()
+    }
+
+    #[test]
+    fn test_filter_reset_fires_after_trigger_consecutive_rejections() {
+        // T3.10: with default trigger=5, the 5th consecutive accepted
+        // step preceded by a filter-rejected trial fires the reset.
+        let mut filter = Filter::new(100.0);
+        for i in 0..4 {
+            let fired = simulate_filter_rejected_iter(&mut filter);
+            assert!(!fired, "reset must not fire on iter {}", i);
+            assert_eq!(filter.n_filter_resets(), 0);
+        }
+        let fired = simulate_filter_rejected_iter(&mut filter);
+        assert!(fired, "5th consecutive filter-rejected accept must trigger reset");
+        assert_eq!(filter.n_filter_resets(), 1);
+        assert!(filter.is_empty(), "reset must clear filter entries");
+    }
+
+    #[test]
+    fn test_filter_reset_counter_resets_on_clean_acceptance() {
+        // T3.10: an accepted step *not* preceded by a filter rejection
+        // resets the consecutive counter to zero.
+        let mut filter = Filter::new(100.0);
+        for _ in 0..4 {
+            let fired = simulate_filter_rejected_iter(&mut filter);
+            assert!(!fired);
+        }
+        // Clean acceptance (no prior filter rejection): counter should reset.
+        let fired_clean = filter.note_acceptance();
+        assert!(!fired_clean);
+        // Now another filter-rejected iteration: counter starts back at 1,
+        // so reset must NOT fire.
+        let fired = simulate_filter_rejected_iter(&mut filter);
+        assert!(!fired, "counter should have reset after clean acceptance");
+        assert_eq!(filter.n_filter_resets(), 0);
+    }
+
+    #[test]
+    fn test_filter_reset_capped_by_max_filter_resets() {
+        // T3.10: after `max_filter_resets` resets, further filter
+        // rejections must not trigger another reset.
+        let mut filter = Filter::new(100.0);
+        // Tight cap to keep the test fast: trigger=2, max_resets=2.
+        filter.set_filter_reset_options(2, 2);
+        // Reset #1.
+        assert!(!simulate_filter_rejected_iter(&mut filter));
+        assert!(simulate_filter_rejected_iter(&mut filter));
+        assert_eq!(filter.n_filter_resets(), 1);
+        // Reset #2.
+        assert!(!simulate_filter_rejected_iter(&mut filter));
+        assert!(simulate_filter_rejected_iter(&mut filter));
+        assert_eq!(filter.n_filter_resets(), 2);
+        // Cap reached: further filter-rejected iterations must not reset.
+        for _ in 0..10 {
+            let fired = simulate_filter_rejected_iter(&mut filter);
+            assert!(!fired, "no reset must fire past max_filter_resets");
+        }
+        assert_eq!(filter.n_filter_resets(), 2);
+    }
+
+    #[test]
+    fn test_filter_reset_disabled_when_max_resets_zero() {
+        // T3.10: `max_filter_resets = 0` disables the heuristic entirely.
+        let mut filter = Filter::new(100.0);
+        filter.set_filter_reset_options(1, 0);
+        for _ in 0..20 {
+            let fired = simulate_filter_rejected_iter(&mut filter);
+            assert!(!fired, "max_filter_resets=0 must disable resets");
+        }
+        assert_eq!(filter.n_filter_resets(), 0);
+        assert!(!filter.is_empty(), "filter entries must persist when disabled");
+    }
+
+    #[test]
+    fn test_filter_reset_trigger_set_floored_at_one() {
+        // T3.10: trigger=0 would cause a runaway reset on every accepted
+        // step; the setter floors it to 1. With trigger=1 the very first
+        // filter-rejected accept fires a reset.
+        let mut filter = Filter::new(100.0);
+        filter.set_filter_reset_options(0, 5);
+        let fired = simulate_filter_rejected_iter(&mut filter);
+        assert!(fired, "trigger=0 floored to 1 should fire on first rejection");
+        assert_eq!(filter.n_filter_resets(), 1);
     }
 }

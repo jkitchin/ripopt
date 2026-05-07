@@ -38,7 +38,6 @@ impl NlpProblem for Rosenbrock {
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
     fn hessian_values(&self, _x: &[f64], _new_x: bool, _obj_factor: f64, _lambda: &[f64], _vals: &mut [f64]) -> bool {
         panic!("hessian_values should not be called in limited-memory mode");
-        true
     }
 }
 
@@ -117,7 +116,6 @@ impl NlpProblem for Hs071Lbfgs {
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
     fn hessian_values(&self, _x: &[f64], _new_x: bool, _obj_factor: f64, _lambda: &[f64], _vals: &mut [f64]) -> bool {
         panic!("hessian_values should not be called in limited-memory mode");
-        true
     }
 }
 
@@ -129,11 +127,6 @@ fn lbfgs_ipm_hs071_constrained() {
         print_level: 0,
         hessian_approximation_lbfgs: true,
         // Disable fallbacks that would call hessian_values on the original problem
-        enable_sqp_fallback: false,
-        enable_al_fallback: false,
-        enable_slack_fallback: false,
-        enable_lbfgs_fallback: false,
-        enable_lbfgs_hessian_fallback: false,
         ..SolverOptions::default()
     };
     let result = ripopt::solve(&problem, &options);
@@ -192,7 +185,6 @@ impl NlpProblem for SimpleQuadratic {
     fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
     fn hessian_values(&self, _x: &[f64], _new_x: bool, _: f64, _: &[f64], _: &mut [f64]) -> bool {
         panic!("hessian_values must not be called in limited-memory mode");
-        true
     }
 }
 
@@ -251,12 +243,18 @@ fn lbfgs_ipm_unit_bk_formation() {
 }
 
 // ===========================================================================
-// L-BFGS Hessian FALLBACK tests
+// L-BFGS Hessian failure-path smoke tests
+//
+// The auto-retry "L-BFGS Hessian fallback" was retired during the v0.8
+// Ipopt alignment work (A7) — Ipopt 3.14 has no equivalent. The remaining
+// tests in this section verify behaviour on a deliberately-bad Hessian
+// problem under the *current* solver: inertia correction must rescue
+// what it can, and `hessian_approximation_lbfgs` must be settable
+// manually to force the L-BFGS path.
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
-// Problem with a deliberately bad Hessian that causes IPM failure.
-// The fallback should retry with L-BFGS Hessian and succeed.
+// Problem with a deliberately bad Hessian.
 // ---------------------------------------------------------------------------
 
 struct BadHessianQuadratic;
@@ -301,43 +299,18 @@ impl NlpProblem for BadHessianQuadratic {
     }
 }
 
-/// Test that the L-BFGS Hessian fallback activates and solves a problem
-/// where the user-provided Hessian is wrong.
+/// Default options on a deliberately-bad Hessian: the IPM either fails or
+/// is rescued by inertia correction (which can dominate the wrong
+/// curvature). This test pins the contract that ripopt no longer
+/// auto-retries with L-BFGS — Ipopt 3.14 has no such retry, so neither
+/// does ripopt v0.8+. If the user wants L-BFGS, they set
+/// `hessian_approximation_lbfgs = true` (see the "manual switch" test
+/// `lbfgs_mode_solves_bad_hessian` below).
 #[test]
-fn lbfgs_hessian_fallback_recovers_bad_hessian() {
+fn bad_hessian_default_options_inertia_or_fail() {
     let problem = BadHessianQuadratic;
     let options = SolverOptions {
         print_level: 0,
-        // Keep other fallbacks disabled so only L-BFGS Hessian fallback can help
-        enable_lbfgs_fallback: false,
-        enable_al_fallback: false,
-        enable_sqp_fallback: false,
-        enable_slack_fallback: false,
-        enable_lbfgs_hessian_fallback: true,
-        max_iter: 100,
-        ..SolverOptions::default()
-    };
-    let result = ripopt::solve(&problem, &options);
-    assert!(
-        result.status == SolveStatus::Optimal,
-        "L-BFGS Hessian fallback should recover from bad Hessian, got {:?}",
-        result.status
-    );
-    assert!(result.x[0].abs() < 1e-2, "x[0]={}, expected ~0", result.x[0]);
-    assert!(result.x[1].abs() < 1e-2, "x[1]={}, expected ~0", result.x[1]);
-}
-
-/// Test that the fallback is skipped when disabled.
-#[test]
-fn lbfgs_hessian_fallback_disabled() {
-    let problem = BadHessianQuadratic;
-    let options = SolverOptions {
-        print_level: 0,
-        enable_lbfgs_fallback: false,
-        enable_al_fallback: false,
-        enable_sqp_fallback: false,
-        enable_slack_fallback: false,
-        enable_lbfgs_hessian_fallback: false,
         max_iter: 50,
         ..SolverOptions::default()
     };
@@ -402,7 +375,6 @@ fn lbfgs_hessian_fallback_skipped_when_already_lbfgs() {
     let options = SolverOptions {
         print_level: 0,
         hessian_approximation_lbfgs: true,
-        enable_lbfgs_hessian_fallback: true, // enabled but should be skipped
         ..SolverOptions::default()
     };
     let _result = ripopt::solve(&problem, &options);
@@ -473,11 +445,6 @@ fn lbfgs_hessian_fallback_constrained() {
     let problem = BadHessianConstrained;
     let options = SolverOptions {
         print_level: 0,
-        enable_lbfgs_fallback: false,
-        enable_al_fallback: false,
-        enable_sqp_fallback: false,
-        enable_slack_fallback: false,
-        enable_lbfgs_hessian_fallback: true,
         max_iter: 200,
         ..SolverOptions::default()
     };
@@ -533,16 +500,6 @@ fn lbfgs_ipm_c_api_option() {
 
         let ret3 = ripopt::c_api::ripopt_add_str_option(nlp, key.as_ptr(), val_bad.as_ptr());
         assert_eq!(ret3, 0, "invalid value should be rejected");
-
-        let key2 = CString::new("enable_lbfgs_hessian_fallback").unwrap();
-        let val_yes = CString::new("yes").unwrap();
-        let val_no = CString::new("no").unwrap();
-
-        let ret4 = ripopt::c_api::ripopt_add_str_option(nlp, key2.as_ptr(), val_yes.as_ptr());
-        assert_eq!(ret4, 1, "enable_lbfgs_hessian_fallback=yes should be accepted");
-
-        let ret5 = ripopt::c_api::ripopt_add_str_option(nlp, key2.as_ptr(), val_no.as_ptr());
-        assert_eq!(ret5, 1, "enable_lbfgs_hessian_fallback=no should be accepted");
 
         ripopt::c_api::ripopt_free(nlp);
     }

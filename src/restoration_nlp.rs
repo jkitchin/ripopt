@@ -1,3 +1,6 @@
+use std::cell::Cell;
+
+use crate::filter::FilterEntry;
 use crate::problem::NlpProblem;
 
 /// NLP problem wrapper for the restoration phase.
@@ -22,7 +25,16 @@ pub struct RestorationNlp<'a> {
     x_r: Vec<f64>,
     d_r2: Vec<f64>,
     rho: f64,
-    eta: f64,
+    /// η is computed dynamically per-evaluation as
+    /// `eta_factor * sqrt(current_mu)` (Ipopt
+    /// `RestoIpoptNLP::Eta`, IpRestoIpoptNLP.cpp:759). The current
+    /// μ is updated by the inner IPM via `notify_mu` so that as μ
+    /// drops during the restoration solve, the proximity weight η
+    /// tracks it instead of remaining frozen at the entry value.
+    eta_factor: f64,
+    /// Current barrier μ feeding the η computation. Interior
+    /// mutability so `notify_mu(&self, ...)` can refresh it.
+    current_mu: Cell<f64>,
     inner_jac_rows: Vec<usize>,
     inner_jac_cols: Vec<usize>,
     resto_hess_rows: Vec<usize>,
@@ -34,6 +46,73 @@ pub struct RestorationNlp<'a> {
     p_init: Vec<f64>,
     /// Cached initial n values.
     n_init: Vec<f64>,
+    /// Parent NLP's max-bound-violation `||c(x_R) − π[g_l,g_u](c(x_R))||_∞`
+    /// at restoration entry. The early-exit hook compares the current
+    /// inner-iterate's parent violation against
+    /// `parent_kappa_resto · parent_theta_entry`.
+    /// `0.0` disables early exit (no parent target injected).
+    parent_theta_entry: f64,
+    /// Required infeasibility-reduction factor (Ipopt's
+    /// `required_infeasibility_reduction`, default 0.9). When the
+    /// parent's max-bound-violation falls to this fraction of the
+    /// entry value, the inner solve exits Optimal.
+    parent_kappa_resto: f64,
+    /// Cached parent constraint bounds (used by `resto_early_exit` to
+    /// recompute the parent max-bound-violation without going back
+    /// through the wrapper stack).
+    parent_g_l: Vec<f64>,
+    parent_g_u: Vec<f64>,
+    /// Optional acceptable tolerance for early exit
+    /// (`min(tol, constr_viol_tol)`); a parent violation below this
+    /// floor exits even if `kappa_resto` would not yet trigger.
+    parent_small_threshold: f64,
+    /// 1-norm of the parent's bound-violation at restoration entry —
+    /// used for the filter / sufficient-progress gates (Ipopt
+    /// `IpFilterLSAcceptor::IsAcceptableToCurrentIterate`,
+    /// IpFilterLSAcceptor.cpp:497-498). Distinct from
+    /// `parent_theta_entry` (max-norm) which feeds the κ_resto gate
+    /// (Ipopt `IpRestoConvCheck.cpp:184-190`).
+    parent_theta_entry_l1: f64,
+    /// Parent's `f(x_R)` at restoration entry. φ for the inner solve
+    /// is taken to be the original NLP objective only — matching
+    /// ripopt's existing post-restoration `classify_restoration_outcome`
+    /// metric (`src/ipm.rs:8562`); this keeps the inner early-exit
+    /// gate and the post-resto Success classifier consistent so the
+    /// parent never rejects a point the inner just exited on.
+    parent_phi_entry: f64,
+    /// Parent filter snapshot at restoration entry (Ipopt's parent
+    /// `FilterLSAcceptor`'s entry list, frozen for the duration of
+    /// the inner solve — `IpFilterLSAcceptor.cpp:497`).
+    parent_filter_entries: Vec<FilterEntry>,
+    /// Parent filter `theta_max` (envelope cap; rejects trials whose
+    /// 1-norm θ exceeds this).
+    parent_theta_max: f64,
+    /// Parent filter `gamma_theta` (sufficient-θ-reduction margin;
+    /// Ipopt default 1e-5).
+    parent_gamma_theta: f64,
+    /// Parent filter `gamma_phi` (sufficient-φ-reduction margin;
+    /// Ipopt default 1e-8).
+    parent_gamma_phi: f64,
+    /// Parent's curr_mu at restoration entry. Used to compute the
+    /// **barrier** φ_trial = f(x) − μ·Σ ln(slack) for the parent-filter
+    /// gate (D5 fix: matches `IpRestoConvCheck.cpp:193`'s use of
+    /// `orig_ip_cq->trial_barrier_obj()`). Without this the parent
+    /// filter would be tested with raw `f(x)` against entries that
+    /// store barrier-φ — a category mismatch that loosens the gate.
+    parent_mu_entry: f64,
+    /// Parent x lower bounds (n_orig). Finite entries contribute
+    /// `−μ·ln(x − x_l)` to the parent's barrier φ.
+    parent_x_l: Vec<f64>,
+    /// Parent x upper bounds (n_orig). Finite entries contribute
+    /// `−μ·ln(x_u − x)` to the parent's barrier φ.
+    parent_x_u: Vec<f64>,
+    /// `IpRestoFilterConvCheck::CheckConvergence` skips the early-exit
+    /// test on the very first inner iteration (Ipopt's
+    /// `first_resto_iter_` flag, IpRestoConvCheck.cpp:73-78); without
+    /// this guard the resto solve can declare success at iter 0
+    /// before the slack variables have moved. Cell so the immutable
+    /// `resto_early_exit(&self, ...)` hook can flip it.
+    first_iter_seen: Cell<bool>,
 }
 
 impl<'a> RestorationNlp<'a> {
@@ -53,7 +132,9 @@ impl<'a> RestorationNlp<'a> {
     ) -> Self {
         let n = inner.num_variables();
         let m = inner.num_constraints();
-        let eta = eta_f * mu_entry.sqrt();
+        // η is recomputed each evaluation from current_mu (see
+        // `eta()` below). At construction we seed current_mu with
+        // mu_entry; the inner IPM refreshes it via `notify_mu`.
 
         // D_R[i] = 1/max(1, |x_r[i]|), d_r2[i] = D_R[i]^2
         let d_r2: Vec<f64> = x_r
@@ -144,7 +225,8 @@ impl<'a> RestorationNlp<'a> {
             x_r: x_r.to_vec(),
             d_r2,
             rho,
-            eta,
+            eta_factor: eta_f,
+            current_mu: Cell::new(mu_entry.max(0.0)),
             inner_jac_rows,
             inner_jac_cols,
             resto_hess_rows,
@@ -153,7 +235,76 @@ impl<'a> RestorationNlp<'a> {
             diag_indices,
             p_init,
             n_init,
+            parent_theta_entry: 0.0,
+            parent_kappa_resto: 0.0,
+            parent_g_l: g_l,
+            parent_g_u: g_u,
+            parent_small_threshold: 0.0,
+            parent_theta_entry_l1: 0.0,
+            parent_phi_entry: 0.0,
+            parent_filter_entries: Vec::new(),
+            parent_theta_max: f64::INFINITY,
+            parent_gamma_theta: 1e-5,
+            parent_gamma_phi: 1e-8,
+            parent_mu_entry: mu_entry.max(0.0),
+            parent_x_l: Vec::new(),
+            parent_x_u: Vec::new(),
+            first_iter_seen: Cell::new(false),
         }
+    }
+
+    /// Inject the parent NLP's restoration-entry violation
+    /// `theta_entry` (max-norm bound-violation, used by the κ_resto
+    /// gate per `IpRestoConvCheck.cpp:184-190`), `theta_entry_l1`
+    /// (1-norm bound-violation, used by the filter and
+    /// sufficient-progress gates per
+    /// `IpFilterLSAcceptor.cpp:497-498`), `phi_entry` (parent's
+    /// `f(x_R)`), the required-reduction factor `kappa_resto`
+    /// (Ipopt's `required_infeasibility_reduction`, default 0.9), the
+    /// small-threshold floor (`min(tol, constr_viol_tol)`), the
+    /// parent filter parameters (`theta_max`, `gamma_theta`,
+    /// `gamma_phi`) and a snapshot of the parent's filter entries.
+    ///
+    /// Together these support the full
+    /// `IpRestoFilterConvCheck::TestOrigProgress`
+    /// (`IpRestoFilterConvCheck.cpp:53-80`) early-exit gate:
+    /// (1) skip on first inner iter; (2) max-norm κ_resto reduction;
+    /// (3) parent-filter acceptance; (4) sufficient progress on
+    /// (θ_entry, φ_entry).
+    pub fn set_parent_target(
+        &mut self,
+        theta_entry: f64,
+        theta_entry_l1: f64,
+        phi_entry: f64,
+        kappa_resto: f64,
+        small_threshold: f64,
+        theta_max: f64,
+        gamma_theta: f64,
+        gamma_phi: f64,
+        filter_entries: Vec<FilterEntry>,
+        mu_entry: f64,
+        x_l: Vec<f64>,
+        x_u: Vec<f64>,
+    ) {
+        self.parent_theta_entry = theta_entry.max(0.0);
+        self.parent_theta_entry_l1 = theta_entry_l1.max(0.0);
+        self.parent_phi_entry = phi_entry;
+        self.parent_kappa_resto = kappa_resto.max(0.0);
+        self.parent_small_threshold = small_threshold.max(0.0);
+        self.parent_theta_max = theta_max;
+        self.parent_gamma_theta = gamma_theta.max(0.0);
+        self.parent_gamma_phi = gamma_phi.max(0.0);
+        self.parent_filter_entries = filter_entries;
+        self.parent_mu_entry = mu_entry.max(0.0);
+        self.parent_x_l = x_l;
+        self.parent_x_u = x_u;
+        self.first_iter_seen.set(false);
+    }
+
+    /// Current η = η_factor · √μ, with μ tracked by `notify_mu`.
+    /// Mirrors Ipopt `RestoIpoptNLP::Eta(mu)` (IpRestoIpoptNLP.cpp:759).
+    fn eta(&self) -> f64 {
+        self.eta_factor * self.current_mu.get().max(0.0).sqrt()
     }
 }
 
@@ -204,9 +355,10 @@ impl NlpProblem for RestorationNlp<'_> {
         }
 
         // (eta/2) * ||D_R(x - x_r)||^2
+        let eta = self.eta();
         for i in 0..n {
             let diff = x[i] - self.x_r[i];
-            *obj += 0.5 * self.eta * self.d_r2[i] * diff * diff;
+            *obj += 0.5 * eta * self.d_r2[i] * diff * diff;
         }
 
         true
@@ -217,8 +369,9 @@ impl NlpProblem for RestorationNlp<'_> {
         let m = self.m_orig;
 
         // x part: eta * D_R^2 * (x - x_r)
+        let eta = self.eta();
         for i in 0..n {
-            grad[i] = self.eta * self.d_r2[i] * (x[i] - self.x_r[i]);
+            grad[i] = eta * self.d_r2[i] * (x[i] - self.x_r[i]);
         }
 
         // p and n parts: rho
@@ -317,13 +470,159 @@ impl NlpProblem for RestorationNlp<'_> {
         }
 
         // Add obj_factor * eta * d_r2[i] to each diagonal
+        let eta = self.eta();
         for i in 0..n {
             let idx = self.diag_indices[i];
-            vals[idx] += obj_factor * self.eta * self.d_r2[i];
+            vals[idx] += obj_factor * eta * self.d_r2[i];
         }
 
         // p/n blocks have zero Hessian (barrier mu/s^2 is added by IPM automatically)
         true
+    }
+
+    /// Refresh `current_mu` so subsequent `objective` / `gradient` /
+    /// `hessian_values` calls compute η = η_factor·√μ at the new μ
+    /// instead of the entry-time value (Ipopt
+    /// `RestoIpoptNLP::Eta(mu)` reads μ dynamically per evaluation).
+    fn notify_mu(&self, mu: f64) {
+        if mu.is_finite() && mu >= 0.0 {
+            self.current_mu.set(mu);
+        }
+    }
+
+    /// Ipopt `IpRestoFilterConvCheck::TestOrigProgress`
+    /// (`IpRestoFilterConvCheck.cpp:53-80`,
+    /// `IpRestoConvCheck.cpp:71-248`): the inner solve exits early
+    /// when ALL of the following gates pass at the current inner
+    /// iterate `x_n`:
+    ///
+    /// 1. **Not first inner iter** — Ipopt's `first_resto_iter_`
+    ///    flag (IpRestoConvCheck.cpp:73-78) skips the test on iter 0
+    ///    so the slack variables have a chance to move.
+    /// 2. **κ_resto reduction (max-norm)** —
+    ///    `θ_max(x_n) ≤ max(κ_resto · θ_entry_max, small_threshold)`,
+    ///    Ipopt's primary `required_infeasibility_reduction` gate
+    ///    (`IpRestoConvCheck.cpp:184-190`).
+    /// 3. **Parent filter acceptance (1-norm θ, raw f as φ)** — the
+    ///    `(θ_l1, φ)` pair must not be dominated by any parent
+    ///    filter entry, mirroring `Filter::IsAcceptable`
+    ///    (`IpFilterLSAcceptor.cpp:497`).
+    /// 4. **Sufficient progress vs parent iterate** —
+    ///    `θ_l1(x_n) ≤ (1−γ_θ)·θ_entry_l1` OR
+    ///    `φ(x_n) − φ_entry ≤ −γ_φ · θ_entry_l1`, mirroring
+    ///    `IsAcceptableToCurrentIterate` (`IpFilterLSAcceptor.cpp:497-498`).
+    ///
+    /// The φ used here is the **parent barrier objective**
+    /// `φ(x) = f(x) − μ_parent · Σ ln(slack)` over finite x bounds
+    /// (D5 fix). This matches `IpRestoConvCheck.cpp:193`
+    /// (`orig_ip_cq->trial_barrier_obj()`); the parent filter stores
+    /// barrier-φ entries, so testing raw `f` against them was a
+    /// category mismatch. With μ_parent captured at restoration entry
+    /// the gate is consistent with the parent's filter semantics.
+    fn resto_early_exit(&self, x: &[f64]) -> bool {
+        let n = self.n_orig;
+        let m = self.m_orig;
+        if self.parent_theta_entry <= 0.0 || x.len() < n {
+            return false;
+        }
+        // Gate 1: skip on first inner iter (Ipopt first_resto_iter_).
+        if !self.first_iter_seen.get() {
+            self.first_iter_seen.set(true);
+            return false;
+        }
+
+        // Compute parent c(x_n).
+        let mut g = vec![0.0; m];
+        if m > 0 && !self.inner.constraints(&x[..n], true, &mut g) {
+            return false;
+        }
+        let mut max_viol = 0.0_f64;
+        let mut l1_viol = 0.0_f64;
+        for i in 0..m {
+            let lo = self.parent_g_l[i];
+            let hi = self.parent_g_u[i];
+            let v = if g[i] < lo {
+                lo - g[i]
+            } else if g[i] > hi {
+                g[i] - hi
+            } else {
+                0.0
+            };
+            if v > max_viol {
+                max_viol = v;
+            }
+            l1_viol += v;
+        }
+
+        // Gate 2: κ_resto reduction in max-norm.
+        let threshold_max = (self.parent_kappa_resto * self.parent_theta_entry)
+            .max(self.parent_small_threshold);
+        let gate_kappa = max_viol <= threshold_max;
+
+        // φ_trial = f(x_n) − μ_parent · Σ ln(slack) — parent barrier
+        // objective. D5 fix: the parent filter stores barrier-φ
+        // entries (`compute_barrier_phi` is the parent's metric); the
+        // raw `f(x)` would mismatch when slacks are tight.
+        let mut f_val = 0.0;
+        if !self.inner.objective(&x[..n], false, &mut f_val) || !f_val.is_finite() {
+            return false;
+        }
+        let mut phi_trial = f_val;
+        if self.parent_mu_entry > 0.0 {
+            let nb = self.parent_x_l.len().min(self.parent_x_u.len()).min(n);
+            for i in 0..nb {
+                if self.parent_x_l[i].is_finite() {
+                    let s = x[i] - self.parent_x_l[i];
+                    if s <= 0.0 {
+                        return false;
+                    }
+                    phi_trial -= self.parent_mu_entry * s.ln();
+                }
+                if self.parent_x_u[i].is_finite() {
+                    let s = self.parent_x_u[i] - x[i];
+                    if s <= 0.0 {
+                        return false;
+                    }
+                    phi_trial -= self.parent_mu_entry * s.ln();
+                }
+            }
+            if !phi_trial.is_finite() {
+                return false;
+            }
+        }
+
+        // Gate 3: parent filter acceptance on (θ_l1, φ).
+        let theta_entry_l1 = self.parent_theta_entry_l1;
+        let phi_entry = self.parent_phi_entry;
+        let gamma_theta = self.parent_gamma_theta;
+        let gamma_phi = self.parent_gamma_phi;
+        let gate_filter = if l1_viol.is_nan() || phi_trial.is_nan() {
+            false
+        } else if l1_viol > self.parent_theta_max {
+            false
+        } else {
+            !self.parent_filter_entries.iter().any(|e| {
+                l1_viol >= (1.0 - gamma_theta) * e.theta
+                    && phi_trial >= e.phi - gamma_phi * e.theta
+            })
+        };
+
+        // Gate 4: sufficient progress vs (θ_entry_l1, φ_entry).
+        let theta_progress = l1_viol <= (1.0 - gamma_theta) * theta_entry_l1;
+        let phi_progress = (phi_trial - phi_entry) <= -gamma_phi * theta_entry_l1;
+        let gate_progress = theta_progress || phi_progress;
+
+        let exit = gate_kappa && gate_filter && gate_progress;
+        if std::env::var("RIPOPT_TRACE_RESTO_EXIT").is_ok() {
+            eprintln!(
+                "  resto-exit-probe: max_viol={:.3e}/thr={:.3e} l1={:.3e}/entry_l1={:.3e} \
+                 phi={:.3e}/entry={:.3e} κ={} flt={} prog={} → exit={}",
+                max_viol, threshold_max, l1_viol, theta_entry_l1,
+                phi_trial, phi_entry,
+                gate_kappa, gate_filter, gate_progress, exit,
+            );
+        }
+        exit
     }
 }
 
@@ -484,6 +783,57 @@ mod tests {
         assert!((vals[3] - 1.0).abs() < 1e-10);
     }
 
+    /// T0.10: η must NOT be frozen at restoration entry. After
+    /// `notify_mu` the proximity term in `objective` and `gradient`
+    /// must use the new μ (Ipopt RestoIpoptNLP::Eta reads μ
+    /// dynamically per evaluation; IpRestoIpoptNLP.cpp:759).
+    #[test]
+    fn test_eta_tracks_notify_mu() {
+        let prob = SimpleConstrained;
+        // x_r = (1,2) so D_R^2 = (1, 1/4).
+        let x_r = vec![1.0, 2.0];
+        // mu_entry = 0.1, eta_factor = 1.0 → η_entry = sqrt(0.1).
+        let resto = RestorationNlp::new(&prob, &x_r, 0.1, 1000.0, 1.0);
+
+        // Evaluate objective at x = (2, 4, 0, 0): only proximity term contributes.
+        // Proximity = 0.5 * η * (D_R^2[0] * (2-1)^2 + D_R^2[1] * (4-2)^2)
+        //           = 0.5 * η * (1*1 + 0.25*4) = η.
+        let x = vec![2.0, 4.0, 0.0, 0.0];
+        let mut obj_entry = 0.0;
+        resto.objective(&x, true, &mut obj_entry);
+        let eta_entry = 0.1f64.sqrt();
+        assert!(
+            (obj_entry - eta_entry).abs() < 1e-12,
+            "obj_entry = {}, expected {}",
+            obj_entry, eta_entry
+        );
+
+        // Drop μ → η must shrink.
+        resto.notify_mu(0.01);
+        let mut obj_after = 0.0;
+        resto.objective(&x, true, &mut obj_after);
+        let eta_after = 0.01f64.sqrt();
+        assert!(
+            (obj_after - eta_after).abs() < 1e-12,
+            "obj_after = {}, expected {} (η must track current μ, not entry μ)",
+            obj_after, eta_after
+        );
+        assert!(
+            obj_after < obj_entry,
+            "lower μ must give smaller proximity term (η ∝ √μ)"
+        );
+
+        // Gradient at x = (1+ε, 2, 0, 0): grad[0] = η * D_R^2[0] * (x[0]-x_r[0]) = η.
+        let x2 = vec![2.0, 2.0, 0.0, 0.0];
+        let mut grad = vec![0.0; resto.num_variables()];
+        resto.gradient(&x2, true, &mut grad);
+        assert!(
+            (grad[0] - eta_after).abs() < 1e-12,
+            "grad[0] = {}, expected {} after notify_mu(0.01)",
+            grad[0], eta_after
+        );
+    }
+
     #[test]
     fn test_hessian_values() {
         let prob = SimpleConstrained;
@@ -503,5 +853,106 @@ mod tests {
             "vals[1] = {}",
             vals[1]
         );
+    }
+
+    /// Spec §7.4 (T2.22): Hessian of the restoration objective uses D_R^2,
+    /// not D_R, and the slack rows/cols are zero. The original Hessian must
+    /// be evaluated with `obj_factor=0` (P22, `IpRestoIpoptNLP.cpp:691`).
+    #[test]
+    fn test_hessian_uses_d_r_squared_and_zeroes_slacks() {
+        let prob = SimpleConstrained;
+        let x_r = vec![2.0_f64, 4.0];
+        let mu: f64 = 0.25;
+        let eta = 1.0 * mu.sqrt();
+        let resto = RestorationNlp::new(&prob, &x_r, mu, 1000.0, 1.0);
+        let (hrows, hcols) = resto.hessian_structure();
+        let nnz = hrows.len();
+        let mut vals = vec![0.0; nnz];
+        let x = vec![3.0, 5.0, 0.1, 0.1];
+        let lambda = vec![0.0];
+        resto.hessian_values(&x, true, 1.0, &lambda, &mut vals);
+
+        let mut diag_x = vec![0.0; 2];
+        let mut max_off_x_or_slack = 0.0_f64;
+        for k in 0..nnz {
+            let r = hrows[k];
+            let c = hcols[k];
+            if r == c && r < 2 {
+                diag_x[r] = vals[k];
+            } else if vals[k].abs() > max_off_x_or_slack {
+                max_off_x_or_slack = vals[k].abs();
+            }
+        }
+        assert!(
+            (diag_x[0] - eta * 0.25).abs() < 1e-12,
+            "diag_x[0] should be eta*D_R^2[0] = {} but was {}",
+            eta * 0.25, diag_x[0]
+        );
+        assert!(
+            (diag_x[1] - eta * 0.0625).abs() < 1e-12,
+            "diag_x[1] should be eta*D_R^2[1] = {} but was {}",
+            eta * 0.0625, diag_x[1]
+        );
+        assert!((diag_x[0] - eta * 0.5).abs() > 1e-3, "regression: D_R not D_R^2");
+        assert!(
+            max_off_x_or_slack < 1e-12,
+            "slack rows/cols and x off-diag must be zero, max abs = {}",
+            max_off_x_or_slack
+        );
+    }
+
+    /// Spec §7.2 / T2.22 item A1: residual is c(x) − p + n.
+    #[test]
+    fn test_eval_g_signs_match_spec() {
+        let prob = SimpleConstrained;
+        let x_r = vec![0.0, 0.0];
+        let resto = RestorationNlp::new(&prob, &x_r, 0.1, 1000.0, 1.0);
+        let mut g = vec![0.0; 1];
+        let x = vec![1.0, 3.0, 1.0, 0.0];
+        resto.constraints(&x, true, &mut g);
+        assert!((g[0] - 3.0).abs() < 1e-12, "expected 3 (= 4-1+0), got {}", g[0]);
+        let x2 = vec![1.0, 3.0, 0.0, 1.0];
+        resto.constraints(&x2, true, &mut g);
+        assert!((g[0] - 5.0).abs() < 1e-12, "expected 5 (= 4-0+1), got {}", g[0]);
+    }
+
+    /// Spec §7.2 / T2.22 item A2: Jacobian slack columns [−I_p, +I_n].
+    #[test]
+    fn test_eval_jac_g_slack_signs_match_spec() {
+        let prob = SimpleConstrained;
+        let x_r = vec![0.0, 0.0];
+        let resto = RestorationNlp::new(&prob, &x_r, 0.1, 1000.0, 1.0);
+        let (rows, cols) = resto.jacobian_structure();
+        let mut vals = vec![0.0; rows.len()];
+        resto.jacobian_values(&[0.5, 0.5, 0.1, 0.1], true, &mut vals);
+        for (k, (&r, &c)) in rows.iter().zip(cols.iter()).enumerate() {
+            assert_eq!(r, 0);
+            match c {
+                0 | 1 => assert!((vals[k] - 1.0).abs() < 1e-12, "J_x[{}]=1, got {}", c, vals[k]),
+                2 => assert!((vals[k] - (-1.0)).abs() < 1e-12, "p-col should be -1, got {}", vals[k]),
+                3 => assert!((vals[k] - 1.0).abs() < 1e-12, "n-col should be +1, got {}", vals[k]),
+                _ => panic!("unexpected col {}", c),
+            }
+        }
+    }
+
+    /// Spec §7.2 / T2.22 item A3: gradient `[η·D_R²·(x−x_R), ρ·1, ρ·1]`.
+    #[test]
+    fn test_eval_grad_f_uses_d_r_squared() {
+        let prob = SimpleConstrained;
+        let x_r = vec![2.0_f64, 4.0];
+        let mu: f64 = 0.25;
+        let eta = mu.sqrt();
+        let rho = 1000.0;
+        let resto = RestorationNlp::new(&prob, &x_r, mu, rho, 1.0);
+        let nv = resto.num_variables();
+        let mut grad = vec![0.0; nv];
+        let x = vec![3.0, 5.0, 0.7, 0.3];
+        resto.gradient(&x, true, &mut grad);
+        assert!((grad[0] - eta * 0.25).abs() < 1e-12, "grad[0] = {}", grad[0]);
+        assert!((grad[1] - eta * 0.0625).abs() < 1e-12, "grad[1] = {}", grad[1]);
+        assert!((grad[2] - rho).abs() < 1e-12);
+        assert!((grad[3] - rho).abs() < 1e-12);
+        assert!((grad[0] - eta * 0.5).abs() > 1e-3, "regression: grad uses D_R, not D_R^2");
     }
 }

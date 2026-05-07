@@ -1475,6 +1475,10 @@ impl NlpProblem for OverdeterminedInconsistent {
 }
 
 #[test]
+#[ignore = "NE→LS reformulation removed in T2.13; ripopt no longer detects \
+            inconsistent overdetermined systems and reports NumericalError. \
+            Recovery would require proper local-infeasibility detection at \
+            the IPM level (Ipopt-style) rather than the removed heuristic."]
 fn ne_to_ls_inconsistent() {
     let problem = OverdeterminedInconsistent;
     let options = SolverOptions { print_level: 0, ..SolverOptions::default() };
@@ -1729,11 +1733,6 @@ fn intermediate_callback_early_stop() {
     let options = SolverOptions {
         print_level: 0,
         enable_preprocessing: false,
-        enable_lbfgs_fallback: false,
-        enable_al_fallback: false,
-        enable_sqp_fallback: false,
-        enable_slack_fallback: false,
-        enable_lbfgs_hessian_fallback: false,
         ..SolverOptions::default()
     };
     let result = ripopt::solve(&HS071, &options);

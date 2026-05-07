@@ -1,7 +1,7 @@
 use crate::logging::rip_log;
 
 /// Status of the solve.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum SolveStatus {
     /// Converged to optimal solution within tolerance.
     Optimal,
@@ -22,8 +22,11 @@ pub enum SolveStatus {
     MaxIterations,
     /// Numerical difficulties (e.g., singular KKT system).
     NumericalError,
-    /// Problem appears unbounded below.
-    Unbounded,
+    /// Iterates diverged: ‖x‖_∞ exceeded `diverging_iterates_tol`
+    /// (default 1e20). Mirrors Ipopt 3.14's
+    /// `Diverging_Iterates` (`IpReturnCodes_inc.h`); the legitimate
+    /// signature of an unbounded NLP after the bound-relaxation push.
+    DivergingIterates,
     /// Restoration phase failed.
     RestorationFailed,
     /// User callback returned `false`, indicating evaluation failure at the
@@ -32,6 +35,13 @@ pub enum SolveStatus {
     EvaluationError,
     /// Intermediate callback returned `false`, requesting early termination.
     UserRequestedStop,
+    /// Search direction has become too small to make further progress.
+    /// Mirrors Ipopt's `STOP_AT_TINY_STEP` from `IpBacktrackingLineSearch.cpp`,
+    /// reported as `Search_Direction_Becomes_Too_Small` in
+    /// `IpReturnCodes_inc.h`. The current iterate is the best ripopt can
+    /// produce with the current barrier subproblem; downstream code is
+    /// expected to treat it analogously to acceptable termination.
+    StopAtTinyStep,
     /// Internal error.
     InternalError,
 }
@@ -41,7 +51,7 @@ pub enum SolveStatus {
 /// Captures counts of key solver events (restoration entries, barrier parameter
 /// mode switches, filter rejects, etc.) and final convergence measures.
 /// Useful for automated analysis and solver tuning.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct SolverDiagnostics {
     /// Number of GN (Gauss-Newton) restoration entries.
     pub restoration_count: usize,
@@ -69,6 +79,31 @@ pub struct SolverDiagnostics {
     pub wall_time_secs: f64,
     /// Fallback strategy used, if any.
     pub fallback_used: Option<String>,
+    /// T3.25 follow-up: number of `factor_with_inertia_correction_cached`
+    /// invocations whose 13-tag fingerprint matched the previous
+    /// successful factor and so skipped the underlying `solver.factor`.
+    /// Always 0 when `SolverOptions::factor_cache_enabled = false`.
+    pub factor_cache_hits: u64,
+    /// T3.25 follow-up: number of cached-entry calls that fell through
+    /// to a real factorization. Counted even when the cache is enabled
+    /// but the fingerprint changed (atag bump or first call).
+    pub factor_cache_misses: u64,
+    /// T3.25 follow-up: total number of times `solver.factor` was
+    /// invoked through the cached entry point. Exercised by every
+    /// caller of `factor_with_inertia_correction_cached`, including
+    /// the cache-disabled path where every call factors.
+    pub factor_cache_factor_calls: u64,
+    /// B11: cumulative NLP-callback counts surfaced in the final
+    /// summary. ripopt's `constraints` and `jacobian_values` fill the
+    /// joint c/d block in one call, so `n_constr_evals`/`n_jac_evals`
+    /// count both the equality and the inequality side; the printed
+    /// summary repeats the same value on the equality and inequality
+    /// rows for Ipopt-format compatibility.
+    pub n_obj_evals: usize,
+    pub n_grad_evals: usize,
+    pub n_constr_evals: usize,
+    pub n_jac_evals: usize,
+    pub n_hess_evals: usize,
 }
 
 impl SolverDiagnostics {

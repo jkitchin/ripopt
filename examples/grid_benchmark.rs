@@ -90,6 +90,22 @@ struct BenchEntry {
     solve_time: f64,
 }
 
+fn append_jsonl(
+    writer: &mut Option<std::io::BufWriter<std::fs::File>>,
+    path: &std::path::Path,
+    entry: &BenchEntry,
+) {
+    use std::io::Write;
+    if let Some(w) = writer.as_mut() {
+        if let Ok(line) = serde_json::to_string(entry) {
+            if writeln!(w, "{}", line).is_err() {
+                eprintln!("WARNING: append to {} failed", path.display());
+            }
+            let _ = w.flush();
+        }
+    }
+}
+
 fn solve_ripopt<P: NlpProblem>(problem: &P, tol: f64, max_iter: usize) -> SolveResult {
     let plvl = std::env::var("RIPOPT_PRINT_LEVEL").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let options = SolverOptions { tol, max_iter, max_wall_time: 60.0, print_level: plvl, ..SolverOptions::default() };
@@ -126,6 +142,24 @@ fn main() {
 
     let mut results: Vec<BenchEntry> = Vec::new();
 
+    let results_path_owned: std::path::PathBuf = match std::env::var("RESULTS_FILE") {
+        Ok(p) => std::path::PathBuf::from(p),
+        Err(_) => std::path::PathBuf::from("grid_results.json"),
+    };
+    let jsonl_path = match std::env::var("RESULTS_JSONL") {
+        Ok(p) => std::path::PathBuf::from(p),
+        Err(_) => results_path_owned.with_extension("jsonl"),
+    };
+    let mut jsonl_writer: Option<std::io::BufWriter<std::fs::File>> =
+        match std::fs::File::create(&jsonl_path) {
+            Ok(f) => Some(std::io::BufWriter::new(f)),
+            Err(e) => {
+                eprintln!("WARNING: cannot open {}: {}", jsonl_path.display(), e);
+                None
+            }
+        };
+    eprintln!("Streaming results to {}", jsonl_path.display());
+
     macro_rules! bench {
         ($name:expr, $problem:expr, $known_opt:expr) => {{
             let p = $problem;
@@ -144,11 +178,13 @@ fn main() {
             if rp.status != "Optimal" {
                 notes.push(format!("ripopt={}", rp.status));
             }
-            results.push(BenchEntry {
+            let entry_rp = BenchEntry {
                 solver: "ripopt".into(), name: $name.into(), n, m,
                 status: rp.status.clone(), objective: rp.objective,
                 iterations: rp.iterations, solve_time: rp.time_s,
-            });
+            };
+            append_jsonl(&mut jsonl_writer, &jsonl_path, &entry_rp);
+            results.push(entry_rp);
             let rp_gap = ((rp.objective - $known_opt) / $known_opt * 100.0).abs();
 
             #[cfg(feature = "ipopt-native")]
@@ -156,11 +192,13 @@ fn main() {
                 let ip = ipopt_ffi::solve_ipopt(&p, tol, max_iter as i32);
                 line += &format!(" | {:>12.2} {:>5} {:>8.4}", ip.objective, ip.iterations, ip.time_s);
                 if ip.status != "Optimal" { notes.push(format!("ipopt={}", ip.status)); }
-                results.push(BenchEntry {
+                let entry_ip = BenchEntry {
                     solver: "ipopt".into(), name: $name.into(), n, m,
                     status: ip.status.clone(), objective: ip.objective,
                     iterations: ip.iterations, solve_time: ip.time_s,
-                });
+                };
+                append_jsonl(&mut jsonl_writer, &jsonl_path, &entry_ip);
+                results.push(entry_ip);
             }
 
             println!("{}", line);
@@ -182,10 +220,7 @@ fn main() {
 
     println!("{}", "-".repeat(width));
 
-    // Write JSON results
-    let results_path = std::env::var("RESULTS_FILE")
-        .unwrap_or_else(|_| "grid_results.json".to_string());
     let json = serde_json::to_string_pretty(&results).unwrap();
-    std::fs::write(&results_path, json).unwrap();
-    eprintln!("Results written to {}", results_path);
+    std::fs::write(&results_path_owned, json).unwrap();
+    eprintln!("Results written to {}", results_path_owned.display());
 }

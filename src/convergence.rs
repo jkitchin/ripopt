@@ -21,8 +21,19 @@ pub enum ConvergenceStatus {
 
 /// Information needed to check convergence.
 pub struct ConvergenceInfo {
-    /// Primal infeasibility: max |c_i(x)| for violated constraints.
+    /// User-facing primal infeasibility: max raw bound-violation on g.
+    /// Equality rows: `|g − g_l|`. Inequality rows: `max(g_l−g, 0) +
+    /// max(g−g_u, 0)`. This is what the unscaled (top-level) convergence
+    /// gate and the restoration trigger see.
     pub primal_inf: f64,
+    /// Slack-coupling primal infeasibility for the scaled (barrier-level)
+    /// gate: equality rows `|g − g_l|`, inequality rows `|g − s|` where `s`
+    /// is the explicit slack iterate. Mirrors Ipopt's
+    /// `IpIpoptCalculatedQuantities::curr_primal_infeasibility`
+    /// (`||c||_∞ ∪ ||d − s||_∞`). When the caller has not yet plumbed `s`
+    /// through, set this equal to `primal_inf` (degrades to the user-side
+    /// residual, never tighter than Ipopt's).
+    pub primal_inf_internal: f64,
     /// Dual infeasibility: ||grad_f + J^T y - z_l + z_u||_inf using iterative z.
     pub dual_inf: f64,
     /// Dual infeasibility using iterative z with component-wise scaling (for unscaled gate).
@@ -46,7 +57,59 @@ pub struct ConvergenceInfo {
     pub bound_multiplier_sum: f64,
     /// Total number of bound-multiplier components (2n) — denominator for s_c.
     pub bound_multiplier_count: usize,
+    /// `‖x‖_∞` of the current iterate, used by the divergence gate
+    /// against `options.diverging_iterates_tol` (Ipopt
+    /// `IpOptErrorConvCheck.cpp:255`). Default `0.0` when an upstream
+    /// caller cannot supply x; that value never triggers divergence.
+    pub x_max_abs: f64,
 }
+
+/// Test whether the iterate meets Ipopt's acceptable-level thresholds,
+/// including the relative objective-change gate
+/// `|f_k − f_{k-1}| / max(1, |f_k|) ≤ acceptable_obj_change_tol`
+/// (`IpOptErrorConvCheck.cpp:115, 322-330`). When `last_obj` is `None`
+/// (iteration 0, no previous objective) the obj-change gate is skipped.
+pub fn meets_acceptable_thresholds(
+    info: &ConvergenceInfo,
+    options: &SolverOptions,
+    s_d: f64,
+    s_c: f64,
+    last_obj: Option<f64>,
+) -> bool {
+    const ACCEPTABLE_TOL: f64 = 1e-6;
+    const ACCEPTABLE_DUAL_INF_TOL: f64 = 1e10;
+    const ACCEPTABLE_CONSTR_VIOL_TOL: f64 = 1e-2;
+    const ACCEPTABLE_COMPL_INF_TOL: f64 = 1e-2;
+
+    let scaled_ok = info.primal_inf_internal <= ACCEPTABLE_TOL
+        && info.dual_inf <= ACCEPTABLE_TOL * s_d
+        && info.compl_inf <= ACCEPTABLE_TOL * s_c;
+    let unscaled_ok = info.primal_inf <= ACCEPTABLE_CONSTR_VIOL_TOL
+        && info.dual_inf_unscaled <= ACCEPTABLE_DUAL_INF_TOL
+        && info.compl_inf <= ACCEPTABLE_COMPL_INF_TOL;
+
+    let obj_change_ok = match last_obj {
+        Some(prev) => {
+            let denom = info.objective.abs().max(1.0);
+            (info.objective - prev).abs() / denom <= options.acceptable_obj_change_tol
+        }
+        None => true,
+    };
+
+    scaled_ok && unscaled_ok && obj_change_ok
+}
+
+/// Acceptable-level thresholds matching Ipopt defaults
+/// (`IpOptErrorConvCheck.cpp:70-121`):
+///   acceptable_tol = 1e-6, acceptable_dual_inf_tol = 1e10,
+///   acceptable_constr_viol_tol = 1e-2, acceptable_compl_inf_tol = 1e-2.
+pub const ACCEPTABLE_TOL: f64 = 1e-6;
+pub const ACCEPTABLE_DUAL_INF_TOL: f64 = 1e10;
+pub const ACCEPTABLE_CONSTR_VIOL_TOL: f64 = 1e-2;
+pub const ACCEPTABLE_COMPL_INF_TOL: f64 = 1e-2;
+/// Number of consecutive acceptable iterations required for the
+/// `Acceptable` exit (Ipopt's `acceptable_iter`).
+pub const NEAR_TOL_ITERS: usize = 15;
 
 /// Check convergence of the IPM algorithm.
 ///
@@ -55,6 +118,18 @@ pub fn check_convergence(
     info: &ConvergenceInfo,
     options: &SolverOptions,
     consecutive_acceptable: usize,
+) -> ConvergenceStatus {
+    check_convergence_with_last_obj(info, options, consecutive_acceptable, None)
+}
+
+/// Variant of `check_convergence` that threads the previous iterate's
+/// objective for the acceptable-level relative-change gate. Iteration 0
+/// callers pass `None`; subsequent iterations pass the prior `f`.
+pub fn check_convergence_with_last_obj(
+    info: &ConvergenceInfo,
+    options: &SolverOptions,
+    consecutive_acceptable: usize,
+    last_obj: Option<f64>,
 ) -> ConvergenceStatus {
     // Ipopt-style scaling factors (IpIpoptCalculatedQuantities.cpp:3663-3700):
     //   s_d = max(s_max, sum|y, z_l, z_u| / (m+2n)) / s_max  — for dual residual
@@ -79,8 +154,10 @@ pub fn check_convergence(
     let compl_tol = options.tol * s_c;
 
     // Strict convergence: BOTH scaled AND unscaled must pass.
-    // All checks use iterative z (matches Ipopt's curr_dual_infeasibility).
-    let scaled_ok = info.primal_inf <= primal_tol
+    // Scaled (barrier-level) uses Ipopt's `||c||_∞ ∪ ||d − s||_∞` slack-
+    // coupling residual; unscaled (top-level/restoration) uses the user-
+    // facing raw bound violation on g.
+    let scaled_ok = info.primal_inf_internal <= primal_tol
         && info.dual_inf <= dual_tol
         && info.compl_inf <= compl_tol;
     let unscaled_ok = info.primal_inf <= options.constr_viol_tol
@@ -90,36 +167,19 @@ pub fn check_convergence(
         return ConvergenceStatus::Converged;
     }
 
-    // Acceptable-level check matching Ipopt defaults
-    // (IpOptErrorConvCheck.cpp:70-121):
-    //   acceptable_tol = 1e-6
-    //   acceptable_iter = 15 consecutive iterations
-    //   acceptable_dual_inf_tol = 1e10   (effectively disabled)
-    //   acceptable_constr_viol_tol = 1e-2
-    //   acceptable_compl_inf_tol = 1e-2
-    // Ipopt's acceptable_obj_change_tol = 1e20 (disabled by default).
-    const NEAR_TOL_ITERS: usize = 15;
-    const ACCEPTABLE_TOL: f64 = 1e-6;
-    const ACCEPTABLE_DUAL_INF_TOL: f64 = 1e10;
-    const ACCEPTABLE_CONSTR_VIOL_TOL: f64 = 1e-2;
-    const ACCEPTABLE_COMPL_INF_TOL: f64 = 1e-2;
-
-    let near_scaled_ok = info.primal_inf <= ACCEPTABLE_TOL
-        && info.dual_inf <= ACCEPTABLE_TOL * s_d
-        && info.compl_inf <= ACCEPTABLE_TOL * s_c;
-    let near_unscaled_ok = info.primal_inf <= ACCEPTABLE_CONSTR_VIOL_TOL
-        && info.dual_inf_unscaled <= ACCEPTABLE_DUAL_INF_TOL
-        && info.compl_inf <= ACCEPTABLE_COMPL_INF_TOL;
-
-    if near_scaled_ok && near_unscaled_ok
-        && consecutive_acceptable >= NEAR_TOL_ITERS
+    // `acceptable_iter == 0` disables the acceptable exit entirely
+    // (Ipopt 3.14 `IpOptErrorConvCheck.cpp:241`).
+    if options.acceptable_iter > 0
+        && meets_acceptable_thresholds(info, options, s_d, s_c, last_obj)
+        && consecutive_acceptable >= options.acceptable_iter
     {
         return ConvergenceStatus::Acceptable;
     }
 
-    // Check divergence (use 1e50 — constrained problems can have large feasible objectives,
-    // and transient excursions to large |obj| can occur during interior point iterations)
-    if info.objective.abs() > 1e50 {
+    // Divergence gate: ‖x‖_∞ > diverging_iterates_tol (Ipopt 3.14
+    // IpOptErrorConvCheck.cpp:255). Earlier ripopt tested |f| > 1e50,
+    // which fired on legitimate large-objective constrained problems.
+    if info.x_max_abs > options.diverging_iterates_tol {
         return ConvergenceStatus::Diverging;
     }
 
@@ -164,14 +224,71 @@ pub fn primal_infeasibility_max(g: &[f64], g_l: &[f64], g_u: &[f64]) -> f64 {
     max_viol
 }
 
-/// Compute dual infeasibility: ||grad_f - J^T * lambda - z_l + z_u||_inf.
+/// Slack-coupling primal infeasibility (Ipopt's barrier-level
+/// `inf_pr` = `||c(x)||_∞ ∪ ||d(x) − s||_∞`).
+///
+/// Equality rows (`g_l == g_u`) contribute `|g[i] − g_l[i]|`.
+/// Inequality rows contribute `|g[i] − s[i]|`, since the IPM iterates an
+/// explicit slack `s` with `g_l ≤ s ≤ g_u` and the equation
+/// `g(x) − s = 0` is the actual constraint the Newton system enforces
+/// (`IpIpoptCalculatedQuantities.cpp::curr_primal_infeasibility`,
+/// 1-norm overload). The 1-norm flavor is used inside the filter line
+/// search; the max-norm flavor (see `primal_infeasibility_internal_max`)
+/// is used for the barrier-level convergence test.
+pub fn primal_infeasibility_internal(
+    g: &[f64],
+    s: &[f64],
+    g_l: &[f64],
+    g_u: &[f64],
+) -> f64 {
+    let mut sum = 0.0f64;
+    for i in 0..g.len() {
+        if is_equality_constraint(g_l[i], g_u[i]) {
+            sum += (g[i] - g_l[i]).abs();
+        } else {
+            sum += (g[i] - s[i]).abs();
+        }
+    }
+    sum
+}
+
+/// Max-norm variant of [`primal_infeasibility_internal`]; used for the
+/// barrier-level convergence test (Ipopt's E_mu primal residual).
+pub fn primal_infeasibility_internal_max(
+    g: &[f64],
+    s: &[f64],
+    g_l: &[f64],
+    g_u: &[f64],
+) -> f64 {
+    let mut m = 0.0f64;
+    for i in 0..g.len() {
+        let r = if is_equality_constraint(g_l[i], g_u[i]) {
+            (g[i] - g_l[i]).abs()
+        } else {
+            (g[i] - s[i]).abs()
+        };
+        if r > m {
+            m = r;
+        }
+    }
+    m
+}
+
+/// Compute dual infeasibility: ||grad_f + J^T * lambda - z_l + z_u||_inf.
+///
+/// Mirrors Ipopt's `IpoptCalculatedQuantities::curr_grad_lag_x()`
+/// (`IpIpoptCalculatedQuantities.cpp:1993-2030`) — the *plain*
+/// Lagrangian gradient with NO `kappa_d` damping. The damped variant
+/// `curr_grad_lag_with_damping_x` (`IpIpoptCalculatedQuantities.cpp:2131+`)
+/// is used only for the barrier-objective gradient and Newton RHS,
+/// never for the convergence test (`IpOptErrorConvCheck::CheckConvergence`
+/// → `unscaled_curr_dual_infeasibility(NORM_MAX)` → `curr_grad_lag_x`).
 ///
 /// `grad_f`: gradient of objective
 /// `jac_rows`, `jac_cols`, `jac_vals`: Jacobian in COO format
 /// `lambda`: constraint multipliers
 /// `z_l`, `z_u`: bound multipliers
 /// `n`: number of variables
-#[allow(clippy::too_many_arguments)]
 pub fn dual_infeasibility(
     grad_f: &[f64],
     jac_rows: &[usize],
@@ -201,13 +318,18 @@ pub fn dual_infeasibility(
     residual.iter().map(|r| r.abs()).fold(0.0f64, f64::max)
 }
 
-/// Compute component-wise scaled dual infeasibility.
+/// Compute the unscaled dual infeasibility max-norm.
 ///
-/// Uses `|r_i| / (1 + |grad_f_i|)` per component, which makes the metric
-/// insensitive to gradient magnitude across variables. This prevents
-/// poorly-scaled problems from having artificially large unscaled dual
-/// infeasibility even when the scaled version is small.
-#[allow(clippy::too_many_arguments)]
+/// T3.1: dropped the ripopt-specific per-component `(1 + |grad_f_i|)`
+/// divisor. Ipopt's `IpIpoptCalculatedQuantities::curr_dual_infeasibility`
+/// computes the raw max-norm of `grad_f + J^T y - z_L + z_U` and only
+/// applies the global `s_d` scaling at the convergence-test boundary
+/// (`IpOptErrorConvCheck.cpp:208`). The per-component normalisation
+/// could declare false-Optimal on problems with one large gradient
+/// component shadowing uniformly small residuals.
+///
+/// As in `dual_infeasibility`, no `kappa_d` damping: the convergence
+/// test uses `curr_grad_lag_x` (plain), not `curr_grad_lag_with_damping_x`.
 pub fn dual_infeasibility_scaled(
     grad_f: &[f64],
     jac_rows: &[usize],
@@ -219,27 +341,15 @@ pub fn dual_infeasibility_scaled(
     n: usize,
 ) -> f64 {
     let mut residual = vec![0.0; n];
-
-    // Start with gradient of objective
     residual[..n].copy_from_slice(&grad_f[..n]);
-
-    // Add J^T * lambda (Ipopt convention: L = f + y^T g)
     for (idx, (&row, &col)) in jac_rows.iter().zip(jac_cols.iter()).enumerate() {
         residual[col] += jac_vals[idx] * lambda[row];
     }
-
-    // Subtract z_l and add z_u (bound multipliers)
     for i in 0..n {
         residual[i] -= z_l[i];
         residual[i] += z_u[i];
     }
-
-    // Component-wise scaling: divide by (1 + |grad_f_i|)
-    residual
-        .iter()
-        .enumerate()
-        .map(|(i, r)| r.abs() / (1.0 + grad_f[i].abs()))
-        .fold(0.0f64, f64::max)
+    residual.iter().map(|r| r.abs()).fold(0.0f64, f64::max)
 }
 
 /// Compute complementarity error for bound constraints.
@@ -273,10 +383,19 @@ pub fn complementarity_error(
 /// Compute full complementarity error including constraint slack complementarity.
 ///
 /// In addition to variable bound complementarity (x-x_l)*z_l and (x_u-x)*z_u,
-/// this also checks constraint slack complementarity for inequality constraints:
-/// - Lower-bounded: (g(x) - g_l) * max(y\[i\], 0)
-/// - Upper-bounded: (g_u - g(x)) * max(-y\[i\], 0)
+/// this also checks constraint slack complementarity for inequality constraints
+/// using the dedicated slack-bound multipliers `v_l`, `v_u` (Ipopt's `v_L`,
+/// `v_U`):
+/// - Lower-bounded: (g(x) - g_l) * v_l\[i\]
+/// - Upper-bounded: (g_u - g(x)) * v_u\[i\]
 /// - Equality constraints are skipped.
+///
+/// Mirrors Ipopt's `IpIpoptCalculatedQuantities::curr_complementarity` which
+/// sums Asum() over four projection blocks: z_L, z_U, v_L, v_U
+/// (`IpIpoptCalculatedQuantities.cpp:2467-2497`). The earlier `max(y,0)` /
+/// `max(-y,0)` substitute (T0.3) was an approximation that broke when `y`
+/// drifted away from the central path even though `v_l*slack = mu` was
+/// preserved by `reset_slack_multipliers` — see the HS32 stuck-compl regression.
 #[allow(clippy::too_many_arguments)]
 pub fn complementarity_error_full(
     x: &[f64],
@@ -287,30 +406,229 @@ pub fn complementarity_error_full(
     g: &[f64],
     g_l: &[f64],
     g_u: &[f64],
-    y: &[f64],
+    v_l: &[f64],
+    v_u: &[f64],
     mu: f64,
 ) -> f64 {
     // Start with variable bound complementarity
     let mut max_err = complementarity_error(x, x_l, x_u, z_l, z_u, mu);
 
-    // Add constraint slack complementarity for inequality constraints
+    // Add constraint slack complementarity for inequality constraints.
+    // Ipopt iterates an explicit slack s ≥ 0 (kept interior by the line
+    // search) so v·s − μ is a meaningful central-path residual. ripopt's
+    // implicit-slack formulation lets g(x) drift infeasible during the
+    // line search, where s := g − g_l can go negative; v_l (set to
+    // μ_ks/max(s,1e-20)) is then huge and the unclamped product is
+    // nonsense. Clamp the effective slack at 0 to mirror Ipopt's interior
+    // s (any constraint infeasibility is already counted by primal_inf).
     let m = g.len();
     for i in 0..m {
         if is_equality_constraint(g_l[i], g_u[i]) {
             continue;
         }
         if g_l[i].is_finite() {
-            let slack = g[i] - g_l[i];
-            let mult = y[i].max(0.0);
-            max_err = max_err.max((slack * mult - mu).abs());
+            let slack = (g[i] - g_l[i]).max(0.0);
+            max_err = max_err.max((slack * v_l[i] - mu).abs());
         }
         if g_u[i].is_finite() {
-            let slack = g_u[i] - g[i];
-            let mult = (-y[i]).max(0.0);
-            max_err = max_err.max((slack * mult - mu).abs());
+            let slack = (g_u[i] - g[i]).max(0.0);
+            max_err = max_err.max((slack * v_u[i] - mu).abs());
         }
     }
     max_err
+}
+
+// =====================================================================
+// Phase 2 — split-input variants (c-block / d-block) of the primal,
+// dual, and complementarity residuals. These take Ipopt-style separated
+// inputs: `g_c` is the equality residual (size n_c, zero at feasibility,
+// computed as `g[c_to_combined[k]] - g_l[c_to_combined[k]]`), `g_d` is
+// the inequality value, `d_l` / `d_u` are the inequality bounds, `s_d`
+// is the slack iterate restricted to the d-block.
+//
+// Behavior is bit-equivalent to the combined-input variants above on
+// problems where every row has been classified consistently (i.e.,
+// `is_equality_constraint(g_l[i], g_u[i])` matches the layout). They
+// exist so call sites can stop branching per row and so the underlying
+// storage can be split entirely in Phase 3.
+// =====================================================================
+
+/// 1-norm primal infeasibility on the split layout. Equality contribution
+/// is `||c(x)||_1` (residual already), inequality contribution is the
+/// per-row bound violation summed over the d-block.
+pub fn primal_infeasibility_split(
+    g_c: &[f64],
+    g_d: &[f64],
+    d_l: &[f64],
+    d_u: &[f64],
+) -> f64 {
+    let mut sum = 0.0f64;
+    for &c in g_c {
+        sum += c.abs();
+    }
+    debug_assert_eq!(g_d.len(), d_l.len());
+    debug_assert_eq!(g_d.len(), d_u.len());
+    for k in 0..g_d.len() {
+        if g_d[k] < d_l[k] {
+            sum += d_l[k] - g_d[k];
+        }
+        if g_d[k] > d_u[k] {
+            sum += g_d[k] - d_u[k];
+        }
+    }
+    sum
+}
+
+/// Max-norm primal infeasibility on the split layout. Used by the
+/// barrier-level convergence test (Ipopt's `E_mu` primal residual).
+pub fn primal_infeasibility_max_split(
+    g_c: &[f64],
+    g_d: &[f64],
+    d_l: &[f64],
+    d_u: &[f64],
+) -> f64 {
+    let mut m = 0.0f64;
+    for &c in g_c {
+        let a = c.abs();
+        if a > m {
+            m = a;
+        }
+    }
+    debug_assert_eq!(g_d.len(), d_l.len());
+    debug_assert_eq!(g_d.len(), d_u.len());
+    for k in 0..g_d.len() {
+        if g_d[k] < d_l[k] {
+            let v = d_l[k] - g_d[k];
+            if v > m {
+                m = v;
+            }
+        }
+        if g_d[k] > d_u[k] {
+            let v = g_d[k] - d_u[k];
+            if v > m {
+                m = v;
+            }
+        }
+    }
+    m
+}
+
+/// Slack-coupling primal infeasibility (Ipopt's `inf_pr` =
+/// `||c(x)||_1 + ||d(x) − s||_1` on the split layout). Equality rows
+/// contribute `|c[k]|`; inequality rows contribute `|d[k] − s_d[k]|`.
+pub fn primal_infeasibility_internal_split(
+    g_c: &[f64],
+    g_d: &[f64],
+    s_d: &[f64],
+) -> f64 {
+    let mut sum = 0.0f64;
+    for &c in g_c {
+        sum += c.abs();
+    }
+    debug_assert_eq!(g_d.len(), s_d.len());
+    for k in 0..g_d.len() {
+        sum += (g_d[k] - s_d[k]).abs();
+    }
+    sum
+}
+
+/// Max-norm variant of [`primal_infeasibility_internal_split`].
+pub fn primal_infeasibility_internal_max_split(
+    g_c: &[f64],
+    g_d: &[f64],
+    s_d: &[f64],
+) -> f64 {
+    let mut m = 0.0f64;
+    for &c in g_c {
+        let a = c.abs();
+        if a > m {
+            m = a;
+        }
+    }
+    debug_assert_eq!(g_d.len(), s_d.len());
+    for k in 0..g_d.len() {
+        let r = (g_d[k] - s_d[k]).abs();
+        if r > m {
+            m = r;
+        }
+    }
+    m
+}
+
+/// Complementarity error on the split layout. Equality multipliers `y_c`
+/// have no complementarity contribution (no slack); only the d-block
+/// pairs (slack ↔ v_l, v_u) contribute, alongside the variable-bound
+/// pairs (z_l, z_u) handled inside [`complementarity_error`].
+#[allow(clippy::too_many_arguments)]
+pub fn complementarity_error_full_split(
+    x: &[f64],
+    x_l: &[f64],
+    x_u: &[f64],
+    z_l: &[f64],
+    z_u: &[f64],
+    g_d: &[f64],
+    d_l: &[f64],
+    d_u: &[f64],
+    v_l_d: &[f64],
+    v_u_d: &[f64],
+    mu: f64,
+) -> f64 {
+    let mut max_err = complementarity_error(x, x_l, x_u, z_l, z_u, mu);
+    debug_assert_eq!(g_d.len(), d_l.len());
+    debug_assert_eq!(g_d.len(), d_u.len());
+    debug_assert_eq!(g_d.len(), v_l_d.len());
+    debug_assert_eq!(g_d.len(), v_u_d.len());
+    for k in 0..g_d.len() {
+        if d_l[k].is_finite() {
+            let slack = (g_d[k] - d_l[k]).max(0.0);
+            max_err = max_err.max((slack * v_l_d[k] - mu).abs());
+        }
+        if d_u[k].is_finite() {
+            let slack = (d_u[k] - g_d[k]).max(0.0);
+            max_err = max_err.max((slack * v_u_d[k] - mu).abs());
+        }
+    }
+    max_err
+}
+
+/// Dual infeasibility max-norm on the split-form Jacobian. Computes
+/// `||grad_f + J_c^T y_c + J_d^T y_d - z_L + z_U||_∞` without
+/// materialising the combined `(jac_*, y)` triplet. Mirrors Ipopt's
+/// plain `curr_grad_lag_x` (`IpIpoptCalculatedQuantities.cpp:1993-2030`)
+/// — no κ_d damping, used by the convergence test.
+#[allow(clippy::too_many_arguments)]
+pub fn dual_infeasibility_split(
+    grad_f: &[f64],
+    jac_c_rows: &[usize],
+    jac_c_cols: &[usize],
+    jac_c_vals: &[f64],
+    y_c: &[f64],
+    jac_d_rows: &[usize],
+    jac_d_cols: &[usize],
+    jac_d_vals: &[f64],
+    y_d: &[f64],
+    z_l: &[f64],
+    z_u: &[f64],
+    n: usize,
+) -> f64 {
+    let mut residual = vec![0.0; n];
+    residual[..n].copy_from_slice(&grad_f[..n]);
+
+    // J_c^T * y_c (Phase 5c: split-form, no combined materialisation)
+    for (idx, (&kc, &col)) in jac_c_rows.iter().zip(jac_c_cols.iter()).enumerate() {
+        residual[col] += jac_c_vals[idx] * y_c[kc];
+    }
+    // J_d^T * y_d
+    for (idx, (&kd, &col)) in jac_d_rows.iter().zip(jac_d_cols.iter()).enumerate() {
+        residual[col] += jac_d_vals[idx] * y_d[kd];
+    }
+
+    for i in 0..n {
+        residual[i] -= z_l[i];
+        residual[i] += z_u[i];
+    }
+
+    residual.iter().map(|r| r.abs()).fold(0.0f64, f64::max)
 }
 
 #[cfg(test)]
@@ -338,6 +656,7 @@ mod tests {
     fn test_convergence_optimal() {
         let info = ConvergenceInfo {
             primal_inf: 1e-10,
+            primal_inf_internal: 1e-10,
             dual_inf: 1e-10,
             dual_inf_unscaled: 1e-10,
             compl_inf: 1e-10,
@@ -347,6 +666,7 @@ mod tests {
             multiplier_count: 0,
             bound_multiplier_sum: 0.0,
             bound_multiplier_count: 0,
+            x_max_abs: 0.0,
         };
         let opts = SolverOptions::default();
         assert_eq!(
@@ -359,6 +679,7 @@ mod tests {
     fn test_convergence_not_converged() {
         let info = ConvergenceInfo {
             primal_inf: 1e-3,
+            primal_inf_internal: 1e-3,
             dual_inf: 1e-3,
             dual_inf_unscaled: 1e-3,
             compl_inf: 1e-3,
@@ -368,6 +689,7 @@ mod tests {
             multiplier_count: 0,
             bound_multiplier_sum: 0.0,
             bound_multiplier_count: 0,
+            x_max_abs: 0.0,
         };
         let opts = SolverOptions::default();
         assert_eq!(
@@ -378,17 +700,21 @@ mod tests {
 
     #[test]
     fn test_convergence_diverging() {
+        // T0.6: divergence is gated by ‖x‖_∞ > diverging_iterates_tol,
+        // not |f| (Ipopt IpOptErrorConvCheck.cpp:255).
         let info = ConvergenceInfo {
             primal_inf: 1e-3,
+            primal_inf_internal: 1e-3,
             dual_inf: 1e-3,
             dual_inf_unscaled: 1e-3,
             compl_inf: 1e-3,
             mu: 1e-11,
-            objective: 1e51,
+            objective: 1.0,
             multiplier_sum: 0.0,
             multiplier_count: 0,
             bound_multiplier_sum: 0.0,
             bound_multiplier_count: 0,
+            x_max_abs: 1e25,
         };
         let opts = SolverOptions::default();
         assert_eq!(
@@ -398,9 +724,78 @@ mod tests {
     }
 
     #[test]
+    fn test_convergence_diverging_uses_x_not_obj() {
+        // T0.6: |f| huge but ‖x‖_∞ small ⇒ NOT diverging.
+        let info = ConvergenceInfo {
+            primal_inf: 1e-3, primal_inf_internal: 1e-3,
+            dual_inf: 1e-3, dual_inf_unscaled: 1e-3,
+            compl_inf: 1e-3, mu: 1e-11, objective: 1e60,
+            multiplier_sum: 0.0, multiplier_count: 0,
+            bound_multiplier_sum: 0.0, bound_multiplier_count: 0,
+            x_max_abs: 1e15,
+        };
+        let opts = SolverOptions::default();
+        assert_ne!(check_convergence(&info, &opts, 0), ConvergenceStatus::Diverging);
+    }
+
+    #[test]
+    fn test_meets_acceptable_thresholds_obj_change_passes() {
+        // T0.5: |Δf| / max(1, |f|) = |10.001 - 10.0| / 10.001 ≈ 1e-4.
+        // With acceptable_obj_change_tol = 1e-2, gate passes.
+        let info = ConvergenceInfo {
+            primal_inf: 1e-7, primal_inf_internal: 1e-7,
+            dual_inf: 1e-7, dual_inf_unscaled: 1e-7,
+            compl_inf: 1e-7, mu: 0.0, objective: 10.001,
+            multiplier_sum: 0.0, multiplier_count: 0,
+            bound_multiplier_sum: 0.0, bound_multiplier_count: 0,
+            x_max_abs: 0.0,
+        };
+        let mut opts = SolverOptions::default();
+        opts.acceptable_obj_change_tol = 1e-2;
+        assert!(meets_acceptable_thresholds(&info, &opts, 1.0, 1.0, Some(10.0)),
+            "|Δf|/|f| ≈ 1e-4 ≤ 1e-2 should pass");
+    }
+
+    #[test]
+    fn test_meets_acceptable_thresholds_obj_change_blocks() {
+        // T0.5: |Δf| / max(1, |f|) = |11.0 - 10.0| / 11.0 ≈ 0.091.
+        // With acceptable_obj_change_tol = 1e-2, gate blocks.
+        let info = ConvergenceInfo {
+            primal_inf: 1e-7, primal_inf_internal: 1e-7,
+            dual_inf: 1e-7, dual_inf_unscaled: 1e-7,
+            compl_inf: 1e-7, mu: 0.0, objective: 11.0,
+            multiplier_sum: 0.0, multiplier_count: 0,
+            bound_multiplier_sum: 0.0, bound_multiplier_count: 0,
+            x_max_abs: 0.0,
+        };
+        let mut opts = SolverOptions::default();
+        opts.acceptable_obj_change_tol = 1e-2;
+        assert!(!meets_acceptable_thresholds(&info, &opts, 1.0, 1.0, Some(10.0)),
+            "|Δf|/|f| ≈ 0.09 > 1e-2 should block");
+    }
+
+    #[test]
+    fn test_meets_acceptable_thresholds_no_prev_obj_skips_gate() {
+        // T0.5: last_obj = None (iter 0) skips the gate.
+        let info = ConvergenceInfo {
+            primal_inf: 1e-7, primal_inf_internal: 1e-7,
+            dual_inf: 1e-7, dual_inf_unscaled: 1e-7,
+            compl_inf: 1e-7, mu: 0.0, objective: 11.0,
+            multiplier_sum: 0.0, multiplier_count: 0,
+            bound_multiplier_sum: 0.0, bound_multiplier_count: 0,
+            x_max_abs: 0.0,
+        };
+        let mut opts = SolverOptions::default();
+        opts.acceptable_obj_change_tol = 1e-12; // would block any change
+        assert!(meets_acceptable_thresholds(&info, &opts, 1.0, 1.0, None),
+            "iter-0 None should bypass the gate");
+    }
+
+    #[test]
     fn test_convergence_acceptable() {
         let info = ConvergenceInfo {
             primal_inf: 1e-7,
+            primal_inf_internal: 1e-7,
             dual_inf: 1e-7,
             dual_inf_unscaled: 1e-7,
             compl_inf: 1e-7,
@@ -410,6 +805,7 @@ mod tests {
             multiplier_count: 0,
             bound_multiplier_sum: 0.0,
             bound_multiplier_count: 0,
+            x_max_abs: 0.0,
         };
         let opts = SolverOptions::default();
         // Need enough consecutive near-tolerance iterations (hardcoded NEAR_TOL_ITERS=15).
@@ -423,6 +819,7 @@ mod tests {
     fn test_convergence_acceptable_insufficient_count() {
         let info = ConvergenceInfo {
             primal_inf: 1e-7,
+            primal_inf_internal: 1e-7,
             dual_inf: 1e-7,
             dual_inf_unscaled: 1e-7,
             compl_inf: 1e-7,
@@ -432,6 +829,7 @@ mod tests {
             multiplier_count: 0,
             bound_multiplier_sum: 0.0,
             bound_multiplier_count: 0,
+            x_max_abs: 0.0,
         };
         let opts = SolverOptions::default();
         // Not enough consecutive iterations (14 < 15)
@@ -446,6 +844,7 @@ mod tests {
         // Large multipliers should scale the dual tolerance
         let info = ConvergenceInfo {
             primal_inf: 1e-10,
+            primal_inf_internal: 1e-10,
             dual_inf: 5e-5, // Would fail without scaling
             dual_inf_unscaled: 5e-5,
             compl_inf: 1e-10,
@@ -458,6 +857,7 @@ mod tests {
             // arithmetic check below valid.
             bound_multiplier_sum: 1e6,
             bound_multiplier_count: 10,
+            x_max_abs: 0.0,
         };
         let opts = SolverOptions::default();
         // s_d = max(100, 1e6/10)/100 = 1e5/100 = 1000
@@ -485,6 +885,7 @@ mod tests {
         // Scaled dual_inf small, but iterative dual_inf_unscaled large.
         let info = ConvergenceInfo {
             primal_inf: 1e-10,
+            primal_inf_internal: 1e-10,
             dual_inf: 1e-10,
             dual_inf_unscaled: 1.5, // > dual_inf_tol=1.0
             compl_inf: 1e-10,
@@ -494,6 +895,7 @@ mod tests {
             multiplier_count: 0,
             bound_multiplier_sum: 0.0,
             bound_multiplier_count: 0,
+            x_max_abs: 0.0,
         };
         let opts = SolverOptions::default();
         assert_eq!(
@@ -570,27 +972,14 @@ mod tests {
         assert!(di2 > 0.1, "Non-stationary should give positive dual_inf");
     }
 
-    #[test]
-    fn test_dual_infeasibility_scaled_insensitive_to_gradient_magnitude() {
-        let n = 2;
-        // Large gradient magnitudes
-        let grad_f = vec![1e6, 1e6];
-        let jac_rows = vec![];
-        let jac_cols = vec![];
-        let jac_vals: Vec<f64> = vec![];
-        let lambda: Vec<f64> = vec![];
-        // Residual = grad_f - z_l + z_u = [1e6 - 0, 1e6 - 0] = [1e6, 1e6]
-        let z_l = vec![0.0, 0.0];
-        let z_u = vec![0.0, 0.0];
-
-        // Unscaled: max |r_i| = 1e6
-        let di = dual_infeasibility(&grad_f, &jac_rows, &jac_cols, &jac_vals, &lambda, &z_l, &z_u, n);
-        assert!(di > 1e5, "Unscaled should be large: {}", di);
-
-        // Scaled: max |r_i| / (1 + |grad_f_i|) ≈ 1e6 / (1 + 1e6) ≈ 1.0
-        let di_s = dual_infeasibility_scaled(&grad_f, &jac_rows, &jac_cols, &jac_vals, &lambda, &z_l, &z_u, n);
-        assert!(di_s < 1.1, "Scaled should be ~1.0: {}", di_s);
-    }
+    // T3.1 (2026-04-27): removed
+    // `test_dual_infeasibility_scaled_insensitive_to_gradient_magnitude`.
+    // Its premise — that the dual-residual max-norm should be divided
+    // component-wise by `1 + |grad_f_i|` — was a ripopt-specific
+    // heuristic with no Ipopt analog. `dual_infeasibility_scaled` now
+    // matches `IpIpoptCalculatedQuantities::curr_dual_infeasibility`'s
+    // raw L_inf formula; the global `s_d` scaling is applied at the
+    // convergence-test boundary instead.
 
     #[test]
     fn test_dual_infeasibility_scaled_stationarity() {
@@ -605,5 +994,154 @@ mod tests {
         // At stationarity, both scaled and unscaled should be ~0
         let di_s = dual_infeasibility_scaled(&grad_f, &jac_rows, &jac_cols, &jac_vals, &lambda, &z_l, &z_u, n);
         assert!(di_s < 1e-12, "Scaled stationarity should give 0, got {}", di_s);
+    }
+
+    /// DEV-1: The convergence-test `dual_infeasibility` MUST mirror
+    /// Ipopt's plain `curr_grad_lag_x` (no κ_d damping). For a
+    /// one-sided lower-bounded variable with a small negative raw
+    /// residual, the function must report the residual verbatim — the
+    /// damping that would otherwise mask it lives in
+    /// `curr_grad_lag_with_damping_x` and is used only by the barrier
+    /// objective and Newton RHS, not the convergence test
+    /// (`IpOptErrorConvCheck.cpp:208` → `curr_dual_infeasibility` →
+    /// `curr_grad_lag_x`).
+    #[test]
+    fn test_dual_infeasibility_no_kappa_d_damping_at_convergence_test() {
+        let n = 1;
+        let grad_f = vec![1.0];
+        let jac_rows: Vec<usize> = vec![];
+        let jac_cols: Vec<usize> = vec![];
+        let jac_vals: Vec<f64> = vec![];
+        let lambda: Vec<f64> = vec![];
+        // raw grad_lag = grad_f - z_l = 1.0 - (1.0 + 1e-6) = -1e-6
+        let z_l = vec![1.0 + 1e-6];
+        let z_u = vec![0.0];
+        let di = dual_infeasibility(
+            &grad_f, &jac_rows, &jac_cols, &jac_vals, &lambda, &z_l, &z_u, n,
+        );
+        assert!(
+            (di - 1e-6).abs() < 1e-15,
+            "convergence-test dual_inf must expose raw residual, got {}",
+            di,
+        );
+    }
+
+    // ---- Phase 2 split-variant equivalence tests --------------------
+
+    /// Helper: project combined (g, g_l, g_u) onto split (g_c residual,
+    /// g_d, d_l, d_u) by classifying each row via `is_equality_constraint`.
+    fn project_split(
+        g: &[f64],
+        g_l: &[f64],
+        g_u: &[f64],
+    ) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+        let mut g_c = Vec::new();
+        let mut g_d = Vec::new();
+        let mut d_l = Vec::new();
+        let mut d_u = Vec::new();
+        for i in 0..g.len() {
+            if is_equality_constraint(g_l[i], g_u[i]) {
+                g_c.push(g[i] - g_l[i]);
+            } else {
+                g_d.push(g[i]);
+                d_l.push(g_l[i]);
+                d_u.push(g_u[i]);
+            }
+        }
+        (g_c, g_d, d_l, d_u)
+    }
+
+    #[test]
+    fn split_primal_inf_matches_combined_mixed() {
+        // 4 rows: eq, ineq, eq, ineq. g violates row 1 below d_l, row 3 above d_u.
+        let g = vec![5.0, 0.5, -2.0, 6.0];
+        let g_l = vec![5.0, 1.0, -2.0, 2.0];
+        let g_u = vec![5.0, 4.0, -2.0, 5.0];
+        let (g_c, g_d, d_l, d_u) = project_split(&g, &g_l, &g_u);
+        let combined = primal_infeasibility(&g, &g_l, &g_u);
+        let split = primal_infeasibility_split(&g_c, &g_d, &d_l, &d_u);
+        assert!(
+            (combined - split).abs() < 1e-15,
+            "1-norm: combined={} split={}",
+            combined,
+            split,
+        );
+        let combined_max = primal_infeasibility_max(&g, &g_l, &g_u);
+        let split_max = primal_infeasibility_max_split(&g_c, &g_d, &d_l, &d_u);
+        assert!((combined_max - split_max).abs() < 1e-15);
+    }
+
+    #[test]
+    fn split_primal_inf_matches_combined_eq_violation() {
+        // Equality residual nonzero — exercises the c-block branch.
+        let g = vec![5.5, 3.0];
+        let g_l = vec![5.0, 1.0];
+        let g_u = vec![5.0, 4.0];
+        let (g_c, g_d, d_l, d_u) = project_split(&g, &g_l, &g_u);
+        // |5.5-5.0| + 0 (3.0 in [1,4])
+        assert_eq!(primal_infeasibility_split(&g_c, &g_d, &d_l, &d_u), 0.5);
+        assert!(
+            (primal_infeasibility(&g, &g_l, &g_u)
+                - primal_infeasibility_split(&g_c, &g_d, &d_l, &d_u))
+            .abs()
+                < 1e-15
+        );
+    }
+
+    #[test]
+    fn split_internal_primal_inf_matches_combined() {
+        // Slack-coupled residual: eq |c|, ineq |d - s|.
+        let g = vec![5.5, 3.0, -2.1];
+        let g_l = vec![5.0, 1.0, -2.0];
+        let g_u = vec![5.0, 4.0, -2.0];
+        let s = vec![5.0, 2.5, -2.0]; // s for eq rows is sentinel = g_l
+        let (g_c, g_d, _d_l, _d_u) = project_split(&g, &g_l, &g_u);
+        let s_d: Vec<f64> = (0..g.len())
+            .filter(|&i| !is_equality_constraint(g_l[i], g_u[i]))
+            .map(|i| s[i])
+            .collect();
+        let combined = primal_infeasibility_internal(&g, &s, &g_l, &g_u);
+        let split = primal_infeasibility_internal_split(&g_c, &g_d, &s_d);
+        assert!((combined - split).abs() < 1e-15);
+        let combined_max = primal_infeasibility_internal_max(&g, &s, &g_l, &g_u);
+        let split_max = primal_infeasibility_internal_max_split(&g_c, &g_d, &s_d);
+        assert!((combined_max - split_max).abs() < 1e-15);
+    }
+
+    #[test]
+    fn split_complementarity_matches_combined() {
+        // 2 inequalities + 1 equality (eq has v_l=v_u=0 in combined frame).
+        let x = vec![0.5];
+        let x_l = vec![0.0];
+        let x_u = vec![1.0];
+        let z_l = vec![2.0];
+        let z_u = vec![1.0];
+        let g = vec![3.0, 5.0, 0.0]; // ineq, ineq, eq
+        let g_l = vec![1.0, f64::NEG_INFINITY, 0.0];
+        let g_u = vec![4.0, 6.0, 0.0];
+        let v_l = vec![0.5, 0.0, 0.0];
+        let v_u = vec![0.7, 0.3, 0.0];
+        let mu = 0.1;
+        let combined = complementarity_error_full(
+            &x, &x_l, &x_u, &z_l, &z_u, &g, &g_l, &g_u, &v_l, &v_u, mu,
+        );
+        let (_g_c, g_d, d_l, d_u) = project_split(&g, &g_l, &g_u);
+        let v_l_d: Vec<f64> = (0..g.len())
+            .filter(|&i| !is_equality_constraint(g_l[i], g_u[i]))
+            .map(|i| v_l[i])
+            .collect();
+        let v_u_d: Vec<f64> = (0..g.len())
+            .filter(|&i| !is_equality_constraint(g_l[i], g_u[i]))
+            .map(|i| v_u[i])
+            .collect();
+        let split = complementarity_error_full_split(
+            &x, &x_l, &x_u, &z_l, &z_u, &g_d, &d_l, &d_u, &v_l_d, &v_u_d, mu,
+        );
+        assert!(
+            (combined - split).abs() < 1e-15,
+            "combined={} split={}",
+            combined,
+            split,
+        );
     }
 }

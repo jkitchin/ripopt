@@ -348,12 +348,13 @@ fn ripopt_status_to_string(status: SolveStatus) -> String {
         SolveStatus::Infeasible => "Infeasible".to_string(),
         SolveStatus::MaxIterations => "MaxIterations".to_string(),
         SolveStatus::NumericalError => "NumericalError".to_string(),
-        SolveStatus::Unbounded => "Unbounded".to_string(),
+        SolveStatus::DivergingIterates => "DivergingIterates".to_string(),
         SolveStatus::RestorationFailed => "RestorationFailed".to_string(),
         SolveStatus::InternalError => "InternalError".to_string(),
         SolveStatus::LocalInfeasibility => "LocalInfeasibility".to_string(),
         SolveStatus::EvaluationError => "EvaluationError".to_string(),
         SolveStatus::UserRequestedStop => "UserRequestedStop".to_string(),
+        SolveStatus::StopAtTinyStep => "StopAtTinyStep".to_string(),
     }
 }
 
@@ -497,12 +498,14 @@ fn run_single_solver(name: &str, solver: &str) {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
+            let ir_full_8_block = std::env::var("RIPOPT_IR_8BLOCK").is_ok();
             let options = SolverOptions {
                 tol: 1e-8,
                 max_iter: 3000,
                 print_level,
                 mu_strategy_adaptive: true,
                 max_wall_time: 30.0,
+                ir_residual_full_8_block: ir_full_8_block,
                 ..SolverOptions::default()
             };
 
@@ -655,6 +658,45 @@ fn main() {
 
     let mut all_results: Vec<CutestResult> = Vec::new();
 
+    // Optional JSONL stream: write one CutestResult per line as each
+    // subprocess completes. Set RESULTS_JSONL=path; defaults to alongside
+    // RESULTS_FILE with a `.jsonl` extension (or `results.jsonl` in suite_dir).
+    // Survives crashes and lets external tooling tail progress live.
+    let jsonl_path: std::path::PathBuf = match std::env::var("RESULTS_JSONL") {
+        Ok(p) => std::path::PathBuf::from(p),
+        Err(_) => {
+            let base = match std::env::var("RESULTS_FILE") {
+                Ok(p) => std::path::PathBuf::from(p),
+                Err(_) => suite_dir.join("results.json"),
+            };
+            base.with_extension("jsonl")
+        }
+    };
+    let mut jsonl_writer = match std::fs::File::create(&jsonl_path) {
+        Ok(f) => Some(std::io::BufWriter::new(f)),
+        Err(e) => {
+            eprintln!("WARNING: cannot open {}: {}", jsonl_path.display(), e);
+            None
+        }
+    };
+    eprintln!("Streaming results to {}", jsonl_path.display());
+
+    fn append_jsonl(
+        writer: &mut Option<std::io::BufWriter<std::fs::File>>,
+        path: &std::path::Path,
+        r: &CutestResult,
+    ) {
+        use std::io::Write;
+        if let Some(w) = writer.as_mut() {
+            if let Ok(line) = serde_json::to_string(r) {
+                if writeln!(w, "{}", line).is_err() {
+                    eprintln!("WARNING: append to {} failed", path.display());
+                }
+                let _ = w.flush();
+            }
+        }
+    }
+
     for name in &problem_names {
         let lib_path = problems_dir.join(format!("lib{}.{}", name, std::env::consts::DLL_EXTENSION));
         let outsdif_path = problems_dir.join(format!("{}_OUTSDIF.d", name));
@@ -717,7 +759,7 @@ fn main() {
                             (format!("Crash({})", code_str), "CRASH")
                         };
                         eprint!("{}: {} ", solver, label);
-                        all_results.push(CutestResult {
+                        let r = CutestResult {
                             name: name.clone(), solver: solver.to_string(),
                             n, m, status,
                             objective: f64::NAN, x: vec![],
@@ -726,7 +768,9 @@ fn main() {
                             final_primal_inf: None, final_dual_inf: None,
                             final_dual_inf_scaled: None,
                             final_compl: None, final_mu: None,
-                        });
+                        };
+                        append_jsonl(&mut jsonl_writer, &jsonl_path, &r);
+                        all_results.push(r);
                         continue;
                     }
 
@@ -738,6 +782,7 @@ fn main() {
                             continue;
                         }
                         if let Ok(result) = serde_json::from_str::<CutestResult>(line) {
+                            append_jsonl(&mut jsonl_writer, &jsonl_path, &result);
                             all_results.push(result);
                             parsed = true;
                         }

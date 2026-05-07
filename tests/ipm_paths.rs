@@ -300,19 +300,16 @@ fn ipm_unbounded_detection() {
     let problem = UnboundedProblem;
     let options = SolverOptions {
         print_level: 0,
-        enable_lbfgs_fallback: false,
-        enable_al_fallback: false,
-        enable_sqp_fallback: false,
         ..SolverOptions::default()
     };
     let result = ripopt::solve(&problem, &options);
     // Without bounds, the solver may detect unboundedness, hit numerical issues,
     // reach max iterations, or declare acceptable at a large negative objective.
     assert!(
-        result.status == SolveStatus::Unbounded
+        result.status == SolveStatus::DivergingIterates
             || result.status == SolveStatus::NumericalError
             || result.status == SolveStatus::MaxIterations,
-        "Expected Unbounded/NumericalError/MaxIterations, got {:?}",
+        "Expected DivergingIterates/NumericalError/MaxIterations, got {:?}",
         result.status
     );
 }
@@ -543,7 +540,6 @@ fn ipm_lbfgs_fallback_unconstrained() {
     let problem = RosenbrockLbfgs;
     let options = SolverOptions {
         print_level: 0,
-        enable_lbfgs_fallback: true,
         ..SolverOptions::default()
     };
     let result = ripopt::solve(&problem, &options);

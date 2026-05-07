@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.8.0] - 2026-05-06
+
+**BREAKING:** the default sparse linear solver has changed from `rmumps` to
+[`feral`](https://crates.io/crates/feral), a pure-Rust multifrontal LDLᵀ solver with Bunch-Kaufman
+1×1/2×2 pivoting, certified inertia, MC64 scaling, and AMD/METIS ordering.
+`rmumps` remains available behind the opt-in `rmumps` feature for A/B
+comparison and regression hunting.
+
+### Changed
+- **Default sparse linear solver: feral** (replaces rmumps).
+  - `default-features = ["feral", "faer"]` (was `["rmumps", "faer"]`).
+  - Build with the legacy backend via
+    `cargo build --no-default-features --features "rmumps faer"`.
+  - HS suite parity: 118/120 Optimal under both backends with zero status
+    flips (HS116/HS374 fail under both). Geomean solve-time within 5%.
+  - `LinearSolverChoice::{Direct, Iterative, Hybrid}` now route to
+    `FeralLdl` / `FeralIterativeMinres` / `FeralHybrid` by default. Under
+    the feral backend, Iterative reduces to Direct + iterative refinement
+    (the full LDLᵀ as MINRES preconditioner converges in one step); a true
+    incomplete-LDLᵀ + MINRES path is deferred to v0.9.
+
+### Added
+- `src/linear_solver/feral_direct.rs` — `FeralLdl` wrapper with cached
+  symbolic factorization, COO→CSC value scatter, MA27-style pivot-threshold
+  escalation in `increase_quality()`, and `ZeroPivotAction::ForceAccept` so
+  ripopt's existing inertia-correction loop drives perturbation.
+- `src/linear_solver/feral_iterative.rs`, `feral_hybrid.rs` — companions
+  for `LinearSolverChoice::Iterative` and `Hybrid`.
+- `tests/feral_solvers.rs` — direct trait-surface tests for `FeralLdl`.
+
 ## [0.7.1] - 2026-04-25
 
 Patch release focused on the **Reference-Gap Roadmap**: porting concrete

@@ -70,18 +70,22 @@
 //! - Mehrotra predictor-corrector IPM with Gondzio corrections
 //! - Filter line search with second-order corrections
 //! - Gauss-Newton and NLP restoration phases
-//! - Fallback cascade: IPM → L-BFGS → Augmented Lagrangian → SQP → slack reformulation
+//! - Fallback cascade: IPM → L-BFGS → slack reformulation
 //! - Sparse (multifrontal LDL^T) and dense (Bunch-Kaufman LDL^T) linear solvers
 //! - Parametric sensitivity analysis ([`solve_with_sensitivity`])
 
-pub mod augmented_lagrangian;
 pub mod intermediate;
 pub(crate) mod logging;
 pub mod c_api;
+pub mod bound_layout;
+pub mod constraint_layout;
+pub mod d_bound_layout;
 pub mod convergence;
 pub mod filter;
 pub mod ipm;
+pub mod iter0_dump;
 pub mod kkt;
+pub mod kkt_aug;
 pub mod lbfgs;
 pub mod linearity;
 pub mod linear_solver;
@@ -89,16 +93,19 @@ pub mod nl;
 pub mod options;
 pub mod preprocessing;
 pub mod problem;
-pub mod restoration;
 pub mod restoration_nlp;
 pub mod result;
 pub mod sensitivity;
 pub mod slack_formulation;
-pub mod sqp;
+pub mod solution_report;
+pub(crate) mod split_nlp;
 pub mod trace;
 pub mod warmstart;
 
-pub use options::{SolverOptions, LinearSolverChoice};
+pub use options::{
+    BoundMultInitMethod, FixedVariableTreatment, LinearSolverChoice, NlpScalingMethod,
+    SolverOptions,
+};
 pub use problem::NlpProblem;
 pub use result::{SolveResult, SolverDiagnostics, SolveStatus};
 pub use sensitivity::{ParametricNlpProblem, SensitivityContext, SensitivityResult};

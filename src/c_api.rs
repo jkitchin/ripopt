@@ -341,7 +341,9 @@ fn map_status(s: SolveStatus) -> RipoptReturnStatus {
         SolveStatus::NumericalError => RipoptReturnStatus::ErrorInStepComputation,
         SolveStatus::EvaluationError => RipoptReturnStatus::InvalidNumberDetected,
         SolveStatus::UserRequestedStop => RipoptReturnStatus::UserRequestedStop,
-        SolveStatus::Unbounded => RipoptReturnStatus::DivergingIterates,
+        // Ipopt maps STOP_AT_TINY_STEP to Search_Direction_Becomes_Too_Small.
+        SolveStatus::StopAtTinyStep => RipoptReturnStatus::SearchDirectionTooSmall,
+        SolveStatus::DivergingIterates => RipoptReturnStatus::DivergingIterates,
         SolveStatus::InternalError => RipoptReturnStatus::InternalError,
     }
 }
@@ -471,6 +473,13 @@ pub unsafe extern "C" fn ripopt_add_num_option(
         "adaptive_mu_monotone_init_factor" => p.options.adaptive_mu_monotone_init_factor = val,
         "warm_start_target_mu" => p.options.warm_start_target_mu = Some(val),
         "user_obj_scaling" => p.options.user_obj_scaling = Some(val),
+        "obj_scaling_factor" => p.options.obj_scaling_factor = val,
+        "nlp_scaling_max_gradient" => p.options.nlp_scaling_max_gradient = val,
+        "nlp_scaling_min_value" => p.options.nlp_scaling_min_value = val,
+        "nlp_scaling_obj_target_gradient" => p.options.nlp_scaling_obj_target_gradient = val,
+        "nlp_scaling_constr_target_gradient" => {
+            p.options.nlp_scaling_constr_target_gradient = val
+        }
         _ => return 0,
     }
     1
@@ -549,23 +558,11 @@ pub unsafe extern "C" fn ripopt_add_str_option(
         "disable_nlp_restoration" => {
             p.options.disable_nlp_restoration = value == "yes";
         }
-        "enable_slack_fallback" => {
-            p.options.enable_slack_fallback = value == "yes";
-        }
-        "enable_lbfgs_fallback" => {
-            p.options.enable_lbfgs_fallback = value == "yes";
-        }
-        "enable_al_fallback" => {
-            p.options.enable_al_fallback = value == "yes";
-        }
         "enable_preprocessing" => {
             p.options.enable_preprocessing = value == "yes";
         }
         "detect_linear_constraints" => {
             p.options.detect_linear_constraints = value == "yes";
-        }
-        "enable_sqp_fallback" => {
-            p.options.enable_sqp_fallback = value == "yes";
         }
         "hessian_approximation" => {
             match value {
@@ -574,20 +571,30 @@ pub unsafe extern "C" fn ripopt_add_str_option(
                 _ => return 0,
             }
         }
-        "enable_lbfgs_hessian_fallback" => {
-            p.options.enable_lbfgs_hessian_fallback = value == "yes";
-        }
         "mehrotra_pc" => {
             p.options.mehrotra_pc = value == "yes";
-        }
-        "proactive_infeasibility_detection" => {
-            p.options.proactive_infeasibility_detection = value == "yes";
         }
         "mu_oracle_quality_function" => {
             p.options.mu_oracle_quality_function = value == "yes";
         }
         "quality_function_centrality" => {
             p.options.quality_function_centrality = value == "yes";
+        }
+        "quality_function_max_section_steps" => {
+            if let Ok(v) = value.parse::<usize>() {
+                p.options.quality_function_max_section_steps = v;
+            } else {
+                return 0;
+            }
+        }
+        "nlp_scaling_method" => {
+            use crate::options::NlpScalingMethod;
+            p.options.nlp_scaling_method = match value {
+                "none" => NlpScalingMethod::None,
+                "gradient-based" => NlpScalingMethod::Gradient,
+                "user-scaling" => NlpScalingMethod::User,
+                _ => return 0,
+            };
         }
         _ => return 0,
     }

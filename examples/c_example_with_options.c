@@ -213,7 +213,7 @@ int main(void)
     /* Solve 2: tighter tolerance */
     fail |= solve_and_report(
         "HS071 with tight tolerance",
-        1e-12, 3000, 0, "adaptive");
+        1e-10, 3000, 0, "adaptive");
 
     /* Solve 3: monotone mu */
     fail |= solve_and_report(

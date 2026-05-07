@@ -88,4 +88,29 @@ pub trait NlpProblem {
     /// `new_x` is `true` when `x` differs from the previous evaluation point.
     /// Return `true` on success, `false` if evaluation fails at this point.
     fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, lambda: &[f64], vals: &mut [f64]) -> bool;
+
+    /// Optional hook: notify the problem of the current barrier parameter μ.
+    ///
+    /// Default: no-op. Override when the objective depends on μ (the
+    /// restoration NLP has `(η/2)·‖D_R(x − x_R)‖²` with η = η_factor·√μ
+    /// per Ipopt `RestoIpoptNLP::Eta`; see `IpRestoIpoptNLP.cpp:759`).
+    /// The IPM calls this once per outer iteration, before any objective
+    /// / gradient / Hessian evaluations.
+    fn notify_mu(&self, _mu: f64) {}
+
+    /// Optional hook: per-iteration early-exit test. Default returns
+    /// `false` (never exits early). The IPM consults this once per
+    /// outer iteration after the trial step has been accepted; a `true`
+    /// return ends the solve with `SolveStatus::Optimal` at the current
+    /// iterate.
+    ///
+    /// Used by `RestorationNlp` to implement Ipopt's
+    /// `IpRestoFilterConvCheck::TestOrigProgress`
+    /// (`IpRestoFilterConvCheck.cpp:53-80`): when the parent's
+    /// constraint violation at the restored x has dropped below
+    /// `kappa_resto · theta_entry`, the inner restoration solve exits
+    /// early so the parent can resume — instead of running the inner
+    /// solve to its own KKT convergence (which targets resto-NLP
+    /// optimality, not parent feasibility recovery).
+    fn resto_early_exit(&self, _x: &[f64]) -> bool { false }
 }
