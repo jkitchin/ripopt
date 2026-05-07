@@ -1,13 +1,21 @@
 # ripopt Development Guide
 
+## Linear solver backends
+- **Default (v0.8+)**: pure-Rust [`feral`](https://crates.io/crates/feral) multifrontal LDLᵀ. The
+  `default-features = ["feral", "faer"]`. Modules: `src/linear_solver/feral_direct.rs`,
+  `feral_iterative.rs`, `feral_hybrid.rs`.
+- **Legacy**: `rmumps` is preserved behind the opt-in `rmumps` feature.
+  Build with `cargo build --no-default-features --features "rmumps faer"`.
+  Modules: `src/linear_solver/multifrontal.rs`, `iterative.rs`, `hybrid.rs`.
+- The `LinearSolver` trait surface is unchanged; the IPM, KKT, and
+  restoration paths are oblivious to the backend.
+
 ## Running Tests
-- `cargo test` — run all tests (230 tests, ~3 seconds)
+- `cargo test` — run all tests (~3 seconds)
 
 ## Benchmarks
-- `make benchmark` — full benchmark: HS + CUTEst + large-scale + report
+- `make benchmark` — full benchmark: CUTEst + domain + large-scale + report
 - `make benchmark-report` — regenerate report from existing results
-- `make hs-run` — HS suite only (ripopt + ipopt, ~2 min)
-- `cargo run --release --features hs --bin hs_suite` — HS suite (ripopt only)
 - Individual CUTEst problems: `cargo run --bin cutest_suite --features cutest,ipopt-native --release -- PROBLEM1 PROBLEM2`
 - Full CUTEst suite: `RESULTS_FILE=benchmarks/cutest/results.json cargo run --bin cutest_suite --features cutest,ipopt-native --release`
 
@@ -35,6 +43,25 @@
 - Hiding known failures behind lenient statuses (`Acceptable` was removed for this reason)
 
 **Tests must be honest:** If the solver cannot solve a problem to `Optimal`, the test should either fail (exposing the real limitation), be marked `#[ignore]` with a clear explanation, or be removed. A failing test that documents a real limitation is more valuable than a passing test that hides one.
+
+### Alignment-work exception: regressions are expected and acceptable
+During the v0.8 Ipopt-alignment effort (`docs/V0.8_IPOPT_ALIGNMENT_PLAN.md`), the
+goal is **correctness of the implementation against the Ipopt 3.14 reference**,
+not preservation of benchmark pass-rates. When a planned heuristic deletion
+regresses a benchmark suite, that regression is the expected, honest signal
+that the deleted heuristic was a benchmark-tuning crutch — exactly the thing
+this effort is meant to retire.
+
+**Do not** revert correct alignment changes just because a benchmark count
+drops. **Do not** silently re-document a deleted heuristic as "load-bearing"
+to keep it alive. If a deletion is correct against the Ipopt reference, ship
+it and record the regression in the plan's evidence column. Re-anchoring
+(§3.2) is reserved for cases where the heuristic is actually present in Ipopt
+(or a documented ripopt-specific kernel difference) and ripopt was just
+misplacing it — not for "this heuristic happens to fix N benchmark problems".
+
+Pass rates are downstream metrics we recover by fixing root causes
+(convergence test, restoration, scaling), not by keeping post-hoc promotions.
 
 ## Working on the solver: efficiency rules
 
@@ -69,11 +96,10 @@ If `ipopt-sys` / `ipopt-native` / any external crate fails with a specific cmake
 Facts like "CONCON at iter 48 reaches KKT with pr=du=0 but compl stays at mu=2e-5" or "the LS-y residual only helps when m≤n or J has full rank" are exactly what the memory system exists for. Save them the moment you learn them; future sessions save days.
 
 ## Benchmark Versioning
-After each release, save tagged benchmark results so we can track improvement and regression across versions. Run `make hs-run` (or the full `make benchmark`) and copy the results:
+After each release, save tagged benchmark results so we can track improvement and regression across versions. Run `make benchmark` and copy the results:
 ```
-cp benchmarks/hs/hs_ripopt_results.json benchmarks/hs/hs_ripopt_results_vX.Y.Z.json
-cp benchmarks/hs/hs_ipopt_native_results.json benchmarks/hs/hs_ipopt_native_results_vX.Y.Z.json
 cp benchmarks/BENCHMARK_REPORT.json benchmarks/BENCHMARK_REPORT_vX.Y.Z.json
+cp benchmarks/cutest/results.json    benchmarks/cutest/results_vX.Y.Z.json
 ```
 This enables per-problem timing comparisons between versions (e.g. "did problem 12 get faster?") and catches regressions that aggregate pass rates miss.
 

@@ -1,0 +1,8 @@
+{"solver":"ripopt","name":"case3_lmbd","n":12,"m":12,"status":"Optimal","objective":5812.643016981305,"iterations":10,"solve_time":0.001772292}
+{"solver":"ipopt","name":"case3_lmbd","n":12,"m":12,"status":"Optimal","objective":5812.642934996067,"iterations":10,"solve_time":0.005873917}
+{"solver":"ripopt","name":"case5_pjm","n":20,"m":22,"status":"Optimal","objective":17551.890927682114,"iterations":20,"solve_time":0.003114791}
+{"solver":"ipopt","name":"case5_pjm","n":20,"m":22,"status":"Optimal","objective":17551.8908990633,"iterations":15,"solve_time":0.006692916}
+{"solver":"ripopt","name":"case14_ieee","n":38,"m":68,"status":"Optimal","objective":2178.0804208038203,"iterations":14,"solve_time":0.011437333}
+{"solver":"ipopt","name":"case14_ieee","n":38,"m":68,"status":"Optimal","objective":2178.080406411837,"iterations":11,"solve_time":0.010756708}
+{"solver":"ripopt","name":"case30_ieee","n":72,"m":142,"status":"Optimal","objective":8208.5154586033,"iterations":19,"solve_time":0.033904541}
+{"solver":"ipopt","name":"case30_ieee","n":72,"m":142,"status":"Optimal","objective":8208.515425007794,"iterations":14,"solve_time":0.05154075}

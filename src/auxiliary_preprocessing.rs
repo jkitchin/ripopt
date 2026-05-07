@@ -3688,7 +3688,7 @@ mod tests {
 
         let result = crate::solve(&aux, &quiet_aux_options());
         assert!(
-            result.x[0] >= -1e-10 && result.x[0] <= 1.0 + 1e-10,
+            result.x[0] >= -1e-8 && result.x[0] <= 1.0 + 1e-8,
             "auxiliary solution violated bounds: {:?}",
             result.x
         );

@@ -1,4 +1,6 @@
 use ripopt::nl::{parse_nl_file, write_sol, NlProblem};
+use ripopt::options::NlpScalingMethod;
+use ripopt::solution_report::build_report;
 use ripopt::SolverOptions;
 use std::fs;
 use std::io::BufWriter;
@@ -22,18 +24,44 @@ fn main() {
     }
 
     if args.len() < 2 {
-        eprintln!("Usage: ripopt <problem.nl> [-AMPL] [key=value ...]");
+        eprintln!("Usage: ripopt <problem.nl> [-AMPL] [-o FILE] [key=value ...]");
         eprintln!("Try 'ripopt --help' for more information.");
         std::process::exit(1);
     }
 
     let nl_path = &args[1];
     let mut options = SolverOptions::default();
+    let mut output_path: Option<String> = None;
 
-    // Parse key=value options from command line
-    for arg in &args[2..] {
+    // Parse remaining args: handle -o/--output (with value), bool --json shortcut, and key=value.
+    let mut iter = args[2..].iter();
+    while let Some(arg) = iter.next() {
         if arg == "-AMPL" || arg == "--AMPL" {
-            continue; // AMPL mode flag, acknowledged
+            continue;
+        }
+        if arg == "-o" || arg == "--output" {
+            match iter.next() {
+                Some(p) => output_path = Some(p.clone()),
+                None => {
+                    eprintln!("Error: {} requires a filename argument", arg);
+                    std::process::exit(2);
+                }
+            }
+            continue;
+        }
+        if let Some(p) = arg.strip_prefix("--output=") {
+            output_path = Some(p.to_string());
+            continue;
+        }
+        if arg == "--json" {
+            // Shortcut: write JSON next to the .nl with .json extension.
+            let p = if nl_path.ends_with(".nl") {
+                format!("{}json", &nl_path[..nl_path.len() - 2])
+            } else {
+                format!("{}.json", nl_path)
+            };
+            output_path = Some(p);
+            continue;
         }
         if let Some((key, value)) = arg.split_once('=') {
             apply_option(&mut options, key.trim(), value.trim());
@@ -60,6 +88,31 @@ fn main() {
     let n_vars = nl_data.header.n_vars;
     let n_constrs = nl_data.header.n_constrs;
 
+    // AMPL `scaling_factor` suffix ingestion (mirrors AmplTNLP.cpp:1110-1165).
+    // When the .nl file ships scaling values via S-segments, route them
+    // into ripopt's user-scaling fields and switch the method to User
+    // unless the caller already overrode any of them on the command line.
+    let scaling = nl_data.scaling_factors();
+    if !scaling.is_empty() {
+        if options.user_obj_scaling.is_none() {
+            options.user_obj_scaling = scaling.obj.or(Some(1.0));
+        }
+        if options.user_g_scaling.is_none() {
+            options.user_g_scaling = scaling.g.clone();
+        }
+        if options.user_x_scaling.is_none() {
+            options.user_x_scaling = scaling.x.clone();
+        }
+        // Only flip to User if the caller hasn't pinned the method
+        // explicitly (we can't distinguish "default" from "set to
+        // Gradient" but Gradient with non-empty user_*_scaling already
+        // short-circuits to user values per `compute_nlp_scaling`'s
+        // back-compat branch).
+        if matches!(options.nlp_scaling_method, NlpScalingMethod::Gradient) {
+            options.nlp_scaling_method = NlpScalingMethod::User;
+        }
+    }
+
     let problem = match NlProblem::from_nl_data(nl_data) {
         Ok(p) => p,
         Err(e) => {
@@ -82,11 +135,12 @@ fn main() {
             ripopt::SolveStatus::LocalInfeasibility => "LocalInfeasibility",
             ripopt::SolveStatus::MaxIterations => "MaxIterations",
             ripopt::SolveStatus::NumericalError => "NumericalError",
-            ripopt::SolveStatus::Unbounded => "Unbounded",
+            ripopt::SolveStatus::DivergingIterates => "DivergingIterates",
             ripopt::SolveStatus::RestorationFailed => "RestorationFailed",
             ripopt::SolveStatus::InternalError => "InternalError",
             ripopt::SolveStatus::EvaluationError => "EvaluationError",
             ripopt::SolveStatus::UserRequestedStop => "UserRequestedStop",
+            ripopt::SolveStatus::StopAtTinyStep => "StopAtTinyStep",
         },
         result.iterations
     );
@@ -95,25 +149,59 @@ fn main() {
     // Print diagnostics to stderr
     result.diagnostics.print_summary(result.status, result.iterations);
 
-    // Write SOL file (replace .nl extension with .sol)
-    let sol_path = if nl_path.ends_with(".nl") {
-        format!("{}sol", &nl_path[..nl_path.len() - 2])
-    } else {
-        format!("{}.sol", nl_path)
-    };
+    // Determine output path. Default: .sol next to the .nl input.
+    let out_path = output_path.unwrap_or_else(|| {
+        if nl_path.ends_with(".nl") {
+            format!("{}sol", &nl_path[..nl_path.len() - 2])
+        } else {
+            format!("{}.sol", nl_path)
+        }
+    });
 
-    let sol_file = match fs::File::create(&sol_path) {
+    // Dispatch on extension: .json -> JSON report, anything else -> AMPL SOL.
+    let want_json = std::path::Path::new(&out_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+
+    let out_file = match fs::File::create(&out_path) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("Error creating {}: {}", sol_path, e);
+            eprintln!("Error creating {}: {}", out_path, e);
             std::process::exit(1);
         }
     };
+    let mut writer = BufWriter::new(out_file);
 
-    let mut writer = BufWriter::new(sol_file);
-    if let Err(e) = write_sol(&mut writer, &result, n_vars, n_constrs) {
-        eprintln!("Error writing SOL file: {}", e);
-        std::process::exit(1);
+    if want_json {
+        let problem_name = std::path::Path::new(nl_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string());
+        let problem_source = std::fs::canonicalize(nl_path)
+            .ok()
+            .and_then(|p| p.to_str().map(|s| s.to_string()))
+            .or_else(|| Some(nl_path.clone()));
+        let report = build_report(
+            &problem,
+            &result,
+            &options,
+            args.clone(),
+            problem_name,
+            problem_source,
+        );
+        if let Err(e) = serde_json::to_writer_pretty(&mut writer, &report) {
+            eprintln!("Error writing JSON report: {}", e);
+            std::process::exit(1);
+        }
+        use std::io::Write;
+        let _ = writer.write_all(b"\n");
+    } else {
+        if let Err(e) = write_sol(&mut writer, &result, n_vars, n_constrs) {
+            eprintln!("Error writing SOL file: {}", e);
+            std::process::exit(1);
+        }
     }
 }
 
@@ -121,12 +209,17 @@ fn print_help() {
     println!("ripopt {} — primal-dual interior point NLP solver", env!("CARGO_PKG_VERSION"));
     println!();
     println!("USAGE:");
-    println!("    ripopt <problem.nl> [-AMPL] [key=value ...]");
+    println!("    ripopt <problem.nl> [-AMPL] [-o FILE] [key=value ...]");
     println!();
     println!("FLAGS:");
     println!("    -h, --help       Print this help message and exit");
     println!("    -v, --version    Print version and exit");
     println!("    -AMPL            AMPL solver protocol mode");
+    println!("    -o, --output FILE   Write solution to FILE. Extension selects format:");
+    println!("                        .json -> structured JSON report (validated KKT,");
+    println!("                                 solver metadata, options, command line);");
+    println!("                        any other -> AMPL .sol format (default).");
+    println!("    --json           Shortcut for -o <problem>.json");
     println!();
     println!("OPTIONS:");
     println!();
@@ -134,7 +227,6 @@ fn print_help() {
     println!("    tol=<float>                          Optimality convergence tolerance [1e-8]");
     println!("    max_iter=<int>                       Maximum iterations [3000]");
     println!("    max_wall_time=<float>                Max wall-clock time in seconds (0=no limit) [0.0]");
-    println!("    stall_iter_limit=<int>               Iters without 1% improvement before stall (0=off) [30]");
     println!();
     println!("  Constraint & Dual Tolerances");
     println!("    constr_viol_tol=<float>              Constraint violation tolerance [1e-4]");
@@ -159,8 +251,8 @@ fn print_help() {
     println!("    slack_bound_push=<float>             Slack variable bound push [1e-2]");
     println!("    slack_bound_frac=<float>             Slack variable bound fraction [1e-2]");
     println!("    tau_min=<float>                      Fraction-to-boundary minimum [0.99]");
-    println!("    nlp_lower_bound_inf=<float>          Treat bounds below this as -inf [-1e20]");
-    println!("    nlp_upper_bound_inf=<float>          Treat bounds above this as +inf [1e20]");
+    println!("    nlp_lower_bound_inf=<float>          Treat bounds below this as -inf [-1e19]");
+    println!("    nlp_upper_bound_inf=<float>          Treat bounds above this as +inf [1e19]");
     println!();
     println!("  Warm Start");
     println!("    warm_start_init_point=<bool>         Enable warm-start initialization [no]");
@@ -176,7 +268,7 @@ fn print_help() {
     println!("  Step Control & Line Search");
     println!("    max_soc=<int>                        Max second-order correction steps [4]");
     println!("    watchdog_shortened_iter_trigger=<int> Shortened steps before watchdog [10]");
-    println!("    watchdog_trial_iter_max=<int>        Max watchdog trial iterations [3]");
+    println!("    watchdog_trial_iter_max=<int>        Max watchdog trial iterations [5]");
     println!();
     println!("  Constraint Handling");
     println!("    constraint_slack_barrier=<bool>      Slack log-barriers in filter merit [yes]");
@@ -188,21 +280,12 @@ fn print_help() {
     println!("    hessian_approximation=<str>          exact or limited-memory (L-BFGS) [exact]");
     println!("    linear_solver=<str>                  direct, iterative (MINRES), or hybrid [direct]");
     println!("    sparse_threshold=<int>               Sparse solver if n+m >= threshold [110]");
-    println!("    mehrotra_pc=<bool>                   Mehrotra predictor-corrector [yes]");
+    println!("    mehrotra_pc=<bool>                   Mehrotra predictor-corrector [no]");
     println!("    gondzio_mcc_max=<int>                Max Gondzio centrality corrections [3]");
-    println!();
-    println!("  Fallback Strategies");
-    println!("    enable_slack_fallback=<bool>         Retry with explicit slack variables [yes]");
-    println!("    enable_lbfgs_fallback=<bool>         L-BFGS fallback for unconstrained [yes]");
-    println!("    enable_al_fallback=<bool>            Augmented Lagrangian fallback [yes]");
-    println!("    enable_sqp_fallback=<bool>           SQP fallback for constrained [yes]");
-    println!("    enable_lbfgs_hessian_fallback=<bool> Retry with L-BFGS Hessian [yes]");
     println!();
     println!("  Preprocessing & Diagnostics");
     println!("    enable_preprocessing=<bool>          Internal auxiliary equality solves/recovery, fixed vars, redundancies [yes]");
-    println!("    proactive_infeasibility_detection=<bool> Early infeasibility detection [no]");
     println!("    print_level=<int>                    Verbosity: 0=silent, 5=verbose [5]");
-    println!("    early_stall_timeout=<float>          Max seconds for first 3 iters (0=off) [120.0]");
     println!("    mu_oracle_quality_function=<bool>    Use quality function for mu selection [no]");
     println!();
     println!("  Boolean values accept: yes, true, 1 (anything else is false).");
@@ -384,21 +467,6 @@ fn apply_option(opts: &mut SolverOptions, key: &str, value: &str) {
         "disable_nlp_restoration" => {
             opts.disable_nlp_restoration = value == "yes" || value == "true" || value == "1";
         }
-        "slack_fallback" | "enable_slack_fallback" => {
-            opts.enable_slack_fallback = value == "yes" || value == "true" || value == "1";
-        }
-        "lbfgs_fallback" | "enable_lbfgs_fallback" => {
-            opts.enable_lbfgs_fallback = value == "yes" || value == "true" || value == "1";
-        }
-        "al_fallback" | "enable_al_fallback" => {
-            opts.enable_al_fallback = value == "yes" || value == "true" || value == "1";
-        }
-        "sqp_fallback" | "enable_sqp_fallback" => {
-            opts.enable_sqp_fallback = value == "yes" || value == "true" || value == "1";
-        }
-        "lbfgs_hessian_fallback" | "enable_lbfgs_hessian_fallback" => {
-            opts.enable_lbfgs_hessian_fallback = value == "yes" || value == "true" || value == "1";
-        }
         "enable_preprocessing" => {
             opts.enable_preprocessing = value == "yes" || value == "true" || value == "1";
         }
@@ -412,9 +480,6 @@ fn apply_option(opts: &mut SolverOptions, key: &str, value: &str) {
             if let Ok(v) = value.parse() {
                 opts.gondzio_mcc_max = v;
             }
-        }
-        "proactive_infeasibility_detection" => {
-            opts.proactive_infeasibility_detection = value == "yes" || value == "true" || value == "1";
         }
         "hessian_approximation" => {
             match value {
@@ -431,21 +496,16 @@ fn apply_option(opts: &mut SolverOptions, key: &str, value: &str) {
                 _ => eprintln!("Warning: unknown linear_solver '{}' (use 'direct', 'iterative', or 'hybrid')", value),
             }
         }
-        "stall_iter_limit" => {
-            if let Ok(v) = value.parse() {
-                opts.stall_iter_limit = v;
-            }
-        }
-        "early_stall_timeout" => {
-            if let Ok(v) = value.parse() {
-                opts.early_stall_timeout = v;
-            }
-        }
         "mu_oracle_quality_function" => {
             opts.mu_oracle_quality_function = value == "yes" || value == "true" || value == "1";
         }
         "quality_function_centrality" => {
             opts.quality_function_centrality = value == "yes" || value == "true" || value == "1";
+        }
+        "quality_function_max_section_steps" => {
+            if let Ok(v) = value.parse() {
+                opts.quality_function_max_section_steps = v;
+            }
         }
         "warm_start_target_mu" => {
             if let Ok(v) = value.parse() {
@@ -456,6 +516,55 @@ fn apply_option(opts: &mut SolverOptions, key: &str, value: &str) {
             if let Ok(v) = value.parse() {
                 opts.user_obj_scaling = Some(v);
             }
+        }
+        "nlp_scaling_method" => {
+            use ripopt::options::NlpScalingMethod;
+            opts.nlp_scaling_method = match value {
+                "none" => NlpScalingMethod::None,
+                "gradient-based" => NlpScalingMethod::Gradient,
+                "user-scaling" => NlpScalingMethod::User,
+                _ => {
+                    eprintln!("Warning: unknown nlp_scaling_method '{}'", value);
+                    opts.nlp_scaling_method
+                }
+            };
+        }
+        "obj_scaling_factor" => {
+            if let Ok(v) = value.parse() {
+                opts.obj_scaling_factor = v;
+            }
+        }
+        "nlp_scaling_max_gradient" => {
+            if let Ok(v) = value.parse() {
+                opts.nlp_scaling_max_gradient = v;
+            }
+        }
+        "nlp_scaling_min_value" => {
+            if let Ok(v) = value.parse() {
+                opts.nlp_scaling_min_value = v;
+            }
+        }
+        "nlp_scaling_obj_target_gradient" => {
+            if let Ok(v) = value.parse() {
+                opts.nlp_scaling_obj_target_gradient = v;
+            }
+        }
+        "nlp_scaling_constr_target_gradient" => {
+            if let Ok(v) = value.parse() {
+                opts.nlp_scaling_constr_target_gradient = v;
+            }
+        }
+        "kkt_dump_dir" => {
+            opts.kkt_dump_dir = Some(std::path::PathBuf::from(value));
+        }
+        "kkt_dump_name" => {
+            opts.kkt_dump_name = value.to_string();
+        }
+        "ir_residual_full_8_block" => {
+            opts.ir_residual_full_8_block = value == "yes" || value == "true" || value == "1";
+        }
+        "factor_cache_enabled" => {
+            opts.factor_cache_enabled = value == "yes" || value == "true" || value == "1";
         }
         _ => {
             eprintln!("Warning: unknown option '{}'", key);

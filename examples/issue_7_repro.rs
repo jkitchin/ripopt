@@ -160,12 +160,9 @@ fn main() {
         print_level: 5,
         tol: 1e-7,
         max_iter: 3000,
-        // Disable fallback solvers to expose the raw IPM stall
-        enable_lbfgs_fallback: false,
-        enable_al_fallback: false,
-        enable_sqp_fallback: false,
-        enable_slack_fallback: false,
-        enable_lbfgs_hessian_fallback: false,
+        // The historical enable_*_fallback flags were removed during the v0.8
+        // alignment work (A7); ripopt no longer auto-retries with L-BFGS or
+        // slack fallbacks, so this example shows the raw IPM behaviour.
         disable_nlp_restoration: true,
         ..SolverOptions::default()
     };

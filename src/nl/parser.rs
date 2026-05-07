@@ -1,6 +1,33 @@
 use super::expr::{self, ExprNode};
 use super::header::{self, NlHeader};
 
+/// AMPL suffix kind. Encoded in the low two bits of the `S` segment
+/// flags byte (matches AMPL's `ASL_Sufkind_*` macros).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuffixKind {
+    Variable,
+    Constraint,
+    Objective,
+    Problem,
+}
+
+/// One AMPL suffix table read from an `S` segment.
+///
+/// Format: header line `S<flags> <count> <name>` followed by `count`
+/// `<index> <value>` lines. Bits in `flags`:
+///   - `flags & 3`  → kind (variable/constraint/objective/problem)
+///   - `flags & 4`  → 0 = integer-valued, 4 = float-valued
+///
+/// Mirrors AMPL's `AmplSuffixHandler` convention (`AmplTNLP.cpp:1110-1165`).
+#[derive(Debug, Clone)]
+pub struct NlSuffix {
+    pub name: String,
+    pub kind: SuffixKind,
+    pub float_valued: bool,
+    /// Sparse `(index, value)` pairs as written in the file.
+    pub entries: Vec<(usize, f64)>,
+}
+
 /// AMPL imported (external) function declaration from an `F` segment.
 #[derive(Debug, Clone)]
 pub struct ImportedFunc {
@@ -42,6 +69,70 @@ pub struct NlFileData {
     pub jac_col_ptrs: Vec<usize>,
     /// AMPL imported functions declared via `F` segments.
     pub imported_funcs: Vec<ImportedFunc>,
+    /// AMPL suffix tables declared via `S` segments. Empty for files
+    /// without suffix data.
+    pub suffixes: Vec<NlSuffix>,
+}
+
+impl NlFileData {
+    /// Extract `scaling_factor` suffix entries into dense per-source
+    /// vectors aligned with AmplTNLP's convention
+    /// (`AmplTNLP.cpp:1110-1165`): the same suffix name `scaling_factor`
+    /// is read against three AMPL kinds (objective, variable,
+    /// constraint). Missing entries default to 1.0; a single-entry
+    /// objective suffix collapses to a scalar.
+    pub fn scaling_factors(&self) -> NlScalingFactors {
+        let n = self.header.n_vars;
+        let m = self.header.n_constrs;
+        let mut out = NlScalingFactors::default();
+        for s in &self.suffixes {
+            if s.name != "scaling_factor" {
+                continue;
+            }
+            match s.kind {
+                SuffixKind::Objective => {
+                    // Conventionally only objective 0; take the first.
+                    if let Some(&(_, v)) = s.entries.first() {
+                        out.obj = Some(v);
+                    }
+                }
+                SuffixKind::Variable => {
+                    let mut x = vec![1.0f64; n];
+                    for &(i, v) in &s.entries {
+                        if i < n {
+                            x[i] = v;
+                        }
+                    }
+                    out.x = Some(x);
+                }
+                SuffixKind::Constraint => {
+                    let mut g = vec![1.0f64; m];
+                    for &(i, v) in &s.entries {
+                        if i < m {
+                            g[i] = v;
+                        }
+                    }
+                    out.g = Some(g);
+                }
+                SuffixKind::Problem => {}
+            }
+        }
+        out
+    }
+}
+
+/// Aggregated `scaling_factor` suffix values from an NL file.
+#[derive(Debug, Default, Clone)]
+pub struct NlScalingFactors {
+    pub obj: Option<f64>,
+    pub x: Option<Vec<f64>>,
+    pub g: Option<Vec<f64>>,
+}
+
+impl NlScalingFactors {
+    pub fn is_empty(&self) -> bool {
+        self.obj.is_none() && self.x.is_none() && self.g.is_none()
+    }
 }
 
 /// Parse an NL file from its text content.
@@ -67,6 +158,7 @@ pub fn parse_nl_file(content: &str) -> Result<NlFileData, String> {
         y0: vec![0.0; m],
         jac_col_ptrs: Vec::new(),
         imported_funcs: Vec::new(),
+        suffixes: Vec::new(),
         header,
     };
 
@@ -354,8 +446,50 @@ pub fn parse_nl_file(content: &str) -> Result<NlFileData, String> {
                 }
             }
             b'S' => {
-                // Suffix segment: skip
-                let count = parse_segment_count_after_space(line)?;
+                // Suffix segment header: `S<flags> <count> <name>`.
+                // `flags & 3` selects kind (variable=0, constraint=1,
+                // objective=2, problem=3); `flags & 4` set means the
+                // values are floats (else integers, but we always store
+                // as f64). Mirrors AMPL's `AmplSuffixHandler` ABI.
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                let flags: u32 = parts
+                    .first()
+                    .and_then(|s| s.get(1..))
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                let count: usize = parts
+                    .get(1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                let name = parts.get(2).copied().unwrap_or("").to_string();
+                let kind = match flags & 3 {
+                    0 => SuffixKind::Variable,
+                    1 => SuffixKind::Constraint,
+                    2 => SuffixKind::Objective,
+                    _ => SuffixKind::Problem,
+                };
+                let float_valued = (flags & 4) != 0;
+                let mut entries = Vec::with_capacity(count);
+                for off in 1..=count {
+                    if pos + off >= remaining.len() {
+                        break;
+                    }
+                    let row = remaining[pos + off].trim();
+                    let cols: Vec<&str> = row.split_whitespace().collect();
+                    if cols.len() >= 2 {
+                        let i: usize = cols[0].parse().unwrap_or(usize::MAX);
+                        let v: f64 = cols[1].parse().unwrap_or(0.0);
+                        if i != usize::MAX {
+                            entries.push((i, v));
+                        }
+                    }
+                }
+                data.suffixes.push(NlSuffix {
+                    name,
+                    kind,
+                    float_valued,
+                    entries,
+                });
                 pos += 1 + count;
             }
             b'F' => {

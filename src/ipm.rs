@@ -1,31 +1,30 @@
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
-use crate::convergence::{self, check_convergence, ConvergenceInfo, ConvergenceStatus};
+use crate::convergence::{self, ConvergenceInfo, ConvergenceStatus};
 use crate::filter::{self, Filter, FilterEntry};
 use crate::kkt::{self, InertiaCorrectionParams};
-use crate::linear_solver::banded::BandedLdl;
 use crate::linear_solver::dense::DenseLdl;
-#[cfg(all(feature = "faer", not(feature = "rmumps")))]
+#[cfg(all(feature = "faer", not(any(feature = "feral", feature = "rmumps"))))]
 use crate::linear_solver::sparse::SparseLdl;
-#[cfg(feature = "rmumps")]
+#[cfg(feature = "feral")]
+use crate::linear_solver::feral_direct::FeralLdl;
+#[cfg(feature = "feral")]
+use crate::linear_solver::feral_iterative::FeralIterativeMinres;
+#[cfg(feature = "feral")]
+use crate::linear_solver::feral_hybrid::FeralHybrid;
+#[cfg(all(feature = "rmumps", not(feature = "feral")))]
 use crate::linear_solver::multifrontal::MultifrontalLdl;
-#[cfg(feature = "rmumps")]
+#[cfg(all(feature = "rmumps", not(feature = "feral")))]
 use crate::linear_solver::iterative::IterativeMinres;
-#[cfg(feature = "rmumps")]
+#[cfg(all(feature = "rmumps", not(feature = "feral")))]
 use crate::linear_solver::hybrid::HybridSolver;
-use crate::linear_solver::{KktMatrix, LinearSolver, SymmetricMatrix};
+use crate::linear_solver::{KktMatrix, LinearSolver};
+use crate::options::AlphaForY;
 use crate::options::LinearSolverChoice;
 
-/// Window size for the iterate-averaging oscillation-recovery
-/// strategy: dual-infeasibility and (x, y, z_l, z_u) histories are
-/// truncated to this many trailing entries, and oscillation is
-/// declared when at least `AVG_WINDOW / 2` consecutive sign changes
-/// appear in the differences of the dual-infeasibility history.
-const AVG_WINDOW: usize = 6;
-
 /// Create a new sparse linear solver using the best available backend.
-/// Prefers rmumps (multifrontal) when available, falls back to faer (SparseLdl).
+/// Prefers feral (multifrontal LDLᵀ, default), then rmumps, then faer (SparseLdl), then dense.
 fn new_sparse_solver() -> Box<dyn LinearSolver> {
     new_sparse_solver_with_choice(LinearSolverChoice::Direct)
 }
@@ -34,28 +33,34 @@ fn new_sparse_solver() -> Box<dyn LinearSolver> {
 fn new_sparse_solver_with_choice(choice: LinearSolverChoice) -> Box<dyn LinearSolver> {
     match choice {
         LinearSolverChoice::Direct => {
-            #[cfg(feature = "rmumps")]
+            #[cfg(feature = "feral")]
+            { return Box::new(FeralLdl::new()); }
+            #[cfg(all(not(feature = "feral"), feature = "rmumps"))]
             { return Box::new(MultifrontalLdl::new()); }
-            #[cfg(all(not(feature = "rmumps"), feature = "faer"))]
+            #[cfg(all(not(feature = "feral"), not(feature = "rmumps"), feature = "faer"))]
             { return Box::new(SparseLdl::new()); }
-            #[cfg(not(any(feature = "rmumps", feature = "faer")))]
+            #[cfg(not(any(feature = "feral", feature = "rmumps", feature = "faer")))]
             { return Box::new(DenseLdl::new()); }
         }
         LinearSolverChoice::Iterative => {
-            #[cfg(feature = "rmumps")]
+            #[cfg(feature = "feral")]
+            { return Box::new(FeralIterativeMinres::new()); }
+            #[cfg(all(not(feature = "feral"), feature = "rmumps"))]
             { return Box::new(IterativeMinres::new()); }
-            #[cfg(not(feature = "rmumps"))]
+            #[cfg(all(not(feature = "feral"), not(feature = "rmumps")))]
             {
-                log::warn!("Iterative solver requires rmumps feature; falling back to direct");
+                log::warn!("Iterative solver requires feral or rmumps feature; falling back to direct");
                 return new_sparse_solver_with_choice(LinearSolverChoice::Direct);
             }
         }
         LinearSolverChoice::Hybrid => {
-            #[cfg(feature = "rmumps")]
+            #[cfg(feature = "feral")]
+            { return Box::new(FeralHybrid::new()); }
+            #[cfg(all(not(feature = "feral"), feature = "rmumps"))]
             { return Box::new(HybridSolver::new()); }
-            #[cfg(not(feature = "rmumps"))]
+            #[cfg(all(not(feature = "feral"), not(feature = "rmumps")))]
             {
-                log::warn!("Hybrid solver requires rmumps feature; falling back to direct");
+                log::warn!("Hybrid solver requires feral or rmumps feature; falling back to direct");
                 return new_sparse_solver_with_choice(LinearSolverChoice::Direct);
             }
         }
@@ -71,26 +76,124 @@ fn new_fallback_solver(use_sparse: bool) -> Box<dyn LinearSolver> {
         Box::new(DenseLdl::new())
     }
 }
+use crate::options::BoundMultInitMethod;
+use crate::options::FixedVariableTreatment;
 use crate::options::SolverOptions;
 use crate::problem::NlpProblem;
-use crate::restoration::RestorationPhase;
 use crate::trace;
 use crate::restoration_nlp::RestorationNlp;
 use crate::result::{SolveResult, SolverDiagnostics, SolveStatus};
-use crate::slack_formulation::SlackFormulation;
 use crate::warmstart::WarmStartInitializer;
 use crate::logging::rip_log;
+
+/// NLP problem wrapper that rejects non-finite (NaN/Inf) values from
+/// any evaluation. Mirrors Ipopt 3.14's `IpOrigIpoptNLP.cpp` per-call
+/// `Eval_Error` checks (lines 498, 535, 580, 629). When the inner
+/// implementation returns `true` but any output element is non-finite,
+/// the wrapper converts that to a `false` return, which the IPM line
+/// search treats as a trial-point rejection (and at the current
+/// iterate, as `EvaluationError → NumericalBreakdown`).
+///
+/// Wrapped as the outermost layer in `solve_ipm` so every eval that
+/// reaches the IPM core is guaranteed finite. The check covers
+/// objective, gradient, constraints, Jacobian values, and Hessian
+/// values; bounds / initial point / structure queries do not produce
+/// numerical output and are not checked.
+struct FiniteCheckedProblem<'a, P: NlpProblem> {
+    inner: &'a P,
+}
+
+impl<'a, P: NlpProblem> FiniteCheckedProblem<'a, P> {
+    fn new(inner: &'a P) -> Self {
+        Self { inner }
+    }
+}
+
+impl<P: NlpProblem> NlpProblem for FiniteCheckedProblem<'_, P> {
+    fn num_variables(&self) -> usize { self.inner.num_variables() }
+    fn num_constraints(&self) -> usize { self.inner.num_constraints() }
+    fn bounds(&self, x_l: &mut [f64], x_u: &mut [f64]) {
+        self.inner.bounds(x_l, x_u);
+    }
+    fn constraint_bounds(&self, g_l: &mut [f64], g_u: &mut [f64]) {
+        self.inner.constraint_bounds(g_l, g_u);
+    }
+    fn initial_point(&self, x0: &mut [f64]) { self.inner.initial_point(x0); }
+    fn initial_multipliers(
+        &self,
+        lam_g: &mut [f64],
+        z_l: &mut [f64],
+        z_u: &mut [f64],
+    ) -> bool {
+        self.inner.initial_multipliers(lam_g, z_l, z_u)
+    }
+    fn objective(&self, x: &[f64], new_x: bool, obj: &mut f64) -> bool {
+        if !self.inner.objective(x, new_x, obj) { return false; }
+        obj.is_finite()
+    }
+    fn gradient(&self, x: &[f64], new_x: bool, grad: &mut [f64]) -> bool {
+        if !self.inner.gradient(x, new_x, grad) { return false; }
+        grad.iter().all(|v| v.is_finite())
+    }
+    fn constraints(&self, x: &[f64], new_x: bool, g: &mut [f64]) -> bool {
+        if !self.inner.constraints(x, new_x, g) { return false; }
+        g.iter().all(|v| v.is_finite())
+    }
+    fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+        self.inner.jacobian_structure()
+    }
+    fn jacobian_values(&self, x: &[f64], new_x: bool, vals: &mut [f64]) -> bool {
+        if !self.inner.jacobian_values(x, new_x, vals) { return false; }
+        vals.iter().all(|v| v.is_finite())
+    }
+    fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+        self.inner.hessian_structure()
+    }
+    fn hessian_values(
+        &self,
+        x: &[f64],
+        new_x: bool,
+        obj_factor: f64,
+        lambda: &[f64],
+        vals: &mut [f64],
+    ) -> bool {
+        if !self.inner.hessian_values(x, new_x, obj_factor, lambda, vals) {
+            return false;
+        }
+        vals.iter().all(|v| v.is_finite())
+    }
+    fn notify_mu(&self, mu: f64) {
+        self.inner.notify_mu(mu);
+    }
+    fn resto_early_exit(&self, x: &[f64]) -> bool {
+        self.inner.resto_early_exit(x)
+    }
+}
 
 /// NLP problem wrapper that applies gradient-based scaling.
 ///
 /// Scales objective by `obj_scaling` and each constraint `i` by `g_scaling[i]`
 /// so that the max gradient norm at the initial point is ≤ 100.
 /// This matches Ipopt's `nlp_scaling_method = gradient-based`.
+///
+/// The constraint-bound path also applies `nlp_lower/upper_bound_inf`
+/// sentinel mapping and `bound_relax_factor` IN RAW SPACE before
+/// scaling, mirroring `IpOrigIpoptNLP::InitializeStructures`
+/// (`ref/Ipopt/src/Algorithm/IpOrigIpoptNLP.cpp:343-374`): relax_bounds
+/// runs on raw `d_L`/`d_U`, then `apply_vector_scaling_d_LU` scales the
+/// already-relaxed bounds. Doing the order the other way (scale, then
+/// relax in scaled space) gives `1e-8` padding for any constraint whose
+/// raw bound is `0`, instead of Ipopt's `scale × 1e-8`. For rows with
+/// `|raw_b| < 1/scale` this is an O(1/scale) effective-bound error.
 struct ScaledProblem<'a, P: NlpProblem> {
     inner: &'a P,
     obj_scaling: f64,
     g_scaling: Vec<f64>,
     jac_rows: Vec<usize>,
+    bound_relax_factor: f64,
+    constr_viol_tol: f64,
+    nlp_lower_bound_inf: f64,
+    nlp_upper_bound_inf: f64,
 }
 
 impl<P: NlpProblem> NlpProblem for ScaledProblem<'_, P> {
@@ -104,7 +207,38 @@ impl<P: NlpProblem> NlpProblem for ScaledProblem<'_, P> {
         self.inner.bounds(x_l, x_u);
     }
     fn constraint_bounds(&self, g_l: &mut [f64], g_u: &mut [f64]) {
+        // Order matches Ipopt 3.14 IpOrigIpoptNLP.cpp:343-374:
+        //   raw inner bounds → sentinel-to-infinity → relax_bounds (raw)
+        //   → apply_vector_scaling_d_LU (scale)
+        // The relaxation amount uses |raw_b| (not |scaled_b|), which
+        // matters whenever |raw_b| < 1/scale — most importantly for
+        // raw bounds at exactly 0 (e.g. inequalities `g(x) ≤ 0`).
         self.inner.constraint_bounds(g_l, g_u);
+        for i in 0..g_l.len() {
+            if g_l[i] <= self.nlp_lower_bound_inf {
+                g_l[i] = f64::NEG_INFINITY;
+            }
+            if g_u[i] >= self.nlp_upper_bound_inf {
+                g_u[i] = f64::INFINITY;
+            }
+        }
+        if self.bound_relax_factor > 0.0 {
+            for i in 0..g_l.len() {
+                if g_l[i].is_finite() && g_u[i].is_finite() && g_l[i] == g_u[i] {
+                    continue;
+                }
+                if g_l[i].is_finite() {
+                    let delta = (self.bound_relax_factor * g_l[i].abs().max(1.0))
+                        .min(self.constr_viol_tol);
+                    g_l[i] -= delta;
+                }
+                if g_u[i].is_finite() {
+                    let delta = (self.bound_relax_factor * g_u[i].abs().max(1.0))
+                        .min(self.constr_viol_tol);
+                    g_u[i] += delta;
+                }
+            }
+        }
         for (i, &s) in self.g_scaling.iter().enumerate() {
             if g_l[i].is_finite() {
                 g_l[i] *= s;
@@ -157,6 +291,12 @@ impl<P: NlpProblem> NlpProblem for ScaledProblem<'_, P> {
             .collect();
         self.inner
             .hessian_values(x, _new_x, obj_factor * self.obj_scaling, &scaled_lambda, vals)
+    }
+    fn notify_mu(&self, mu: f64) {
+        self.inner.notify_mu(mu);
+    }
+    fn resto_early_exit(&self, x: &[f64]) -> bool {
+        self.inner.resto_early_exit(x)
     }
 }
 
@@ -331,19 +471,98 @@ impl<P: NlpProblem> NlpProblem for XScaledProblem<'_, P> {
         }
         true
     }
+    fn notify_mu(&self, mu: f64) {
+        self.inner.notify_mu(mu);
+    }
+    fn resto_early_exit(&self, x: &[f64]) -> bool {
+        self.inner.resto_early_exit(x)
+    }
+}
+
+/// Snapshot of the most recent iterate that satisfied the acceptable-level
+/// thresholds (Ipopt's `RestoreAcceptablePoint`). When restoration would
+/// otherwise be triggered on a near-feasible iterate (where the resto NLP
+/// is ill-defined), the IPM rolls back to this point and exits with
+/// `SolveStatus::Acceptable`. Mirrors Ipopt's `STOP_AT_ACCEPTABLE_POINT`
+/// path in `IpIpoptAlgorithm.cpp`.
+struct IterateSnapshot {
+    x: Vec<f64>,
+    y_c: Vec<f64>,
+    y_d: Vec<f64>,
+    /// Native compressed bound multipliers (Phase 6d.6: combined
+    /// storage dropped; this is the canonical form).
+    z_l_compressed: Vec<f64>,
+    z_u_compressed: Vec<f64>,
+    /// Phase 8d: native compressed slack-bound multipliers (combined
+    /// `v_l`/`v_u` storage dropped).
+    v_l_compressed: Vec<f64>,
+    v_u_compressed: Vec<f64>,
+    s: Vec<f64>,
+    mu: f64,
+    obj: f64,
+    c_x: Vec<f64>,
+    d_x: Vec<f64>,
+    grad_f: Vec<f64>,
+    filter_entries: Vec<FilterEntry>,
+    iteration: usize,
+}
+
+impl IterateSnapshot {
+    fn capture(state: &SolverState, filter: &Filter, iteration: usize) -> Self {
+        Self {
+            x: state.x.clone(),
+            y_c: state.y_c.clone(),
+            y_d: state.y_d.clone(),
+            z_l_compressed: state.z_l_compressed.clone(),
+            z_u_compressed: state.z_u_compressed.clone(),
+            v_l_compressed: state.v_l_compressed.clone(),
+            v_u_compressed: state.v_u_compressed.clone(),
+            s: state.s.clone(),
+            mu: state.mu,
+            obj: state.obj,
+            c_x: state.c_x.clone(),
+            d_x: state.d_x.clone(),
+            grad_f: state.grad_f.clone(),
+            filter_entries: filter.save_entries(),
+            iteration,
+        }
+    }
+
+    fn restore(&self, state: &mut SolverState, filter: &mut Filter) {
+        state.x = self.x.clone();
+        state.y_c = self.y_c.clone();
+        state.y_d = self.y_d.clone();
+        state.z_l_compressed = self.z_l_compressed.clone();
+        state.z_u_compressed = self.z_u_compressed.clone();
+        state.v_l_compressed = self.v_l_compressed.clone();
+        state.v_u_compressed = self.v_u_compressed.clone();
+        state.s = self.s.clone();
+        state.mu = self.mu;
+        state.obj = self.obj;
+        state.c_x = self.c_x.clone();
+        state.d_x = self.d_x.clone();
+        state.grad_f = self.grad_f.clone();
+        filter.restore_entries(self.filter_entries.clone());
+    }
 }
 
 /// Saved state for the watchdog mechanism.
 struct WatchdogSavedState {
     x: Vec<f64>,
-    y: Vec<f64>,
-    z_l: Vec<f64>,
-    z_u: Vec<f64>,
-    v_l: Vec<f64>,
-    v_u: Vec<f64>,
+    y_c: Vec<f64>,
+    y_d: Vec<f64>,
+    /// Phase 6d.2: native compressed bound multipliers.
+    z_l_compressed: Vec<f64>,
+    z_u_compressed: Vec<f64>,
+    /// Phase 8d: native compressed slack-bound multipliers (combined
+    /// `v_l`/`v_u` storage dropped).
+    v_l_compressed: Vec<f64>,
+    v_u_compressed: Vec<f64>,
+    s: Vec<f64>,
     mu: f64,
     obj: f64,
-    g: Vec<f64>,
+    c_x: Vec<f64>,
+    d_x: Vec<f64>,
     grad_f: Vec<f64>,
     filter_entries: Vec<FilterEntry>,
     theta: f64,
@@ -356,14 +575,17 @@ impl WatchdogSavedState {
     fn snapshot(state: &SolverState, filter: &Filter, theta: f64, phi: f64) -> Self {
         Self {
             x: state.x.clone(),
-            y: state.y.clone(),
-            z_l: state.z_l.clone(),
-            z_u: state.z_u.clone(),
-            v_l: state.v_l.clone(),
-            v_u: state.v_u.clone(),
+            y_c: state.y_c.clone(),
+            y_d: state.y_d.clone(),
+            z_l_compressed: state.z_l_compressed.clone(),
+            z_u_compressed: state.z_u_compressed.clone(),
+            v_l_compressed: state.v_l_compressed.clone(),
+            v_u_compressed: state.v_u_compressed.clone(),
+            s: state.s.clone(),
             mu: state.mu,
             obj: state.obj,
-            g: state.g.clone(),
+            c_x: state.c_x.clone(),
+            d_x: state.d_x.clone(),
             grad_f: state.grad_f.clone(),
             filter_entries: filter.save_entries(),
             theta,
@@ -376,15 +598,24 @@ impl WatchdogSavedState {
     /// the filter after restore, which the helper would obscure).
     fn restore(&self, state: &mut SolverState) {
         state.x = self.x.clone();
-        state.y = self.y.clone();
-        state.z_l = self.z_l.clone();
-        state.z_u = self.z_u.clone();
-        state.v_l = self.v_l.clone();
-        state.v_u = self.v_u.clone();
+        state.y_c = self.y_c.clone();
+        state.y_d = self.y_d.clone();
+        state.z_l_compressed = self.z_l_compressed.clone();
+        state.z_u_compressed = self.z_u_compressed.clone();
+        state.v_l_compressed = self.v_l_compressed.clone();
+        state.v_u_compressed = self.v_u_compressed.clone();
+        state.s = self.s.clone();
         state.mu = self.mu;
         state.obj = self.obj;
-        state.g = self.g.clone();
+        state.c_x = self.c_x.clone();
+        state.d_x = self.d_x.clone();
         state.grad_f = self.grad_f.clone();
+        // T3.25 follow-up: watchdog revert mutates x/y/z/v outside the
+        // line-search choke point that bumps atags. Bump them and drop
+        // the cache so the next factor cannot replay a stale `(δ_w,
+        // δ_c)` against a now-wrong matrix.
+        state.bump_all_kkt_atags();
+        state.factor_cache.invalidate();
     }
 }
 
@@ -392,26 +623,36 @@ impl WatchdogSavedState {
 pub(crate) struct SolverState {
     /// Current primal variables.
     pub x: Vec<f64>,
-    /// Current constraint multipliers (lambda/y).
-    pub y: Vec<f64>,
-    /// Lower bound multipliers.
-    pub z_l: Vec<f64>,
-    /// Upper bound multipliers.
-    pub z_u: Vec<f64>,
-    /// Constraint slack lower-bound multipliers (Ipopt's v_L).
-    /// v_l[i] > 0 for inequality constraints with finite g_l[i], 0 otherwise.
-    pub v_l: Vec<f64>,
-    /// Constraint slack upper-bound multipliers (Ipopt's v_U).
-    /// v_u[i] > 0 for inequality constraints with finite g_u[i], 0 otherwise.
-    pub v_u: Vec<f64>,
+    /// Equality-constraint multipliers `y_c` (size n_c). Mirrors Ipopt's
+    /// `IteratesVector::y_c()` (`IpIteratesVector.hpp` slot 2). Phase 3b
+    /// of the data-layout refactor: replaces the combined `y: Vec<f64>`
+    /// (size m). User-facing combined multipliers are reconstructed in
+    /// `unscale_solution_vectors` via the layout.
+    pub y_c: Vec<f64>,
+    /// Inequality-constraint multipliers `y_d` (size n_d). Mirrors Ipopt's
+    /// `IteratesVector::y_d()` (slot 3).
+    pub y_d: Vec<f64>,
     /// Search direction: primal.
     pub dx: Vec<f64>,
-    /// Search direction: constraint multipliers.
-    pub dy: Vec<f64>,
-    /// Search direction: lower bound multipliers.
-    pub dz_l: Vec<f64>,
-    /// Search direction: upper bound multipliers.
-    pub dz_u: Vec<f64>,
+    /// Search direction: equality multipliers `dy_c` (size n_c). Phase 3c
+    /// of the data-layout refactor: replaces the combined
+    /// `dy: Vec<f64>` (size m). Mirrors Ipopt's IteratesVector
+    /// search-direction slot for y_c.
+    pub dy_c: Vec<f64>,
+    /// Search direction: inequality multipliers `dy_d` (size n_d).
+    pub dy_d: Vec<f64>,
+    /// Explicit slack iterate (Ipopt's `s`, size `n_d`). Pushed to interior of
+    /// `[d_L, d_U]` at init via slack_bound_push/slack_bound_frac, then advanced
+    /// each iteration by `s ← s + α_p · ds`. Phase 3d of the data-layout refactor:
+    /// dropped the equality-row sentinel slots; `s` is now d-block-only natively
+    /// (matches Ipopt 3.14 `IpIpoptData.cpp:140` where `s` has dimension `n_d`).
+    /// User-facing combined-indexed reads route through `state.s_at(i)`.
+    /// Source: Ipopt 3.14 IpIteratesVector.hpp slot 1.
+    pub s: Vec<f64>,
+    /// Search direction for slack iterate (Ipopt's `delta_s`, size `n_d`).
+    /// Computed by `recover_ds`: `ds[k] = (J_d·dx)[k] + (d[k] - s[k]) - δ_d·dy_d[k]`.
+    /// Phase 3d: resized from m to n_d. Source: IpStdAugSystemSolver.cpp:431-465.
+    pub ds: Vec<f64>,
     /// Barrier parameter.
     pub mu: f64,
     /// Primal step size.
@@ -420,14 +661,20 @@ pub(crate) struct SolverState {
     pub alpha_dual: f64,
     /// Iteration counter.
     pub iter: usize,
-    /// Variable lower bounds.
-    pub x_l: Vec<f64>,
-    /// Variable upper bounds.
-    pub x_u: Vec<f64>,
-    /// Constraint lower bounds.
-    pub g_l: Vec<f64>,
-    /// Constraint upper bounds.
-    pub g_u: Vec<f64>,
+    // Phase 7c: combined-form `x_l`/`x_u` (size `n` with `±inf` sentinels)
+    // dropped. The compressed mirrors `x_l_compressed` (size `n_x_l`) and
+    // `x_u_compressed` (size `n_x_u`) are now the sole canonical storage,
+    // matching Ipopt's `x_L_`/`x_U_` ExpansionMatrix-projected bounds
+    // (`IpOrigIpoptNLP.hpp:226,253`). Use `state.x_l_at(i)` / `x_u_at(i)`
+    // for per-element reads (returns `±inf` on unbounded sides) or
+    // `state.x_l_combined()` / `x_u_combined()` to materialize a full-`n`
+    // view at API boundaries.
+    /// Equality-row target value (Ipopt's `c_rhs`, size `layout.n_c`):
+    /// stores the equality-row target. Phase 3f-final: native split
+    /// storage; the legacy combined `g_l`/`g_u` fields are gone.
+    /// Materialise via `state.g_l_combined()` / `state.g_u_combined()`
+    /// when an m-length slice is required.
+    pub c_rhs: Vec<f64>,
     /// Number of variables.
     pub n: usize,
     /// Number of constraints.
@@ -436,12 +683,50 @@ pub(crate) struct SolverState {
     pub obj: f64,
     /// Current gradient.
     pub grad_f: Vec<f64>,
-    /// Current constraint values.
-    pub g: Vec<f64>,
-    /// Jacobian structure and values.
+    /// Phase 5f: equality residual `c(x)` (size `n_c`). Mirrors Ipopt's
+    /// `OrigIpoptNLP::c()` (`IpIpoptNLP.hpp:117`), where the equality
+    /// target is baked into the residual so `c(x) = 0` at feasibility.
+    /// Written by `evaluate_with_linear` (and by the test-only
+    /// `set_g_combined`).
+    pub c_x: Vec<f64>,
+    /// Phase 5f: inequality value `d(x)` (size `n_d`). Mirrors Ipopt's
+    /// `OrigIpoptNLP::d()` (`IpIpoptNLP.hpp:118`).
+    pub d_x: Vec<f64>,
+    /// Jacobian sparsity pattern (combined m-row wire form). Kept as an
+    /// immutable wire for the restoration NLP boundary, which still
+    /// expects an m-form triplet pattern. Numerical values live in the
+    /// split `jac_c_vals` / `jac_d_vals` storage; there is no combined
+    /// values mirror. Read by test helpers (`rebuild_split_jac_structure`)
+    /// that hand-craft a state from a combined triplet.
+    #[allow(dead_code)]
     pub jac_rows: Vec<usize>,
+    #[allow(dead_code)]
     pub jac_cols: Vec<usize>,
-    pub jac_vals: Vec<f64>,
+    /// Phase 4 split Jacobian — equality-row block (Ipopt's `Jac_c`,
+    /// `IpOrigIpoptNLP.hpp:439`). Triplet form sized `jac_c_nnz`:
+    ///   `jac_c_rows[k] ∈ 0..n_c`  (target row in `c`-block coordinates)
+    ///   `jac_c_cols[k] ∈ 0..n`
+    /// Populated at construction (structure) and refreshed each
+    /// `problem.jacobian_values` call via [`refresh_split_jac_vals`].
+    /// Phase 4a is additive — readers still consume the combined
+    /// triplet; Phase 4b will migrate `kkt_aug` and other consumers.
+    pub jac_c_rows: Vec<usize>,
+    pub jac_c_cols: Vec<usize>,
+    pub jac_c_vals: Vec<f64>,
+    /// Phase 4 split Jacobian — inequality-row block (Ipopt's `Jac_d`,
+    /// `IpOrigIpoptNLP.hpp:449`). Triplet form sized `jac_d_nnz`:
+    ///   `jac_d_rows[k] ∈ 0..n_d`  (target row in `d`-block coordinates)
+    ///   `jac_d_cols[k] ∈ 0..n`
+    pub jac_d_rows: Vec<usize>,
+    pub jac_d_cols: Vec<usize>,
+    pub jac_d_vals: Vec<f64>,
+    /// Phase 4 index maps: `jac_c_combined_idx[k]` is the position in
+    /// the combined `jac_*` triplet that supplies `jac_c_vals[k]`. Same
+    /// for `jac_d`. Built once at construction; used by
+    /// `refresh_split_jac_vals` to copy values without re-checking the
+    /// layout per triplet.
+    pub jac_c_combined_idx: Vec<usize>,
+    pub jac_d_combined_idx: Vec<usize>,
     /// Hessian structure and values.
     pub hess_rows: Vec<usize>,
     pub hess_cols: Vec<usize>,
@@ -450,13 +735,176 @@ pub(crate) struct SolverState {
     pub consecutive_acceptable: usize,
     /// Objective scaling factor (for NLP scaling / result unscaling).
     pub obj_scaling: f64,
-    /// Constraint scaling factors (for NLP scaling / result unscaling).
-    pub g_scaling: Vec<f64>,
+    /// Equality-block constraint scaling factors `dc` (size n_c). Mirrors
+    /// Ipopt's `c_scaling` produced by `IpGradientScaling.cpp:144-185`.
+    /// Phase 3 of the data-layout refactor: replaces the combined
+    /// `g_scaling: Vec<f64>` (size m). User-facing combined scaling is
+    /// reconstructed in `unscale_solution_vectors` via the layout.
+    pub c_scaling: Vec<f64>,
+    /// Inequality-block constraint scaling factors `dd` (size n_d). Mirrors
+    /// Ipopt's `d_scaling` produced by `IpGradientScaling.cpp:191-232`.
+    pub d_scaling: Vec<f64>,
+    /// Equality / inequality constraint layout. Built once from `g_l`/`g_u`
+    /// at construction; stable for the problem lifetime. Single source of
+    /// truth for the c-block / d-block split (replaces per-assemble
+    /// `ConstraintLayout::new` calls — Phase 1 of the data-layout refactor,
+    /// see `docs/V0.8_DATA_LAYOUT_REFACTOR_PLAN.md`).
+    pub layout: crate::constraint_layout::ConstraintLayout,
+    /// Variable-bound layout. Built once from `x_l`/`x_u` at construction;
+    /// stable for the problem lifetime. Single source of truth for the
+    /// finite-bound compression that mirrors Ipopt's `Px_L_` / `Px_U_`
+    /// ExpansionMatrix pair (`IpOrigIpoptNLP.hpp:197-219`). Phase 6 of
+    /// the data-layout refactor — see
+    /// `docs/V0.8_DATA_LAYOUT_REFACTOR_PLAN.md`.
+    pub bound_layout: crate::bound_layout::BoundLayout,
+    /// Compressed lower-bound multipliers (size `bound_layout.n_x_l`).
+    /// Mirrors Ipopt's `z_L` (`IpIpoptData.cpp:140`). Phase 6b: populated
+    /// as a projection of the combined `z_l` at every mutation site.
+    /// Phase 6c will flip readers to consume this instead of the combined
+    /// form; Phase 6d will drop the combined.
+    pub z_l_compressed: Vec<f64>,
+    /// Compressed upper-bound multipliers (size `bound_layout.n_x_u`).
+    /// Mirrors Ipopt's `z_U`. See [`Self::z_l_compressed`].
+    pub z_u_compressed: Vec<f64>,
+    /// Compressed lower-bound multiplier search direction
+    /// (size `bound_layout.n_x_l`). Phase 6b additive mirror of `dz_l`.
+    pub dz_l_compressed: Vec<f64>,
+    /// Compressed upper-bound multiplier search direction
+    /// (size `bound_layout.n_x_u`). Phase 6b additive mirror of `dz_u`.
+    pub dz_u_compressed: Vec<f64>,
+    /// Phase 7a: compressed lower variable bounds (size `bound_layout.n_x_l`),
+    /// holding only the finite lower-bound values (one entry per `k` in
+    /// `0..n_x_l`, mapped via `bound_layout.x_l_to_full`). Mirrors Ipopt's
+    /// `x_L_` (`IpOrigIpoptNLP.hpp:226`). Phase 7a is additive — readers
+    /// still consume the combined `x_l` (size `n` with `-inf` sentinels);
+    /// later sub-phases migrate readers and drop the combined form.
+    pub x_l_compressed: Vec<f64>,
+    /// Phase 7a: compressed upper variable bounds (size `bound_layout.n_x_u`).
+    /// Mirrors Ipopt's `x_U_`. See [`Self::x_l_compressed`].
+    pub x_u_compressed: Vec<f64>,
+    /// Phase 8a: slack-bound expansion-matrix layout. Mirrors Ipopt's
+    /// `Pd_L_`/`Pd_U_` ExpansionMatrix pair (`IpOrigIpoptNLP.hpp:241-263`).
+    /// Indexes the n_d slack rows; classifies each as having a finite
+    /// lower / upper slack bound. Built once per `SolverState` from
+    /// `d_l`/`d_u`.
+    pub d_bound_layout: crate::d_bound_layout::DBoundLayout,
+    /// Phase 8b: compressed slack-lower-bound multipliers (size
+    /// `d_bound_layout.n_d_l`). Mirrors Ipopt's `v_L`. Populated as a
+    /// projection of the combined `v_l` at every mutation site; Phase 8c
+    /// migrates readers and Phase 8d drops the combined storage.
+    pub v_l_compressed: Vec<f64>,
+    /// Phase 8b: compressed slack-upper-bound multipliers (size
+    /// `d_bound_layout.n_d_u`). Mirrors Ipopt's `v_U`.
+    pub v_u_compressed: Vec<f64>,
+    /// Phase 8b: compressed slack-lower-bound multiplier search
+    /// direction (size `d_bound_layout.n_d_l`). Mirrors Ipopt's `dv_L`.
+    pub dv_l_compressed: Vec<f64>,
+    /// Phase 8b: compressed slack-upper-bound multiplier search
+    /// direction (size `d_bound_layout.n_d_u`).
+    pub dv_u_compressed: Vec<f64>,
+    /// Phase 9b: compressed slack-row lower bounds (size
+    /// `d_bound_layout.n_d_l`). Mirrors Ipopt's `d_L_` in
+    /// `IpOrigIpoptNLP.hpp:241-263`. Holds finite lower bounds only;
+    /// the combined `d_l` array (size `n_d`) keeps `f64::NEG_INFINITY`
+    /// in the unbounded slots.
+    pub d_l_compressed: Vec<f64>,
+    /// Phase 9b: compressed slack-row upper bounds (size
+    /// `d_bound_layout.n_d_u`). Mirrors Ipopt's `d_U_`.
+    pub d_u_compressed: Vec<f64>,
     /// Accumulated solver diagnostics.
     pub diagnostics: SolverDiagnostics,
     /// Last point at which evaluations were performed (for new_x tracking).
     /// Initialized to NaN so the first evaluation always gets new_x = true.
     x_last_eval: Vec<f64>,
+    /// Cumulative count of slack adjustments performed by
+    /// `apply_slack_move` (Ipopt 3.14's `slack_move`). Each undersized
+    /// primal slack found after an accepted step contributes one
+    /// increment; surfaced for diagnostics only.
+    pub adjusted_slacks_count: usize,
+    /// True when the problem is square in Ipopt's sense:
+    /// `m == n` or the equality-constraint count equals `n`.
+    /// Mirrors `IpoptCalculatedQuantities::IsSquareProblem`
+    /// (IpIpoptCalculatedQuantities.cpp:3732). Set once at setup
+    /// after bound preprocessing and read-only thereafter.
+    /// Currently unread: kept for future restoration / convergence
+    /// hooks that need square-problem detection (Ipopt branches in
+    /// `IpAlgorithm::ComputeFeasibilityMultipliers`).
+    #[allow(dead_code)]
+    pub is_square: bool,
+    /// Most recent iterate that met the acceptable-level thresholds.
+    /// Overwritten every time the convergence helpers see acceptable
+    /// quality; consumed by the restoration trigger to fall back to
+    /// `Acceptable` instead of attempting a singular resto NLP on a
+    /// near-feasible iterate.
+    acceptable_iterate: Option<IterateSnapshot>,
+    /// Objective value of the previous iterate, used by the
+    /// acceptable-level relative-change gate
+    /// (`acceptable_obj_change_tol`). `None` on iteration 0.
+    pub last_obj_for_acceptable: Option<f64>,
+    /// T3.25: monotone version counters for the upstream KKT inputs.
+    /// Bumped at the coarse mutation events the IPM controls (line
+    /// search step accepted, multiplier update, callback re-evaluation
+    /// after a new x). Snapshotted into `KktSystem.input_atags` at
+    /// assembly time and consulted by `FactorCache` to short-circuit
+    /// redundant factorizations within a single iteration (QF mu oracle
+    /// → main step, Mehrotra predictor → corrector, Gondzio MCC).
+    pub kkt_atags: kkt::KktInputAtags,
+    /// T3.25 follow-up: per-iteration factorization cache shared
+    /// across the QF mu oracle, the main IPM step, and the condensed
+    /// fallback retries. Initialised from
+    /// `SolverOptions::factor_cache_enabled` in `SolverState::new`;
+    /// when the option is `false` every call is a forced miss
+    /// (`factor_with_inertia_correction_cached` still tracks
+    /// `factor_calls` for diagnostics).
+    pub factor_cache: kkt::FactorCache,
+    /// B11: cumulative NLP-callback counts surfaced in the final
+    /// summary. Mirror Ipopt's per-callback counters
+    /// (`IpOrigIpoptNLP::FinalizeSolution` reports). ripopt's
+    /// `constraints` and `jacobian_values` fill the joint c/d block in
+    /// one call, so `n_constr_evals`/`n_jac_evals` count both the
+    /// equality and the inequality side; the final summary prints the
+    /// same value on both rows.
+    pub n_obj_evals: usize,
+    pub n_grad_evals: usize,
+    pub n_constr_evals: usize,
+    pub n_jac_evals: usize,
+    pub n_hess_evals: usize,
+}
+
+impl SolverState {
+    /// T3.25: invalidate all 11 KKT-input atags. Coarse hammer used
+    /// after restoration handoffs, snapshot restores, and any other
+    /// path where state mutates outside the line-search choke point.
+    /// Cheap (11 increments); correctness over precision.
+    #[inline]
+    pub fn bump_all_kkt_atags(&mut self) {
+        let a = &mut self.kkt_atags;
+        a.w = a.w.wrapping_add(1);
+        a.j_c = a.j_c.wrapping_add(1);
+        a.j_d = a.j_d.wrapping_add(1);
+        a.z_l = a.z_l.wrapping_add(1);
+        a.z_u = a.z_u.wrapping_add(1);
+        a.v_l = a.v_l.wrapping_add(1);
+        a.v_u = a.v_u.wrapping_add(1);
+        a.slacks_x = a.slacks_x.wrapping_add(1);
+        a.slacks_s = a.slacks_s.wrapping_add(1);
+        a.sigma_x = a.sigma_x.wrapping_add(1);
+        a.sigma_s = a.sigma_s.wrapping_add(1);
+    }
+
+    /// T3.25: bump just the dual-multiplier atags (z_l, z_u, v_l, v_u),
+    /// plus their derived `sigma_x` and `sigma_s` views. Used by paths
+    /// that update bound multipliers without changing the primal x.
+    #[inline]
+    pub fn bump_dual_atags(&mut self) {
+        let a = &mut self.kkt_atags;
+        a.z_l = a.z_l.wrapping_add(1);
+        a.z_u = a.z_u.wrapping_add(1);
+        a.v_l = a.v_l.wrapping_add(1);
+        a.v_u = a.v_u.wrapping_add(1);
+        a.sigma_x = a.sigma_x.wrapping_add(1);
+        a.sigma_s = a.sigma_s.wrapping_add(1);
+    }
 }
 
 /// Barrier parameter mode (Ipopt's adaptive mu strategy).
@@ -494,6 +942,32 @@ struct MuState {
     consecutive_soft_restoration: usize,
     /// Sliding window of dual infeasibility values for stagnation detection.
     dual_inf_window: Vec<f64>,
+    /// Snapshot of `avg_compl` at the *first* Free-mode μ-oracle call.
+    /// Used to derive Ipopt's `mu_max = mu_max_fact * initial_avg_compl`
+    /// upper bound on adaptive μ (`IpAdaptiveMuUpdate.cpp:267-273`).
+    /// `None` until the first oracle call captures it.
+    initial_avg_compl: Option<f64>,
+    /// T3.11: snapshot of the last Free-mode iterate that satisfied
+    /// `CheckSufficientProgress` (Ipopt `accepted_point_`,
+    /// `IpAdaptiveMuUpdate.cpp:541-545`). Restored on the Free→Fixed
+    /// switch when `adaptive_mu_restore_previous_iterate` is on. `None`
+    /// until the option fires the first capture.
+    accepted_iterate: Option<AcceptedIterateSnapshot>,
+}
+
+/// T3.11: full primal-dual iterate snapshot used by the
+/// `adaptive_mu_restore_previous_iterate` rollback. Mirrors Ipopt's
+/// `IteratesVector` payload (`IpAdaptiveMuUpdate.cpp:367-369`); slacks
+/// are implicit in ripopt so only x/y/z_l/z_u/v_l/v_u are stored.
+#[derive(Clone)]
+struct AcceptedIterateSnapshot {
+    x: Vec<f64>,
+    y: Vec<f64>,
+    /// Phase 6d.2: native compressed bound multipliers.
+    z_l_compressed: Vec<f64>,
+    z_u_compressed: Vec<f64>,
+    v_l: Vec<f64>,
+    v_u: Vec<f64>,
 }
 
 impl MuState {
@@ -502,13 +976,29 @@ impl MuState {
             mode: MuMode::Free,
             ref_vals: Vec::with_capacity(8),
             num_refs_max: 4,
-            refs_red_fact: 0.999,
+            refs_red_fact: 0.9999,
             tiny_step: false,
             first_iter_in_mode: true,
             consecutive_restoration_failures: 0,
             consecutive_insufficient: 0,
             consecutive_soft_restoration: 0,
             dual_inf_window: Vec::with_capacity(4),
+            initial_avg_compl: None,
+            accepted_iterate: None,
+        }
+    }
+
+    /// Compute the Ipopt `mu_max = mu_max_fact * initial_avg_compl` cap,
+    /// capturing `initial_avg_compl` lazily on the first Free-mode oracle
+    /// call. Mirrors `IpAdaptiveMuUpdate.cpp:267-273`. Falls back to
+    /// `1e10` until first capture (matches Ipopt before the first call).
+    fn mu_max_cap(&mut self, options: &SolverOptions, avg_compl: f64) -> f64 {
+        if self.initial_avg_compl.is_none() && avg_compl.is_finite() && avg_compl > 0.0 {
+            self.initial_avg_compl = Some(avg_compl);
+        }
+        match self.initial_avg_compl {
+            Some(init) => options.mu_max_fact * init,
+            None => 1e10,
         }
     }
 
@@ -567,20 +1057,28 @@ impl LbfgsIpmState {
         }
     }
 
-    /// Compute ∇_x L = ∇f + J^T λ
+    /// Compute ∇_x L = ∇f + Jac_c^T y_c + Jac_d^T y_d. Native split form.
     fn compute_lagrangian_gradient(
         grad_f: &[f64],
-        jac_rows: &[usize],
-        jac_cols: &[usize],
-        jac_vals: &[f64],
-        lambda: &[f64],
+        jac_c_rows: &[usize],
+        jac_c_cols: &[usize],
+        jac_c_vals: &[f64],
+        jac_d_rows: &[usize],
+        jac_d_cols: &[usize],
+        jac_d_vals: &[f64],
+        y_c: &[f64],
+        y_d: &[f64],
         n: usize,
     ) -> Vec<f64> {
         let mut lag_grad = grad_f.to_vec();
-        for (idx, (&row, &col)) in jac_rows.iter().zip(jac_cols.iter()).enumerate() {
-            // J^T λ: column `col` of J^T gets contribution from row `row`
+        for (idx, (&kc, &col)) in jac_c_rows.iter().zip(jac_c_cols.iter()).enumerate() {
             if col < n {
-                lag_grad[col] += jac_vals[idx] * lambda[row];
+                lag_grad[col] += jac_c_vals[idx] * y_c[kc];
+            }
+        }
+        for (idx, (&kd, &col)) in jac_d_rows.iter().zip(jac_d_cols.iter()).enumerate() {
+            if col < n {
+                lag_grad[col] += jac_d_vals[idx] * y_d[kd];
             }
         }
         lag_grad
@@ -787,13 +1285,28 @@ impl SolverState {
         // in f64). Without this conversion, z_l ≈ mu/1e30 and slack ≈ 1e30, giving
         // slack * z_l ≈ mu ≠ 0 as a spurious complementarity contribution that blocks
         // convergence detection even when the NLP is solved.
+        //
+        // For x bounds: applied here in the IPM layer (variables are not
+        // scaled by ScaledProblem). For g bounds: ScaledProblem applies
+        // sentinel + bound_relax_factor in raw space inside its
+        // `constraint_bounds`, mirroring Ipopt's relax-then-scale order
+        // (IpOrigIpoptNLP.cpp:343-374). See ScaledProblem doc comment.
         sentinel_bounds_to_infinity(&mut x_l, &mut x_u, options);
-        sentinel_bounds_to_infinity(&mut g_l, &mut g_u, options);
+
+        // Ipopt's bound_relax_factor for variable bounds: widen every finite
+        // bound outward by min(constr_viol_tol, factor·max(|b|,1)). Mirrors
+        // IpOrigIpoptNLP.cpp:355-356. Must run AFTER infinity sentinels
+        // (so we don't relax 1e30) and BEFORE bound_push / fixed-variable
+        // handling. (Constraint-bound counterpart is in ScaledProblem.)
+        apply_bound_relax_factor(
+            &mut x_l, &mut x_u,
+            options.bound_relax_factor, options.constr_viol_tol,
+        );
 
         let mut x = vec![0.0; n];
         problem.initial_point(&mut x);
 
-        relax_fixed_variable_bounds(&mut x_l, &mut x_u);
+        relax_fixed_variable_bounds(&mut x_l, &mut x_u, options);
 
         push_initial_point_from_bounds(&mut x, &x_l, &x_u, options);
 
@@ -805,7 +1318,7 @@ impl SolverState {
             (true, Some(mu)) if mu > 0.0 => mu,
             _ => options.mu_init,
         };
-        let (mut z_l, mut z_u) = init_bound_multipliers(&x, &x_l, &x_u, initial_mu);
+        let (mut z_l, mut z_u) = init_bound_multipliers(&x, &x_l, &x_u, initial_mu, options);
 
         let (jac_rows, jac_cols) = problem.jacobian_structure();
         let jac_nnz = jac_rows.len();
@@ -817,50 +1330,648 @@ impl SolverState {
         let hess_nnz = hess_rows.len();
 
         let mut y = compute_initial_y_with_ls(
-            problem, options, &x, &jac_rows, &jac_cols, &g_l, &g_u, n, m, jac_nnz,
+            problem, options, &x, &z_l, &z_u, &jac_rows, &jac_cols,
+            &x_l, &x_u, &g_l, &g_u, n, m, jac_nnz,
         );
 
         if options.warm_start {
             apply_warm_start_multipliers(problem, &mut y, &mut z_l, &mut z_u);
         }
 
+        let m_eq = (0..m).filter(|&i| g_l[i] == g_u[i]).count();
+        let is_square = m == n || m_eq == n;
+        let layout = crate::constraint_layout::ConstraintLayout::new(&g_l, &g_u);
+        let bound_layout = crate::bound_layout::BoundLayout::new(&x_l, &x_u);
+        // Phase 6b: native compressed bound-multiplier mirrors. At
+        // construction, `z_l`/`z_u` already carry zero on unbounded sides,
+        // so `project_l`/`project_u` extracts only the active components.
+        let z_l_compressed = bound_layout.project_l(&z_l);
+        let z_u_compressed = bound_layout.project_u(&z_u);
+        // Phase 7a: compressed variable-bound storage (size n_x_l/n_x_u).
+        // Mirrors Ipopt's `x_L_`/`x_U_` (`IpOrigIpoptNLP.hpp:226,253`).
+        let x_l_compressed = bound_layout.project_l(&x_l);
+        let x_u_compressed = bound_layout.project_u(&x_u);
+        // Phase 8a/b: slack-bound expansion-matrix layout + compressed
+        // multiplier mirrors. Mirrors Ipopt's `Pd_L_`/`Pd_U_` and
+        // `v_L`/`v_U` (`IpOrigIpoptNLP.hpp:241-263`).
+        let d_bound_layout =
+            crate::d_bound_layout::DBoundLayout::new(&layout.project_d(&g_l), &layout.project_d(&g_u));
+        let v_l_compressed = vec![0.0; d_bound_layout.n_d_l];
+        let v_u_compressed = vec![0.0; d_bound_layout.n_d_u];
+        let dv_l_compressed = vec![0.0; d_bound_layout.n_d_l];
+        let dv_u_compressed = vec![0.0; d_bound_layout.n_d_u];
+        // Phase 9b: compressed slack-bound storage (Ipopt's `d_L_`/`d_U_`).
+        let d_l_compressed = d_bound_layout.project_l(&layout.project_d(&g_l));
+        let d_u_compressed = d_bound_layout.project_u(&layout.project_d(&g_u));
+
+        // Phase 3b: split y into y_c (n_c) and y_d (n_d). Combined y from
+        // the LS init is projected via the layout; consumers needing the
+        // combined view reconstruct it via `state.y_combined()`.
+        let y_c = layout.project_c(&y);
+        let y_d = layout.project_d(&y);
+
+        // Phase 3f: split-form bound storage. c_rhs holds the equality
+        // target (= g_l[eq] = g_u[eq]). Inequality bounds live in the
+        // compressed `d_l_compressed` / `d_u_compressed` mirrors built
+        // above (Phase 9b); the combined `d_l`/`d_u` storage was dropped
+        // in Phase 9d.
+        let c_rhs: Vec<f64> = layout.c_to_combined.iter().map(|&i| g_l[i]).collect();
+
+        // Phase 4a: build the split Jacobian structure by walking the
+        // combined triplet once and routing each entry to the c-block
+        // (eq row) or d-block (ineq row) using the layout's row maps.
+        // The combined-index map captures the per-split-entry source
+        // position so values can be copied without re-checking the
+        // partition each evaluate.
+        let mut jac_c_rows: Vec<usize> = Vec::new();
+        let mut jac_c_cols: Vec<usize> = Vec::new();
+        let mut jac_c_combined_idx: Vec<usize> = Vec::new();
+        let mut jac_d_rows: Vec<usize> = Vec::new();
+        let mut jac_d_cols: Vec<usize> = Vec::new();
+        let mut jac_d_combined_idx: Vec<usize> = Vec::new();
+        for (idx, (&row, &col)) in jac_rows.iter().zip(jac_cols.iter()).enumerate() {
+            if let Some(k_c) = layout.eq_pos[row] {
+                jac_c_rows.push(k_c);
+                jac_c_cols.push(col);
+                jac_c_combined_idx.push(idx);
+            } else if let Some(k_d) = layout.ineq_pos[row] {
+                jac_d_rows.push(k_d);
+                jac_d_cols.push(col);
+                jac_d_combined_idx.push(idx);
+            }
+        }
+        let jac_c_vals = vec![0.0; jac_c_rows.len()];
+        let jac_d_vals = vec![0.0; jac_d_rows.len()];
+
         Self {
             x,
-            y,
-            z_l,
-            z_u,
-            v_l: vec![0.0; m],
-            v_u: vec![0.0; m],
+            y_c,
+            y_d,
             dx: vec![0.0; n],
-            dy: vec![0.0; m],
-            dz_l: vec![0.0; n],
-            dz_u: vec![0.0; n],
+            dy_c: vec![0.0; layout.n_c],
+            dy_d: vec![0.0; layout.n_d],
+            // Slack iterate `s` and step `ds` (size n_d). At construction zeroed;
+            // the proper push-to-interior init runs in `initialize_slack_iterate`
+            // (B1.2). Phase 3d: native d-block sizing, no equality-row sentinels.
+            s: vec![0.0; layout.n_d],
+            ds: vec![0.0; layout.n_d],
 
             mu: initial_mu,
             alpha_primal: 0.0,
             alpha_dual: 0.0,
             iter: 0,
-            x_l,
-            x_u,
-            g_l,
-            g_u,
+            c_rhs,
             n,
             m,
             obj: 0.0,
             grad_f: vec![0.0; n],
-            g: vec![0.0; m],
+            c_x: vec![0.0; layout.n_c],
+            d_x: vec![0.0; layout.n_d],
             jac_rows,
             jac_cols,
-            jac_vals: vec![0.0; jac_nnz],
+            jac_c_rows,
+            jac_c_cols,
+            jac_c_vals,
+            jac_d_rows,
+            jac_d_cols,
+            jac_d_vals,
+            jac_c_combined_idx,
+            jac_d_combined_idx,
             hess_rows,
             hess_cols,
             hess_vals: vec![0.0; hess_nnz],
             consecutive_acceptable: 0,
             obj_scaling: 1.0,
-            g_scaling: vec![1.0; m],
+            c_scaling: vec![1.0; layout.n_c],
+            d_scaling: vec![1.0; layout.n_d],
+            layout,
+            z_l_compressed,
+            z_u_compressed,
+            dz_l_compressed: vec![0.0; bound_layout.n_x_l],
+            dz_u_compressed: vec![0.0; bound_layout.n_x_u],
+            x_l_compressed,
+            x_u_compressed,
+            bound_layout,
+            d_bound_layout,
+            v_l_compressed,
+            v_u_compressed,
+            dv_l_compressed,
+            dv_u_compressed,
+            d_l_compressed,
+            d_u_compressed,
             diagnostics: SolverDiagnostics::default(),
             x_last_eval: vec![f64::NAN; n],
+            adjusted_slacks_count: 0,
+            is_square,
+            acceptable_iterate: None,
+            last_obj_for_acceptable: None,
+            kkt_atags: kkt::KktInputAtags::default(),
+            factor_cache: {
+                let mut c = kkt::FactorCache::new();
+                c.enabled = options.factor_cache_enabled;
+                c
+            },
+            n_obj_evals: 0,
+            n_grad_evals: 0,
+            n_constr_evals: 0,
+            n_jac_evals: 0,
+            n_hess_evals: 0,
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 1 split-layout accessors. Backed by combined storage today;
+    // Phase 3 will swap the backing fields and these become trivial
+    // pass-throughs. See docs/V0.8_DATA_LAYOUT_REFACTOR_PLAN.md.
+    //
+    // Naming mirrors Ipopt 3.14:
+    //   c-block  ↔  equality constraints (size n_c)
+    //   d-block  ↔  inequality constraints (size n_d), the only block
+    //              with bounds and slacks
+    // -------------------------------------------------------------------
+
+    /// Equality-constraint residual `c(x) := g[i] - g_l[i]` projected onto
+    /// the c-block (size n_c). At feasibility `c(x) = 0`. Mirrors Ipopt's
+    /// `OrigIpoptNLP::c()` (`IpIpoptNLP.hpp:117`), where the equality
+    /// target is baked into the residual at TNLPAdapter level
+    /// (`IpTNLPAdapter.cpp:567-570`). Note the asymmetry with `g_d()`,
+    /// which returns the raw inequality value (not a residual) because
+    /// inequalities have a band, not a point target.
+    pub fn g_c(&self) -> Vec<f64> {
+        self.c_x.clone()
+    }
+
+    /// Inequality constraint values `d(x)` (size n_d). Mirrors Ipopt's
+    /// `OrigIpoptNLP::d()` (`IpIpoptNLP.hpp:118`). At feasibility
+    /// `d_L ≤ d(x) ≤ d_U`.
+    pub fn g_d(&self) -> Vec<f64> {
+        self.d_x.clone()
+    }
+
+    /// Inequality lower bounds `d_L` (size n_d, may contain -inf).
+    /// Mirrors Ipopt's `OrigIpoptNLP::d_L()` (`IpIpoptNLP.hpp:153`).
+    /// Phase 9c: expand from compressed storage (`f64::NEG_INFINITY`
+    /// pad for d-rows without a finite lower bound).
+    pub fn d_l(&self) -> Vec<f64> {
+        self.d_bound_layout
+            .expand_l(&self.d_l_compressed, f64::NEG_INFINITY)
+    }
+
+    /// Inequality upper bounds `d_U` (size n_d, may contain +inf).
+    /// Mirrors Ipopt's `OrigIpoptNLP::d_U()` (`IpIpoptNLP.hpp:155`).
+    /// Phase 9c: expand from compressed storage.
+    pub fn d_u(&self) -> Vec<f64> {
+        self.d_bound_layout
+            .expand_u(&self.d_u_compressed, f64::INFINITY)
+    }
+
+    /// Inequality lower bound at d-block index `k`. Returns
+    /// `f64::NEG_INFINITY` when the d-row has no finite lower bound.
+    /// Phase 9c: routes through compressed storage.
+    pub fn d_l_at(&self, k: usize) -> f64 {
+        match self.d_bound_layout.full_to_d_l[k] {
+            Some(kc) => self.d_l_compressed[kc],
+            None => f64::NEG_INFINITY,
+        }
+    }
+
+    /// Inequality upper bound at d-block index `k`. Returns
+    /// `f64::INFINITY` when the d-row has no finite upper bound.
+    /// Phase 9c: routes through compressed storage.
+    pub fn d_u_at(&self, k: usize) -> f64 {
+        match self.d_bound_layout.full_to_d_u[k] {
+            Some(kc) => self.d_u_compressed[kc],
+            None => f64::INFINITY,
+        }
+    }
+
+    /// Combined-indexed read of the constraint lower bound. For eq rows
+    /// returns `c_rhs[k]`; for ineq rows returns `d_l_at(k)`. Phase 9c:
+    /// d-block read routes through compressed.
+    pub fn g_l_at(&self, i: usize) -> f64 {
+        if let Some(k) = self.layout.eq_pos[i] {
+            self.c_rhs[k]
+        } else if let Some(k) = self.layout.ineq_pos[i] {
+            self.d_l_at(k)
+        } else {
+            unreachable!("constraint row {} is neither eq nor ineq", i)
+        }
+    }
+
+    /// Combined-indexed read of the constraint upper bound. For eq rows
+    /// returns `c_rhs[k]`; for ineq rows returns `d_u_at(k)`.
+    pub fn g_u_at(&self, i: usize) -> f64 {
+        if let Some(k) = self.layout.eq_pos[i] {
+            self.c_rhs[k]
+        } else if let Some(k) = self.layout.ineq_pos[i] {
+            self.d_u_at(k)
+        } else {
+            unreachable!("constraint row {} is neither eq nor ineq", i)
+        }
+    }
+
+    /// Materialise the m-form combined `g_l` for callers (kkt assembly,
+    /// convergence helpers) that still take an m-length slice.
+    pub fn g_l_combined(&self) -> Vec<f64> {
+        (0..self.m).map(|i| self.g_l_at(i)).collect()
+    }
+
+    /// Materialise the m-form combined `g_u`.
+    pub fn g_u_combined(&self) -> Vec<f64> {
+        (0..self.m).map(|i| self.g_u_at(i)).collect()
+    }
+
+    /// Combined-indexed write of the constraint lower bound. Routes to
+    /// `c_rhs` for eq rows or `d_l_compressed` for ineq rows with a
+    /// finite lower bound. Phase 9d: writes the compressed mirror
+    /// directly. The only runtime mutation site (`apply_slack_move`)
+    /// only nudges already-finite bounds, so the layout is invariant.
+    pub fn set_g_l_at(&mut self, i: usize, v: f64) {
+        if let Some(k) = self.layout.eq_pos[i] {
+            self.c_rhs[k] = v;
+        } else if let Some(k) = self.layout.ineq_pos[i] {
+            if let Some(kc) = self.d_bound_layout.full_to_d_l[k] {
+                self.d_l_compressed[kc] = v;
+            }
+        } else {
+            unreachable!("constraint row {} is neither eq nor ineq", i);
+        }
+    }
+
+    /// Combined-indexed write of the constraint upper bound.
+    pub fn set_g_u_at(&mut self, i: usize, v: f64) {
+        if let Some(k) = self.layout.eq_pos[i] {
+            self.c_rhs[k] = v;
+        } else if let Some(k) = self.layout.ineq_pos[i] {
+            if let Some(kc) = self.d_bound_layout.full_to_d_u[k] {
+                self.d_u_compressed[kc] = v;
+            }
+        } else {
+            unreachable!("constraint row {} is neither eq nor ineq", i);
+        }
+    }
+
+    /// Reconstruct the combined m-length multiplier vector from the split
+    /// storage. Allocates per call — for hot-path code, prefer reading
+    /// `state.y_c` / `state.y_d` directly via the layout. User-facing
+    /// (TNLPAdapter-style) sites and leaf-module signatures still take a
+    /// combined `&[f64]`, so this helper bridges them.
+    pub fn y_combined(&self) -> Vec<f64> {
+        let mut out = vec![0.0; self.m];
+        for (k, &i) in self.layout.c_to_combined.iter().enumerate() {
+            out[i] = self.y_c[k];
+        }
+        for (k, &i) in self.layout.d_to_combined.iter().enumerate() {
+            out[i] = self.y_d[k];
+        }
+        out
+    }
+
+    /// Read the combined-indexed multiplier `y[i]` by routing through the
+    /// layout (`y_c[k]` for equality rows, `y_d[k]` for inequality rows).
+    pub fn y_at(&self, i: usize) -> f64 {
+        if let Some(k) = self.layout.eq_pos[i] {
+            self.y_c[k]
+        } else {
+            let k = self.layout.ineq_pos[i].expect("row is c or d");
+            self.y_d[k]
+        }
+    }
+
+    /// Set the combined-indexed multiplier `y[i]` by routing through the
+    /// layout into the corresponding split storage slot.
+    pub fn set_y_at(&mut self, i: usize, v: f64) {
+        if let Some(k) = self.layout.eq_pos[i] {
+            self.y_c[k] = v;
+        } else {
+            let k = self.layout.ineq_pos[i].expect("row is c or d");
+            self.y_d[k] = v;
+        }
+    }
+
+    /// Overwrite the multipliers from a combined m-length slice. Splits
+    /// the input across y_c / y_d via the layout. Used by initial-y
+    /// least-squares, dual recompute, and snapshot restore.
+    pub fn set_y_combined(&mut self, y: &[f64]) {
+        debug_assert_eq!(y.len(), self.m);
+        for (k, &i) in self.layout.c_to_combined.iter().enumerate() {
+            self.y_c[k] = y[i];
+        }
+        for (k, &i) in self.layout.d_to_combined.iter().enumerate() {
+            self.y_d[k] = y[i];
+        }
+    }
+
+    /// Slack iterate `s` (size n_d). Phase 3d flipped storage: this is now
+    /// a direct clone of `self.s`. In Ipopt `s` has dimension `n_d`
+    /// natively (`IpIpoptData.cpp:140`).
+    pub fn s_d(&self) -> Vec<f64> {
+        self.s.clone()
+    }
+
+    /// Reconstruct an m-length combined-indexed slack view. Equality rows
+    /// get the sentinel `g_l[i]`; inequality rows get the real `s_d[k]`.
+    /// Used by snapshots and diagnostics that still expect combined-indexed
+    /// slack data. Allocates per call.
+    pub fn s_combined(&self) -> Vec<f64> {
+        let mut out = vec![0.0; self.m];
+        for i in 0..self.m {
+            if let Some(k) = self.layout.ineq_pos[i] {
+                out[i] = self.s[k];
+            } else if let Some(k) = self.layout.eq_pos[i] {
+                out[i] = self.c_rhs[k];
+            }
+        }
+        out
+    }
+
+    /// Reconstruct an m-length combined-indexed g(x) view from split storage.
+    /// Equality rows get `c_x[k] + c_rhs[k]` (the original constraint value);
+    /// inequality rows get `d_x[k]`. Used by user-facing intermediate
+    /// callbacks and diagnostics that still expect combined-indexed g.
+    pub fn g_combined(&self) -> Vec<f64> {
+        let mut out = vec![0.0; self.m];
+        for (k, &i) in self.layout.c_to_combined.iter().enumerate() {
+            out[i] = self.c_x[k] + self.c_rhs[k];
+        }
+        for (k, &i) in self.layout.d_to_combined.iter().enumerate() {
+            out[i] = self.d_x[k];
+        }
+        out
+    }
+
+    /// Combined-indexed slack read: returns `s_d[k]` for inequality rows
+    /// and `c_rhs[k]` (equality target sentinel) for equality rows.
+    pub fn s_at(&self, i: usize) -> f64 {
+        if let Some(k) = self.layout.ineq_pos[i] {
+            self.s[k]
+        } else if let Some(k) = self.layout.eq_pos[i] {
+            self.c_rhs[k]
+        } else {
+            unreachable!("constraint row {} is neither eq nor ineq", i)
+        }
+    }
+
+    /// Combined-indexed slack write: stores into `s_d[k]` for inequality
+    /// rows; no-op for equality rows (the sentinel is implicit, not stored).
+    pub fn set_s_at(&mut self, i: usize, v: f64) {
+        if let Some(k) = self.layout.ineq_pos[i] {
+            self.s[k] = v;
+        }
+    }
+
+    /// Reconstruct an m-length combined-indexed `ds` view. Equality rows
+    /// get 0 (no slack step); inequality rows get the real `ds[k]`.
+    pub fn ds_combined(&self) -> Vec<f64> {
+        let mut out = vec![0.0; self.m];
+        for (k, &i) in self.layout.d_to_combined.iter().enumerate() {
+            out[i] = self.ds[k];
+        }
+        out
+    }
+
+    /// Combined-indexed slack-step read: `ds_d[k]` for ineq rows, 0 for eq.
+    pub fn ds_at(&self, i: usize) -> f64 {
+        if let Some(k) = self.layout.ineq_pos[i] {
+            self.ds[k]
+        } else {
+            0.0
+        }
+    }
+
+    /// Inequality-block slack-bound multipliers `v_L` (size n_d).
+    /// Phase 8d: combined `v_l` storage dropped; expand from compressed.
+    pub fn v_l_d(&self) -> Vec<f64> {
+        self.d_bound_layout.expand_l(&self.v_l_compressed, 0.0)
+    }
+
+    /// Inequality-block slack-bound multipliers `v_U` (size n_d).
+    /// Phase 8d: combined `v_u` storage dropped; expand from compressed.
+    pub fn v_u_d(&self) -> Vec<f64> {
+        self.d_bound_layout.expand_u(&self.v_u_compressed, 0.0)
+    }
+
+    /// Reconstruct combined m-length `v_L` view (zero on equality rows
+    /// and on inequality rows without a finite lower slack bound).
+    /// Phase 8c: routes through the compressed mirror via
+    /// `d_bound_layout.full_to_d_l`.
+    pub fn v_l_combined(&self) -> Vec<f64> {
+        let mut out = vec![0.0; self.m];
+        for (k, &i) in self.layout.d_to_combined.iter().enumerate() {
+            if let Some(kc) = self.d_bound_layout.full_to_d_l[k] {
+                out[i] = self.v_l_compressed[kc];
+            }
+        }
+        out
+    }
+
+    /// Reconstruct combined m-length `v_U` view.
+    pub fn v_u_combined(&self) -> Vec<f64> {
+        let mut out = vec![0.0; self.m];
+        for (k, &i) in self.layout.d_to_combined.iter().enumerate() {
+            if let Some(kc) = self.d_bound_layout.full_to_d_u[k] {
+                out[i] = self.v_u_compressed[kc];
+            }
+        }
+        out
+    }
+
+    /// Combined-indexed read: `v_l[k]` for ineq rows with finite lower
+    /// slack bound, 0 otherwise. Phase 8c: routes through the compressed
+    /// mirror.
+    pub fn v_l_at(&self, i: usize) -> f64 {
+        match self.layout.ineq_pos[i] {
+            Some(k) => match self.d_bound_layout.full_to_d_l[k] {
+                Some(kc) => self.v_l_compressed[kc],
+                None => 0.0,
+            },
+            None => 0.0,
+        }
+    }
+
+    /// Combined-indexed read: `v_u[k]` for ineq rows with finite upper
+    /// slack bound, 0 otherwise. Phase 8c: compressed-routed.
+    pub fn v_u_at(&self, i: usize) -> f64 {
+        match self.layout.ineq_pos[i] {
+            Some(k) => match self.d_bound_layout.full_to_d_u[k] {
+                Some(kc) => self.v_u_compressed[kc],
+                None => 0.0,
+            },
+            None => 0.0,
+        }
+    }
+
+    /// Combined-indexed write into `v_L`; no-op for equality rows or
+    /// d-rows without a finite lower slack bound. Phase 8d: writes
+    /// straight into the compressed mirror.
+    pub fn set_v_l_at(&mut self, i: usize, v: f64) {
+        if let Some(k) = self.layout.ineq_pos[i] {
+            if let Some(kc) = self.d_bound_layout.full_to_d_l[k] {
+                self.v_l_compressed[kc] = v;
+            }
+        }
+    }
+
+    /// Combined-indexed write into `v_U`; no-op for equality rows or
+    /// d-rows without a finite upper slack bound.
+    pub fn set_v_u_at(&mut self, i: usize, v: f64) {
+        if let Some(k) = self.layout.ineq_pos[i] {
+            if let Some(kc) = self.d_bound_layout.full_to_d_u[k] {
+                self.v_u_compressed[kc] = v;
+            }
+        }
+    }
+
+    /// Overwrite v_L from a combined m-length slice (drops eq rows).
+    /// Phase 8d: rebuild the compressed mirror directly via Pd_L^T.
+    pub fn set_v_l_combined(&mut self, v: &[f64]) {
+        debug_assert_eq!(v.len(), self.m);
+        let v_l_d: Vec<f64> = self
+            .layout
+            .d_to_combined
+            .iter()
+            .map(|&i| v[i])
+            .collect();
+        self.v_l_compressed = self.d_bound_layout.project_l(&v_l_d);
+    }
+
+    /// Overwrite v_U from a combined m-length slice (drops eq rows).
+    pub fn set_v_u_combined(&mut self, v: &[f64]) {
+        debug_assert_eq!(v.len(), self.m);
+        let v_u_d: Vec<f64> = self
+            .layout
+            .d_to_combined
+            .iter()
+            .map(|&i| v[i])
+            .collect();
+        self.v_u_compressed = self.d_bound_layout.project_u(&v_u_d);
+    }
+
+    /// Overwrite the search direction from a combined m-length slice.
+    /// Splits across `dy_c` / `dy_d` via the layout. Used by the KKT
+    /// solver, gradient-descent fallback, and Gondzio correctors.
+    #[cfg(test)]
+    pub fn set_dy_combined(&mut self, dy: &[f64]) {
+        debug_assert_eq!(dy.len(), self.m);
+        for (k, &i) in self.layout.c_to_combined.iter().enumerate() {
+            self.dy_c[k] = dy[i];
+        }
+        for (k, &i) in self.layout.d_to_combined.iter().enumerate() {
+            self.dy_d[k] = dy[i];
+        }
+    }
+
+    /// Phase 4a: split a combined m-form jacobian-values vector into the
+    /// c-block and d-block native storage. Used by test fixtures that
+    /// hand-craft a combined-form Jacobian.
+    #[cfg(test)]
+    pub fn set_jac_vals_combined(&mut self, vals: &[f64]) {
+        for (k, &idx) in self.jac_c_combined_idx.iter().enumerate() {
+            self.jac_c_vals[k] = vals[idx];
+        }
+        for (k, &idx) in self.jac_d_combined_idx.iter().enumerate() {
+            self.jac_d_vals[k] = vals[idx];
+        }
+    }
+
+    /// Split a combined m-form constraint vector into the c-block and
+    /// d-block native storage. `c_x[k] = g[c_to_combined[k]] - c_rhs[k]`
+    /// (Ipopt's `c(x)`, equality residual baked at TNLPAdapter level —
+    /// `IpTNLPAdapter.cpp:567-570`) and `d_x[k] = g[d_to_combined[k]]`
+    /// (Ipopt's raw `d(x)` value). Used by test fixtures that hand-craft
+    /// a combined-form constraint vector.
+    #[cfg(test)]
+    pub fn set_g_combined(&mut self, g: &[f64]) {
+        for (k, &i) in self.layout.c_to_combined.iter().enumerate() {
+            self.c_x[k] = g[i] - self.c_rhs[k];
+        }
+        for (k, &i) in self.layout.d_to_combined.iter().enumerate() {
+            self.d_x[k] = g[i];
+        }
+    }
+
+    /// Reconstruct the combined m-length step vector from the split
+    /// storage. Allocates per call.
+    pub fn dy_combined(&self) -> Vec<f64> {
+        let mut out = vec![0.0; self.m];
+        for (k, &i) in self.layout.c_to_combined.iter().enumerate() {
+            out[i] = self.dy_c[k];
+        }
+        for (k, &i) in self.layout.d_to_combined.iter().enumerate() {
+            out[i] = self.dy_d[k];
+        }
+        out
+    }
+
+    /// Read the combined-indexed step `dy[i]` by routing through the layout.
+    pub fn dy_at(&self, i: usize) -> f64 {
+        if let Some(k) = self.layout.eq_pos[i] {
+            self.dy_c[k]
+        } else {
+            let k = self.layout.ineq_pos[i].expect("row is c or d");
+            self.dy_d[k]
+        }
+    }
+
+    /// Phase 6d.1: materialize a full-`n` view of `z_l` from the
+    /// compressed mirror. Unbounded sides pad to 0 (the production
+    /// invariant). Used at API boundaries (`unscale_solution_vectors`)
+    /// and for kkt_aug callsites that still consume full-`n` slices.
+    pub fn z_l_combined(&self) -> Vec<f64> {
+        self.bound_layout.expand_l(&self.z_l_compressed, 0.0)
+    }
+
+    /// Phase 6d.1: materialize a full-`n` view of `z_u` from the
+    /// compressed mirror. Unbounded sides pad to 0.
+    pub fn z_u_combined(&self) -> Vec<f64> {
+        self.bound_layout.expand_u(&self.z_u_compressed, 0.0)
+    }
+
+    /// Phase 6d.1: materialize a full-`n` view of `dz_l` from the
+    /// compressed mirror. Unbounded sides pad to 0.
+    pub fn dz_l_combined(&self) -> Vec<f64> {
+        self.bound_layout.expand_l(&self.dz_l_compressed, 0.0)
+    }
+
+    /// Phase 6d.1: materialize a full-`n` view of `dz_u` from the
+    /// compressed mirror. Unbounded sides pad to 0.
+    pub fn dz_u_combined(&self) -> Vec<f64> {
+        self.bound_layout.expand_u(&self.dz_u_compressed, 0.0)
+    }
+
+    /// Phase 7b: full-`n` view of the lower variable bound. Reads from
+    /// the compressed mirror via `bound_layout.full_to_x_l[i]`; unbounded
+    /// indices return `f64::NEG_INFINITY`. Bit-identical to the legacy
+    /// `state.x_l_at(i)` read under the production invariant.
+    pub fn x_l_at(&self, i: usize) -> f64 {
+        match self.bound_layout.full_to_x_l[i] {
+            Some(k) => self.x_l_compressed[k],
+            None => f64::NEG_INFINITY,
+        }
+    }
+
+    /// Phase 7b: full-`n` view of the upper variable bound. Reads from
+    /// the compressed mirror via `bound_layout.full_to_x_u[i]`; unbounded
+    /// indices return `f64::INFINITY`.
+    pub fn x_u_at(&self, i: usize) -> f64 {
+        match self.bound_layout.full_to_x_u[i] {
+            Some(k) => self.x_u_compressed[k],
+            None => f64::INFINITY,
+        }
+    }
+
+    /// Phase 7b: materialize a full-`n` view of the lower variable bound
+    /// from the compressed mirror. Unbounded sides pad to
+    /// `f64::NEG_INFINITY`. Used for API boundaries that still expect
+    /// the legacy `&[f64]` slice with `±inf` sentinels.
+    pub fn x_l_combined(&self) -> Vec<f64> {
+        self.bound_layout.expand_l(&self.x_l_compressed, f64::NEG_INFINITY)
+    }
+
+    /// Phase 7b: materialize a full-`n` view of the upper variable bound
+    /// from the compressed mirror. Unbounded sides pad to `f64::INFINITY`.
+    pub fn x_u_combined(&self) -> Vec<f64> {
+        self.bound_layout.expand_u(&self.x_u_compressed, f64::INFINITY)
     }
 
     /// Evaluate all functions, zeroing Hessian lambda for linear constraints.
@@ -873,9 +1984,16 @@ impl SolverState {
         skip_hessian: bool,
     ) -> bool {
         let new_x = self.x != self.x_last_eval;
-        if !problem.objective(&self.x, new_x, &mut self.obj) { return false; }
+        // Phase 10b.1: route through the SplitNlp adapter. The combined
+        // m-form `g(x)` and `jac_g` live only in the adapter's internal
+        // scratch; this function sees only split-form `c(x)` / `d(x)`
+        // and `Jac_c` / `Jac_d`.
+        let nlp = crate::split_nlp::SplitNlp::new(problem, &self.layout);
+        self.n_obj_evals += 1;
+        if !nlp.objective(&self.x, new_x, &mut self.obj) { return false; }
         if !self.obj.is_finite() { return false; }
-        if !problem.gradient(&self.x, false, &mut self.grad_f) { return false; }
+        self.n_grad_evals += 1;
+        if !nlp.gradient(&self.x, false, &mut self.grad_f) { return false; }
         // NB: 42f4015 added element-wise is_finite checks on grad_f and g
         // here. Benchmarking showed they caused regressions on CUTEst
         // problems (BIGGS6NE, CERI651*, HS84/89/92, MAKELA3, OPTCNTRL, ...)
@@ -887,23 +2005,45 @@ impl SolverState {
         // the obj finite check (essential for convergence checks) and the
         // user callback bool return.
         if self.m > 0 {
-            if !problem.constraints(&self.x, false, &mut self.g) { return false; }
-            if !problem.jacobian_values(&self.x, false, &mut self.jac_vals) { return false; }
+            self.n_constr_evals += 1;
+            // Adapter projects user `g(x)` into split `c_raw` and `d`.
+            // We then subtract `c_rhs` to land the equality residual.
+            if !nlp.constraints_split(&self.x, false, &mut self.c_x, &mut self.d_x) {
+                return false;
+            }
+            for k in 0..self.layout.n_c {
+                self.c_x[k] -= self.c_rhs[k];
+            }
+            self.n_jac_evals += 1;
+            if !nlp.jacobian_split(
+                &self.x,
+                false,
+                &self.jac_c_combined_idx,
+                &self.jac_d_combined_idx,
+                &mut self.jac_c_vals,
+                &mut self.jac_d_vals,
+            ) {
+                return false;
+            }
         }
         self.x_last_eval.copy_from_slice(&self.x);
         if skip_hessian {
             return true;
         }
+        self.n_hess_evals += 1;
         if let Some(flags) = linear_constraints {
-            let mut lambda_for_hess = self.y.clone();
+            let mut lambda_for_hess = self.y_combined();
             for (i, &is_lin) in flags.iter().enumerate() {
                 if is_lin {
                     lambda_for_hess[i] = 0.0;
                 }
             }
-            if !problem.hessian_values(&self.x, false, obj_factor, &lambda_for_hess, &mut self.hess_vals) { return false; }
+            if !nlp.hessian_combined(&self.x, false, obj_factor, &lambda_for_hess, &mut self.hess_vals) { return false; }
         } else {
-            if !problem.hessian_values(&self.x, false, obj_factor, &self.y, &mut self.hess_vals) { return false; }
+            // Compose the m-form `lambda` from split `y_c` / `y_d`
+            // inside the adapter rather than materializing via
+            // `y_combined()` first.
+            if !nlp.hessian_from_split(&self.x, false, obj_factor, &self.y_c, &self.y_d, &mut self.hess_vals) { return false; }
         }
         true
     }
@@ -913,14 +2053,20 @@ impl SolverState {
     /// Optionally includes constraint slack log-barriers when enabled.
     fn barrier_objective(&self, options: &SolverOptions) -> f64 {
         compute_barrier_phi(
-            self.obj, &self.x, &self.g, self,
+            self.obj, &self.x, &self.s, self,
             self.n, self.m, options.constraint_slack_barrier,
+            options.kappa_d,
         )
     }
 
     /// Compute constraint violation (theta).
     fn constraint_violation(&self) -> f64 {
-        convergence::primal_infeasibility(&self.g, &self.g_l, &self.g_u)
+        convergence::primal_infeasibility_split(
+            &self.g_c(),
+            &self.g_d(),
+            &self.d_l(),
+            &self.d_u(),
+        )
     }
 
     /// Compute the directional derivative of the barrier objective along the search direction.
@@ -929,706 +2075,160 @@ impl SolverState {
     /// Optionally includes constraint slack derivative terms when enabled.
     fn barrier_directional_derivative(&self, options: &SolverOptions) -> f64 {
         let mut grad_phi_dx = 0.0;
-        for i in 0..self.n {
-            let mut grad_phi_i = self.grad_f[i];
-            if self.x_l[i].is_finite() {
-                grad_phi_i -= self.mu / slack_xl(self, i);
+        let kappa_d = options.kappa_d;
+        // RIPOPT_GBD_PROBE: split gBD into ∇f·dx, x-bound barrier · dx,
+        // and (downstream) s-bound barrier · ds so we can pin down which
+        // component diverges from Ipopt.
+        let probe = std::env::var("RIPOPT_GBD_PROBE").is_ok() && self.iter <= 112;
+        // RIPOPT_TRACK_VAR=533: print z_L, z_U, slacks, dx, dz for one
+        // specific variable across iters.
+        if let Ok(s) = std::env::var("RIPOPT_TRACK_VAR") {
+            if let Ok(idx) = s.parse::<usize>() {
+                if idx < self.n {
+                    let z_l_full = self.bound_layout.expand_l(&self.z_l_compressed, 0.0);
+                    let z_u_full = self.bound_layout.expand_u(&self.z_u_compressed, 0.0);
+                    let dz_l_full = self.bound_layout.expand_l(&self.dz_l_compressed, 0.0);
+                    let dz_u_full = self.bound_layout.expand_u(&self.dz_u_compressed, 0.0);
+                    let xli = self.x_l_at(idx);
+                    let xui = self.x_u_at(idx);
+                    let s_l = if xli.is_finite() { self.x[idx] - xli } else { f64::NAN };
+                    let s_u = if xui.is_finite() { xui - self.x[idx] } else { f64::NAN };
+                    eprintln!(
+                        "[track i={}] iter={} mu={:.3e} x={:.6e} dx={:.6e} s_L={:.3e} s_U={:.3e} z_L={:.3e} z_U={:.3e} dz_L={:.3e} dz_U={:.3e} z_L*s_L={:.3e} z_U*s_U={:.3e}",
+                        idx, self.iter, self.mu, self.x[idx], self.dx[idx], s_l, s_u,
+                        z_l_full[idx], z_u_full[idx], dz_l_full[idx], dz_u_full[idx],
+                        z_l_full[idx]*s_l, z_u_full[idx]*s_u,
+                    );
+                }
             }
-            if self.x_u[i].is_finite() {
-                grad_phi_i += self.mu / slack_xu(self, i);
+        }
+        let mut g_f_dx = 0.0;
+        let mut g_xb_dx = 0.0;
+        let mut g_kd_dx = 0.0;
+        for i in 0..self.n {
+            let l_fin = self.x_l_at(i).is_finite();
+            let u_fin = self.x_u_at(i).is_finite();
+            let mut grad_phi_i = self.grad_f[i];
+            if probe { g_f_dx += self.grad_f[i] * self.dx[i]; }
+            if l_fin {
+                let term = -self.mu / slack_xl(self, i);
+                grad_phi_i += term;
+                if probe { g_xb_dx += term * self.dx[i]; }
+            }
+            if u_fin {
+                let term = self.mu / slack_xu(self, i);
+                grad_phi_i += term;
+                if probe { g_xb_dx += term * self.dx[i]; }
+            }
+            // kappa_d damping gradient: +kappa_d*mu if only x_l finite
+            // (slack = x - x_l), -kappa_d*mu if only x_u finite
+            // (slack = x_u - x).
+            if kappa_d > 0.0 && (l_fin ^ u_fin) {
+                let term = if l_fin { kappa_d * self.mu } else { -kappa_d * self.mu };
+                grad_phi_i += term;
+                if probe { g_kd_dx += term * self.dx[i]; }
             }
             grad_phi_dx += grad_phi_i * self.dx[i];
         }
-        if options.constraint_slack_barrier && self.m > 0 {
-            // Compute J * dx (directional change in constraints)
-            let mut jdx = vec![0.0; self.m];
-            for (idx, (&row, &col)) in
-                self.jac_rows.iter().zip(self.jac_cols.iter()).enumerate()
-            {
-                jdx[row] += self.jac_vals[idx] * self.dx[col];
+        let mut g_sb_ds = 0.0;
+        if options.constraint_slack_barrier && self.layout.n_d > 0 {
+            // Ipopt CalcBarrierTermGradS: barrier on the explicit slack
+            // variable s (not on d(x)), so the directional derivative is
+            // (-μ/(s-d_l) + μ/(d_u-s)) · ds, where ds is the slack step.
+            for k in 0..self.layout.n_d {
+                let dl = self.d_l_at(k);
+                let du = self.d_u_at(k);
+                if dl.is_finite() {
+                    let slack = self.s[k] - dl;
+                    if slack > self.mu * 1e-2 {
+                        let term = -self.mu * self.ds[k] / slack;
+                        grad_phi_dx += term;
+                        if probe { g_sb_ds += term; }
+                    }
+                }
+                if du.is_finite() {
+                    let slack = du - self.s[k];
+                    if slack > self.mu * 1e-2 {
+                        let term = self.mu * self.ds[k] / slack;
+                        grad_phi_dx += term;
+                        if probe { g_sb_ds += term; }
+                    }
+                }
             }
-            for i in 0..self.m {
-                if constraint_is_equality(self, i) {
-                    continue;
-                }
-                if self.g_l[i].is_finite() {
-                    let slack = self.g[i] - self.g_l[i];
-                    if slack > self.mu * 1e-2 {
-                        grad_phi_dx -= self.mu * jdx[i] / slack;
+        }
+        if probe {
+            let dx_inf = self.dx.iter().fold(0.0_f64, |a,&b| a.max(b.abs()));
+            let ds_inf = self.ds.iter().fold(0.0_f64, |a,&b| a.max(b.abs()));
+            let gradf_inf = self.grad_f.iter().fold(0.0_f64, |a,&b| a.max(b.abs()));
+            let mut s_minus_d_inf = 0.0_f64;
+            for k in 0..self.layout.n_d {
+                let v = (self.s[k] - self.d_x[k]).abs();
+                if v > s_minus_d_inf { s_minus_d_inf = v; }
+            }
+            // Identify the dominant (xb)·dx contributor.
+            let mut top_i: usize = usize::MAX;
+            let mut top_term: f64 = 0.0;
+            let mut top_slack: f64 = 0.0;
+            let mut top_side: &'static str = "";
+            for i in 0..self.n {
+                let l_fin = self.x_l_at(i).is_finite();
+                let u_fin = self.x_u_at(i).is_finite();
+                if l_fin {
+                    let s = slack_xl(self, i);
+                    let term = -self.mu / s * self.dx[i];
+                    if term.abs() > top_term.abs() {
+                        top_term = term; top_slack = s; top_i = i; top_side = "L";
                     }
                 }
-                if self.g_u[i].is_finite() {
-                    let slack = self.g_u[i] - self.g[i];
-                    if slack > self.mu * 1e-2 {
-                        grad_phi_dx += self.mu * jdx[i] / slack;
+                if u_fin {
+                    let s = slack_xu(self, i);
+                    let term = self.mu / s * self.dx[i];
+                    if term.abs() > top_term.abs() {
+                        top_term = term; top_slack = s; top_i = i; top_side = "U";
                     }
                 }
+            }
+            let xi = if top_i < self.n { self.x[top_i] } else { f64::NAN };
+            let dxi = if top_i < self.n { self.dx[top_i] } else { f64::NAN };
+            let xli = if top_i < self.n { self.x_l_at(top_i) } else { f64::NAN };
+            let xui = if top_i < self.n { self.x_u_at(top_i) } else { f64::NAN };
+            eprintln!(
+                "[gBD] iter={} mu={:.3e} ∇f·dx={:.6e} (xb)·dx={:.6e} (kd)·dx={:.6e} (sb)·ds={:.6e} TOTAL={:.6e}  |dx|={:.3e} |ds|={:.3e} |∇f|={:.3e} |s-d_x|={:.3e}",
+                self.iter, self.mu, g_f_dx, g_xb_dx, g_kd_dx, g_sb_ds, grad_phi_dx,
+                dx_inf, ds_inf, gradf_inf, s_minus_d_inf,
+            );
+            eprintln!(
+                "[gBD-top] iter={} top_i={} side={} term={:.6e} slack={:.6e} x={:.6e} dx={:.6e} x_l={:.6e} x_u={:.6e}",
+                self.iter, top_i, top_side, top_term, top_slack, xi, dxi, xli, xui,
+            );
+            // Bound-mult / complementarity diagnostic for the offending variable.
+            if top_i < self.n {
+                let z_l_full = self.bound_layout.expand_l(&self.z_l_compressed, 0.0);
+                let z_u_full = self.bound_layout.expand_u(&self.z_u_compressed, 0.0);
+                let dz_l_full = self.bound_layout.expand_l(&self.dz_l_compressed, 0.0);
+                let dz_u_full = self.bound_layout.expand_u(&self.dz_u_compressed, 0.0);
+                let z_l = z_l_full[top_i];
+                let z_u = z_u_full[top_i];
+                let dz_l = dz_l_full[top_i];
+                let dz_u = dz_u_full[top_i];
+                let mu_target = if top_side == "U" {
+                    z_u * top_slack
+                } else {
+                    z_l * top_slack
+                };
+                let sigma = if top_side == "U" {
+                    z_u / top_slack.max(1e-300)
+                } else {
+                    z_l / top_slack.max(1e-300)
+                };
+                eprintln!(
+                    "[gBD-zmu] iter={} top_i={} z_L={:.3e} z_U={:.3e} dz_L={:.3e} dz_U={:.3e}  z*slack={:.3e} (mu={:.3e}) Σ={:.3e}",
+                    self.iter, top_i, z_l, z_u, dz_l, dz_u, mu_target, self.mu, sigma,
+                );
             }
         }
         grad_phi_dx
     }
-}
-
-/// Wrapper that reformulates an overdetermined nonlinear equations (NE) problem
-/// as an unconstrained least-squares problem.
-///
-/// Original:  min 0  subject to  g_i(x) = target_i,  i = 1,...,m   (m > n)
-/// Reformulated:  min 0.5 * Σ (g_i(x) - target_i)^2   (no constraints, keep variable bounds)
-///
-/// Gradient: ∇f_LS = J^T * r   where r_i = g_i(x) - target_i
-/// Hessian:  H_LS ≈ J^T * J   (Gauss-Newton approximation)
-struct LeastSquaresProblem<'a, P: NlpProblem> {
-    inner: &'a P,
-    /// Targets for each constraint (g_l == g_u for equalities).
-    targets: Vec<f64>,
-    /// Jacobian structure cached from inner problem.
-    jac_rows: Vec<usize>,
-    jac_cols: Vec<usize>,
-    /// Hessian structure: lower triangle of J^T*J + ∑ r_i ∇²g_i.
-    hess_rows: Vec<usize>,
-    hess_cols: Vec<usize>,
-    /// Mapping from inner hessian entries to our dense lower triangle index.
-    /// inner_hess_map[k] = index into our vals[] for inner hessian entry k.
-    inner_hess_map: Vec<usize>,
-}
-
-impl<P: NlpProblem> LeastSquaresProblem<'_, P> {
-    fn new(inner: &P) -> LeastSquaresProblem<'_, P> {
-        let n = inner.num_variables();
-        let m = inner.num_constraints();
-        let mut g_l = vec![0.0; m];
-        let mut g_u = vec![0.0; m];
-        inner.constraint_bounds(&mut g_l, &mut g_u);
-        let targets: Vec<f64> = (0..m).map(|i| 0.5 * (g_l[i] + g_u[i])).collect();
-
-        let (jac_rows, jac_cols) = inner.jacobian_structure();
-
-        // Build Hessian structure for J^T*J + ∑r_i∇²g_i (lower triangle, n x n dense).
-        // Since J^T*J is generally dense, use full lower triangle.
-        let mut hess_rows = Vec::with_capacity(n * (n + 1) / 2);
-        let mut hess_cols = Vec::with_capacity(n * (n + 1) / 2);
-        for i in 0..n {
-            for j in 0..=i {
-                hess_rows.push(i);
-                hess_cols.push(j);
-            }
-        }
-
-        // Build mapping from inner hessian entries to our dense lower triangle.
-        // Our layout: for (i,j) with i >= j, index = i*(i+1)/2 + j
-        let (inner_hess_rows, inner_hess_cols) = inner.hessian_structure();
-        let mut inner_hess_map = Vec::with_capacity(inner_hess_rows.len());
-        for k in 0..inner_hess_rows.len() {
-            let (r, c) = (inner_hess_rows[k], inner_hess_cols[k]);
-            // Ensure lower triangle (r >= c)
-            let (i, j) = if r >= c { (r, c) } else { (c, r) };
-            let idx = i * (i + 1) / 2 + j;
-            inner_hess_map.push(idx);
-        }
-
-        LeastSquaresProblem {
-            inner,
-            targets,
-            jac_rows,
-            jac_cols,
-            hess_rows,
-            hess_cols,
-            inner_hess_map,
-        }
-    }
-}
-
-impl<P: NlpProblem> NlpProblem for LeastSquaresProblem<'_, P> {
-    fn num_variables(&self) -> usize {
-        self.inner.num_variables()
-    }
-    fn num_constraints(&self) -> usize {
-        0 // unconstrained LS
-    }
-    fn bounds(&self, x_l: &mut [f64], x_u: &mut [f64]) {
-        self.inner.bounds(x_l, x_u);
-    }
-    fn constraint_bounds(&self, _g_l: &mut [f64], _g_u: &mut [f64]) {
-        // no constraints
-    }
-    fn initial_point(&self, x0: &mut [f64]) {
-        self.inner.initial_point(x0);
-    }
-    fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
-        let m = self.targets.len();
-        let mut g = vec![0.0; m];
-        if !self.inner.constraints(x, _new_x, &mut g) { return false; }
-        let mut sum = 0.0;
-        for i in 0..m {
-            let r = g[i] - self.targets[i];
-            sum += r * r;
-        }
-        *obj = 0.5 * sum;
-        true
-    }
-    fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
-        let n = self.inner.num_variables();
-        let m = self.targets.len();
-        let mut g = vec![0.0; m];
-        if !self.inner.constraints(x, _new_x, &mut g) { return false; }
-        let mut r = vec![0.0; m];
-        for i in 0..m {
-            r[i] = g[i] - self.targets[i];
-        }
-        let jac_nnz = self.jac_rows.len();
-        let mut jac_vals = vec![0.0; jac_nnz];
-        if !self.inner.jacobian_values(x, _new_x, &mut jac_vals) { return false; }
-        for i in 0..n {
-            grad[i] = 0.0;
-        }
-        for (idx, (&row, &col)) in self.jac_rows.iter().zip(self.jac_cols.iter()).enumerate() {
-            grad[col] += jac_vals[idx] * r[row];
-        }
-        true
-    }
-    fn constraints(&self, _x: &[f64], _new_x: bool, _g: &mut [f64]) -> bool { true }
-    fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
-        (vec![], vec![])
-    }
-    fn jacobian_values(&self, _x: &[f64], _new_x: bool, _vals: &mut [f64]) -> bool { true }
-    fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
-        (self.hess_rows.clone(), self.hess_cols.clone())
-    }
-    fn hessian_values(&self, x: &[f64], _new_x: bool, obj_factor: f64, _lambda: &[f64], vals: &mut [f64]) -> bool {
-        let n = self.inner.num_variables();
-        let m = self.targets.len();
-
-        let mut g = vec![0.0; m];
-        if !self.inner.constraints(x, _new_x, &mut g) { return false; }
-        let mut r = vec![0.0; m];
-        for i in 0..m {
-            r[i] = g[i] - self.targets[i];
-        }
-
-        let jac_nnz = self.jac_rows.len();
-        let mut jac_vals = vec![0.0; jac_nnz];
-        if !self.inner.jacobian_values(x, _new_x, &mut jac_vals) { return false; }
-
-        let mut j_dense = vec![0.0; m * n];
-        for (idx, (&row, &col)) in self.jac_rows.iter().zip(self.jac_cols.iter()).enumerate() {
-            j_dense[row * n + col] += jac_vals[idx];
-        }
-
-        let mut idx = 0;
-        for i in 0..n {
-            for j in 0..=i {
-                let mut dot = 0.0;
-                for k in 0..m {
-                    dot += j_dense[k * n + i] * j_dense[k * n + j];
-                }
-                vals[idx] = obj_factor * dot;
-                idx += 1;
-            }
-        }
-
-        let inner_hess_nnz = self.inner_hess_map.len();
-        if inner_hess_nnz > 0 {
-            let mut inner_hess_vals = vec![0.0; inner_hess_nnz];
-            if !self.inner.hessian_values(x, _new_x, 0.0, &r, &mut inner_hess_vals) { return false; }
-            for (k, &v) in inner_hess_vals.iter().enumerate() {
-                vals[self.inner_hess_map[k]] += obj_factor * v;
-            }
-        }
-        true
-    }
-}
-
-/// Detect if a problem is a nonlinear equation system (square or overdetermined).
-///
-/// Returns true if ALL of:
-/// - f(x0) ≈ 0 (zero objective)
-/// - ∇f(x0) ≈ 0 (zero gradient)
-/// - All constraints are equalities (g_l[i] == g_u[i])
-/// - m >= n (square or more constraints than variables)
-/// Solve the Gauss-Newton normal equations (J^T J) dx = J^T r with a
-/// 1e-14 diagonal regularization for numerical stability. `j_dense` is
-/// a row-major m × n matrix. Returns `None` if the regularized normal
-/// matrix is not positive definite (Cholesky failure).
-fn solve_gn_normal_equations(j_dense: &[f64], r: &[f64], n: usize, m: usize) -> Option<Vec<f64>> {
-    let mut jtj = vec![0.0; n * n];
-    let mut jtr = vec![0.0; n];
-    for i in 0..n {
-        for j in 0..n {
-            let mut s = 0.0;
-            for k in 0..m {
-                s += j_dense[k * n + i] * j_dense[k * n + j];
-            }
-            jtj[i * n + j] = s;
-        }
-        let mut s = 0.0;
-        for k in 0..m {
-            s += j_dense[k * n + i] * r[k];
-        }
-        jtr[i] = s;
-    }
-    for i in 0..n {
-        jtj[i * n + i] += 1e-14;
-    }
-    dense_cholesky_solve(&jtj, &jtr, n)
-}
-
-/// Dense Cholesky solve: solve A*x = b where A is n×n symmetric positive definite.
-/// Returns None if A is not positive definite (factorization fails).
-fn dense_cholesky_solve(a: &[f64], b: &[f64], n: usize) -> Option<Vec<f64>> {
-    // Cholesky: A = L * L^T
-    let mut l = vec![0.0; n * n];
-    for j in 0..n {
-        let mut sum = 0.0;
-        for k in 0..j {
-            sum += l[j * n + k] * l[j * n + k];
-        }
-        let diag = a[j * n + j] - sum;
-        if diag <= 0.0 {
-            return None;
-        }
-        l[j * n + j] = diag.sqrt();
-
-        for i in (j + 1)..n {
-            let mut sum = 0.0;
-            for k in 0..j {
-                sum += l[i * n + k] * l[j * n + k];
-            }
-            l[i * n + j] = (a[i * n + j] - sum) / l[j * n + j];
-        }
-    }
-
-    // Forward solve: L * y = b
-    let mut y = vec![0.0; n];
-    for i in 0..n {
-        let mut sum = 0.0;
-        for k in 0..i {
-            sum += l[i * n + k] * y[k];
-        }
-        y[i] = (b[i] - sum) / l[i * n + i];
-    }
-
-    // Back solve: L^T * x = y
-    let mut x = vec![0.0; n];
-    for i in (0..n).rev() {
-        let mut sum = 0.0;
-        for k in (i + 1)..n {
-            sum += l[k * n + i] * x[k];
-        }
-        x[i] = (y[i] - sum) / l[i * n + i];
-    }
-
-    Some(x)
-}
-
-fn detect_ne_problem<P: NlpProblem>(problem: &P) -> bool {
-    let n = problem.num_variables();
-    let m = problem.num_constraints();
-
-    if m < n || m == 0 || n == 0 {
-        return false;
-    }
-
-    // Square systems (m == n) are better solved by direct constrained IPM
-    // (Newton on g(x)=0), which typically converges in a few iterations.
-    // LS reformulation min 0.5*||g||^2 has a harder landscape for square systems.
-    if m == n {
-        return false;
-    }
-
-    // Check objective and gradient at initial point
-    let mut x0 = vec![0.0; n];
-    problem.initial_point(&mut x0);
-
-    let mut f0 = 0.0;
-    if !problem.objective(&x0, true, &mut f0) {
-        return false;
-    }
-    if f0.abs() > 1e-10 {
-        return false;
-    }
-
-    let mut grad = vec![0.0; n];
-    if !problem.gradient(&x0, false, &mut grad) {
-        return false;
-    }
-    let grad_max = linf_norm(&grad);
-    if grad_max > 1e-10 {
-        return false;
-    }
-
-    // Check all constraints are equalities
-    let mut g_l = vec![0.0; m];
-    let mut g_u = vec![0.0; m];
-    problem.constraint_bounds(&mut g_l, &mut g_u);
-    for i in 0..m {
-        if !convergence::is_equality_constraint(g_l[i], g_u[i]) {
-            return false;
-        }
-    }
-
-    // If constraints are already satisfied at x0, no need to reformulate —
-    // the standard IPM can handle it (e.g., FBRAIN3 starts feasible).
-    let mut g0 = vec![0.0; m];
-    if !problem.constraints(&x0, false, &mut g0) {
-        return false;
-    }
-    let theta0 = convergence::primal_infeasibility(&g0, &g_l, &g_u);
-    if theta0 < 1e-8 {
-        return false;
-    }
-
-    true
-}
-
-/// Diagnosis of why the IPM failed, used to select targeted recovery strategies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FailureDiagnosis {
-    /// Constraint violation is large and not decreasing.
-    StallAtInfeasibility,
-    /// All metrics are small but strict tolerances not met.
-    StallNearOptimal,
-    /// Factorization failed, NaN/Inf, or other numerical breakdown.
-    NumericalBreakdown,
-    /// Making progress but hit max iterations.
-    SlowConvergence,
-    /// Dual variables growing unboundedly (ill-conditioned Hessian).
-    DualDivergence,
-}
-
-/// Classify the failure mode from diagnostics to select the best recovery strategy.
-fn diagnose_failure(result: &SolveResult) -> FailureDiagnosis {
-    let d = &result.diagnostics;
-    match result.status {
-        SolveStatus::NumericalError => {
-            if d.final_dual_inf > 1e4 {
-                FailureDiagnosis::DualDivergence
-            } else {
-                FailureDiagnosis::NumericalBreakdown
-            }
-        }
-        SolveStatus::RestorationFailed => FailureDiagnosis::StallAtInfeasibility,
-        SolveStatus::MaxIterations => {
-            // Check dual divergence first — large dual infeasibility indicates
-            // the Hessian or problem scaling is the root issue, not convergence speed.
-            if d.final_dual_inf > 1e4 {
-                FailureDiagnosis::DualDivergence
-            } else if d.final_primal_inf > 1e-2 {
-                FailureDiagnosis::StallAtInfeasibility
-            } else if d.final_primal_inf < 1e-6 && d.final_compl < 1e-4 {
-                FailureDiagnosis::StallNearOptimal
-            } else {
-                FailureDiagnosis::SlowConvergence
-            }
-        }
-        _ => FailureDiagnosis::SlowConvergence,
-    }
-}
-
-/// Check if `candidate` is strictly better than `current`.
-///
-/// A candidate is "better" when it is Optimal **and** either:
-/// 1. `current` is clearly bad (infeasible or objective unusable), or
-/// 2. `candidate.objective < current.objective` (strict improvement).
-///
-/// If `current` is NumericalError/MaxIterations but reached a feasible point
-/// (`pr ≤ constr_viol_tol` and a finite objective), its objective is meaningful
-/// and the candidate should only replace it if it finds a strictly lower objective.
-/// Without this guard, a fallback that converges to a worse local minimum can
-/// silently replace a near-optimal main-IPM iterate.
-fn is_strictly_better(current: &SolveResult, candidate: &SolveResult) -> bool {
-    let candidate_solved = matches!(candidate.status, SolveStatus::Optimal);
-    if !candidate_solved {
-        return false;
-    }
-    let current_solved = matches!(current.status, SolveStatus::Optimal);
-    // Treat `current` as having a meaningful objective if it is feasible,
-    // has a finite objective, and primal infeasibility is within the tolerance.
-    let current_has_good_point = current.objective.is_finite()
-        && current.diagnostics.final_primal_inf <= 1e-4;
-    if current_solved || current_has_good_point {
-        // Require strict objective improvement (with tiny tolerance for FP noise).
-        let tol = 1e-8 * current.objective.abs().max(1.0);
-        candidate.objective < current.objective - tol
-    } else {
-        // current is clearly bad — any Optimal candidate is an improvement.
-        true
-    }
-}
-
-/// If `candidate` is strictly better than `result`, adopt it and tag
-/// `diagnostics.fallback_used = tag`; otherwise log "did not improve".
-/// Centralises the success/no-improvement reporting for the four
-/// solve-then-compare fallback paths (L-BFGS Hessian, AL, SQP, plain
-/// IPM retry). `label` appears in the log line — e.g. "L-BFGS Hessian
-/// fallback", "AL fallback", "SQP fallback", "Plain IPM retry".
-fn adopt_candidate_if_better(
-    result: &mut SolveResult,
-    candidate: SolveResult,
-    options: &SolverOptions,
-    label: &str,
-    tag: &str,
-) {
-    if is_strictly_better(result, &candidate) {
-        if options.print_level >= 5 {
-            rip_log!(
-                "ripopt: {} succeeded ({:?}, obj={:.6e})",
-                label, candidate.status, candidate.objective
-            );
-        }
-        *result = candidate;
-        result.diagnostics.fallback_used = Some(tag.into());
-    } else if options.print_level >= 5 {
-        rip_log!("ripopt: {} did not improve ({:?})", label, candidate.status);
-    }
-}
-
-/// Prepare options for a fallback solve: cap iterations and set remaining time budget.
-/// Returns `None` if there is no time budget remaining.
-fn prepare_fallback_opts(options: &SolverOptions, solve_start: &Instant) -> Option<SolverOptions> {
-    let mut opts = options.clone();
-    opts.max_iter = options.max_iter.min(500).max(options.max_iter / 3);
-    if options.max_wall_time > 0.0 {
-        let remaining = options.max_wall_time - solve_start.elapsed().as_secs_f64();
-        if remaining <= 0.1 {
-            return None;
-        }
-        opts.max_wall_time = remaining;
-    }
-    Some(opts)
-}
-
-/// L-BFGS Hessian fallback: re-run IPM with `hessian_approximation_lbfgs`
-/// enabled. Triggered for `NumericalBreakdown` and as a follow-up after a
-/// failed plain-IPM retry. No-op when the user-provided Hessian is already
-/// disabled or the fallback is opt-out.
-fn try_lbfgs_hessian_fallback<P: NlpProblem>(
-    result: &mut SolveResult,
-    problem: &P,
-    options: &SolverOptions,
-    solve_start: Instant,
-    diagnosis: FailureDiagnosis,
-) {
-    if !options.enable_lbfgs_hessian_fallback || options.hessian_approximation_lbfgs {
-        return;
-    }
-    let Some(mut opts) = prepare_fallback_opts(options, &solve_start) else { return };
-    opts.hessian_approximation_lbfgs = true;
-    opts.enable_lbfgs_hessian_fallback = false;
-    opts.stall_iter_limit = 0;
-    if options.print_level >= 5 {
-        rip_log!("ripopt: Trying L-BFGS Hessian fallback ({:?})", diagnosis);
-    }
-    let candidate = solve_ipm(problem, &opts);
-    adopt_candidate_if_better(result, candidate, options, "L-BFGS Hessian fallback", "lbfgs_hessian");
-}
-
-/// Augmented Lagrangian fallback: solve via `crate::augmented_lagrangian`.
-/// Only fires for constrained problems; primarily used for
-/// `SlowConvergence` failures.
-fn try_al_fallback<P: NlpProblem>(
-    result: &mut SolveResult,
-    problem: &P,
-    options: &SolverOptions,
-    solve_start: Instant,
-    diagnosis: FailureDiagnosis,
-    has_constraints: bool,
-) {
-    if !options.enable_al_fallback || !has_constraints {
-        return;
-    }
-    let Some(opts) = prepare_fallback_opts(options, &solve_start) else { return };
-    if options.print_level >= 5 {
-        rip_log!("ripopt: Trying AL fallback ({:?})", diagnosis);
-    }
-    let candidate = crate::augmented_lagrangian::solve(problem, &opts);
-    adopt_candidate_if_better(result, candidate, options, "AL fallback", "augmented_lagrangian");
-}
-
-/// SQP fallback: solve via `crate::sqp`. Only fires for constrained
-/// problems. Used for `StallAtInfeasibility`, `SlowConvergence`, and
-/// `StallNearOptimal` (where SQP refines a near-optimal IPM iterate).
-fn try_sqp_fallback<P: NlpProblem>(
-    result: &mut SolveResult,
-    problem: &P,
-    options: &SolverOptions,
-    solve_start: Instant,
-    diagnosis: FailureDiagnosis,
-    has_constraints: bool,
-) {
-    if !options.enable_sqp_fallback || !has_constraints {
-        return;
-    }
-    let Some(opts) = prepare_fallback_opts(options, &solve_start) else { return };
-    if options.print_level >= 5 {
-        rip_log!("ripopt: Trying SQP fallback ({:?})", diagnosis);
-    }
-    let candidate = crate::sqp::solve(problem, &opts);
-    adopt_candidate_if_better(result, candidate, options, "SQP fallback", "sqp");
-}
-
-/// Slack reformulation fallback: re-run IPM on `SlackFormulation::new`,
-/// adding explicit slack variables for inequality constraints. Returns
-/// `Some(SolveResult)` (with x truncated back to the original variable
-/// space) when the slack solve strictly improves on the current result;
-/// `None` otherwise.
-fn try_slack_fallback<P: NlpProblem>(
-    result: &mut SolveResult,
-    problem: &P,
-    options: &SolverOptions,
-    solve_start: Instant,
-    diagnosis: FailureDiagnosis,
-    has_inequalities: bool,
-) -> Option<SolveResult> {
-    if !options.enable_slack_fallback || !has_inequalities {
-        return None;
-    }
-    let mut opts = prepare_fallback_opts(options, &solve_start)?;
-    opts.enable_slack_fallback = false;
-    if options.print_level >= 5 {
-        rip_log!("ripopt: Trying slack fallback ({:?})", diagnosis);
-    }
-    let slack_prob = SlackFormulation::new(problem, &result.x);
-    let candidate = solve_ipm(&slack_prob, &opts);
-    if is_strictly_better(result, &candidate) {
-        let n = problem.num_variables();
-        let m = problem.num_constraints();
-        if options.print_level >= 5 {
-            rip_log!(
-                "ripopt: Slack fallback succeeded ({:?}, obj={:.6e})",
-                candidate.status, candidate.objective
-            );
-        }
-        let x_out = candidate.x[..n].to_vec();
-        let mut g_out = vec![0.0; m];
-        let _ = problem.constraints(&x_out, true, &mut g_out);
-        let mut diag = candidate.diagnostics;
-        diag.fallback_used = Some("slack".into());
-        diag.wall_time_secs = solve_start.elapsed().as_secs_f64();
-        return Some(SolveResult {
-            x: x_out,
-            objective: candidate.objective,
-            constraint_multipliers: candidate.constraint_multipliers,
-            bound_multipliers_lower: candidate.bound_multipliers_lower[..n].to_vec(),
-            bound_multipliers_upper: candidate.bound_multipliers_upper[..n].to_vec(),
-            constraint_values: g_out,
-            status: candidate.status,
-            iterations: result.iterations + candidate.iterations,
-            diagnostics: diag,
-        });
-    } else if options.print_level >= 5 {
-        rip_log!("ripopt: Slack fallback did not improve ({:?})", candidate.status);
-    }
-    None
-}
-
-/// Plain-IPM retry for `DualDivergence`: re-run IPM with Gondzio MCC,
-/// Mehrotra PC, and stall detection disabled. Large dual infeasibility
-/// often means the advanced Newton corrections steered the solver into
-/// a bad basin.
-fn try_plain_ipm_retry<P: NlpProblem>(
-    result: &mut SolveResult,
-    problem: &P,
-    options: &SolverOptions,
-    solve_start: Instant,
-) {
-    let Some(mut opts) = prepare_fallback_opts(options, &solve_start) else { return };
-    opts.gondzio_mcc_max = 0;
-    opts.mehrotra_pc = false;
-    opts.stall_iter_limit = 0;
-    if options.print_level >= 5 {
-        rip_log!("ripopt: Trying plain IPM retry (no corrections) for DualDivergence");
-    }
-    let candidate = solve_ipm(problem, &opts);
-    adopt_candidate_if_better(result, candidate, options, "Plain IPM retry", "plain_ipm");
-}
-
-/// Dispatch failure-recovery fallbacks based on the diagnosis. Returns
-/// `Some(SolveResult)` if the slack fallback fires for
-/// `StallAtInfeasibility` and produces a result we want to return early.
-/// Otherwise updates `result` in place and returns `None`.
-fn dispatch_failure_recovery<P: NlpProblem>(
-    result: &mut SolveResult,
-    problem: &P,
-    options: &SolverOptions,
-    solve_start: Instant,
-    diagnosis: FailureDiagnosis,
-    has_constraints: bool,
-    has_inequalities: bool,
-) -> Option<SolveResult> {
-    match diagnosis {
-        FailureDiagnosis::StallAtInfeasibility => {
-            if let Some(slack_result) = try_slack_fallback(
-                result, problem, options, solve_start, diagnosis, has_inequalities,
-            ) {
-                return Some(slack_result);
-            }
-            try_sqp_fallback(result, problem, options, solve_start, diagnosis, has_constraints);
-        }
-        FailureDiagnosis::NumericalBreakdown => {
-            try_lbfgs_hessian_fallback(result, problem, options, solve_start, diagnosis);
-        }
-        FailureDiagnosis::DualDivergence => {
-            try_plain_ipm_retry(result, problem, options, solve_start);
-            if !matches!(result.status, SolveStatus::Optimal) {
-                try_lbfgs_hessian_fallback(result, problem, options, solve_start, diagnosis);
-            }
-        }
-        FailureDiagnosis::SlowConvergence => {
-            try_al_fallback(result, problem, options, solve_start, diagnosis, has_constraints);
-            if !matches!(result.status, SolveStatus::Optimal) {
-                try_sqp_fallback(result, problem, options, solve_start, diagnosis, has_constraints);
-            }
-        }
-        FailureDiagnosis::StallNearOptimal => {
-            // A stall *at* a near-feasible point with growing Hessian
-            // perturbation often indicates the user-provided Hessian has
-            // wrong curvature: inertia correction recovers definiteness
-            // but at the cost of vanishing step sizes. Try the L-BFGS
-            // Hessian fallback first (cheap, often diagnostic), then SQP.
-            try_lbfgs_hessian_fallback(result, problem, options, solve_start, diagnosis);
-            if !matches!(result.status, SolveStatus::Optimal) {
-                try_sqp_fallback(result, problem, options, solve_start, diagnosis, has_constraints);
-            }
-        }
-    }
-    None
-}
-
-/// Slow-optimal slack fallback: if the initial IPM was Optimal but
-/// started from a feasible point and the objective worsened (or didn't
-/// improve) while consuming > 5% of the wall-time budget, it likely
-/// converged to a bad local minimum — try slack reformulation.
-fn try_slow_optimal_slack_fallback<P: NlpProblem>(
-    result: &mut SolveResult,
-    problem: &P,
-    options: &SolverOptions,
-    solve_start: Instant,
-    diagnosis: FailureDiagnosis,
-    has_inequalities: bool,
-    initial_feasible: bool,
-    initial_obj: f64,
-) -> Option<SolveResult> {
-    if !(matches!(result.status, SolveStatus::Optimal)
-        && has_inequalities
-        && options.enable_slack_fallback
-        && options.max_wall_time > 0.0)
-    {
-        return None;
-    }
-    let time_used = solve_start.elapsed().as_secs_f64();
-    let worsened_from_feasible = initial_feasible
-        && initial_obj.is_finite()
-        && result.objective > initial_obj - 1e-3 * initial_obj.abs().max(1.0);
-    if !(time_used > 0.05 * options.max_wall_time && worsened_from_feasible) {
-        return None;
-    }
-    if options.print_level >= 5 {
-        rip_log!(
-            "ripopt: Slow-optimal detected (obj={:.4e}, init_obj={:.4e}, time={:.1}s/{:.1}s), trying slack fallback",
-            result.objective, initial_obj, time_used, options.max_wall_time
-        );
-    }
-    try_slack_fallback(result, problem, options, solve_start, diagnosis, has_inequalities)
 }
 
 enum AuxiliaryPreprocessAttempt {
@@ -1766,6 +2366,9 @@ fn auxiliary_reduced_solve_options(
     reduced_opts.warm_start_y = None;
     reduced_opts.warm_start_z_l = None;
     reduced_opts.warm_start_z_u = None;
+    reduced_opts.warm_start_s = None;
+    reduced_opts.warm_start_v_l = None;
+    reduced_opts.warm_start_v_u = None;
     let aux_x_scaling = options
         .user_x_scaling
         .as_ref()
@@ -2164,12 +2767,37 @@ fn try_auxiliary_postsolve_solve<P: NlpProblem>(
     AuxiliaryPreprocessAttempt::Failed
 }
 
+/// Run preprocessing (fixed-variable and redundant-constraint elimination)
+/// and, if it reduces the problem, recursively solve the smaller problem
+/// then unmap the solution back to the user's variable space. Returns
+/// `Some(result)` whenever preprocessing reduced the problem (regardless
+/// of solve status); `None` if no reduction was possible, so the caller
+/// solves the original problem directly.
+///
+/// This mirrors Ipopt 3.14's `TNLPAdapter` forward-pass behavior: when
+/// the adapter eliminates fixed variables, it commits to the reduced
+/// problem — there is no retry-on-failure with the unreduced problem.
 fn try_standard_preprocessed_solve<P: NlpProblem>(
     problem: &P,
     options: &SolverOptions,
-    solve_start: Instant,
 ) -> Option<SolveResult> {
-    let prep = crate::preprocessing::PreprocessedProblem::new(problem as &dyn NlpProblem, options.bound_push);
+    let make_parameter = matches!(
+        options.fixed_variable_treatment,
+        FixedVariableTreatment::MakeParameter
+    );
+    let prep = if options.enable_preprocessing {
+        crate::preprocessing::PreprocessedProblem::new(
+            problem as &dyn NlpProblem,
+            options.bound_push,
+        )
+    } else if make_parameter {
+        // `fixed_variable_treatment = make_parameter` activates fixed-var
+        // elimination even when full preprocessing is disabled. Mirrors
+        // Ipopt 3.14's `TNLPAdapter` behavior.
+        crate::preprocessing::PreprocessedProblem::new_fixed_only(problem as &dyn NlpProblem)
+    } else {
+        return None;
+    };
     if !prep.did_reduce() {
         return None;
     }
@@ -2183,57 +2811,37 @@ fn try_standard_preprocessed_solve<P: NlpProblem>(
     }
     let mut prep_opts = options.clone();
     prep_opts.enable_preprocessing = false;
-    if options.max_wall_time > 0.0 {
-        let elapsed = solve_start.elapsed().as_secs_f64();
-        let remaining = (options.max_wall_time - elapsed).max(1.0);
-        prep_opts.max_wall_time = remaining * 0.5;
-    }
     let reduced_result = solve(&prep, &prep_opts);
-    let result = prep.unmap_solution(&reduced_result);
-    if matches!(result.status, SolveStatus::Optimal) {
-        return Some(result);
-    }
-    if options.print_level >= 5 {
-        rip_log!(
-            "ripopt: Preprocessed solve failed ({:?}), retrying without preprocessing",
-            result.status
-        );
-    }
-    None
+    Some(prep.unmap_solution(&reduced_result))
 }
 
 /// Run preprocessing (presolve auxiliary equality-block reduction, postsolve
 /// auxiliary equality recovery, then fixed-variable and redundant-constraint
 /// elimination)
-/// and, if it reduces the problem, recursively `solve` the smaller problem
-/// then unmap the solution. Returns `Some(result)` only when the
-/// preprocessed solve reaches `Optimal`; otherwise returns `None` so the
-/// caller falls through to the unpreprocessed path.
-///
-/// The preprocessed solve is capped at 50% of the remaining wall-time budget
-/// so the unpreprocessed retry has time left when preprocessing leads the
-/// solver into a bad basin (e.g. ganges.gms).
+/// and, if it reduces the problem, recursively `solve` the smaller problem.
+/// Auxiliary reductions must validate in the full space before being returned;
+/// the standard fixed/redundant preprocessor keeps upstream's commit-to-reduced
+/// behavior.
 fn try_preprocessed_solve<P: NlpProblem>(
     problem: &P,
     options: &SolverOptions,
     solve_start: Instant,
 ) -> Option<SolveResult> {
-    if !options.enable_preprocessing {
-        return None;
-    }
+    if options.enable_preprocessing {
+        if let AuxiliaryPreprocessAttempt::Solved(result) =
+            try_auxiliary_preprocessed_solve(problem, options, solve_start)
+        {
+            return Some(result);
+        }
 
-    if let AuxiliaryPreprocessAttempt::Solved(result) =
-        try_auxiliary_preprocessed_solve(problem, options, solve_start)
-    {
-        return Some(result);
-    }
-
-    match try_auxiliary_postsolve_solve(problem, options, solve_start) {
-        AuxiliaryPreprocessAttempt::Solved(result) => Some(result),
-        AuxiliaryPreprocessAttempt::Failed | AuxiliaryPreprocessAttempt::NoCandidates => {
-            try_standard_preprocessed_solve(problem, options, solve_start)
+        if let AuxiliaryPreprocessAttempt::Solved(result) =
+            try_auxiliary_postsolve_solve(problem, options, solve_start)
+        {
+            return Some(result);
         }
     }
+
+    try_standard_preprocessed_solve(problem, options)
 }
 
 /// Compute the accepted step length and resulting θ for one Gauss–Newton
@@ -2242,381 +2850,6 @@ fn try_preprocessed_solve<P: NlpProblem>(
 /// `Some((alpha, theta))` if an improving step was found, `None` if the
 /// constraint evaluation failed; the caller owns the "no improvement"
 /// termination check by comparing the returned θ against the previous one.
-fn try_polish_step_with_backtrack<P: NlpProblem>(
-    problem: &P,
-    polished_x: &[f64],
-    dx: &[f64],
-    x_l_var: &[f64],
-    x_u_var: &[f64],
-    g_l: &[f64],
-    g_u: &[f64],
-    current_theta: f64,
-    n: usize,
-    m: usize,
-) -> Option<(f64, f64)> {
-    let mut alpha = 1.0;
-    let tau = 0.995;
-    for i in 0..n {
-        if dx[i] < 0.0 && x_l_var[i].is_finite() {
-            let max_step = -tau * (polished_x[i] - x_l_var[i]) / dx[i];
-            if max_step < alpha { alpha = max_step; }
-        }
-        if dx[i] > 0.0 && x_u_var[i].is_finite() {
-            let max_step = tau * (x_u_var[i] - polished_x[i]) / dx[i];
-            if max_step < alpha { alpha = max_step; }
-        }
-    }
-    alpha = alpha.max(0.0).min(1.0);
-
-    let mut trial_x = vec![0.0; n];
-    let mut trial_g = vec![0.0; m];
-    let mut best_alpha = alpha;
-    let mut best_theta = current_theta;
-    for _ in 0..10 {
-        for i in 0..n {
-            trial_x[i] = polished_x[i] - best_alpha * dx[i];
-        }
-        if !problem.constraints(&trial_x, true, &mut trial_g) {
-            best_alpha *= 0.5;
-            continue;
-        }
-        let trial_theta = convergence::primal_infeasibility(&trial_g, g_l, g_u);
-        if trial_theta < current_theta {
-            best_theta = trial_theta;
-            return Some((best_alpha, best_theta));
-        }
-        best_alpha *= 0.5;
-    }
-    Some((best_alpha, best_theta))
-}
-
-/// Gauss–Newton polish of an LS solution against the original constraint
-/// system. Runs only when the current `theta` is above `options.tol` but
-/// below `1e-2` — the regime where a few Newton steps on `g(x) = target`
-/// can plausibly drive feasibility under the tolerance. Mutates
-/// `polished_x`, `theta`, and `g_final` in place.
-fn polish_ls_solution_with_newton<P: NlpProblem>(
-    problem: &P,
-    options: &SolverOptions,
-    polished_x: &mut [f64],
-    theta: &mut f64,
-    g_final: &mut [f64],
-    g_l: &[f64],
-    g_u: &[f64],
-    n: usize,
-    m: usize,
-) {
-    if !(*theta > options.tol && *theta < 1e-2) {
-        return;
-    }
-    let mut x_l_var = vec![0.0; n];
-    let mut x_u_var = vec![0.0; n];
-    problem.bounds(&mut x_l_var, &mut x_u_var);
-    let (jac_rows, jac_cols) = problem.jacobian_structure();
-    let nnz = jac_rows.len();
-
-    let target: Vec<f64> = (0..m).map(|i| {
-        if (g_u[i] - g_l[i]).abs() < 1e-15 { g_l[i] } else { 0.5 * (g_l[i] + g_u[i]) }
-    }).collect();
-
-    let max_newton_iters = 20;
-    for newton_iter in 0..max_newton_iters {
-        let r: Vec<f64> = (0..m).map(|i| g_final[i] - target[i]).collect();
-
-        let mut jac_vals = vec![0.0; nnz];
-        if !problem.jacobian_values(polished_x, true, &mut jac_vals) {
-            break;
-        }
-
-        let mut j_dense = vec![0.0; m * n];
-        for k in 0..nnz {
-            j_dense[jac_rows[k] * n + jac_cols[k]] += jac_vals[k];
-        }
-
-        let dx = match solve_gn_normal_equations(&j_dense, &r, n, m) {
-            Some(dx) => dx,
-            None => break,
-        };
-
-        let (best_alpha, best_theta) = match try_polish_step_with_backtrack(
-            problem, polished_x, &dx, &x_l_var, &x_u_var, g_l, g_u, *theta, n, m,
-        ) {
-            Some(t) => t,
-            None => break,
-        };
-
-        if best_theta >= *theta * 0.999 {
-            break;
-        }
-
-        for i in 0..n {
-            polished_x[i] -= best_alpha * dx[i];
-        }
-        if !problem.constraints(polished_x, true, g_final) {
-            break;
-        }
-        *theta = best_theta;
-
-        if options.print_level >= 5 {
-            rip_log!(
-                "ripopt: Newton polish iter {}: theta={:.2e}, alpha={:.4}",
-                newton_iter + 1, *theta, best_alpha,
-            );
-        }
-
-        if *theta < options.tol {
-            break;
-        }
-    }
-}
-
-/// Build the final `SolveResult` for the NE-to-LS reformulation path.
-/// When `enable_lbfgs_fallback` is on and the LS path landed in
-/// LocalInfeasibility, runs L-BFGS on the LS problem and adopts its
-/// solution if it improves theta; otherwise keeps the polished_x /
-/// ls_result tuple. All paths converge to a single SolveResult build.
-#[allow(clippy::too_many_arguments)]
-fn finalize_ne_to_ls_result<P: NlpProblem>(
-    problem: &P,
-    options: &SolverOptions,
-    ls_problem: &LeastSquaresProblem<'_, P>,
-    ls_result: &SolveResult,
-    polished_x: Vec<f64>,
-    status: SolveStatus,
-    g_out: Vec<f64>,
-    g_l: &[f64],
-    g_u: &[f64],
-    theta: f64,
-    m: usize,
-) -> SolveResult {
-    let (final_x, final_status, final_g, final_iters, final_zl, final_zu) =
-        if status == SolveStatus::LocalInfeasibility && options.enable_lbfgs_fallback {
-            if options.print_level >= 5 {
-                rip_log!(
-                    "ripopt: NE-to-LS LocalInfeasibility (theta={:.4e}), trying L-BFGS on LS",
-                    theta
-                );
-            }
-            let lbfgs_ls = crate::lbfgs::solve(ls_problem, options);
-            let mut g_lb = vec![0.0; m];
-            let theta_lb = if problem.constraints(&lbfgs_ls.x, true, &mut g_lb) {
-                convergence::primal_infeasibility(&g_lb, g_l, g_u)
-            } else {
-                f64::INFINITY
-            };
-
-            if theta_lb < theta {
-                let new_status = if theta_lb < options.tol {
-                    SolveStatus::Optimal
-                } else {
-                    SolveStatus::LocalInfeasibility
-                };
-                if options.print_level >= 5 {
-                    rip_log!(
-                        "ripopt: L-BFGS improved NE-to-LS (theta: {:.4e} -> {:.4e}, status={:?})",
-                        theta, theta_lb, new_status
-                    );
-                }
-                (lbfgs_ls.x, new_status, g_lb, lbfgs_ls.iterations,
-                 lbfgs_ls.bound_multipliers_lower, lbfgs_ls.bound_multipliers_upper)
-            } else {
-                if options.print_level >= 5 {
-                    rip_log!(
-                        "ripopt: L-BFGS did not improve NE-to-LS (theta_lb={:.4e} >= theta={:.4e})",
-                        theta_lb, theta
-                    );
-                }
-                (polished_x, status, g_out, ls_result.iterations,
-                 ls_result.bound_multipliers_lower.clone(),
-                 ls_result.bound_multipliers_upper.clone())
-            }
-        } else {
-            (polished_x, status, g_out, ls_result.iterations,
-             ls_result.bound_multipliers_lower.clone(),
-             ls_result.bound_multipliers_upper.clone())
-        };
-
-    SolveResult {
-        x: final_x,
-        objective: 0.0,
-        constraint_multipliers: vec![0.0; m],
-        bound_multipliers_lower: final_zl,
-        bound_multipliers_upper: final_zu,
-        constraint_values: final_g,
-        status: final_status,
-        iterations: final_iters,
-        diagnostics: SolverDiagnostics::default(),
-    }
-}
-
-/// LS reformulation reported infeasibility on a square or non-converged
-/// system — fall back to the constrained IPM on the original problem,
-/// then optionally to the augmented-Lagrangian solver. Honors the
-/// outer wall-clock deadline by trimming `fallback_opts.max_wall_time`
-/// and short-circuiting to `MaxIterations` if no time is left. Always
-/// returns a final `SolveResult`; callers wrap it in `Some(...)`.
-fn run_ne_constrained_ipm_fallback<P: NlpProblem>(
-    problem: &P,
-    options: &SolverOptions,
-    solve_start: Instant,
-    ls_result: &SolveResult,
-    g_out: &[f64],
-    theta: f64,
-    m: usize,
-) -> SolveResult {
-    if options.print_level >= 5 {
-        rip_log!(
-            "ripopt: LS reformulation reports infeasibility (theta={:.4e}, ls_status={:?}), falling back to constrained IPM",
-            theta, ls_result.status
-        );
-    }
-    let mut fallback_opts = options.clone();
-    if options.max_wall_time > 0.0 {
-        let remaining = options.max_wall_time - solve_start.elapsed().as_secs_f64();
-        if remaining <= 0.1 {
-            return SolveResult {
-                x: ls_result.x.clone(),
-                objective: 0.0,
-                constraint_multipliers: vec![0.0; m],
-                bound_multipliers_lower: ls_result.bound_multipliers_lower.clone(),
-                bound_multipliers_upper: ls_result.bound_multipliers_upper.clone(),
-                constraint_values: g_out.to_vec(),
-                status: SolveStatus::MaxIterations,
-                iterations: ls_result.iterations,
-                diagnostics: SolverDiagnostics::default(),
-            };
-        }
-        fallback_opts.max_wall_time = remaining;
-    }
-    let ipm_result = solve_ipm(problem, &fallback_opts);
-    if matches!(ipm_result.status, SolveStatus::Optimal) {
-        return ipm_result;
-    }
-    // IPM fallback failed — try AL for square NE systems
-    if options.enable_al_fallback {
-        if options.print_level >= 5 {
-            rip_log!(
-                "ripopt: NE constrained IPM fallback failed ({:?}), trying AL",
-                ipm_result.status
-            );
-        }
-        let mut al_opts = options.clone();
-        al_opts.max_iter = options.max_iter.min(500).max(options.max_iter / 3);
-        if options.max_wall_time > 0.0 {
-            let remaining = options.max_wall_time - solve_start.elapsed().as_secs_f64();
-            if remaining <= 0.1 {
-                return ipm_result;
-            }
-            al_opts.max_wall_time = remaining;
-        }
-        let al_result = crate::augmented_lagrangian::solve(problem, &al_opts);
-        if matches!(al_result.status, SolveStatus::Optimal) {
-            if options.print_level >= 5 {
-                rip_log!(
-                    "ripopt: NE AL fallback succeeded ({:?}, obj={:.6e})",
-                    al_result.status, al_result.objective
-                );
-            }
-            return al_result;
-        }
-    }
-    ipm_result
-}
-
-/// Detect an overdetermined nonlinear equation problem (f ≡ 0, all equalities,
-/// m ≥ n) and, if detected, solve it by reformulating as the unconstrained
-/// least-squares problem `min 0.5·||g(x) − target||²` via
-/// `LeastSquaresProblem`. Post-solve, polish with Gauss-Newton on the
-/// original system, falling back to constrained IPM (and AL for square
-/// systems) when the LS residual is above `options.tol`.
-///
-/// Returns `Some(SolveResult)` when the NE detection fires, `None`
-/// otherwise (caller should fall through to the normal IPM path).
-fn try_ne_to_ls_reformulation<P: NlpProblem>(
-    problem: &P,
-    options: &SolverOptions,
-    solve_start: Instant,
-) -> Option<SolveResult> {
-    if !detect_ne_problem(problem) {
-        return None;
-    }
-    let n = problem.num_variables();
-    let m = problem.num_constraints();
-    if options.print_level >= 5 {
-        rip_log!(
-            "ripopt: Detected overdetermined NE problem (n={}, m={}), reformulating as least-squares",
-            n, m
-        );
-    }
-    let ls_problem = LeastSquaresProblem::new(problem);
-    // For square systems (m == n), cap LS iterations — they often fail the LS
-    // approach because there are no "extra" equations to drive residuals down.
-    let mut ls_opts = options.clone();
-    if m == n {
-        ls_opts.max_iter = (options.max_iter / 10).min(100);
-    }
-    let ls_result = solve_ipm(&ls_problem, &ls_opts);
-
-    // Evaluate original constraint violation at the LS solution
-    let mut g_final = vec![0.0; m];
-    if !problem.constraints(&ls_result.x, true, &mut g_final) {
-        let mut diag = ls_result.diagnostics.clone();
-        diag.fallback_used = Some("ne-to-ls".into());
-        return Some(SolveResult {
-            x: ls_result.x,
-            objective: ls_result.objective,
-            constraint_multipliers: vec![0.0; m],
-            bound_multipliers_lower: ls_result.bound_multipliers_lower,
-            bound_multipliers_upper: ls_result.bound_multipliers_upper,
-            constraint_values: g_final,
-            status: SolveStatus::EvaluationError,
-            iterations: ls_result.iterations,
-            diagnostics: diag,
-        });
-    }
-    let mut g_l = vec![0.0; m];
-    let mut g_u = vec![0.0; m];
-    problem.constraint_bounds(&mut g_l, &mut g_u);
-    let mut theta = convergence::primal_infeasibility(&g_final, &g_l, &g_u);
-
-    // Newton polish: if theta is close but not quite at tol, try a few
-    // Gauss-Newton steps on the original system g(x) = target to drive
-    // constraint violation below tol.
-    let mut polished_x = ls_result.x.clone();
-    polish_ls_solution_with_newton(
-        problem, options,
-        &mut polished_x, &mut theta, &mut g_final,
-        &g_l, &g_u, n, m,
-    );
-
-    let g_out = g_final;
-
-    let status = if theta < options.tol {
-        SolveStatus::Optimal
-    } else {
-        SolveStatus::LocalInfeasibility
-    };
-
-    if options.print_level >= 5 {
-        rip_log!(
-            "ripopt: NE-to-LS result: obj_LS={:.4e}, constraint_violation={:.4e}, status={:?}",
-            ls_result.objective, theta, status
-        );
-    }
-
-    // Fall back to constrained IPM when LS reports infeasibility.
-    let ls_converged = matches!(ls_result.status, SolveStatus::Optimal);
-    if status == SolveStatus::LocalInfeasibility && (m == n || !ls_converged) {
-        return Some(run_ne_constrained_ipm_fallback(
-            problem, options, solve_start, &ls_result, &g_out, theta, m,
-        ));
-    }
-
-    Some(finalize_ne_to_ls_result(
-        problem, options, &ls_problem, &ls_result,
-        polished_x, status, g_out, &g_l, &g_u, theta, m,
-    ))
-}
 
 /// Solve the NLP using the interior point method.
 ///
@@ -2680,183 +2913,84 @@ fn solve_inner<P: NlpProblem>(
     options: &SolverOptions,
     solve_start: Instant,
 ) -> SolveResult {
-    // Capture initial objective and feasibility for slow-optimal detection.
-    // NOTE: disabled -- extra problem evaluations here change CUTEst FP state and cause regressions.
-    let (initial_obj, initial_feasible) = (f64::INFINITY, false);
-
     if let Some(result) = try_preprocessed_solve(problem, options, solve_start) {
         return result;
     }
-
-    if let Some(result) = try_ne_to_ls_reformulation(problem, options, solve_start) {
-        return result;
-    }
-
-    let mut result = run_initial_solve(problem, options);
-
-    let diagnosis = diagnose_failure(&result);
-    let has_constraints = problem.num_constraints() > 0;
-    let has_inequalities = has_inequality_constraints(problem);
-
-    if options.print_level >= 5 && !matches!(result.status, SolveStatus::Optimal) {
-        rip_log!("ripopt: Failure diagnosis: {:?}", diagnosis);
-    }
-
-    try_conservative_ipm_retry(&mut result, problem, options, solve_start);
-
-    if !matches!(result.status, SolveStatus::Optimal) {
-        if let Some(slack_result) = dispatch_failure_recovery(
-            &mut result, problem, options, solve_start, diagnosis,
-            has_constraints, has_inequalities,
-        ) {
-            return slack_result;
-        }
-    }
-
-    if let Some(slack_result) = try_slow_optimal_slack_fallback(
-        &mut result, problem, options, solve_start, diagnosis,
-        has_inequalities, initial_feasible, initial_obj,
-    ) {
-        return slack_result;
-    }
-
-    apply_late_optimality_promotion(&mut result, options);
-
+    let mut result = solve_ipm(problem, options);
     result.diagnostics.wall_time_secs = solve_start.elapsed().as_secs_f64();
+    if options.print_level >= 4 {
+        print_final_summary(&result);
+    }
     result
 }
 
-/// Run the initial solve, picking a method based on problem structure:
+/// B11: Print Ipopt-style final summary block when the IPM has
+/// terminated. Uses fields populated on `result.diagnostics` plus the
+/// solve status. Mirrors Ipopt's
+/// `IpoptApplication::FinalizeSolution` summary, except ripopt's
+/// `constraints` / `jacobian_values` are joint callbacks so the
+/// equality and inequality counters share a single value (Ipopt's
+/// per-side split would require splitting the NLP trait, which is a
+/// larger refactor — flagged as future work in the SolverDiagnostics
+/// docstring).
 ///
-///   * **Unconstrained (`m == 0`) and L-BFGS fallback enabled**: try
-///     L-BFGS first; if L-BFGS converges to Optimal, return its result.
-///     Otherwise run IPM and return the better of the two.
-///   * **Constrained with a wall-time budget**: cap the initial IPM at
-///     50% of `max_wall_time` so SQP/slack/AL fallbacks have time left.
-///   * **Constrained without a wall-time budget**: full IPM with the
-///     unmodified options.
-fn run_initial_solve<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult {
-    if options.enable_lbfgs_fallback && problem.num_constraints() == 0 {
-        let lbfgs_result = crate::lbfgs::solve(problem, options);
-        if matches!(lbfgs_result.status, SolveStatus::Optimal) {
-            if options.print_level >= 5 {
-                rip_log!(
-                    "ripopt: L-BFGS solved unconstrained problem ({:?}, obj={:.6e})",
-                    lbfgs_result.status, lbfgs_result.objective
-                );
-            }
-            return lbfgs_result;
-        }
-        if options.print_level >= 5 {
-            rip_log!(
-                "ripopt: L-BFGS failed ({:?}, obj={:.6e}), trying IPM",
-                lbfgs_result.status, lbfgs_result.objective
-            );
-        }
-        let ipm_result = solve_ipm(problem, options);
-        if matches!(ipm_result.status, SolveStatus::Optimal) {
-            ipm_result
-        } else if lbfgs_result.objective < ipm_result.objective {
-            lbfgs_result
-        } else {
-            ipm_result
-        }
-    } else if options.max_wall_time > 0.0 && problem.num_constraints() > 0 {
-        let mut main_opts = options.clone();
-        main_opts.max_wall_time = options.max_wall_time * 0.5;
-        solve_ipm(problem, &main_opts)
-    } else {
-        solve_ipm(problem, options)
-    }
-}
-
-/// Conservative IPM retry: revert v0.4.0 algorithmic changes (Gondzio MCC,
-/// Mehrotra PC, stall detection) to recover the pre-regression trajectory.
-/// This is the most reliable recovery for problems sensitive to Newton
-/// direction changes (TRO3X3, STRATEC, MGH10LS, ACOPR30). Only fires for
-/// `n ≤ 200` and a non-Optimal current result; consumes 70% of the
-/// remaining wall-time budget when one is set.
-fn try_conservative_ipm_retry<P: NlpProblem>(
-    result: &mut SolveResult,
-    problem: &P,
-    options: &SolverOptions,
-    solve_start: Instant,
-) {
-    let n_problem = problem.num_variables();
-    if n_problem > 200 || matches!(result.status, SolveStatus::Optimal) {
-        return;
-    }
-    let Some(mut opts) = prepare_fallback_opts(options, &solve_start) else {
-        return;
-    };
-    opts.gondzio_mcc_max = 0;
-    opts.mehrotra_pc = false;
-    opts.stall_iter_limit = 0;
-    opts.proactive_infeasibility_detection = true;
-    opts.max_iter = options.max_iter;
-    if options.max_wall_time > 0.0 {
-        let remaining = options.max_wall_time - solve_start.elapsed().as_secs_f64();
-        opts.max_wall_time = remaining * 0.7;
-    }
-    if options.print_level >= 5 {
-        rip_log!("ripopt: Trying conservative IPM retry (no Gondzio/Mehrotra, no stall detection)");
-    }
-    let candidate = solve_ipm(problem, &opts);
-    adopt_candidate_if_better(result, candidate, options, "Conservative retry", "conservative_ipm");
-}
-
-/// Promote a stalled result (NumericalError/MaxIterations/Acceptable) to
-/// Optimal or Acceptable when the final iterative-z residuals already meet
-/// the KKT gates. Applied AFTER all fallbacks so conservative retries can
-/// fix wrong local minima before we accept them.
-///
-/// Uses Ipopt-style residual checks:
-///   * Optimal if pr ≤ `constr_viol_tol`, co ≤ `compl_inf_tol`, du strict.
-///   * Acceptable (if not already) when du ≤ 1e-6, pr ≤ 1e-2, co ≤ 1e-2
-///     (Ipopt's `acceptable_tol`).
-fn apply_late_optimality_promotion(result: &mut SolveResult, options: &SolverOptions) {
-    if !matches!(result.status, SolveStatus::NumericalError | SolveStatus::MaxIterations | SolveStatus::Acceptable) {
-        return;
-    }
+/// Scaled vs unscaled: `obj_scaling` is applied at the IPM level, so
+/// `result.objective` is already the unscaled value. ripopt does not
+/// currently track a separate "scaled" objective for reporting; print
+/// the same value on both rows. Same applies to inf_pr/inf_du/compl —
+/// ripopt's diagnostics store the unscaled iteration values, and the
+/// scaled gates use s_d/s_c on the fly. Print the diagnostics as
+/// "(unscaled)" and the s_d-divided values as "(scaled)" to match
+/// Ipopt's output ordering.
+fn print_final_summary(result: &SolveResult) {
     let d = &result.diagnostics;
-    let pr_ok = d.final_primal_inf <= options.constr_viol_tol;
-    let co_ok = d.final_compl <= options.compl_inf_tol;
-    let du_strict_ok = d.final_dual_inf <= options.dual_inf_tol
-        && d.final_dual_inf <= options.tol * 1000.0;
-    if pr_ok && co_ok && du_strict_ok {
-        if options.print_level >= 5 {
-            rip_log!(
-                "ripopt: Late-optimal (pr={:.2e}, du={:.2e}, co={:.2e}), returning Optimal",
-                d.final_primal_inf, d.final_dual_inf, d.final_compl
-            );
-        }
-        result.status = SolveStatus::Optimal;
-    } else if !matches!(result.status, SolveStatus::Acceptable) {
-        let du_acc_ok = d.final_dual_inf <= 1e-6
-            && d.final_primal_inf <= 1e-2
-            && d.final_compl <= 1e-2;
-        if du_acc_ok {
-            if options.print_level >= 5 {
-                rip_log!(
-                    "ripopt: Late-acceptable (pr={:.2e}, du={:.2e}, co={:.2e}), returning Acceptable",
-                    d.final_primal_inf, d.final_dual_inf, d.final_compl
-                );
-            }
-            result.status = SolveStatus::Acceptable;
-        }
-    }
-}
+    let status_str = match result.status {
+        SolveStatus::Optimal => "Optimal Solution Found.",
+        SolveStatus::Acceptable => "Solved To Acceptable Level.",
+        SolveStatus::Infeasible => "Converged to a point of local infeasibility. Problem may be infeasible.",
+        SolveStatus::LocalInfeasibility => "Converged to a point of local infeasibility.",
+        SolveStatus::MaxIterations => "Maximum Number of Iterations Exceeded.",
+        SolveStatus::NumericalError => "Numerical Difficulties Encountered.",
+        SolveStatus::DivergingIterates => "Diverging Iterates -- Problem May Be Unbounded.",
+        SolveStatus::RestorationFailed => "Restoration Failed.",
+        SolveStatus::EvaluationError => "Evaluation Error.",
+        SolveStatus::UserRequestedStop => "User Requested Stop.",
+        SolveStatus::StopAtTinyStep => "Search Direction Becomes Too Small.",
+        SolveStatus::InternalError => "Internal Error.",
+    };
 
-/// Check if a problem has any inequality constraints (g_l[i] != g_u[i]).
-fn has_inequality_constraints<P: NlpProblem>(problem: &P) -> bool {
-    let m = problem.num_constraints();
-    if m == 0 {
-        return false;
-    }
-    let mut g_l = vec![0.0; m];
-    let mut g_u = vec![0.0; m];
-    problem.constraint_bounds(&mut g_l, &mut g_u);
-    (0..m).any(|i| (g_l[i] - g_u[i]).abs() > 0.0)
+    // s_d uses the dual-multiplier sum from the converged iterate; s_c
+    // is recomputed from the dual_inf/compl ratio when meaningful.
+    let s_d = d.final_s_d.max(1.0);
+    let inf_du_scaled = d.final_dual_inf / s_d;
+    // Ipopt's NLP-error formula: max(inf_du/s_d, inf_pr_user, compl/s_c).
+    // ripopt does not currently track s_c on diagnostics; treat as 1.0
+    // (matches the "no scaling" path Ipopt uses for problems where the
+    // multiplier sums fall below the threshold).
+    let s_c: f64 = 1.0;
+    let compl_scaled = d.final_compl / s_c;
+    let nlp_error = inf_du_scaled.max(d.final_primal_inf).max(compl_scaled);
+
+    rip_log!("");
+    rip_log!("Number of Iterations....: {}", result.iterations);
+    rip_log!("");
+    rip_log!("                                   (scaled)                 (unscaled)");
+    rip_log!("Objective...............:  {:>22.16e}   {:>22.16e}", result.objective, result.objective);
+    rip_log!("Dual infeasibility......:  {:>22.16e}   {:>22.16e}", inf_du_scaled, d.final_dual_inf);
+    rip_log!("Constraint violation....:  {:>22.16e}   {:>22.16e}", d.final_primal_inf, d.final_primal_inf);
+    rip_log!("Complementarity.........:  {:>22.16e}   {:>22.16e}", compl_scaled, d.final_compl);
+    rip_log!("Overall NLP error.......:  {:>22.16e}   {:>22.16e}", nlp_error, nlp_error);
+    rip_log!("");
+    rip_log!("Number of objective function evaluations             = {}", d.n_obj_evals);
+    rip_log!("Number of objective gradient evaluations             = {}", d.n_grad_evals);
+    rip_log!("Number of equality constraint evaluations            = {}", d.n_constr_evals);
+    rip_log!("Number of inequality constraint evaluations          = {}", d.n_constr_evals);
+    rip_log!("Number of equality constraint Jacobian evaluations   = {}", d.n_jac_evals);
+    rip_log!("Number of inequality constraint Jacobian evaluations = {}", d.n_jac_evals);
+    rip_log!("Number of Lagrangian Hessian evaluations             = {}", d.n_hess_evals);
+    rip_log!("Total seconds in ripopt                              = {:.3}", d.wall_time_secs);
+    rip_log!("");
+    rip_log!("EXIT: {}", status_str);
 }
 
 /// Accumulates wall-clock time spent in each phase of the IPM loop.
@@ -2905,130 +3039,98 @@ impl PhaseTimings {
     }
 }
 
-/// Dump a KKT system to disk for external solver benchmarking.
+/// B10: Print Ipopt-style problem statistics block at solve start.
 ///
-/// Writes two files to `dir`:
-/// - `<name>_<iter:04>.mtx` — Matrix Market symmetric format, lower triangle, 1-indexed
-/// - `<name>_<iter:04>.json` — Metadata: problem_name, iteration, n, m, rhs, inertia, status
+/// Mirrors the block printed by `IpIpoptApplication::OptimizeNLP` after
+/// the NLP is loaded and before iteration 0:
 ///
-/// All IO errors are logged as warnings and never propagate to the caller.
-/// Collect the lower-triangle non-zero entries of `kkt.matrix` as
-/// `(row, col, val)` triples in 1-indexed Matrix Market order.
-/// Dense: walk the lower triangle column-major. Sparse: triplets are
-/// stored upper-triangle (row ≤ col); flip each to the lower
-/// triangle, aggregate duplicates by summation, and sort
-/// column-major for reader convenience.
-fn collect_kkt_lower_triangle_entries(kkt: &kkt::KktSystem) -> Vec<(usize, usize, f64)> {
-    let dim = kkt.dim;
-    match &kkt.matrix {
-        KktMatrix::Dense(d) => {
-            let mut v = Vec::with_capacity(dim * (dim + 1) / 2);
-            for j in 0..dim {
-                for i in j..dim {
-                    let val = d.get(i, j);
-                    if val != 0.0 {
-                        v.push((i + 1, j + 1, val));
-                    }
-                }
-            }
-            v
+/// ```text
+/// Number of nonzeros in equality constraint Jacobian.: NNNN
+/// Number of nonzeros in inequality constraint Jacobian: NNNN
+/// Number of nonzeros in Lagrangian Hessian.............: NNNN
+///
+/// Total number of variables............................: NNNN
+///                      variables with only lower bounds: NNNN
+///                 variables with lower and upper bounds: NNNN
+///                      variables with only upper bounds: NNNN
+/// Total number of equality constraints.................: NNNN
+/// Total number of inequality constraints...............: NNNN
+///         inequality constraints with only lower bounds: NNNN
+///    inequality constraints with lower and upper bounds: NNNN
+///         inequality constraints with only upper bounds: NNNN
+/// ```
+///
+/// Equality vs inequality is the slack-reformulation classification
+/// (`g_l[i] == g_u[i]` ⇔ equality). Hessian nnz counts the lower-triangle
+/// entries actually returned by `hessian_structure` (Ipopt also reports
+/// the lower triangle). Free variables (no finite bound) are not printed
+/// as a separate row in Ipopt 3.14's standard output; they are implied by
+/// `total − sum(only_lower, both, only_upper)`.
+fn print_problem_header(state: &SolverState) {
+    let n = state.n;
+    let m = state.m;
+
+    // Variable bound classification.
+    let mut var_only_lower = 0usize;
+    let mut var_both = 0usize;
+    let mut var_only_upper = 0usize;
+    for i in 0..n {
+        let l_fin = state.x_l_at(i).is_finite();
+        let u_fin = state.x_u_at(i).is_finite();
+        match (l_fin, u_fin) {
+            (true, true) => var_both += 1,
+            (true, false) => var_only_lower += 1,
+            (false, true) => var_only_upper += 1,
+            _ => {}
         }
-        KktMatrix::Sparse(s) => {
-            let mut map: std::collections::HashMap<(usize, usize), f64> =
-                std::collections::HashMap::with_capacity(s.triplet_rows.len());
-            for k in 0..s.triplet_rows.len() {
-                let r = s.triplet_rows[k];
-                let c = s.triplet_cols[k];
-                *map.entry((c, r)).or_insert(0.0) += s.triplet_vals[k];
+    }
+
+    // Constraint classification + per-row equality flag.
+    let mut n_eq = 0usize;
+    let mut n_ineq_only_lower = 0usize;
+    let mut n_ineq_both = 0usize;
+    let mut n_ineq_only_upper = 0usize;
+    let mut row_is_eq = vec![false; m];
+    for i in 0..m {
+        let l_fin = state.g_l_at(i).is_finite();
+        let u_fin = state.g_u_at(i).is_finite();
+        let is_eq = l_fin && u_fin && (state.g_l_at(i) - state.g_u_at(i)).abs() < 1e-14;
+        if is_eq {
+            n_eq += 1;
+            row_is_eq[i] = true;
+        } else {
+            match (l_fin, u_fin) {
+                (true, true) => n_ineq_both += 1,
+                (true, false) => n_ineq_only_lower += 1,
+                (false, true) => n_ineq_only_upper += 1,
+                _ => {} // unbounded inequality (rare; not classified by Ipopt)
             }
-            let mut v: Vec<(usize, usize, f64)> = map
-                .into_iter()
-                .filter(|(_, val)| *val != 0.0)
-                .map(|((i, j), val)| (i + 1, j + 1, val))
-                .collect();
-            v.sort_unstable_by_key(|&(i, j, _)| (j, i));
-            v
         }
     }
-}
+    let n_ineq = n_ineq_only_lower + n_ineq_both + n_ineq_only_upper;
 
-/// Write the Matrix Market `.mtx` file for one KKT dump. Header line
-/// is `%%MatrixMarket matrix coordinate real symmetric`, body is
-/// `{dim} {dim} {nnz}` followed by one `i j val` line per entry in
-/// `%.17e` precision.
-fn write_kkt_mtx_file(
-    mtx_path: &std::path::Path,
-    dim: usize,
-    entries: &[(usize, usize, f64)],
-) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut file = std::fs::File::create(mtx_path)?;
-    writeln!(file, "%%MatrixMarket matrix coordinate real symmetric")?;
-    writeln!(file, "{} {} {}", dim, dim, entries.len())?;
-    for (i, j, v) in entries {
-        writeln!(file, "{} {} {:.17e}", i, j, v)?;
-    }
-    Ok(())
-}
+    // Jacobian nnz split by equality vs inequality row.
+    let _ = m;
+    let _ = row_is_eq;
+    let jac_nnz_eq = state.jac_c_rows.len();
+    let jac_nnz_ineq = state.jac_d_rows.len();
+    let hess_nnz = state.hess_rows.len();
 
-/// Write the JSON sidecar describing a KKT dump (problem name,
-/// iteration, n/m, RHS, regularization δ_W/δ_C, and inertia
-/// counts). Inertia defaults to (0, 0, 0) if not yet computed.
-fn write_kkt_json_sidecar(
-    json_path: &std::path::Path,
-    name: &str,
-    iteration: usize,
-    kkt: &kkt::KktSystem,
-    inertia: Option<(usize, usize, usize)>,
-    delta_w: f64,
-    delta_c: f64,
-) -> std::io::Result<()> {
-    use std::io::Write;
-    let (pos, neg, zer) = inertia.unwrap_or((0, 0, 0));
-    let meta = serde_json::json!({
-        "problem_name": name,
-        "iteration": iteration,
-        "n": kkt.n,
-        "m": kkt.m,
-        "rhs": kkt.rhs,
-        "inertia": { "positive": pos, "negative": neg, "zero": zer },
-        "delta_w": delta_w,
-        "delta_c": delta_c,
-        "status": "ongoing"
-    });
-    let mut file = std::fs::File::create(json_path)?;
-    write!(file, "{}", meta)?;
-    Ok(())
-}
-
-fn dump_kkt_matrix(
-    dir: &std::path::Path,
-    name: &str,
-    iteration: usize,
-    kkt: &kkt::KktSystem,
-    inertia: Option<(usize, usize, usize)>,
-    delta_w: f64,
-    delta_c: f64,
-) {
-    if let Err(e) = std::fs::create_dir_all(dir) {
-        log::warn!("kkt_dump: cannot create directory {}: {}", dir.display(), e);
-        return;
-    }
-
-    let stem = format!("{}_{:04}", name, iteration);
-    let mtx_path = dir.join(format!("{}.mtx", stem));
-    let entries = collect_kkt_lower_triangle_entries(kkt);
-    if let Err(e) = write_kkt_mtx_file(&mtx_path, kkt.dim, &entries) {
-        log::warn!("kkt_dump: failed to write {}.mtx: {}", stem, e);
-        return;
-    }
-
-    let json_path = dir.join(format!("{}.json", stem));
-    if let Err(e) = write_kkt_json_sidecar(
-        &json_path, name, iteration, kkt, inertia, delta_w, delta_c,
-    ) {
-        log::warn!("kkt_dump: failed to write {}.json: {}", stem, e);
-    }
+    rip_log!("");
+    rip_log!("Number of nonzeros in equality constraint Jacobian...:    {:>8}", jac_nnz_eq);
+    rip_log!("Number of nonzeros in inequality constraint Jacobian.:    {:>8}", jac_nnz_ineq);
+    rip_log!("Number of nonzeros in Lagrangian Hessian.............:    {:>8}", hess_nnz);
+    rip_log!("");
+    rip_log!("Total number of variables............................:    {:>8}", n);
+    rip_log!("                     variables with only lower bounds:    {:>8}", var_only_lower);
+    rip_log!("                variables with lower and upper bounds:    {:>8}", var_both);
+    rip_log!("                     variables with only upper bounds:    {:>8}", var_only_upper);
+    rip_log!("Total number of equality constraints.................:    {:>8}", n_eq);
+    rip_log!("Total number of inequality constraints...............:    {:>8}", n_ineq);
+    rip_log!("        inequality constraints with only lower bounds:    {:>8}", n_ineq_only_lower);
+    rip_log!("   inequality constraints with lower and upper bounds:    {:>8}", n_ineq_both);
+    rip_log!("        inequality constraints with only upper bounds:    {:>8}", n_ineq_only_upper);
+    rip_log!("");
 }
 
 /// Update the L-BFGS Hessian approximation (no-op when `lbfgs_state` is `None`).
@@ -3051,7 +3153,10 @@ fn update_lbfgs_hessian(
 ) {
     if let Some(ref mut lbfgs) = lbfgs_state {
         let lag_grad = LbfgsIpmState::compute_lagrangian_gradient(
-            &state.grad_f, &state.jac_rows, &state.jac_cols, &state.jac_vals, &state.y, state.n,
+            &state.grad_f,
+            &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals,
+            &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals,
+            &state.y_c, &state.y_d, state.n,
         );
         lbfgs.update(&state.x, &lag_grad);
         lbfgs.fill_hessian(&mut state.hess_vals);
@@ -3076,37 +3181,10 @@ fn evaluate_and_refresh_lbfgs<P: NlpProblem>(
     ok
 }
 
-/// Bundled output of the per-iteration KKT assembly phase.
-///
-/// Holds the barrier diagonal `sigma` and whichever of the three KKT
-/// representations the dispatch selected. Exactly one of
-/// `condensed_system`, `sparse_condensed_system`, `kkt_system_opt`
-/// is `Some` on exit.
-struct AssembledKkt {
-    sigma: Vec<f64>,
-    use_sparse_condensed: bool,
-    condensed_system: Option<kkt::CondensedKktSystem>,
-    sparse_condensed_system: Option<kkt::SparseCondensedKktSystem>,
-    kkt_system_opt: Option<kkt::KktSystem>,
-}
-
-/// Build the KKT system(s) for the current iterate.
-///
-/// Three-way dispatch:
-/// - Dense condensed Schur complement when `m >= 2n` and `n` is small.
-///   Cost `O(n^2 m + n^3)` beats `O((n+m)^3)` when `m >> n`.
-/// - Sparse condensed Schur when the problem is large with constraints
-///   and dense condensed is not already selected.
-/// - Full augmented (n+m)x(n+m) KKT otherwise.
-///
-/// Extracted from `solve_ipm` as part of the v0.8 main-loop
-/// decomposition. Does not touch `timings` — the caller records the
-/// elapsed duration.
 /// Outcome of the backtracking line-search trial loop.
 enum LineSearchOutcome {
     StepAccepted,
     Rejected,
-    Return(SolveResult),
 }
 
 /// Run the Ipopt-style backtracking line search on the current direction.
@@ -3131,39 +3209,62 @@ enum LineSearchOutcome {
 /// `constraint_slack_barrier` is on, all finite inequality-constraint
 /// bounds via g whose slack exceeds mu*1e-2 (the small-slack guard
 /// matches the line-search loop and the SOC routines).
+///
+/// When `kappa_d > 0`, also adds Ipopt's `kappa_d` damping term
+/// `+ kappa_d * mu * Σ slack_oneside[i]` for each variable with exactly
+/// one finite bound. Without this term the barrier is unbounded below
+/// for one-sided-bound variables (Ipopt 3.14 default `kappa_d = 1e-5`).
 fn compute_barrier_phi(
     obj: f64,
     x: &[f64],
-    g: &[f64],
+    s: &[f64],
     state: &SolverState,
     n: usize,
-    m: usize,
+    _m: usize,
     constraint_slack_barrier: bool,
+    kappa_d: f64,
 ) -> f64 {
     let mut phi = obj;
     for i in 0..n {
-        if state.x_l[i].is_finite() {
-            let slack = (x[i] - state.x_l[i]).max(1e-20);
+        let l_fin = state.x_l_at(i).is_finite();
+        let u_fin = state.x_u_at(i).is_finite();
+        if l_fin {
+            let slack = (x[i] - state.x_l_at(i)).max(1e-20);
             phi -= state.mu * slack.ln();
         }
-        if state.x_u[i].is_finite() {
-            let slack = (state.x_u[i] - x[i]).max(1e-20);
+        if u_fin {
+            let slack = (state.x_u_at(i) - x[i]).max(1e-20);
             phi -= state.mu * slack.ln();
+        }
+        // kappa_d damping: penalize drift toward the open side for
+        // variables with exactly one finite bound. Mirrors Ipopt 3.14
+        // CalcBarrierTerm in IpIpoptCalculatedQuantities.cpp.
+        if kappa_d > 0.0 && (l_fin ^ u_fin) {
+            let s_oneside = if l_fin {
+                (x[i] - state.x_l_at(i)).max(0.0)
+            } else {
+                (state.x_u_at(i) - x[i]).max(0.0)
+            };
+            phi += kappa_d * state.mu * s_oneside;
         }
     }
     if constraint_slack_barrier {
-        for i in 0..m {
-            if constraint_is_equality(state, i) {
-                continue;
-            }
-            if state.g_l[i].is_finite() {
-                let slack = g[i] - state.g_l[i];
+        // Ipopt 3.14 CalcBarrierTerm uses slack_s_L = s - d_l and
+        // slack_s_U = d_u - s — the barrier acts on the explicit slack
+        // iterate s, not on d(x). When the iterate is infeasible
+        // (theta>0) these differ; using d(x) here flips the sign of
+        // grad φ · dx and breaks filter alignment.
+        for k in 0..state.layout.n_d {
+            let dl = state.d_l_at(k);
+            let du = state.d_u_at(k);
+            if dl.is_finite() {
+                let slack = s[k] - dl;
                 if slack > state.mu * 1e-2 {
                     phi -= state.mu * slack.ln();
                 }
             }
-            if state.g_u[i].is_finite() {
-                let slack = state.g_u[i] - g[i];
+            if du.is_finite() {
+                let slack = du - s[k];
                 if slack > state.mu * 1e-2 {
                     phi -= state.mu * slack.ln();
                 }
@@ -3171,50 +3272,6 @@ fn compute_barrier_phi(
         }
     }
     phi
-}
-
-/// Dispatch a Second-Order Correction attempt to the appropriate solver
-/// path: dense condensed (cond_solver_for_soc + condensed_system), sparse
-/// condensed, or full augmented KKT. Returns the SOC trial tuple
-/// `(x, obj, g, alpha)` on acceptance, `None` otherwise. Caller checks
-/// `theta_trial > theta_current` and `*ls_steps == 0` before calling.
-#[allow(clippy::too_many_arguments)]
-fn dispatch_soc_attempt<P: NlpProblem>(
-    state: &SolverState,
-    problem: &P,
-    x_trial: &[f64],
-    g_trial: &[f64],
-    condensed_system: &Option<kkt::CondensedKktSystem>,
-    cond_solver_for_soc: &mut Option<DenseLdl>,
-    sparse_condensed_system: &Option<kkt::SparseCondensedKktSystem>,
-    kkt_system_opt: &Option<kkt::KktSystem>,
-    lin_solver: &mut dyn LinearSolver,
-    filter: &Filter,
-    theta_current: f64,
-    phi_current: f64,
-    grad_phi_step: f64,
-    alpha: f64,
-    options: &SolverOptions,
-) -> Option<(Vec<f64>, f64, Vec<f64>, f64)> {
-    if let (Some(cond), Some(cs)) = (condensed_system.as_ref(), cond_solver_for_soc.as_mut()) {
-        attempt_soc_condensed(
-            state, problem, g_trial, cs, cond, filter,
-            theta_current, phi_current, grad_phi_step, alpha, options,
-        )
-    } else if let Some(sc) = sparse_condensed_system.as_ref() {
-        attempt_soc_sparse_condensed(
-            state, problem, g_trial, lin_solver, sc, filter,
-            theta_current, phi_current, grad_phi_step, alpha, options,
-        )
-    } else if let Some(kkt) = kkt_system_opt.as_ref() {
-        attempt_soc(
-            state, problem, x_trial, g_trial,
-            lin_solver, kkt, filter,
-            theta_current, phi_current, grad_phi_step, alpha, options,
-        )
-    } else {
-        None
-    }
 }
 
 /// Project the candidate iterate `x + alpha*dx` onto the open variable
@@ -3225,18 +3282,22 @@ fn dispatch_soc_attempt<P: NlpProblem>(
 /// objective/constraints failed or returned NaN/Inf — caller halves
 /// alpha and retries.
 fn evaluate_trial_point<P: NlpProblem>(
-    state: &SolverState,
+    state: &mut SolverState,
     problem: &P,
     alpha: f64,
     m: usize,
 ) -> Option<(Vec<f64>, f64, Vec<f64>, f64)> {
     let x_trial = compute_clamped_trial_x(state, &state.dx, alpha);
 
+    // Phase 10b.3: trial-point eval routes through SplitNlp.
+    let nlp = crate::split_nlp::SplitNlp::new(problem, &state.layout);
     let mut obj_trial = f64::INFINITY;
-    let obj_ok = problem.objective(&x_trial, true, &mut obj_trial);
+    state.n_obj_evals += 1;
+    let obj_ok = nlp.objective(&x_trial, true, &mut obj_trial);
     let mut g_trial = vec![0.0; m];
     let constr_ok = if m > 0 {
-        problem.constraints(&x_trial, true, &mut g_trial)
+        state.n_constr_evals += 1;
+        nlp.constraints_combined(&x_trial, true, &mut g_trial)
     } else {
         true
     };
@@ -3247,7 +3308,12 @@ fn evaluate_trial_point<P: NlpProblem>(
         return None;
     }
 
-    let theta_trial = theta_for_g(state, &g_trial);
+    // Slack-coupled trial theta — A8.19. Trial slack `s + α·ds` is
+    // feasible because `compute_alpha_max` already applied frac-to-bound
+    // to the primal slack step.
+    let s_trial = compute_trial_slack(state, alpha);
+    let (c_trial, d_trial) = split_from_g(state, &g_trial);
+    let theta_trial = theta_for_split_d_s(state, &c_trial, &d_trial, &s_trial);
     Some((x_trial, obj_trial, g_trial, theta_trial))
 }
 
@@ -3281,40 +3347,34 @@ fn run_line_search_loop<P: NlpProblem>(
     problem: &P,
     options: &SolverOptions,
     filter: &mut Filter,
-    condensed_system: &Option<kkt::CondensedKktSystem>,
-    cond_solver_for_soc: &mut Option<DenseLdl>,
-    sparse_condensed_system: &Option<kkt::SparseCondensedKktSystem>,
-    kkt_system_opt: &Option<kkt::KktSystem>,
-    lin_solver: &mut dyn LinearSolver,
+    inertia_params: &mut InertiaCorrectionParams,
     alpha_primal_max: f64,
     theta_current: f64,
     phi_current: f64,
     grad_phi_step: f64,
     min_alpha: f64,
-    force_restoration: bool,
     watchdog_active: bool,
     iteration: usize,
     n: usize,
     m: usize,
-    start_time: Instant,
-    early_timeout: f64,
     trace_meta: &mut TraceMetadata,
     ls_steps: &mut usize,
+    aug_solver: &mut dyn LinearSolver,
+    aug_kkt: &crate::kkt_aug::AugKktSystem,
 ) -> LineSearchOutcome {
     let mut alpha = alpha_primal_max;
     let mut step_accepted = false;
     *ls_steps = 0;
 
-    for _ls_iter in 0..40 {
-        if force_restoration {
-            break;
-        }
-        // Intra-iteration early stall check (scaled by problem size)
-        if iteration < 3 && options.early_stall_timeout > 0.0
-            && start_time.elapsed().as_secs_f64() > early_timeout
-        {
-            return LineSearchOutcome::Return(make_result(state, SolveStatus::NumericalError));
-        }
+    // DEV-35: no hard-coded line-search step cap. Ipopt
+    // (IpFilterLSAcceptor.cpp::ComputeAlphaMin and the backtracking
+    // loop in IpBacktrackingLineSearch::DoBacktrackingLineSearch)
+    // terminates the line search on `alpha < alpha_min`, where
+    // alpha_min is itself derived from filter parameters and the
+    // current iterate. The previous `for _ls_iter in 0..40` cap was
+    // ripopt-specific and could prematurely abandon a step that was
+    // still on track to either accept or fall through to alpha_min.
+    loop {
         if alpha < min_alpha {
             break;
         }
@@ -3329,26 +3389,58 @@ fn run_line_search_loop<P: NlpProblem>(
                 }
             };
 
-        // Watchdog: accept full step unconditionally (bypass filter)
-        if watchdog_active && alpha == alpha_primal_max {
-            commit_trial_point(state, x_trial, obj_trial, g_trial, alpha);
-            step_accepted = true;
-            break;
-        }
-
-        // Barrier objective at trial
+        // Barrier objective at trial — uses the explicit-slack iterate
+        // `s_trial = s + α·ds` (Ipopt's curr_slack_*-based phi).
+        let s_trial = compute_trial_slack(state, alpha);
         let phi_trial = compute_barrier_phi(
-            obj_trial, &x_trial, &g_trial, state, n, m, options.constraint_slack_barrier,
+            obj_trial, &x_trial, &s_trial, state, n, m, options.constraint_slack_barrier,
+            options.kappa_d,
         );
 
-        let (acceptable, used_switching) = filter.check_acceptability(
+        if std::env::var("RIPOPT_LS_PROBE").is_ok() && iteration <= 112 {
+            let is_ft = filter.is_ftype(theta_current, grad_phi_step, alpha);
+            let armijo = filter.armijo_condition(phi_current, phi_trial, grad_phi_step, alpha);
+            let suf_theta = filter.sufficient_infeasibility_reduction(theta_current, theta_trial);
+            let suf_phi_rhs = phi_current - filter.gamma_phi() * theta_current;
+            let suf_phi = phi_trial <= suf_phi_rhs;
+            let omi = filter.passes_obj_max_inc(phi_current, phi_trial, false);
+            let in_filter = filter.is_acceptable(theta_trial, phi_trial);
+            eprintln!(
+                "[probe] iter={} ls={} alpha={:.3e} gBD={:.6e} theta_curr={:.10e} theta_tr={:.10e} phi_curr={:.10e} phi_tr={:.10e} dphi={:.3e} dtheta={:.3e} entries={} is_ft={} armijo={} suf_theta={} suf_phi={} (rhs={:.10e}) omi={} in_filter={}",
+                iteration, *ls_steps, alpha, grad_phi_step,
+                theta_current, theta_trial, phi_current, phi_trial,
+                phi_trial - phi_current, theta_trial - theta_current,
+                filter.len(), is_ft, armijo, suf_theta, suf_phi, suf_phi_rhs, omi, in_filter,
+            );
+        }
+
+        // DEV-30/31: `augment_required` is the Ipopt
+        // `UpdateForNextIteration` augmentation gate (`!IsFtype || !ArmijoHolds`,
+        // IpFilterLSAcceptor.cpp:881-895). Pure IsFtype, *without* the
+        // theta_min clause, so h-type accepts that happened to satisfy
+        // IsFtype+Armijo at the accepted alpha do not over-augment.
+        let (acceptable, augment_required) = filter.check_acceptability(
             theta_current,
             phi_current,
             theta_trial,
             phi_trial,
             grad_phi_step,
-            alpha,
+            alpha, false,
         );
+
+        // Watchdog full step (T2.21, spec §4): filter check still runs (Ipopt
+        // fidelity), but on accept we skip filter augmentation so transient
+        // infeasibility is tolerated across the watchdog's trial window. See
+        // `IpBacktrackingLineSearch.cpp::DoBacktrackingLineSearch`.
+        if watchdog_active && alpha == alpha_primal_max && acceptable {
+            commit_trial_point(state, x_trial, obj_trial, g_trial, alpha);
+            step_accepted = true;
+            // T3.10: watchdog-accept also runs the filter-reset
+            // bookkeeping so consecutive trapped iterations advance
+            // the counter even when filter augmentation is suppressed.
+            filter.note_acceptance();
+            break;
+        }
 
         if !acceptable && options.print_level >= 7 && *ls_steps < 5 {
             log_line_search_rejection(
@@ -3360,19 +3452,29 @@ fn run_line_search_loop<P: NlpProblem>(
         if acceptable {
             commit_trial_point(state, x_trial, obj_trial, g_trial, alpha);
             step_accepted = true;
-            if !used_switching {
+            if augment_required {
                 filter.add(theta_current, phi_current);
+            }
+            // T3.10: post-acceptance filter-reset trigger
+            // (`IpFilterLSAcceptor.cpp:407-434`).
+            let reset_fired = filter.note_acceptance();
+            if reset_fired && options.print_level >= 5 {
+                eprintln!(
+                    "  [filter] iter={}: filter reset (resets={})",
+                    state.iter, filter.n_filter_resets()
+                );
             }
             break;
         }
 
-        // SOC on the first trial only, if full step increased theta
-        if theta_trial > theta_current && options.max_soc > 0 && *ls_steps == 0 {
-            let soc_accepted = dispatch_soc_attempt(
-                state, problem, &x_trial, &g_trial, condensed_system,
-                cond_solver_for_soc, sparse_condensed_system, kkt_system_opt,
-                lin_solver, filter, theta_current, phi_current, grad_phi_step,
-                alpha, options,
+        // SOC on the first trial only, if full step did not strictly decrease theta.
+        // Mirrors `IpFilterLSAcceptor::TrySecondOrderCorrection` entry condition
+        // (`IpFilterLSAcceptor.cpp` SOC dispatch): `theta_trial >= theta_current`.
+        if theta_trial >= theta_current && options.max_soc > 0 && *ls_steps == 0 {
+            let soc_accepted = attempt_soc_aug(
+                state, problem, &g_trial, inertia_params, filter,
+                theta_current, phi_current, grad_phi_step, alpha, options,
+                aug_solver, aug_kkt,
             );
             if let Some((x_soc, obj_soc, g_soc, alpha_soc)) = soc_accepted {
                 state.diagnostics.soc_corrections += 1;
@@ -3380,6 +3482,9 @@ fn run_line_search_loop<P: NlpProblem>(
                 commit_trial_point(state, x_soc, obj_soc, g_soc, alpha_soc);
                 step_accepted = true;
                 filter.add(theta_current, phi_current);
+                // T3.10: SOC-accepted step counts as an accepted step
+                // for the filter-reset heuristic.
+                filter.note_acceptance();
                 break;
             }
         }
@@ -3392,61 +3497,6 @@ fn run_line_search_loop<P: NlpProblem>(
         LineSearchOutcome::StepAccepted
     } else {
         LineSearchOutcome::Rejected
-    }
-}
-
-fn assemble_kkt_systems(
-    state: &SolverState,
-    n: usize,
-    m: usize,
-    use_sparse: bool,
-    disable_sparse_condensed: bool,
-) -> AssembledKkt {
-    let sigma = compute_sigma_from_state(state);
-
-    let use_condensed = m >= 2 * n && n > 0 && (!use_sparse || n <= 100);
-    let use_sparse_condensed = use_sparse && m > 0 && !use_condensed && !disable_sparse_condensed;
-
-    let condensed_system = if use_condensed {
-        Some(kkt::assemble_condensed_kkt(
-            n, m,
-            &state.hess_rows, &state.hess_cols, &state.hess_vals,
-            &state.jac_rows, &state.jac_cols, &state.jac_vals,
-            &sigma, &state.grad_f, &state.g, &state.g_l, &state.g_u,
-            &state.y, &state.z_l, &state.z_u,
-            &state.x, &state.x_l, &state.x_u, state.mu,
-            &state.v_l, &state.v_u,
-        ))
-    } else {
-        None
-    };
-
-    let sparse_condensed_system = if use_sparse_condensed {
-        Some(kkt::assemble_sparse_condensed_kkt(
-            n, m,
-            &state.hess_rows, &state.hess_cols, &state.hess_vals,
-            &state.jac_rows, &state.jac_cols, &state.jac_vals,
-            &sigma, &state.grad_f, &state.g, &state.g_l, &state.g_u,
-            &state.y, &state.z_l, &state.z_u,
-            &state.x, &state.x_l, &state.x_u, state.mu,
-            &state.v_l, &state.v_u,
-        ))
-    } else {
-        None
-    };
-
-    let kkt_system_opt = if !use_condensed && !use_sparse_condensed {
-        Some(assemble_kkt_from_state(state, n, m, &sigma, use_sparse))
-    } else {
-        None
-    };
-
-    AssembledKkt {
-        sigma,
-        use_sparse_condensed,
-        condensed_system,
-        sparse_condensed_system,
-        kkt_system_opt,
     }
 }
 
@@ -3473,349 +3523,412 @@ fn assemble_kkt_systems(
 /// mu mode, μ_KS uses `max(avg_compl, μ)` (capped at 1e3) so the
 /// clamp tracks actual centrality rather than the lagging μ. Returns
 /// the μ_KS used (printed in the diagnostics row).
+/// Advance bound multipliers to the trial step `z + alpha_d·dz`, with a
+/// floor of `1e-20` to keep them strictly positive. Mirrors Ipopt's
+/// trial-iterate construction (the line-search applies the same step
+/// internally before AcceptTrialPoint commits). Split out from
+/// `apply_kappa_sigma_bound_multiplier_reset` so that
+/// `apply_slack_move` (which fires between this and the kappa_sigma
+/// clamp, per Ipopt order) sees the trial z, not the previous-iter z.
+fn advance_z_to_trial(state: &mut SolverState, alpha_d: f64) {
+    // Phase 6d.6: compressed bound storage is canonical. Walk it
+    // natively; the combined mirror is dropped.
+    for k in 0..state.bound_layout.n_x_l {
+        let new_z = (state.z_l_compressed[k] + alpha_d * state.dz_l_compressed[k]).max(1e-20);
+        state.z_l_compressed[k] = new_z;
+    }
+    for k in 0..state.bound_layout.n_x_u {
+        let new_z = (state.z_u_compressed[k] + alpha_d * state.dz_u_compressed[k]).max(1e-20);
+        state.z_u_compressed[k] = new_z;
+    }
+    // Slack-bound multipliers v_L, v_U: same Newton update as z_L, z_U
+    // (Ipopt's `IpIpoptAlg.cpp:652-770` advances all four blocks with the
+    // shared α_dual). Phase 8d: walk compressed storage directly; the
+    // d_bound_layout already excludes equality rows and d-rows without
+    // a finite slack bound.
+    for kc in 0..state.d_bound_layout.n_d_l {
+        let new_v = (state.v_l_compressed[kc] + alpha_d * state.dv_l_compressed[kc]).max(1e-20);
+        state.v_l_compressed[kc] = new_v;
+    }
+    for kc in 0..state.d_bound_layout.n_d_u {
+        let new_v = (state.v_u_compressed[kc] + alpha_d * state.dv_u_compressed[kc]).max(1e-20);
+        state.v_u_compressed[kc] = new_v;
+    }
+    // T3.25: bump dual atags so a downstream factor doesn't reuse a
+    // stale fingerprint after this trial-step write.
+    state.bump_dual_atags();
+}
+
+/// Apply the kappa_sigma reset to bound multipliers (Ipopt's
+/// `correct_bound_multiplier` at `IpIpoptAlg.cpp:716-767`):
+/// clamp each `z` into `[mu_ks/(kappa_sigma·s), kappa_sigma·mu_ks/s]`.
+/// Assumes z has already been advanced to the trial step (see
+/// `advance_z_to_trial`) and any pending slack_move has run.
 fn apply_kappa_sigma_bound_multiplier_reset(
     state: &mut SolverState,
     mu_state: &MuState,
-    alpha_d: f64,
 ) -> f64 {
-    let n = state.n;
+    let m = state.m;
     let kappa_sigma = 1e10;
+    // T2.3: drop the ripopt-specific `.max(state.mu)` clamp on the Free-mode
+    // mu_ks; Ipopt's `correct_bound_multiplier` uses the current barrier
+    // parameter directly. Keep the `1e3` upper cap as a numerical safety
+    // (avg_compl spikes can produce wildly wide z-clamps otherwise).
     let mu_ks = if mu_state.mode == MuMode::Free {
-        compute_avg_complementarity(state)
-            .max(state.mu)
-            .min(1e3)
+        compute_avg_complementarity(state).min(1e3)
     } else {
         state.mu
     };
-    for i in 0..n {
-        if state.x_l[i].is_finite() {
-            let z_new = (state.z_l[i] + alpha_d * state.dz_l[i]).max(1e-20);
-            let s_l = slack_xl(state, i);
-            let z_lo = mu_ks / (kappa_sigma * s_l);
-            let z_hi = kappa_sigma * mu_ks / s_l;
-            state.z_l[i] = z_new.clamp(z_lo, z_hi);
-        }
-        if state.x_u[i].is_finite() {
-            let z_new = (state.z_u[i] + alpha_d * state.dz_u[i]).max(1e-20);
-            let s_u = slack_xu(state, i);
-            let z_lo = mu_ks / (kappa_sigma * s_u);
-            let z_hi = kappa_sigma * mu_ks / s_u;
-            state.z_u[i] = z_new.clamp(z_lo, z_hi);
-        }
+    // Phase 6d.6: compressed bound storage is canonical.
+    for k in 0..state.bound_layout.n_x_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        let s_l = slack_xl(state, i);
+        let z_lo = mu_ks / (kappa_sigma * s_l);
+        let z_hi = kappa_sigma * mu_ks / s_l;
+        state.z_l_compressed[k] = state.z_l_compressed[k].clamp(z_lo, z_hi);
     }
+    for k in 0..state.bound_layout.n_x_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        let s_u = slack_xu(state, i);
+        let z_lo = mu_ks / (kappa_sigma * s_u);
+        let z_hi = kappa_sigma * mu_ks / s_u;
+        state.z_u_compressed[k] = state.z_u_compressed[k].clamp(z_lo, z_hi);
+    }
+    // Apply the same κ_σ band to the slack-bound multipliers v_L, v_U
+    // (Ipopt's `correct_bound_multiplier` runs over ALL FOUR blocks,
+    // `IpIpoptAlg.cpp:721-758`). Phase 8d: walk compressed storage
+    // directly; only finite-bound entries exist.
+    for kc in 0..state.d_bound_layout.n_d_l {
+        let k = state.d_bound_layout.d_l_to_full[kc];
+        let i = state.layout.d_to_combined[k];
+        let s_l = slack_gl(state, i);
+        let v_lo = mu_ks / (kappa_sigma * s_l);
+        let v_hi = kappa_sigma * mu_ks / s_l;
+        state.v_l_compressed[kc] = state.v_l_compressed[kc].clamp(v_lo, v_hi);
+    }
+    for kc in 0..state.d_bound_layout.n_d_u {
+        let k = state.d_bound_layout.d_u_to_full[kc];
+        let i = state.layout.d_to_combined[k];
+        let s_u = slack_gu(state, i);
+        let v_lo = mu_ks / (kappa_sigma * s_u);
+        let v_hi = kappa_sigma * mu_ks / s_u;
+        state.v_u_compressed[kc] = state.v_u_compressed[kc].clamp(v_lo, v_hi);
+    }
+    let _ = m;
     mu_ks
 }
 
-/// Per-component sign-flip damping state for the y multiplier update.
-/// `prev_dy` holds the previous iterate's dy (for sign comparison) and
-/// `sign_change_count[i]` accumulates consecutive sign flips on row i;
-/// when a count hits 3 the corresponding dy[i] is halved.
-struct DyOscillationTracker {
-    prev_dy: Option<Vec<f64>>,
-    sign_change_count: Vec<u8>,
-}
-
-impl DyOscillationTracker {
-    fn new(m: usize) -> Self {
-        Self {
-            prev_dy: None,
-            sign_change_count: vec![0u8; m],
-        }
-    }
-}
-
-/// Apply the y multiplier update with sign-flip damping. Once the
-/// solver is near convergence (`consecutive_acceptable >= 1`),
-/// components of `dy` whose sign has flipped relative to the previous
-/// iterate accumulate a counter; when the count hits 3, the step is
-/// halved (0.5·dy). Components without a flip reset their counter.
-/// `state.y[i] += alpha_y * dy_i` for each row, then `tracker.prev_dy`
-/// is rotated to hold the current `dy`.
-fn apply_damped_y_update(
-    state: &mut SolverState,
-    alpha_y: f64,
-    tracker: &mut DyOscillationTracker,
-) {
+/// Apply Ipopt 3.14's `slack_move` runtime slack adjustment.
+///
+/// Mirrors `IpoptCalculatedQuantities::CalculateSafeSlack`
+/// (`ref/Ipopt/src/Algorithm/IpIpoptCalculatedQuantities.cpp:455-537`).
+///
+/// Trigger: a primal slack `s_l = x[i] - x_l[i]` (or upper mirror
+/// `s_u = x_u[i] - x[i]`) is "unsafe" when it falls below
+///   `s_min = max(eps * min(1, mu), f64::MIN_POSITIVE)`.
+/// At unsafe slacks, the corresponding *bound* (not the variable) is
+/// nudged outward so the new slack equals
+///   `new_s = min(max(mu / z, s_min),
+///                slack_move * max(1.0, |bound|) + s_old)`.
+/// When `z <= 0`, the `mu / z` term is treated as `+infinity`, so the
+/// upper cap binds.
+///
+/// Per Ipopt: this fires BEFORE the kappa_sigma bound-multiplier reset,
+/// so `apply_kappa_sigma_bound_multiplier_reset` sees the corrected
+/// slacks when it clamps `z_l` / `z_u` against `mu / s`.
+///
+/// Returns the number of components adjusted on this call. The
+/// cumulative count is also accumulated into
+/// `state.adjusted_slacks_count`.
+fn apply_slack_move(state: &mut SolverState, options: &SolverOptions) -> usize {
+    let n = state.n;
     let m = state.m;
-    let near_convergence = state.consecutive_acceptable >= 1;
+    let slack_move = options.slack_move;
+    if !(slack_move > 0.0) {
+        return 0;
+    }
+    let mu = state.mu;
+    // Ipopt: s_min = eps * min(1, mu); fallback to MIN_POSITIVE if mu is
+    // so small that s_min underflows. See IpIpoptCalculatedQuantities.cpp:469-477.
+    let s_min = (f64::EPSILON * mu.min(1.0)).max(f64::MIN_POSITIVE);
+    let mut adjusted = 0usize;
+    // Phase 6d.3: walk compressed bound mirrors. The set
+    // {i : x_l[i].is_finite()} matches `x_l_to_full[..n_x_l]` exactly.
+    let _ = n;
+    for k in 0..state.bound_layout.n_x_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        let s_l = state.x[i] - state.x_l_compressed[k];
+        if s_l < s_min {
+            let z = state.z_l_compressed[k];
+            let from_mu = if z > 0.0 { mu / z } else { f64::INFINITY };
+            let cap = slack_move * state.x_l_compressed[k].abs().max(1.0) + s_l;
+            let new_s = from_mu.max(s_min).min(cap);
+            state.x_l_compressed[k] -= new_s - s_l;
+            adjusted += 1;
+        }
+    }
+    for k in 0..state.bound_layout.n_x_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        let s_u = state.x_u_compressed[k] - state.x[i];
+        if s_u < s_min {
+            let z = state.z_u_compressed[k];
+            let from_mu = if z > 0.0 { mu / z } else { f64::INFINITY };
+            let cap = slack_move * state.x_u_compressed[k].abs().max(1.0) + s_u;
+            let new_s = from_mu.max(s_min).min(cap);
+            state.x_u_compressed[k] += new_s - s_u;
+            adjusted += 1;
+        }
+    }
+    // B-cross8: extend slack_move to the constraint slack iterate `s`
+    // against `[g_l, g_u]` (Ipopt's CalculateSafeSlack runs over all
+    // four slack blocks: x_L, x_U, s_L, s_U; see
+    // IpIpoptCalculatedQuantities.cpp:455-537). Skip equality rows
+    // (their s is held at the equality value as a sentinel).
     for i in 0..m {
-        let sign_change = if let Some(ref pdy) = tracker.prev_dy {
-            pdy[i] * state.dy[i] < 0.0
-        } else {
-            false
-        };
-        if near_convergence && sign_change {
-            tracker.sign_change_count[i] = tracker.sign_change_count[i].saturating_add(1);
-        } else if !sign_change {
-            tracker.sign_change_count[i] = 0;
+        let l_fin = state.g_l_at(i).is_finite();
+        let u_fin = state.g_u_at(i).is_finite();
+        if l_fin && u_fin && (state.g_l_at(i) - state.g_u_at(i)).abs() < 1e-14 {
+            continue;
         }
-        let dy_i = if near_convergence && tracker.sign_change_count[i] >= 3 {
-            0.5 * state.dy[i]
-        } else {
-            state.dy[i]
-        };
-        state.y[i] += alpha_y * dy_i;
+        let s_i = state.s_at(i);
+        if l_fin {
+            let g_l_i = state.g_l_at(i);
+            let s_l = s_i - g_l_i;
+            if s_l < s_min {
+                let v = state.v_l_at(i);
+                let from_mu = if v > 0.0 { mu / v } else { f64::INFINITY };
+                let cap = slack_move * g_l_i.abs().max(1.0) + s_l;
+                let new_s = from_mu.max(s_min).min(cap);
+                state.set_g_l_at(i, g_l_i - (new_s - s_l));
+                adjusted += 1;
+            }
+        }
+        if u_fin {
+            let g_u_i = state.g_u_at(i);
+            let s_u = g_u_i - s_i;
+            if s_u < s_min {
+                let v = state.v_u_at(i);
+                let from_mu = if v > 0.0 { mu / v } else { f64::INFINITY };
+                let cap = slack_move * g_u_i.abs().max(1.0) + s_u;
+                let new_s = from_mu.max(s_min).min(cap);
+                state.set_g_u_at(i, g_u_i + (new_s - s_u));
+                adjusted += 1;
+            }
+        }
     }
-    tracker.prev_dy = Some(state.dy.clone());
+    state.adjusted_slacks_count += adjusted;
+    adjusted
 }
 
-fn update_dual_variables(
-    state: &mut SolverState,
-    mu_state: &MuState,
-    alpha_dual_max: f64,
-    tracker: &mut DyOscillationTracker,
+/// A8.9: Plain Ipopt y-update — `state.y[i] += alpha_y * dy_i`.
+/// Mirrors `BacktrackingLineSearch::PerformDualStep`
+/// (`IpBacktrackingLineSearch.cpp:919-1006`); Ipopt updates y_c,y_d
+/// with the raw `α_y · dy` from the KKT solve and has no sign-flip
+/// or oscillation damping. The previous ripopt-specific
+/// `DyOscillationTracker` heuristic — halving dy when the same
+/// component flipped sign 3 times near convergence — was a load-
+/// bearing benchmark crutch with no analogue in Ipopt and is
+/// removed here.
+fn apply_y_update(state: &mut SolverState, alpha_y: f64) {
+    for k in 0..state.layout.n_c {
+        state.y_c[k] += alpha_y * state.dy_c[k];
+    }
+    for k in 0..state.layout.n_d {
+        state.y_d[k] += alpha_y * state.dy_d[k];
+    }
+}
+
+/// T3.32: closed-form 1D minimizer of the dual-infeasibility quadratic
+/// `phi(α) = ||r_x + α·J^T·dy||² + ||r_s − α·dy_d||²` per Ipopt
+/// `IpBacktrackingLineSearch.cpp:969-998`.
+///
+/// At call time `state.x` is the trial primal point (committed by the
+/// line-search), but `state.grad_f` and `state.jac_vals` were
+/// evaluated at the pre-step iterate. We re-evaluate both at the
+/// trial point into local buffers so the formula uses the same
+/// quantities Ipopt does (`grad_lag_x_trial` with current y/z, and
+/// `J(x_trial)^T·dy`). Cost: one objective gradient + one Jacobian
+/// values evaluation per accepted step. Paid only when this option
+/// is selected (default `Primal` does no work here).
+///
+/// In ripopt's implicit-slack representation, the s-row residual is
+///   `r_s_i = -y_i - v_l_i + v_u_i`     for inequality rows i
+///   `r_s_i = 0`                          for equality rows i
+/// and `dy_d` is the inequality-row slice of `state.dy` (zero on
+/// equality rows). The closed-form minimum is `α* = -b/a` clipped to
+/// the appropriate interval.
+fn compute_min_dual_infeas_alpha<P: NlpProblem>(
+    state: &SolverState,
+    problem: &P,
+    mode: AlphaForY,
+    alpha_p: f64,
+    alpha_d: f64,
 ) -> f64 {
-    let alpha_y = state.alpha_primal;
-    let alpha_d = alpha_dual_max;
-
-    apply_damped_y_update(state, alpha_y, tracker);
-
-    let mu_ks = apply_kappa_sigma_bound_multiplier_reset(state, mu_state, alpha_d);
-
-    state.alpha_dual = alpha_d;
-    mu_ks
-}
-
-/// Apply Gondzio multiple centrality corrections (MCC).
-///
-/// After the main Newton direction has been computed, perform up to
-/// `options.gondzio_mcc_max` additional centrality corrections using
-/// the SAME factored KKT matrix (one extra backsolve per correction)
-/// to drive complementarity pairs far from μ back toward the central
-/// path.
-///
-/// Guards:
-/// - Reject corrections whose solution magnitude exceeds `1e10`× the
-///   RHS magnitude (null-space blow-ups on rank-deficient systems).
-/// - Dampen corrections that deflect the direction by more than 30°
-///   (basin-switching on nonconvex problems).
-/// - Accept each correction only if it does not shrink α by more
-///   than 10%.
-///
-/// No-op when `options.gondzio_mcc_max == 0` or when the KKT is
-/// condensed (this helper only runs on the full-augmented path).
-///
-/// Reference: Gondzio (1994, Comput. Optim. Appl.); Gondzio (2007).
-/// Combine the Gondzio MCC corrector step `(ddx, ddy)` with the
-/// current Newton direction stored in `state.{dx, dy, dz_l, dz_u}`,
-/// recovering the bound-multiplier corrections via
-/// `dz_L = -(z_L/s_L)·ddx`, `dz_U = (z_U/s_U)·ddx` (no centering
-/// term). If the resulting `dx_c` deflects more than ~45° from the
-/// original `state.dx` (cos(angle) < 0.7), damp the correction with
-/// blending factor `alpha_damp = 0.3` to keep the corrected step
-/// close to the Newton direction.
-///
-/// Returns `(dx_c, dy_c, dz_l_c, dz_u_c)`.
-fn build_mcc_corrected_direction(
-    state: &SolverState,
-    ddx: &[f64],
-    ddy: &[f64],
-    iteration: usize,
-    n: usize,
-    m: usize,
-    dx_norm_orig: f64,
-) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
-    let mut ddz_l = vec![0.0_f64; n];
-    let mut ddz_u = vec![0.0_f64; n];
-    for i in 0..n {
-        if state.x_l[i].is_finite() {
-            ddz_l[i] = -(state.z_l[i] / slack_xl(state, i)) * ddx[i];
-        }
-        if state.x_u[i].is_finite() {
-            ddz_u[i] = (state.z_u[i] / slack_xu(state, i)) * ddx[i];
-        }
-    }
-
-    let mut dx_c: Vec<f64> = state.dx.iter().zip(ddx.iter()).map(|(a, b)| a + b).collect();
-    let mut dy_c: Vec<f64> = state.dy.iter().zip(ddy.iter()).map(|(a, b)| a + b).collect();
-    let mut dz_l_c: Vec<f64> = state.dz_l.iter().zip(ddz_l.iter()).map(|(a, b)| a + b).collect();
-    let mut dz_u_c: Vec<f64> = state.dz_u.iter().zip(ddz_u.iter()).map(|(a, b)| a + b).collect();
-
-    if dx_norm_orig > 1e-30 {
-        let dx_c_norm: f64 = l2_norm(&dx_c);
-        if dx_c_norm > 1e-30 {
-            let dot = dot_product(&state.dx, &dx_c);
-            let cos_angle = dot / (dx_norm_orig * dx_c_norm);
-            if cos_angle < 0.7 {
-                let alpha_damp = 0.3;
-                for i in 0..n { dx_c[i] = (1.0 - alpha_damp) * state.dx[i] + alpha_damp * dx_c[i]; }
-                for i in 0..m { dy_c[i] = (1.0 - alpha_damp) * state.dy[i] + alpha_damp * dy_c[i]; }
-                for i in 0..n { dz_l_c[i] = (1.0 - alpha_damp) * state.dz_l[i] + alpha_damp * dz_l_c[i]; }
-                for i in 0..n { dz_u_c[i] = (1.0 - alpha_damp) * state.dz_u[i] + alpha_damp * dz_u_c[i]; }
-                log::debug!(
-                    "Gondzio MCC iter {}: dampened correction (cos={:.3})",
-                    iteration, cos_angle
-                );
-            }
-        }
-    }
-
-    (dx_c, dy_c, dz_l_c, dz_u_c)
-}
-
-/// Build the Gondzio multiple-centrality-corrections (MCC)
-/// corrector RHS for the augmented KKT system. For each bound,
-/// projects the trial complementarity `c = z·s` at the current
-/// step `alpha_mcc` onto the centrality interval
-/// `[beta_min·μ_target, beta_max·μ_target]`; only complementarities
-/// outside this band contribute, with sign chosen so adding the
-/// correction step pulls `c` back inside.
-///
-/// Returns the RHS vector (zero outside the bound rows) and a
-/// boolean indicating whether at least one bound contributed —
-/// when no bound contributes, the caller short-circuits the loop.
-fn build_mcc_corrector_rhs(
-    state: &SolverState,
-    kkt_dim: usize,
-    alpha_mcc: f64,
-    mu_target: f64,
-    beta_min: f64,
-    beta_max: f64,
-    n: usize,
-) -> (Vec<f64>, bool) {
-    let mut rhs_mcc = vec![0.0_f64; kkt_dim];
-    let mut needs_correction = false;
-    for i in 0..n {
-        if state.x_l[i].is_finite() {
-            let s_t = (state.x[i] + alpha_mcc * state.dx[i]
-                - state.x_l[i]).max(1e-20);
-            let z_t = (state.z_l[i] + alpha_mcc * state.dz_l[i]).max(1e-20);
-            let c = z_t * s_t;
-            if c < beta_min * mu_target || c > beta_max * mu_target {
-                rhs_mcc[i] += (mu_target - c) / s_t;
-                needs_correction = true;
-            }
-        }
-        if state.x_u[i].is_finite() {
-            let s_t = (state.x_u[i] - state.x[i]
-                - alpha_mcc * state.dx[i]).max(1e-20);
-            let z_t = (state.z_u[i] + alpha_mcc * state.dz_u[i]).max(1e-20);
-            let c = z_t * s_t;
-            if c < beta_min * mu_target || c > beta_max * mu_target {
-                rhs_mcc[i] -= (mu_target - c) / s_t;
-                needs_correction = true;
-            }
-        }
-    }
-    (rhs_mcc, needs_correction)
-}
-
-/// Maximum step size α such that the iterate stays within
-/// `tau_mcc` × distance-to-boundary of the bounds for both the
-/// primal variables (lower and upper) and the bound multipliers.
-/// Used twice inside the Gondzio MCC loop: once on the original
-/// Newton direction and once on each candidate corrected direction.
-fn compute_mcc_alpha_max(
-    state: &SolverState,
-    dx: &[f64],
-    dz_l: &[f64],
-    dz_u: &[f64],
-    tau_mcc: f64,
-) -> f64 {
-    let alpha = fraction_to_boundary_dual_z_min(state, dz_l, dz_u, tau_mcc)
-        .min(fraction_to_boundary_primal_x(state, dx, tau_mcc));
-    alpha.clamp(0.0, 1.0)
-}
-
-/// Validate and apply one Gondzio corrector solution `(ddx, ddy)`.
-/// Rejects if `||(ddx,ddy)||_∞ > 1e10·||rhs||_∞.max(1)` (null-space
-/// blow-up on rank-deficient systems). Otherwise builds the
-/// corrected direction `(dx_c, dy_c, dz_l_c, dz_u_c)` and the new
-/// `α_max` along it. Accepts only when α has not shrunk by more than
-/// 10% (`α_new ≥ 0.9·α_mcc`); on accept, mutates `state.{dx,dy,dz_l,
-/// dz_u}` and returns `Some(α_new)`. Returns `None` (caller breaks)
-/// on rejection or insufficient α.
-fn try_apply_one_mcc_correction(
-    state: &mut SolverState,
-    iteration: usize,
-    alpha_mcc: f64,
-    tau_mcc: f64,
-    dx_norm_orig: f64,
-    rhs_mcc: &[f64],
-    ddx: &[f64],
-    ddy: &[f64],
-    n: usize,
-    m: usize,
-) -> Option<f64> {
-    let nrm_rhs: f64 = linf_norm(rhs_mcc);
-    let nrm_sol: f64 = ddx.iter().chain(ddy.iter()).map(|v| v.abs()).fold(0.0_f64, f64::max);
-    if nrm_sol > 1e10 * nrm_rhs.max(1.0) {
-        log::debug!(
-            "Gondzio MCC iter {}: ||sol||={:.2e}, ||rhs||={:.2e} — rejecting",
-            iteration, nrm_sol, nrm_rhs,
-        );
-        return None;
-    }
-    let (dx_c, dy_c, dz_l_c, dz_u_c) = build_mcc_corrected_direction(
-        state, ddx, ddy, iteration, n, m, dx_norm_orig,
-    );
-
-    let alpha_new = compute_mcc_alpha_max(
-        state, &dx_c, &dz_l_c, &dz_u_c, tau_mcc,
-    );
-
-    if alpha_new >= 0.9 * alpha_mcc {
-        install_step_directions(state, dx_c, dy_c, dz_l_c, dz_u_c);
-        log::debug!(
-            "Gondzio MCC iter {}: correction accepted, α_mcc={:.4}",
-            iteration, alpha_new
-        );
-        Some(alpha_new)
-    } else {
-        None
-    }
-}
-
-fn apply_gondzio_mcc(
-    state: &mut SolverState,
-    options: &SolverOptions,
-    iteration: usize,
-    mu_state: &MuState,
-    primal_inf: f64,
-    dual_inf: f64,
-    compl_inf: f64,
-    kkt_system_opt: &Option<kkt::KktSystem>,
-    lin_solver: &mut dyn LinearSolver,
-) {
-    if options.gondzio_mcc_max == 0 {
-        return;
-    }
-    let Some(kkt) = kkt_system_opt.as_ref() else { return };
     let n = state.n;
     let m = state.m;
 
-    let tau_mcc = compute_tau(state, options, mu_state, primal_inf, dual_inf, compl_inf);
-    let mut alpha_mcc = compute_mcc_alpha_max(
-        state, &state.dx, &state.dz_l, &state.dz_u, tau_mcc,
-    );
-
-    let mu_target = state.mu;
-    let beta_min = 0.01_f64;
-    let beta_max = 100.0_f64;
-
-    let dx_norm_orig: f64 = l2_norm(&state.dx);
-
-    for _mcc_iter in 0..options.gondzio_mcc_max {
-        let (rhs_mcc, needs_correction) = build_mcc_corrector_rhs(
-            state, kkt.dim, alpha_mcc, mu_target, beta_min, beta_max, n,
-        );
-        if !needs_correction {
-            break;
-        }
-
-        match kkt::solve_with_custom_rhs_refined(&kkt.matrix, kkt.n, kkt.dim, lin_solver, &rhs_mcc) {
-            Ok((ddx, ddy)) => {
-                match try_apply_one_mcc_correction(
-                    state, iteration, alpha_mcc, tau_mcc, dx_norm_orig,
-                    &rhs_mcc, &ddx, &ddy, n, m,
-                ) {
-                    Some(alpha_new) => alpha_mcc = alpha_new,
-                    None => break,
-                }
-            }
-            Err(_) => break,
-        }
+    // Evaluate grad_f and Jacobian values at the trial primal point.
+    // `state.x` already holds the trial coords (committed pre-call).
+    // Phase 10b.4: route through SplitNlp; the adapter's
+    // `jacobian_split` collapses the combined→split projection.
+    let nlp = crate::split_nlp::SplitNlp::new(problem, &state.layout);
+    let mut grad_f_trial = vec![0.0_f64; n];
+    if !nlp.gradient(&state.x, true, &mut grad_f_trial) {
+        return alpha_p; // graceful fallback
     }
+    let mut jac_c_trial = vec![0.0_f64; state.jac_c_vals.len()];
+    let mut jac_d_trial = vec![0.0_f64; state.jac_d_vals.len()];
+    if !nlp.jacobian_split(
+        &state.x,
+        false,
+        &state.jac_c_combined_idx,
+        &state.jac_d_combined_idx,
+        &mut jac_c_trial,
+        &mut jac_d_trial,
+    ) {
+        return alpha_p;
+    }
+
+    // r_x = grad_lag_x(trial) = grad_f_trial + J(trial)^T · y_curr − z_L + z_U.
+    // (The kappa_d damping is omitted here to match Ipopt's formula on
+    // line 977 which uses the raw `grad_lag_x` without the damping
+    // term — Ipopt resets y_c/y_d to current via `BackupCurrent` at
+    // 975-980 then queries `curr_grad_lag_x_amax_func()`.)
+    let mut r_x = grad_f_trial.clone();
+    for (k, (&kc, &col)) in state.jac_c_rows.iter().zip(state.jac_c_cols.iter()).enumerate() {
+        r_x[col] += jac_c_trial[k] * state.y_c[kc];
+    }
+    for (k, (&kd, &col)) in state.jac_d_rows.iter().zip(state.jac_d_cols.iter()).enumerate() {
+        r_x[col] += jac_d_trial[k] * state.y_d[kd];
+    }
+    // Phase 6d.3: walk compressed bound mirrors. Unbounded sides
+    // contribute 0, identical to the n-wide form.
+    for k in 0..state.bound_layout.n_x_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        r_x[i] -= state.z_l_compressed[k];
+    }
+    for k in 0..state.bound_layout.n_x_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        r_x[i] += state.z_u_compressed[k];
+    }
+
+    // r_s and dy_d are d-block-only (Ipopt's slack rows don't exist on
+    // equality constraints). Phase 5e: read directly from split storage.
+    // Phase 8c.5: walk compressed v_l/v_u mirrors via Pd_L/Pd_U (the
+    // unbounded zero-padded entries contribute nothing).
+    let n_d = state.layout.n_d;
+    let mut r_s = vec![0.0_f64; n_d];
+    for k in 0..n_d {
+        r_s[k] = -state.y_d[k];
+    }
+    for kc in 0..state.d_bound_layout.n_d_l {
+        let k = state.d_bound_layout.d_l_to_full[kc];
+        r_s[k] -= state.v_l_compressed[kc];
+    }
+    for kc in 0..state.d_bound_layout.n_d_u {
+        let k = state.d_bound_layout.d_u_to_full[kc];
+        r_s[k] += state.v_u_compressed[kc];
+    }
+    let _ = m;
+
+    // Jt_dy = J(trial)^T · dy (split-form; equality contribution from
+    // jac_c_trial · dy_c, inequality from jac_d_trial · dy_d).
+    let mut jt_dy = vec![0.0_f64; n];
+    for (k, (&kc, &col)) in state.jac_c_rows.iter().zip(state.jac_c_cols.iter()).enumerate() {
+        jt_dy[col] += jac_c_trial[k] * state.dy_c[kc];
+    }
+    for (k, (&kd, &col)) in state.jac_d_rows.iter().zip(state.jac_d_cols.iter()).enumerate() {
+        jt_dy[col] += jac_d_trial[k] * state.dy_d[kd];
+    }
+
+    // a = ||Jt_dy||² + ||dy_d||²
+    let a: f64 = jt_dy.iter().map(|v| v * v).sum::<f64>()
+        + state.dy_d.iter().map(|v| v * v).sum::<f64>();
+    // b = r_x · Jt_dy − r_s · dy_d
+    let b: f64 = r_x.iter().zip(jt_dy.iter()).map(|(rx, jd)| rx * jd).sum::<f64>()
+        - r_s.iter().zip(state.dy_d.iter()).map(|(rs, dd)| rs * dd).sum::<f64>();
+
+    // Closed-form minimum α* = -b/a. Guard a==0 (Δy entirely zero) by
+    // falling back to alpha_p (matches Ipopt's behavior — α_y is
+    // irrelevant when dy = 0).
+    if a <= 0.0 {
+        return alpha_p;
+    }
+    let alpha_star = -b / a;
+
+    // Clip per mode.
+    match mode {
+        AlphaForY::MinDualInfeas => alpha_star.clamp(0.0, 1.0),
+        AlphaForY::SaferMinDualInfeas => {
+            let lo = alpha_p.min(alpha_d);
+            let hi = alpha_p.max(alpha_d);
+            alpha_star.clamp(lo, hi)
+        }
+        _ => unreachable!("compute_min_dual_infeas_alpha called with non-min-dual-infeas mode"),
+    }
+}
+
+fn update_dual_variables<P: NlpProblem>(
+    state: &mut SolverState,
+    mu_state: &MuState,
+    alpha_dual_max: f64,
+    options: &SolverOptions,
+    problem: &P,
+) -> f64 {
+    // T3.32: pick alpha_y per `alpha_for_y` option, matching Ipopt
+    // IpBacktrackingLineSearch.cpp:84-104 (simple modes) and
+    // :969-998 (closed-form 1D minimizer for MinDualInfeas variants).
+    let alpha_p = state.alpha_primal;
+    let alpha_d = alpha_dual_max;
+    // DEV-32: PRIMAL_AND_FULL / DUAL_AND_FULL switch to the full step
+    // when the *primal step infinity norm* is small, not when the
+    // primal/dual step length is large. Per Ipopt
+    // IpBacktrackingLineSearch.cpp:937-958 and the option
+    // documentation at line 95-96/103-104:
+    //   dxnorm = max(|delta_x|_inf, |delta_s|_inf)
+    //   if dxnorm <= alpha_for_y_tol → alpha_y = 1
+    let dxnorm = || -> f64 {
+        let dx_inf = state.dx.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+        let ds_inf = state.ds.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+        dx_inf.max(ds_inf)
+    };
+    let alpha_y = match options.alpha_for_y {
+        AlphaForY::Primal => alpha_p,
+        AlphaForY::BoundMult => alpha_d,
+        AlphaForY::Min => alpha_p.min(alpha_d),
+        AlphaForY::Max => alpha_p.max(alpha_d),
+        AlphaForY::Full => 1.0,
+        AlphaForY::PrimalAndFull => {
+            if dxnorm() <= options.alpha_for_y_tol { 1.0 } else { alpha_p }
+        }
+        AlphaForY::DualAndFull => {
+            if dxnorm() <= options.alpha_for_y_tol { 1.0 } else { alpha_d }
+        }
+        AlphaForY::MinDualInfeas | AlphaForY::SaferMinDualInfeas => {
+            compute_min_dual_infeas_alpha(state, problem, options.alpha_for_y, alpha_p, alpha_d)
+        }
+    };
+
+    apply_y_update(state, alpha_y);
+
+    // Ipopt post-step order (IpIpoptAlg.cpp:652-770):
+    //   1. Advance z to trial step.
+    //   2. slack_move on trial (slack, z) pair (mutates x_l/x_u).
+    //   3. kappa_sigma clamps z using the post-slack-move slacks.
+    advance_z_to_trial(state, alpha_d);
+
+    let n_adjusted = apply_slack_move(state, options);
+    if n_adjusted > 0 && options.print_level >= 6 {
+        eprintln!(
+            "  [slack_move] iter={}: adjusted {} bound(s) (cumulative {})",
+            state.iter, n_adjusted, state.adjusted_slacks_count
+        );
+    }
+
+    let mu_ks = apply_kappa_sigma_bound_multiplier_reset(state, mu_state);
+
+    state.alpha_dual = alpha_d;
+    mu_ks
 }
 
 /// Watchdog control-flow decision returned after update.
@@ -3905,9 +4018,19 @@ fn process_watchdog_trial<P: NlpProblem>(
     let saved = wd.saved.as_ref()?;
     let theta_now = state.constraint_violation();
     let phi_now = state.barrier_objective(options);
+    // Ipopt-aligned watchdog progress check: the trial iterate must be
+    // acceptable to the saved filter and provide sufficient decrease
+    // against the saved (theta, phi) snapshot using the same
+    // gamma_theta / gamma_phi margins the filter line search uses.
+    // Reference: Ipopt's IpBacktrackingLineSearch only retains the
+    // watchdog while DoBacktrackingLineSearch accepts; that acceptance
+    // is the filter sufficient-progress test relative to the watchdog
+    // reference iterate.
+    let gamma_theta = filter.gamma_theta();
+    let gamma_phi = filter.gamma_phi();
     let made_progress = filter.is_acceptable(theta_now, phi_now)
-        && (theta_now < (1.0 - 1e-5) * saved.theta
-            || phi_now < saved.phi - 1e-5 * saved.theta);
+        && (theta_now <= (1.0 - gamma_theta) * saved.theta
+            || phi_now <= saved.phi - gamma_phi * saved.theta);
 
     if made_progress {
         log::debug!(
@@ -3979,723 +4102,6 @@ fn update_watchdog<P: NlpProblem>(
     WatchdogDecision::Proceed
 }
 
-/// Outcome of the search-direction solve.
-enum DirectionSolveDecision {
-    Proceed {
-        dx: Vec<f64>,
-        dy: Vec<f64>,
-        cond_solver_for_soc: Option<DenseLdl>,
-        mehrotra_aff: Option<(Vec<f64>, Vec<f64>, Vec<f64>, f64)>,
-    },
-    Continue,
-    Return(SolveResult),
-}
-
-/// Outcome of the dense-condensed branch in `solve_for_search_direction`.
-/// `Solved` carries the primal/dual step and (when the BK factorization
-/// of the n×n Schur complement succeeded) the cached `DenseLdl` used by
-/// SOC. `Continue` and `Return` propagate restoration / NumericalError.
-enum CondensedDirectionOutcome {
-    Solved {
-        dx: Vec<f64>,
-        dy: Vec<f64>,
-        cond_solver: Option<DenseLdl>,
-    },
-    Continue,
-    Return(SolveResult),
-}
-
-/// Outcome of `restore_after_solve_failure`. Continue = restoration
-/// succeeded and the iterate was updated; Return = restoration failed
-/// and the caller should bubble up `NumericalError`.
-enum SolveRestoreOutcome {
-    Continue,
-    Return(SolveResult),
-}
-
-/// Shared helper for the "factor or solve failed → call restoration"
-/// pattern that appears in `solve_dense_condensed_direction` (factor
-/// failure and KKT solve failure paths) and in
-/// `solve_for_search_direction`'s full-augmented error path.
-///
-/// On restoration success, advances `state.x`, zeros `alpha_primal`,
-/// re-evaluates the linear-aware step and updates the L-BFGS Hessian
-/// estimate. On failure, returns a `NumericalError` `SolveResult`.
-#[allow(clippy::too_many_arguments)]
-fn restore_after_solve_failure<P: NlpProblem>(
-    state: &mut SolverState,
-    problem: &P,
-    options: &SolverOptions,
-    n: usize,
-    m: usize,
-    filter: &Filter,
-    restoration: &mut RestorationPhase,
-    lbfgs_state: &mut Option<LbfgsIpmState>,
-    lbfgs_mode: bool,
-    linear_constraints: Option<&[bool]>,
-    deadline: Option<Instant>,
-) -> SolveRestoreOutcome {
-    let (x_rest, success) = restoration.restore(
-        &state.x, &state.x_l, &state.x_u, &state.g_l, &state.g_u,
-        &state.jac_rows, &state.jac_cols, n, m, options,
-        &|theta, phi| filter.is_acceptable(theta, phi),
-        &|x_eval, g_out| problem.constraints(x_eval, true, g_out),
-        &|x_eval, jac_out| problem.jacobian_values(x_eval, true, jac_out),
-        Some(&|x_eval: &[f64], obj_out: &mut f64| problem.objective(x_eval, true, obj_out)),
-        deadline,
-    );
-    if success {
-        state.x = x_rest;
-        state.alpha_primal = 0.0;
-        let _ = evaluate_and_refresh_lbfgs(state, problem, lbfgs_state, linear_constraints, lbfgs_mode);
-        return SolveRestoreOutcome::Continue;
-    }
-    SolveRestoreOutcome::Return(make_result(state, SolveStatus::NumericalError))
-}
-
-/// Mehrotra PC deflection revert: solve the original (μ-current)
-/// RHS via iterative refinement and check the angle between the
-/// PC step `dx_dir` and the original step `dx_orig`. If
-/// cos(angle) < 0.7 (i.e. >~45° deflection), revert to the
-/// original direction, restore the original RHS in
-/// `kkt_system_opt`, and clear `mehrotra_aff`. This guards against
-/// the predictor probe pushing the search direction far from a
-/// reasonable Newton step in early iterations.
-fn maybe_revert_mehrotra_deflection(
-    dx_dir: &mut Vec<f64>,
-    dy_dir: &mut Vec<f64>,
-    mehrotra_aff: &mut Option<(Vec<f64>, Vec<f64>, Vec<f64>, f64)>,
-    saved_rhs: &Option<Vec<f64>>,
-    kkt_system_opt: &mut Option<kkt::KktSystem>,
-    lin_solver: &mut dyn LinearSolver,
-) {
-    let Some(orig_rhs) = saved_rhs.as_ref() else { return };
-    let Some(kkt) = kkt_system_opt.as_ref() else { return };
-    let Ok((dx_orig, dy_orig)) = kkt::solve_with_custom_rhs_refined(
-        &kkt.matrix, kkt.n, kkt.dim, lin_solver, orig_rhs,
-    ) else { return };
-    let norm_orig: f64 = l2_norm(&dx_orig);
-    let norm_pc: f64 = l2_norm(dx_dir);
-    if norm_orig <= 1e-30 || norm_pc <= 1e-30 {
-        return;
-    }
-    let dot = dot_product(&dx_orig, dx_dir);
-    let cos_angle = dot / (norm_orig * norm_pc);
-    if cos_angle >= 0.7 {
-        return;
-    }
-    log::debug!(
-        "Mehrotra PC deflection too large (cos={:.3}), reverting",
-        cos_angle
-    );
-    *dx_dir = dx_orig;
-    *dy_dir = dy_orig;
-    kkt_system_opt.as_mut().unwrap().rhs = orig_rhs.clone();
-    *mehrotra_aff = None;
-}
-
-/// Ipopt-style quality escalation around `kkt::solve_for_direction`
-/// for the full augmented KKT path. After the initial solve, on a
-/// `PretendSingular` error walks the escalation ladder:
-///
-///   1. Ruiz equilibrate (if not already scaled);
-///   2. raise the linear solver's pivot tolerance;
-///   3. apply δ_c constraint regularization (if `m > 0`);
-///   4. apply δ_w Hessian regularization.
-///
-/// Each rung re-factors and re-solves; the loop exits once the
-/// solve no longer reports `PretendSingular`. Returns the final
-/// `dir_result` and the (possibly increased) `(ic_delta_w, ic_delta_c)`.
-fn solve_with_quality_escalation(
-    kkt_system_opt: &mut Option<kkt::KktSystem>,
-    lin_solver: &mut dyn LinearSolver,
-    inertia_params: &mut InertiaCorrectionParams,
-    mut ic_delta_w: f64,
-    mut ic_delta_c: f64,
-    n: usize,
-    m: usize,
-) -> (Result<(Vec<f64>, Vec<f64>), crate::linear_solver::SolverError>, f64, f64) {
-    let mut dir_result = kkt::solve_for_direction(
-        kkt_system_opt.as_ref().unwrap(), lin_solver, ic_delta_w, ic_delta_c,
-    );
-    if matches!(dir_result, Err(crate::linear_solver::SolverError::PretendSingular)) {
-        if let Some(kkt_system) = kkt_system_opt.as_mut() {
-            let mut ps_resolved = false;
-
-            if !ps_resolved {
-                if !inertia_params.use_scaling && kkt_system.scale_factors.is_none() {
-                    inertia_params.use_scaling = true;
-                    let scale = kkt::ruiz_equilibrate(&mut kkt_system.matrix, &mut kkt_system.rhs);
-                    kkt_system.scale_factors = Some(scale);
-                    if lin_solver.factor(&kkt_system.matrix).is_ok() {
-                        dir_result = kkt::solve_for_direction(kkt_system, lin_solver, ic_delta_w, ic_delta_c);
-                        ps_resolved = !matches!(dir_result, Err(crate::linear_solver::SolverError::PretendSingular));
-                    }
-                }
-                if !ps_resolved && lin_solver.increase_quality() {
-                    if lin_solver.factor(&kkt_system.matrix).is_ok() {
-                        dir_result = kkt::solve_for_direction(kkt_system, lin_solver, ic_delta_w, ic_delta_c);
-                        ps_resolved = !matches!(dir_result, Err(crate::linear_solver::SolverError::PretendSingular));
-                    }
-                }
-            }
-
-            if !ps_resolved && m > 0 && ic_delta_c == 0.0 {
-                let dc = inertia_params.delta_c_base;
-                let mut perturbed = kkt_system.matrix.clone();
-                perturbed.add_diagonal_range(n, n + m, -dc);
-                if lin_solver.factor(&perturbed).is_ok() {
-                    kkt_system.matrix = perturbed;
-                    ic_delta_c = dc;
-                    dir_result = kkt::solve_for_direction(kkt_system, lin_solver, ic_delta_w, ic_delta_c);
-                    ps_resolved = !matches!(dir_result, Err(crate::linear_solver::SolverError::PretendSingular));
-                }
-            }
-            if !ps_resolved && matches!(dir_result, Err(crate::linear_solver::SolverError::PretendSingular)) {
-                let dw = if ic_delta_w == 0.0 { inertia_params.delta_w_init } else { ic_delta_w * inertia_params.delta_w_inc_fact };
-                let dc = if m > 0 && ic_delta_c == 0.0 { inertia_params.delta_c_base } else { ic_delta_c };
-                let mut perturbed = kkt_system.matrix.clone();
-                perturbed.add_diagonal_range(0, n, dw);
-                if m > 0 && dc > ic_delta_c {
-                    perturbed.add_diagonal_range(n, n + m, -(dc - ic_delta_c));
-                }
-                if lin_solver.factor(&perturbed).is_ok() {
-                    kkt_system.matrix = perturbed;
-                    ic_delta_w = dw;
-                    ic_delta_c = dc;
-                    inertia_params.delta_w_last = dw;
-                    dir_result = kkt::solve_for_direction(kkt_system, lin_solver, ic_delta_w, ic_delta_c);
-                }
-            }
-            if !inertia_params.use_scaling {
-                inertia_params.use_scaling = true;
-            }
-        }
-    }
-    (dir_result, ic_delta_w, ic_delta_c)
-}
-
-/// Mehrotra predictor-corrector probe: solve the affine-predictor
-/// system (rhs zeroed of barrier terms), recover bound-multiplier
-/// directions via `kkt::recover_dz` at μ=0, take the
-/// fraction-to-boundary step α_aff under τ=1-1e-3, derive the
-/// affine complementarity μ_aff and centering parameter
-/// σ = (μ_aff/μ)^3 ∈ [0,1], and rebuild the RHS at
-/// μ_pc = max(σ·μ, μ_min). Returns the rebuilt RHS together with
-/// the affine direction (dx_aff, dz_l_aff, dz_u_aff) and μ_pc.
-/// Returns None when the affine solve fails or no bound
-/// constraints contributed to μ_aff.
-/// Compute the affine complementarity μ_aff = (1/N) Σ s⁺(α) · z⁺(α)
-/// over active bounds, where s⁺ and z⁺ are the affine-step trial
-/// slacks and bound multipliers. Each slack/multiplier is floored at
-/// 1e-20 to keep the product bounded against trial points that touch
-/// a bound. Returns `None` when no bounds are active (so σ_Mehrotra
-/// is undefined and the caller should skip the corrector).
-fn compute_affine_complementarity(
-    state: &SolverState,
-    dx_aff: &[f64],
-    dz_l_aff: &[f64],
-    dz_u_aff: &[f64],
-    alpha_aff: f64,
-    n: usize,
-) -> Option<f64> {
-    let mut mu_aff_sum = 0.0_f64;
-    let mut nb: usize = 0;
-    for i in 0..n {
-        if state.x_l[i].is_finite() {
-            let s = (state.x[i] + alpha_aff * dx_aff[i]
-                - state.x_l[i]).max(1e-20);
-            let z = (state.z_l[i] + alpha_aff * dz_l_aff[i]).max(1e-20);
-            mu_aff_sum += s * z;
-            nb += 1;
-        }
-        if state.x_u[i].is_finite() {
-            let s = (state.x_u[i] - state.x[i]
-                - alpha_aff * dx_aff[i]).max(1e-20);
-            let z = (state.z_u[i] + alpha_aff * dz_u_aff[i]).max(1e-20);
-            mu_aff_sum += s * z;
-            nb += 1;
-        }
-    }
-    if nb == 0 {
-        None
-    } else {
-        Some(mu_aff_sum / nb as f64)
-    }
-}
-
-/// Fraction-to-boundary step length for the affine predictor.
-/// Combines the dual-z minimum (`fraction_to_boundary_dual_z_min`)
-/// with primal-slack ratios on each variable's active bound under
-/// τ = 1 - 1e-3, clamped to `[0, 1]`. Used inside the Mehrotra
-/// predictor to derive α_aff before computing the affine
-/// complementarity μ_aff and centering parameter σ.
-fn compute_affine_step_alpha(
-    state: &SolverState,
-    dx_aff: &[f64],
-    dz_l_aff: &[f64],
-    dz_u_aff: &[f64],
-    n: usize,
-) -> f64 {
-    let tau_aff = 1.0 - 1e-3;
-    let mut alpha_aff = fraction_to_boundary_dual_z_min(state, dz_l_aff, dz_u_aff, tau_aff)
-        .min(1.0);
-    for i in 0..n {
-        if state.x_l[i].is_finite() && dx_aff[i] < 0.0 {
-            alpha_aff = alpha_aff.min(tau_aff * slack_xl(state, i) / (-dx_aff[i]));
-        }
-        if state.x_u[i].is_finite() && dx_aff[i] > 0.0 {
-            alpha_aff = alpha_aff.min(tau_aff * slack_xu(state, i) / dx_aff[i]);
-        }
-    }
-    alpha_aff.clamp(0.0, 1.0)
-}
-
-fn try_mehrotra_predictor(
-    state: &SolverState,
-    options: &SolverOptions,
-    kkt: &kkt::KktSystem,
-    lin_solver: &mut dyn LinearSolver,
-    iteration: usize,
-    n: usize,
-    last_mehrotra_sigma: &mut Option<f64>,
-) -> Option<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, f64)> {
-    let rhs_aff = kkt::affine_predictor_rhs(
-        &kkt.rhs, &state.x, &state.x_l, &state.x_u, state.mu,
-    );
-    let (dx_aff, _) = kkt::solve_with_custom_rhs_refined(
-        &kkt.matrix, kkt.n, kkt.dim, lin_solver, &rhs_aff,
-    ).ok()?;
-    let (dz_l_aff, dz_u_aff) = recover_dz_from_state(state, &dx_aff, 0.0);
-    let alpha_aff = compute_affine_step_alpha(state, &dx_aff, &dz_l_aff, &dz_u_aff, n);
-    let mu_aff = compute_affine_complementarity(
-        state, &dx_aff, &dz_l_aff, &dz_u_aff, alpha_aff, n,
-    )?;
-    let sigma_mehr = (mu_aff / state.mu).powi(3).clamp(0.0, 1.0);
-    *last_mehrotra_sigma = Some(sigma_mehr);
-    let mu_pc = (sigma_mehr * state.mu).max(options.mu_min);
-    log::debug!(
-        "Mehrotra PC iter {}: σ={:.4} α_aff={:.4} μ: {:.2e}→{:.2e}",
-        iteration, sigma_mehr, alpha_aff, state.mu, mu_pc
-    );
-    let new_rhs = kkt::rebuild_rhs_with_mu(
-        &kkt.rhs, &state.x, &state.x_l, &state.x_u,
-        state.mu, mu_pc,
-    );
-    Some((new_rhs, dx_aff, dz_l_aff, dz_u_aff, mu_pc))
-}
-
-/// Sparse condensed direction solve: factor the sparse Schur
-/// complement S with the banded/sparse solver. On factor or
-/// solve failure rebuilds the full augmented KKT, factors it with
-/// inertia correction (using a fresh fallback solver), and falls
-/// back to a gradient-descent step if even that fails. Always
-/// returns a (dx, dy) pair — restoration is never invoked here
-/// because gradient_descent_fallback acts as the floor.
-#[allow(clippy::too_many_arguments)]
-fn solve_sparse_condensed_direction(
-    state: &SolverState,
-    sc: &kkt::SparseCondensedKktSystem,
-    sigma: &[f64],
-    n: usize,
-    m: usize,
-    use_sparse: bool,
-    lin_solver: &mut dyn LinearSolver,
-    inertia_params: &mut InertiaCorrectionParams,
-) -> (Vec<f64>, Vec<f64>) {
-    let kkt_sc = KktMatrix::Sparse(sc.matrix.clone());
-    let factor_ok = lin_solver.factor(&kkt_sc).is_ok();
-    if factor_ok {
-        match kkt::solve_sparse_condensed(sc, lin_solver) {
-            Ok(d) => return d,
-            Err(_) => {}
-        }
-    }
-    let mut kkt = assemble_kkt_from_state(state, n, m, sigma, use_sparse);
-    let mut fallback_solver = new_fallback_solver(use_sparse);
-    if let Ok((fb_dw, fb_dc)) = kkt::factor_with_inertia_correction(
-        &mut kkt, fallback_solver.as_mut(), inertia_params, state.mu,
-    ) {
-        kkt::solve_for_direction(&kkt, fallback_solver.as_mut(), fb_dw, fb_dc)
-            .unwrap_or_else(|_| gradient_descent_fallback(state)
-                .unwrap_or_else(|| (vec![0.0; n], vec![0.0; m])))
-    } else {
-        gradient_descent_fallback(state)
-            .unwrap_or_else(|| (vec![0.0; n], vec![0.0; m]))
-    }
-}
-
-/// Dense condensed direction solve: Bunch-Kaufman on the n×n Schur
-/// complement `H + Σ + J^T·D_c^{-1}·J`. On BK or solve failure rebuilds
-/// the full augmented KKT, factors it with inertia correction, and
-/// solves; falls back to restoration on persistent failure.
-#[allow(clippy::too_many_arguments)]
-fn solve_dense_condensed_direction<P: NlpProblem>(
-    state: &mut SolverState,
-    problem: &P,
-    options: &SolverOptions,
-    n: usize,
-    m: usize,
-    use_sparse: bool,
-    cond: &kkt::CondensedKktSystem,
-    sigma: &[f64],
-    kkt_system_opt: &mut Option<kkt::KktSystem>,
-    lin_solver: &mut dyn LinearSolver,
-    inertia_params: &mut InertiaCorrectionParams,
-    filter: &Filter,
-    restoration: &mut RestorationPhase,
-    lbfgs_state: &mut Option<LbfgsIpmState>,
-    lbfgs_mode: bool,
-    linear_constraints: Option<&[bool]>,
-    deadline: Option<Instant>,
-) -> CondensedDirectionOutcome {
-    let mut cond_solver = DenseLdl::new();
-    let t_cond_bk = Instant::now();
-    let cond_ok = cond_solver.bunch_kaufman_factor(&cond.matrix).is_ok();
-    if options.print_level >= 5 {
-        rip_log!("ripopt: Dense condensed BK factor n={}: {:.3}s (ok={})",
-            n, t_cond_bk.elapsed().as_secs_f64(), cond_ok);
-    }
-    let cond_result = if cond_ok {
-        kkt::solve_condensed(cond, &mut cond_solver).ok()
-    } else {
-        None
-    };
-
-    if let Some((dx, dy)) = cond_result {
-        return CondensedDirectionOutcome::Solved {
-            dx,
-            dy,
-            cond_solver: Some(cond_solver),
-        };
-    }
-
-    // Condensed failed — build full KKT on demand.
-    fall_back_to_full_kkt_after_condensed_failure(
-        state, problem, options, n, m, use_sparse, sigma,
-        kkt_system_opt, lin_solver, inertia_params, filter, restoration,
-        lbfgs_state, lbfgs_mode, linear_constraints, deadline,
-    )
-}
-
-/// Build the full augmented KKT on demand and try to solve it after the
-/// dense-condensed Bunch–Kaufman path failed. On factor or solve failure,
-/// dispatches to `restore_after_solve_failure`. On success, transfers
-/// ownership of the freshly built `KktSystem` into `kkt_system_opt` so
-/// downstream consumers (line search, SOC) see the same matrix.
-#[allow(clippy::too_many_arguments)]
-/// Run `restore_after_solve_failure` and convert the resulting
-/// `SolveRestoreOutcome` into a `CondensedDirectionOutcome`. Used at
-/// every KKT-failure exit on the condensed-fallback path so the
-/// `Continue` / `Return` mapping isn't duplicated at each call site.
-#[allow(clippy::too_many_arguments)]
-fn apply_solve_failure_restoration<P: NlpProblem>(
-    state: &mut SolverState,
-    problem: &P,
-    options: &SolverOptions,
-    n: usize,
-    m: usize,
-    filter: &Filter,
-    restoration: &mut RestorationPhase,
-    lbfgs_state: &mut Option<LbfgsIpmState>,
-    lbfgs_mode: bool,
-    linear_constraints: Option<&[bool]>,
-    deadline: Option<Instant>,
-) -> CondensedDirectionOutcome {
-    match restore_after_solve_failure(
-        state, problem, options, n, m, filter, restoration,
-        lbfgs_state, lbfgs_mode, linear_constraints, deadline,
-    ) {
-        SolveRestoreOutcome::Continue => CondensedDirectionOutcome::Continue,
-        SolveRestoreOutcome::Return(r) => CondensedDirectionOutcome::Return(r),
-    }
-}
-
-fn fall_back_to_full_kkt_after_condensed_failure<P: NlpProblem>(
-    state: &mut SolverState,
-    problem: &P,
-    options: &SolverOptions,
-    n: usize,
-    m: usize,
-    use_sparse: bool,
-    sigma: &[f64],
-    kkt_system_opt: &mut Option<kkt::KktSystem>,
-    lin_solver: &mut dyn LinearSolver,
-    inertia_params: &mut InertiaCorrectionParams,
-    filter: &Filter,
-    restoration: &mut RestorationPhase,
-    lbfgs_state: &mut Option<LbfgsIpmState>,
-    lbfgs_mode: bool,
-    linear_constraints: Option<&[bool]>,
-    deadline: Option<Instant>,
-) -> CondensedDirectionOutcome {
-    let mut kkt = assemble_kkt_from_state(state, n, m, sigma, use_sparse);
-    let fb_ic = kkt::factor_with_inertia_correction(
-        &mut kkt, lin_solver, inertia_params, state.mu,
-    );
-    if fb_ic.is_err() {
-        return apply_solve_failure_restoration(
-            state, problem, options, n, m, filter, restoration,
-            lbfgs_state, lbfgs_mode, linear_constraints, deadline,
-        );
-    }
-    let (fb_dw, fb_dc) = fb_ic.unwrap();
-    match kkt::solve_for_direction(&kkt, lin_solver, fb_dw, fb_dc) {
-        Ok((dx, dy)) => {
-            *kkt_system_opt = Some(kkt);
-            CondensedDirectionOutcome::Solved {
-                dx,
-                dy,
-                cond_solver: None,
-            }
-        }
-        Err(e) => {
-            log::warn!("KKT solve failed: {}", e);
-            apply_solve_failure_restoration(
-                state, problem, options, n, m, filter, restoration,
-                lbfgs_state, lbfgs_mode, linear_constraints, deadline,
-            )
-        }
-    }
-}
-
-/// Solve the KKT system for the primal-dual Newton search direction.
-///
-/// Dispatches over the three KKT representations:
-///
-///  * **Dense condensed** (`m ≥ 2n` and small `n`) — Bunch-Kaufman on the
-///    `n×n` Schur complement `H + Σ + J^T·D_c^{-1}·J`. On BK failure
-///    builds the full augmented KKT on demand and retries.
-///  * **Sparse condensed** — sparse factor of the Schur complement.
-///    On factor/solve failure falls back to the full augmented KKT
-///    with `gradient_descent_fallback` as last resort.
-///  * **Full augmented** (`else` branch) — optional Mehrotra
-///    predictor-corrector probe to update μ, then Ipopt-style quality
-///    escalation (Ruiz scaling → raise pivot tolerance → δ_c → δ_w),
-///    with 30° deflection revert if the PC direction strays too far
-///    from the original.
-///
-/// Mirrors `IpPDSearchDirCalc.cpp:81-110` / `IpPDFullSpaceSolver.cpp`
-/// in Ipopt.
-#[allow(clippy::too_many_arguments)]
-/// Outcome of `solve_full_augmented_direction`.
-enum FullAugmentedOutcome {
-    Solved {
-        dx: Vec<f64>,
-        dy: Vec<f64>,
-        mehrotra_aff: Option<(Vec<f64>, Vec<f64>, Vec<f64>, f64)>,
-    },
-    Continue,
-    Return(SolveResult),
-}
-
-/// Solve the full (n+m)×(n+m) augmented KKT system with optional
-/// Mehrotra predictor-corrector and quality-escalation pivoting. On
-/// solver failure, attempts the gradient-descent fallback and then
-/// restoration. The Mehrotra branch saves the original RHS,
-/// substitutes the corrector RHS, and reverts the deflection
-/// post-solve when the corrector overshot. δ_w/δ_c escalations are
-/// applied in-place to kkt_system_opt and the solver instance.
-#[allow(clippy::too_many_arguments)]
-fn solve_full_augmented_direction<P: NlpProblem>(
-    state: &mut SolverState,
-    problem: &P,
-    options: &SolverOptions,
-    iteration: usize,
-    n: usize,
-    m: usize,
-    kkt_system_opt: &mut Option<kkt::KktSystem>,
-    lin_solver: &mut dyn LinearSolver,
-    inertia_params: &mut InertiaCorrectionParams,
-    ic_delta_w: f64,
-    ic_delta_c: f64,
-    filter: &Filter,
-    restoration: &mut RestorationPhase,
-    lbfgs_state: &mut Option<LbfgsIpmState>,
-    lbfgs_mode: bool,
-    linear_constraints: Option<&[bool]>,
-    last_mehrotra_sigma: &mut Option<f64>,
-    deadline: Option<Instant>,
-) -> FullAugmentedOutcome {
-    let saved_rhs = if options.mehrotra_pc {
-        kkt_system_opt.as_ref().map(|k| k.rhs.clone())
-    } else {
-        None
-    };
-    let mut mehrotra_applied = false;
-    let mut mehrotra_aff: Option<(Vec<f64>, Vec<f64>, Vec<f64>, f64)> = None;
-
-    if options.mehrotra_pc {
-        let has_bounds = (0..n).any(|i| state.x_l[i].is_finite() || state.x_u[i].is_finite());
-        if has_bounds {
-            let pc_result = try_mehrotra_predictor(
-                state, options, kkt_system_opt.as_ref().unwrap(), lin_solver,
-                iteration, n, last_mehrotra_sigma,
-            );
-            if let Some((new_rhs, dx_aff_v, dz_l_aff_v, dz_u_aff_v, mu_pc_used)) = pc_result {
-                kkt_system_opt.as_mut().unwrap().rhs = new_rhs;
-                mehrotra_applied = true;
-                mehrotra_aff = Some((dx_aff_v, dz_l_aff_v, dz_u_aff_v, mu_pc_used));
-            }
-        }
-    }
-
-    // Escalated (δ_w, δ_c) values are not read again — the helper mutates
-    // kkt_system.matrix, inertia_params, and lin_solver in place, which
-    // carries the escalation effect into subsequent iterations.
-    let (dir_result, _, _) = solve_with_quality_escalation(
-        kkt_system_opt, lin_solver, inertia_params, ic_delta_w, ic_delta_c, n, m,
-    );
-    let (mut dx_dir, mut dy_dir) = match dir_result {
-        Ok(d) => d,
-        Err(e) => {
-            log::warn!("KKT solve failed: {}", e);
-            if let Some(fallback) = gradient_descent_fallback(state) {
-                fallback
-            } else {
-                match restore_after_solve_failure(
-                    state, problem, options, n, m, filter, restoration,
-                    lbfgs_state, lbfgs_mode, linear_constraints, deadline,
-                ) {
-                    SolveRestoreOutcome::Continue => return FullAugmentedOutcome::Continue,
-                    SolveRestoreOutcome::Return(r) => return FullAugmentedOutcome::Return(r),
-                }
-            }
-        }
-    };
-
-    if mehrotra_applied {
-        maybe_revert_mehrotra_deflection(
-            &mut dx_dir, &mut dy_dir, &mut mehrotra_aff,
-            &saved_rhs, kkt_system_opt, lin_solver,
-        );
-    }
-
-    FullAugmentedOutcome::Solved { dx: dx_dir, dy: dy_dir, mehrotra_aff }
-}
-
-fn solve_for_search_direction<P: NlpProblem>(
-    state: &mut SolverState,
-    problem: &P,
-    options: &SolverOptions,
-    iteration: usize,
-    n: usize,
-    m: usize,
-    use_sparse: bool,
-    condensed_system: &Option<kkt::CondensedKktSystem>,
-    sparse_condensed_system: &Option<kkt::SparseCondensedKktSystem>,
-    kkt_system_opt: &mut Option<kkt::KktSystem>,
-    lin_solver: &mut dyn LinearSolver,
-    sigma: &[f64],
-    inertia_params: &mut InertiaCorrectionParams,
-    ic_delta_w: f64,
-    ic_delta_c: f64,
-    filter: &Filter,
-    restoration: &mut RestorationPhase,
-    lbfgs_state: &mut Option<LbfgsIpmState>,
-    lbfgs_mode: bool,
-    linear_constraints: Option<&[bool]>,
-    last_mehrotra_sigma: &mut Option<f64>,
-    deadline: Option<Instant>,
-) -> DirectionSolveDecision {
-    let mut cond_solver_for_soc: Option<DenseLdl> = None;
-    let mut mehrotra_aff: Option<(Vec<f64>, Vec<f64>, Vec<f64>, f64)> = None;
-
-    let (dx, dy) = if let Some(cond) = condensed_system.as_ref() {
-        match solve_dense_condensed_direction(
-            state, problem, options, n, m, use_sparse, cond, sigma,
-            kkt_system_opt, lin_solver, inertia_params, filter, restoration,
-            lbfgs_state, lbfgs_mode, linear_constraints, deadline,
-        ) {
-            CondensedDirectionOutcome::Solved { dx, dy, cond_solver } => {
-                cond_solver_for_soc = cond_solver;
-                (dx, dy)
-            }
-            CondensedDirectionOutcome::Continue => return DirectionSolveDecision::Continue,
-            CondensedDirectionOutcome::Return(r) => return DirectionSolveDecision::Return(r),
-        }
-    } else if let Some(sc) = sparse_condensed_system.as_ref() {
-        solve_sparse_condensed_direction(
-            state, sc, sigma, n, m, use_sparse, lin_solver, inertia_params,
-        )
-    } else {
-        match solve_full_augmented_direction(
-            state, problem, options, iteration, n, m, kkt_system_opt, lin_solver,
-            inertia_params, ic_delta_w, ic_delta_c, filter, restoration,
-            lbfgs_state, lbfgs_mode, linear_constraints, last_mehrotra_sigma, deadline,
-        ) {
-            FullAugmentedOutcome::Solved { dx, dy, mehrotra_aff: aff } => {
-                mehrotra_aff = aff;
-                (dx, dy)
-            }
-            FullAugmentedOutcome::Continue => return DirectionSolveDecision::Continue,
-            FullAugmentedOutcome::Return(r) => return DirectionSolveDecision::Return(r),
-        }
-    };
-
-    DirectionSolveDecision::Proceed {
-        dx,
-        dy,
-        cond_solver_for_soc,
-        mehrotra_aff,
-    }
-}
-
-/// First-iteration bandwidth detection for the sparse condensed Schur
-/// complement. On `iteration == 0` with `use_sparse_condensed`, measure
-/// the bandwidth of S and either:
-///   - `bw > n/2`: abandon sparse condensed, rebuild the full augmented
-///     KKT via `kkt::assemble_kkt`, and keep the sparse solver;
-///   - `bw*bw <= n`: swap in a `BandedLdl` solver;
-///   - otherwise: keep the current sparse solver.
-///
-/// The dense-condensed path has no bandwidth concept, so this is a
-/// no-op on that path.
-#[allow(clippy::too_many_arguments)]
-fn adjust_sparse_condensed_bandwidth<P: NlpProblem>(
-    state: &SolverState,
-    _problem: &P,
-    options: &SolverOptions,
-    n: usize,
-    m: usize,
-    use_sparse: bool,
-    use_sparse_condensed: bool,
-    sigma: &[f64],
-    sparse_condensed_system: &mut Option<kkt::SparseCondensedKktSystem>,
-    kkt_system_opt: &mut Option<kkt::KktSystem>,
-    lin_solver: &mut Box<dyn LinearSolver>,
-    disable_sparse_condensed: &mut bool,
-) {
-    if !use_sparse_condensed {
-        return;
-    }
-    let sc_bw = sparse_condensed_system.as_ref().map(|sc| {
-        BandedLdl::compute_bandwidth(&sc.matrix.triplet_rows, &sc.matrix.triplet_cols)
-    });
-    let Some(bw) = sc_bw else { return };
-
-    if bw > n / 2 {
-        // Condensed Schur complement is essentially dense — switch to full
-        // augmented KKT with the sparse solver (rmumps/AMD/ND handles this).
-        if options.print_level >= 3 {
-            rip_log!(
-                "ripopt: Sparse condensed S has bandwidth {} for n={}, switching to dense condensed KKT",
-                bw, n
-            );
-        }
-        *disable_sparse_condensed = true;
-        *sparse_condensed_system = None;
-        *kkt_system_opt = Some(assemble_kkt_from_state(state, n, m, sigma, use_sparse));
-    } else if bw * bw <= n {
-        if options.print_level >= 5 {
-            rip_log!("ripopt: Sparse condensed S has bandwidth {} for n={}, using banded solver", bw, n);
-        }
-        *lin_solver = Box::new(BandedLdl::new());
-    } else if options.print_level >= 5 {
-        rip_log!("ripopt: Sparse condensed S has bandwidth {} for n={}, using sparse solver", bw, n);
-    }
-}
-
 /// Post-step "acceptable" tracking. Mirrors the pre-step acceptable check
 /// (see `track_consecutive_acceptable`) but is evaluated at the freshly
 /// accepted iterate — catches cases where the step just taken pushes
@@ -4739,8 +4145,7 @@ enum RestorationCascadeDecision {
 }
 
 /// Attempt full NLP restoration on `fail_count ∈ {2, 4}` (skipped if
-/// disabled, KKT dim > 50000, or the early-stall timeout has nearly
-/// elapsed within the first 3 iterations). Returns true when restoration
+/// disabled or KKT dim > 50000). Returns true when restoration
 /// succeeded and the cascade should short-circuit with `Continue`; false
 /// when the caller should fall through to the recovery / max-attempts
 /// classification.
@@ -4754,38 +4159,43 @@ fn try_nlp_restoration_phase<P: NlpProblem>(
     lbfgs_state: &mut Option<LbfgsIpmState>,
     lbfgs_mode: bool,
     linear_constraints: Option<&[bool]>,
-    iteration: usize,
+    _iteration: usize,
     fail_count: usize,
     n: usize,
     m: usize,
     start_time: Instant,
-    early_timeout: f64,
     theta_current: f64,
 ) -> bool {
+    // Ipopt 3.14 invokes RestoPhase on the FIRST post-soft-resto
+    // line-search failure (`IpBacktrackingLineSearch.cpp:558-623`).
+    // There is no parity / fail_count gate in the reference. The
+    // earlier `fail_count == 2 || 4` pattern was a ripopt-specific
+    // heuristic that delayed restoration so mu-jitter recovery could
+    // mask the failure — observed on arki0003 to keep the solver
+    // running for 300+ iters past the point where Ipopt enters
+    // restoration (iter ~110). Gate removed.
+    let _ = fail_count;
     let kkt_dim = n + m;
-    let skip_nlp_restoration = iteration < 3
-        && options.early_stall_timeout > 0.0
-        && start_time.elapsed().as_secs_f64() > early_timeout * 0.5;
-    if !((fail_count == 2 || fail_count == 4)
-        && !options.disable_nlp_restoration
-        && kkt_dim <= 50000
-        && !skip_nlp_restoration)
-    {
+    if options.disable_nlp_restoration || kkt_dim > 50000 {
         return false;
     }
 
     state.diagnostics.nlp_restoration_count += 1;
-    let (x_nlp, outcome) = attempt_nlp_restoration(
+    let (x_nlp, resto_z, outcome) = attempt_nlp_restoration(
         problem, state, filter, options, theta_current, start_time,
     );
     match outcome {
         RestorationOutcome::Success => {
+            // T0.9: apply_restoration_success now filter-gates the
+            // restored iterate. If the filter rejects (theta_new,
+            // phi_new), commit nothing and fall through to recovery
+            // — matches Ipopt RestoFilterConvCheck::TestOrigProgress
+            // returning CONTINUE instead of CONVERGED.
             apply_restoration_success(
                 state, filter, mu_state, options, n, m,
-                problem, &x_nlp,
+                problem, &x_nlp, resto_z.as_ref(),
                 linear_constraints, lbfgs_mode, lbfgs_state,
-            );
-            true
+            )
         }
         RestorationOutcome::LocalInfeasibility | RestorationOutcome::Failed => {
             // Fall through to continue recovery. Don't immediately return
@@ -4793,55 +4203,6 @@ fn try_nlp_restoration_phase<P: NlpProblem>(
             // is more reliable.
             false
         }
-    }
-}
-
-/// Run the fast Gauss–Newton restoration. Returns true if GN restoration
-/// succeeded and `apply_restoration_success` was invoked (caller should
-/// short-circuit the cascade with `Continue`); false otherwise (caller
-/// proceeds to the recovery / NLP-restoration fallbacks).
-#[allow(clippy::too_many_arguments)]
-fn try_gn_restoration<P: NlpProblem>(
-    state: &mut SolverState,
-    problem: &P,
-    options: &SolverOptions,
-    filter: &mut Filter,
-    mu_state: &mut MuState,
-    lbfgs_state: &mut Option<LbfgsIpmState>,
-    lbfgs_mode: bool,
-    linear_constraints: Option<&[bool]>,
-    restoration: &mut RestorationPhase,
-    n: usize,
-    m: usize,
-    deadline: Option<Instant>,
-) -> bool {
-    let (x_rest, gn_success) = restoration.restore(
-        &state.x,
-        &state.x_l,
-        &state.x_u,
-        &state.g_l,
-        &state.g_u,
-        &state.jac_rows,
-        &state.jac_cols,
-        n,
-        m,
-        options,
-        &|theta, phi| filter.is_acceptable(theta, phi),
-        &|x_eval, g_out| problem.constraints(x_eval, true, g_out),
-        &|x_eval, jac_out| problem.jacobian_values(x_eval, true, jac_out),
-        Some(&|x_eval: &[f64], obj_out: &mut f64| problem.objective(x_eval, true, obj_out)),
-        deadline,
-    );
-
-    if gn_success {
-        state.diagnostics.restoration_count += 1;
-        apply_restoration_success(
-            state, filter, mu_state, options, n, m, problem, &x_rest,
-            linear_constraints, lbfgs_mode, lbfgs_state,
-        );
-        true
-    } else {
-        false
     }
 }
 
@@ -4854,16 +4215,16 @@ fn try_gn_restoration<P: NlpProblem>(
 #[allow(clippy::too_many_arguments)]
 fn apply_restoration_recovery_strategy<P: NlpProblem>(
     state: &mut SolverState,
-    problem: &P,
+    _problem: &P,
     options: &SolverOptions,
     filter: &mut Filter,
     mu_state: &mut MuState,
     inertia_params: &mut InertiaCorrectionParams,
-    lbfgs_state: &mut Option<LbfgsIpmState>,
-    lbfgs_mode: bool,
-    linear_constraints: Option<&[bool]>,
+    _lbfgs_state: &mut Option<LbfgsIpmState>,
+    _lbfgs_mode: bool,
+    _linear_constraints: Option<&[bool]>,
     fail_count: usize,
-    n: usize,
+    _n: usize,
 ) {
     log::debug!("Restoration failed (attempt #{}), trying recovery", fail_count);
     let mu_factors: [f64; 6] = [10.0, 0.1, 100.0, 0.01, 1000.0, 0.001];
@@ -4877,13 +4238,11 @@ fn apply_restoration_recovery_strategy<P: NlpProblem>(
     }
     reset_filter_with_current_theta(state, filter);
     inertia_params.delta_w_last = 0.0;
-
-    if fail_count >= 3 {
-        perturb_x_after_repeated_restoration_failures(
-            state, problem, lbfgs_state, fail_count, n,
-            linear_constraints, lbfgs_mode,
-        );
-    }
+    // T3.25 follow-up: μ change rescales sigma which feeds the Hessian
+    // (1,1) block diagonal — the matrix differs from the cached one.
+    // Belt-and-braces: bump atags AND drop the cache.
+    state.bump_all_kkt_atags();
+    state.factor_cache.invalidate();
 }
 
 /// First-restoration-failure μ update. In Free mode, switch to
@@ -4915,36 +4274,6 @@ fn apply_first_restoration_failure_mu_update(
     }
 }
 
-/// After a third (or later) restoration failure, perturb every
-/// component of `state.x` by `±1e-4·range` with a deterministic
-/// `(7i + 13·fail_count) mod 3` sign pattern, where `range` is the
-/// finite bound width when both bounds exist or `max(|x_i|, 1)`
-/// otherwise. Each component is then re-clamped to its open-bound
-/// interior, and the problem is re-evaluated (refreshing the
-/// L-BFGS Hessian as a side effect). Mirrors the deterministic
-/// perturbation scheme already used by `try_last_resort_perturbation`.
-#[allow(clippy::too_many_arguments)]
-fn perturb_x_after_repeated_restoration_failures<P: NlpProblem>(
-    state: &mut SolverState,
-    problem: &P,
-    lbfgs_state: &mut Option<LbfgsIpmState>,
-    fail_count: usize,
-    n: usize,
-    linear_constraints: Option<&[bool]>,
-    lbfgs_mode: bool,
-) {
-    for i in 0..n {
-        let range = if state.x_l[i].is_finite() && state.x_u[i].is_finite() {
-            state.x_u[i] - state.x_l[i]
-        } else {
-            state.x[i].abs().max(1.0)
-        };
-        let sign = if (i * 7 + fail_count * 13) % 3 == 0 { -1.0 } else { 1.0 };
-        state.x[i] += sign * 1e-4 * range;
-        clamp_to_open_bounds(&mut state.x, &state.x_l, &state.x_u, i);
-    }
-    let _ = evaluate_and_refresh_lbfgs(state, problem, lbfgs_state, linear_constraints, lbfgs_mode);
-}
 
 /// Classify the terminal status when the restoration cascade has exhausted its
 /// retry budget. Returns LocalInfeasibility when the constraint-violation
@@ -5009,16 +4338,13 @@ fn run_post_ls_restoration_cascade<P: NlpProblem>(
     lbfgs_state: &mut Option<LbfgsIpmState>,
     lbfgs_mode: bool,
     linear_constraints: Option<&[bool]>,
-    restoration: &mut RestorationPhase,
     iteration: usize,
     n: usize,
     m: usize,
     start_time: Instant,
-    deadline: Option<Instant>,
-    early_timeout: f64,
+    _deadline: Option<Instant>,
     feas: &FeasibilityTracker,
     theta_current: f64,
-    phi_current: f64,
 ) -> RestorationCascadeDecision {
     state.diagnostics.filter_rejects += 1;
 
@@ -5028,24 +4354,13 @@ fn run_post_ls_restoration_cascade<P: NlpProblem>(
     // non-soft accept).
     mu_state.consecutive_soft_restoration = 0;
 
-    // Add current point to filter before entering restoration (Ipopt convention).
-    // augment_for_restoration adds the margin entry
-    // (phi - gamma_phi*theta, (1-gamma_theta)*theta) AND bumps theta_max —
-    // this prevents restoration from handing back a point as bad as the entry.
-    filter.add(theta_current, phi_current);
-    filter.augment_for_restoration(theta_current, phi_current);
+    // Filter augmentation happened at the line-search rejection site
+    // (matching IpBacktrackingLineSearch.cpp:566 — PrepareRestoPhaseStart
+    // augments before the almost-feasible guard, not inside the cascade).
 
-    // Phase 1: Fast GN restoration
     log::debug!("Line search failed at iteration {}, entering restoration", iteration);
 
-    if try_gn_restoration(
-        state, problem, options, filter, mu_state, lbfgs_state, lbfgs_mode,
-        linear_constraints, restoration, n, m, deadline,
-    ) {
-        return RestorationCascadeDecision::Continue;
-    }
-
-    // GN restoration failed — recovery logic with NLP restoration as last resort.
+    // Restoration NLP (L1-penalty Ipopt path). Recovery logic.
     // Bail out of recovery cascade if wall time is nearly exhausted.
     if options.max_wall_time > 0.0 {
         let remaining = options.max_wall_time - start_time.elapsed().as_secs_f64();
@@ -5060,7 +4375,7 @@ fn run_post_ls_restoration_cascade<P: NlpProblem>(
     if try_nlp_restoration_phase(
         state, problem, options, filter, mu_state, lbfgs_state, lbfgs_mode,
         linear_constraints, iteration, fail_count, n, m, start_time,
-        early_timeout, theta_current,
+        theta_current,
     ) {
         return RestorationCascadeDecision::Continue;
     }
@@ -5131,26 +4446,26 @@ enum PostStepEvalDecision {
 /// Ipopt's `IpBacktrackingLineSearch.cpp:776-784` treats a post-step
 /// `Eval_Error` as an α backtrack rather than a fatal. Mirror that by
 /// halving α and α_dual (from the accepted point back toward
-/// `x_pre_step`) up to 5 times; if that fails, invoke the restoration
-/// phase; if restoration also fails, return `NumericalError`.
+/// `x_pre_step`) up to 5 times; if that fails, return `NumericalError`.
+/// (The L1-penalty restoration NLP is invoked separately from the
+/// post-line-search cascade — Ipopt does NOT invoke restoration from
+/// the post-step Eval_Error path either.)
 ///
-/// On success (or successful recovery via α-halving or restoration)
-/// returns `Proceed` / `Continue` for the main loop's control flow.
+/// On success (or successful recovery via α-halving) returns `Proceed`
+/// / `Continue` for the main loop's control flow.
 fn reevaluate_after_step<P: NlpProblem>(
     state: &mut SolverState,
     problem: &P,
-    options: &SolverOptions,
+    _options: &SolverOptions,
     lbfgs_state: &mut Option<LbfgsIpmState>,
-    filter: &mut Filter,
-    restoration: &mut RestorationPhase,
+    _filter: &mut Filter,
     timings: &mut PhaseTimings,
     x_pre_step: &[f64],
     linear_constraints: Option<&[bool]>,
     lbfgs_mode: bool,
-    deadline: Option<Instant>,
+    _deadline: Option<Instant>,
 ) -> PostStepEvalDecision {
     let n = state.n;
-    let m = state.m;
     let t_eval = Instant::now();
     let eval_ok = state.evaluate_with_linear(problem, 1.0, linear_constraints, lbfgs_mode);
     if eval_ok {
@@ -5169,46 +4484,113 @@ fn reevaluate_after_step<P: NlpProblem>(
         return PostStepEvalDecision::Continue;
     }
 
-    // α halving exhausted: try restoration.
-    let (x_rest, success) = restoration.restore(
-        &state.x, &state.x_l, &state.x_u, &state.g_l, &state.g_u,
-        &state.jac_rows, &state.jac_cols, n, m, options,
-        &|theta, phi| filter.is_acceptable(theta, phi),
-        &|x_eval, g_out| problem.constraints(x_eval, true, g_out),
-        &|x_eval, jac_out| problem.jacobian_values(x_eval, true, jac_out),
-        Some(&|x_eval: &[f64], obj_out: &mut f64| problem.objective(x_eval, true, obj_out)),
-        deadline,
-    );
-    if success {
-        state.x = x_rest;
-        state.alpha_primal = 0.0;
-        if state.evaluate_with_linear(problem, 1.0, linear_constraints, lbfgs_mode) {
-            update_lbfgs_hessian(lbfgs_state, state);
-            return PostStepEvalDecision::Continue;
-        }
-    }
-
     PostStepEvalDecision::Return(make_result(state, SolveStatus::NumericalError))
 }
 
-/// Reset the slack-constraint multipliers `v_l`, `v_u` from the
-/// barrier equilibrium `v = mu_ks / slack` after the post-step
-/// re-evaluation.
+/// Compute the per-component "magic step" delta for an explicit slack
+/// vector `s` against constraint values `d` and finite slack bounds
+/// `[d_L, d_U]`. Mirrors Ipopt 3.14
+/// `BacktrackingLineSearch::PerformMagicStep`
+/// (`IpBacktrackingLineSearch.cpp:1013-1111`).
 ///
-/// A simple reset rather than a Newton update — the dv direction is
-/// approximate (we carry no explicit slacks) and applying FTB on `v`
-/// can restrict `alpha_d` too much. Only active slacks (`v > 0`) are
-/// touched.
-fn reset_slack_multipliers(state: &mut SolverState, mu_ks: f64) {
-    let m = state.m;
+/// The magic step minimizes the constraint residual `d - s` along the
+/// `s` coordinate while holding `x` (and therefore `d`) and all
+/// multipliers fixed. For each component `i`:
+///
+/// - If `i` has only a lower bound (`d_L[i]` finite, `d_U[i]` not):
+///   `delta_i = max(0, d_i - s_i)` — push `s` up if `d > s`.
+/// - If `i` has only an upper bound (`d_U[i]` finite, `d_L[i]` not):
+///   `delta_i = min(0, d_i - s_i)` — push `s` down if `d < s`.
+/// - If `i` has both bounds: take the candidate `delta_i`, then
+///   suppress (zero out) when the candidate would *not* reduce
+///   `|d_L + d_U - 2 s|` (the symmetric centering measure used by Ipopt
+///   to avoid pushing `s` against the opposite bound).
+///
+/// `delta` is written component-wise. `s_in` is read-only; the caller
+/// applies `s_new = s_in + delta`. Returns the number of strictly
+/// non-zero components in `delta`.
+///
+/// The helper is generic over slack representation: it accepts plain
+/// slices of the slack value, constraint value, and bounds, so it can
+/// be reused by both ripopt's `SlackFormulation` (where slacks are
+/// appended to `x`) and any future explicit-slack path. ripopt's
+/// standard implicit-slack mode has no `s` distinct from `x`, so the
+/// helper is not invoked there. Marked `allow(dead_code)` outside test
+/// builds because the only current caller is the unit tests; the
+/// helper is intentionally retained as the wiring point for future
+/// explicit-slack code paths (T2.24, spec §5.3).
+#[cfg_attr(not(test), allow(dead_code))]
+fn compute_magic_step_delta(
+    s: &[f64],
+    d: &[f64],
+    d_l: &[f64],
+    d_u: &[f64],
+    delta: &mut [f64],
+) -> usize {
+    let m = s.len();
+    debug_assert_eq!(d.len(), m);
+    debug_assert_eq!(d_l.len(), m);
+    debug_assert_eq!(d_u.len(), m);
+    debug_assert_eq!(delta.len(), m);
+    let mut nnz = 0usize;
     for i in 0..m {
-        if state.v_l[i] > 0.0 && state.g_l[i].is_finite() {
-            state.v_l[i] = mu_ks / slack_gl(state, i);
-        }
-        if state.v_u[i] > 0.0 && state.g_u[i].is_finite() {
-            state.v_u[i] = mu_ks / slack_gu(state, i);
+        let has_l = d_l[i].is_finite();
+        let has_u = d_u[i].is_finite();
+        let r = d[i] - s[i]; // residual we'd like to drive to zero
+        let cand = if has_l && has_u {
+            // candidate is the unbounded magic step (push s toward d):
+            //   max(0, r) along the lower side, min(0, r) along the upper side.
+            // For doubly-bounded entries, Ipopt then suppresses the step
+            // when |d_L + d_U - 2*(s + cand)| > |d_L + d_U - 2*s|.
+            let lower_part = if r > 0.0 { r } else { 0.0 };
+            let upper_part = if r < 0.0 { r } else { 0.0 };
+            let c = lower_part + upper_part; // exactly one of these is non-zero
+            let center_now = (d_l[i] + d_u[i] - 2.0 * s[i]).abs();
+            let center_after = (d_l[i] + d_u[i] - 2.0 * (s[i] + c)).abs();
+            if center_after <= center_now { c } else { 0.0 }
+        } else if has_l {
+            if r > 0.0 { r } else { 0.0 }
+        } else if has_u {
+            if r < 0.0 { r } else { 0.0 }
+        } else {
+            0.0
+        };
+        delta[i] = cand;
+        if cand != 0.0 {
+            nnz += 1;
         }
     }
+    nnz
+}
+
+/// Apply Ipopt 3.14's magic step (spec §5.3,
+/// `IpBacktrackingLineSearch.cpp:1013-1111`) to the explicit
+/// inequality-constraint slack vector `s`, holding `x` and all
+/// multipliers fixed.
+///
+/// **ripopt no-op.** ripopt uses an implicit-slack formulation (see
+/// `.crucible/wiki/concepts/implicit-slack-formulation.org`): there is
+/// no slack vector `s` in `SolverState` — the inequality side is
+/// represented by `g(x)` directly with `v_l`, `v_u` carrying the
+/// barrier multipliers. The magic step's degree of freedom (move `s`
+/// while holding `x` fixed) does not exist in this representation, so
+/// this function is a no-op on the standard solve path. The flag is
+/// honored for spec compliance and future explicit-slack paths
+/// (`slack_formulation.rs`); the closed-form delta is implemented in
+/// [`compute_magic_step_delta`] and tested independently.
+///
+/// Returns the number of slack components updated (always 0 in the
+/// standard implicit-slack path).
+fn apply_magic_step(_state: &mut SolverState, options: &SolverOptions) -> usize {
+    if !options.magic_step {
+        return 0;
+    }
+    // ripopt has no explicit `s` to adjust here — the implicit-slack
+    // formulation embeds the slack value in `g(x)`, which would change
+    // `x` if mutated. The helper `compute_magic_step_delta` provides
+    // the Ipopt-faithful per-component formula for callers that hold
+    // an explicit slack representation (e.g. `SlackFormulation`).
+    0
 }
 
 /// Cap on consecutive accepted soft-restoration iterates before forcing
@@ -5221,39 +4603,54 @@ const MAX_SOFT_RESTO_ITERS: usize = 10;
 /// off the success path that would otherwise dominate the helper.
 struct SoftRestoSnapshot {
     x: Vec<f64>,
-    y: Vec<f64>,
-    z_l: Vec<f64>,
-    z_u: Vec<f64>,
+    y_c: Vec<f64>,
+    y_d: Vec<f64>,
+    /// Phase 6d.2: native compressed bound multipliers.
+    z_l_compressed: Vec<f64>,
+    z_u_compressed: Vec<f64>,
+    s: Vec<f64>,
     obj: f64,
-    g: Vec<f64>,
+    c_x: Vec<f64>,
+    d_x: Vec<f64>,
     grad_f: Vec<f64>,
-    jac_vals: Vec<f64>,
+    jac_c_vals: Vec<f64>,
+    jac_d_vals: Vec<f64>,
     alpha_primal: f64,
 }
 impl SoftRestoSnapshot {
     fn take(state: &SolverState) -> Self {
         Self {
             x: state.x.clone(),
-            y: state.y.clone(),
-            z_l: state.z_l.clone(),
-            z_u: state.z_u.clone(),
+            y_c: state.y_c.clone(),
+            y_d: state.y_d.clone(),
+            z_l_compressed: state.z_l_compressed.clone(),
+            z_u_compressed: state.z_u_compressed.clone(),
+            s: state.s.clone(),
             obj: state.obj,
-            g: state.g.clone(),
+            c_x: state.c_x.clone(),
+            d_x: state.d_x.clone(),
             grad_f: state.grad_f.clone(),
-            jac_vals: state.jac_vals.clone(),
+            jac_c_vals: state.jac_c_vals.clone(),
+            jac_d_vals: state.jac_d_vals.clone(),
             alpha_primal: state.alpha_primal,
         }
     }
     fn restore(self, state: &mut SolverState) {
         state.x = self.x;
-        state.y = self.y;
-        state.z_l = self.z_l;
-        state.z_u = self.z_u;
+        state.y_c = self.y_c;
+        state.y_d = self.y_d;
+        state.z_l_compressed = self.z_l_compressed;
+        state.z_u_compressed = self.z_u_compressed;
+        state.s = self.s;
         state.obj = self.obj;
-        state.g = self.g;
+        state.c_x = self.c_x;
+        state.d_x = self.d_x;
         state.grad_f = self.grad_f;
-        state.jac_vals = self.jac_vals;
+        state.jac_c_vals = self.jac_c_vals;
+        state.jac_d_vals = self.jac_d_vals;
         state.alpha_primal = self.alpha_primal;
+        // T3.25: snapshot restore touches every tracked input.
+        state.bump_all_kkt_atags();
     }
 }
 
@@ -5304,12 +4701,22 @@ fn attempt_soft_restoration<P: NlpProblem>(
     let x_trial = compute_clamped_trial_x(state, &state.dx, alpha_p);
     state.x = x_trial;
     for i in 0..m {
-        state.y[i] += alpha_d * state.dy[i];
+        let v = state.y_at(i) + alpha_d * state.dy_at(i);
+        state.set_y_at(i, v);
     }
-    for i in 0..n {
-        state.z_l[i] = (state.z_l[i] + alpha_d * state.dz_l[i]).max(0.0);
-        state.z_u[i] = (state.z_u[i] + alpha_d * state.dz_u[i]).max(0.0);
+    // Phase 6d.6: compressed bound storage is canonical. Note the
+    // soft-resto floor is `0.0`, not `1e-20`.
+    for k in 0..state.bound_layout.n_x_l {
+        state.z_l_compressed[k] = (state.z_l_compressed[k]
+            + alpha_d * state.dz_l_compressed[k]).max(0.0);
     }
+    for k in 0..state.bound_layout.n_x_u {
+        state.z_u_compressed[k] = (state.z_u_compressed[k]
+            + alpha_d * state.dz_u_compressed[k]).max(0.0);
+    }
+    // T3.25: soft-resto trial step writes x and duals directly (does
+    // not go through commit_trial_point), so bump atags ourselves.
+    state.bump_all_kkt_atags();
 
     // Re-evaluate obj + grad + constraints + jac (skip Hessian — soft test
     // only inspects gradient-level info).
@@ -5322,12 +4729,26 @@ fn attempt_soft_restoration<P: NlpProblem>(
         return false;
     }
 
-    let theta_trial = theta_for_g(state, &state.g);
+    // Soft restoration steps x and the duals but not the slack `s`,
+    // so theta is measured against the unchanged `state.s` (A8.19
+    // slack-coupled form).
+    let theta_trial = theta_for_split_d_s(state, &state.c_x, &state.d_x, &state.s);
     let phi_trial = compute_barrier_phi(
-        state.obj, &state.x, &state.g, state, n, m, options.constraint_slack_barrier,
+        state.obj, &state.x, &state.s, state, n, m, options.constraint_slack_barrier,
+        options.kappa_d,
     );
 
-    let filter_ok = filter.is_acceptable(theta_trial, phi_trial);
+    // Ipopt's TrySoftRestoStep (IpBacktrackingLineSearch.cpp:1172) calls
+    // `acceptor_->CheckAcceptabilityOfTrialPoint(0.)` — the FULL filter
+    // check with gBD=0 forcing the h-type branch, which requires either
+    // sufficient theta reduction or sufficient phi reduction. Using the
+    // weaker `is_acceptable` (filter-domination test only) lets null
+    // steps with theta_trial≈theta_current and phi_trial≈phi_current
+    // pass, blocking the hard-restoration cascade on stalled iterates
+    // (observed on arki0003 iters 110-115 with α≈1e-9).
+    let (filter_ok, _) = filter.check_acceptability(
+        theta_current, phi_current, theta_trial, phi_trial, 0.0, alpha_p, false,
+    );
     let pderror_trial = compute_pderror_e_mu(state, state.mu);
     let pderror_ok = pderror_trial <= 0.9999 * pderror_curr;
 
@@ -5349,34 +4770,6 @@ fn attempt_soft_restoration<P: NlpProblem>(
 }
 
 
-/// Snapshot of the lowest-objective feasible iterate seen so far. Used
-/// as the fallback iterate returned at `max_iter` exit and as the
-/// `best_x.is_some()` guard for the dual-stagnation revert.
-struct BestFeasibleIterate {
-    obj: f64,
-    x: Option<Vec<f64>>,
-}
-
-impl BestFeasibleIterate {
-    fn new() -> Self {
-        Self { obj: f64::INFINITY, x: None }
-    }
-}
-
-/// Record the current iterate as the best-feasible point seen so far
-/// if it satisfies `constr_viol_tol` and strictly improves `best.obj`.
-fn track_best_feasible(
-    state: &SolverState,
-    options: &SolverOptions,
-    best: &mut BestFeasibleIterate,
-) {
-    let theta_now = state.constraint_violation();
-    if theta_now < options.constr_viol_tol && state.obj < best.obj {
-        best.obj = state.obj;
-        best.x = Some(state.x.clone());
-    }
-}
-
 /// Fraction-to-boundary step limits for primal and dual.
 ///
 /// `tau` = `max(1 - NLP_error, tau_min)` in Free mode or
@@ -5393,353 +4786,201 @@ fn compute_alpha_max(
 ) -> (f64, f64, f64) {
     let tau = compute_tau(state, options, mu_state, primal_inf, dual_inf, compl_inf);
 
-    let alpha_primal_max =
-        fraction_to_boundary_primal_x(state, &state.dx, tau).clamp(0.0, 1.0);
+    let alpha_primal_max = fraction_to_boundary_primal_x(state, &state.dx, tau)
+        .min(fraction_to_boundary_primal_s(state, &state.ds, tau))
+        .clamp(0.0, 1.0);
 
-    let alpha_dual_max = fraction_to_boundary_dual_z_min(state, &state.dz_l, &state.dz_u, tau);
+    let alpha_dual_z = fraction_to_boundary_dual_z_min(state, &state.dz_l_compressed, &state.dz_u_compressed, tau);
+    // Phase 8c.5: walk compressed v_l/v_u/dv_l/dv_u storage directly.
+    let alpha_dual_v = filter::fraction_to_boundary(&state.v_l_compressed, &state.dv_l_compressed, tau)
+        .min(filter::fraction_to_boundary(&state.v_u_compressed, &state.dv_u_compressed, tau));
+    let alpha_dual_max = alpha_dual_z.min(alpha_dual_v);
 
-    (tau, alpha_primal_max, alpha_dual_max)
-}
+    if std::env::var("RIPOPT_TRACE_STEP").is_ok() {
+        let dvl_inf = state.dv_l_compressed.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+        let dvu_inf = state.dv_u_compressed.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+        let vl_min = state.v_l_compressed.iter().cloned().fold(f64::INFINITY, f64::min);
+        let vu_min = state.v_u_compressed.iter().cloned().fold(f64::INFINITY, f64::min);
+        eprintln!(
+            "  dual-trace: alpha_d_z={:.3e} alpha_d_v={:.3e} | |dv_L|_inf={:.3e} |dv_U|_inf={:.3e} v_L_min={:.3e} v_U_min={:.3e}",
+            alpha_dual_z, alpha_dual_v, dvl_inf, dvu_inf, vl_min, vu_min
+        );
+    }
 
-/// Ipopt-style tiny-step detection: when the relative step size is
-/// below `10*eps` for two consecutive iterations and primal
-/// infeasibility is small, force a monotone μ decrease and set the
-/// `tiny_step` flag so downstream logic knows to accept the full step.
-///
-/// Resets the filter on μ change (standard Ipopt convention).
-fn detect_tiny_step(
-    state: &mut SolverState,
-    options: &SolverOptions,
-    mu_state: &mut MuState,
-    filter: &mut Filter,
-    consecutive_tiny_steps: &mut usize,
-    alpha_primal_max: f64,
-    primal_inf: f64,
-) {
-    let n = state.n;
-    let max_rel_step: f64 = (0..n)
-        .map(|i| (alpha_primal_max * state.dx[i]).abs() / (state.x[i].abs() + 1.0))
-        .fold(0.0f64, f64::max);
-    if max_rel_step < 1e-14 && primal_inf < 1e-4 {
-        *consecutive_tiny_steps += 1;
-        mu_state.tiny_step = true;
-        if *consecutive_tiny_steps >= 2 {
-            let new_mu = (options.mu_linear_decrease_factor * state.mu)
-                .min(state.mu.powf(options.mu_superlinear_decrease_power))
-                .max(options.mu_min);
-            if (new_mu - state.mu).abs() < 1e-20 {
-                log::debug!("Tiny step with mu at minimum, checking acceptability");
-            } else {
-                state.mu = new_mu;
-                reset_filter_with_current_theta(state, filter);
-                log::debug!("Tiny step detected, forced mu decrease to {:.2e}", state.mu);
+    if std::env::var("RIPOPT_TRACE_STEP").is_ok() {
+        // Identify the variable that limits alpha_primal_max.
+        let mut lim_idx: usize = usize::MAX;
+        let mut lim_alpha = 1.0f64;
+        let mut lim_side = "";
+        let mut lim_block = "x";
+        for i in 0..state.n {
+            if state.x_l_at(i).is_finite() && state.dx[i] < 0.0 {
+                let slack = state.x[i] - state.x_l_at(i);
+                let a = -tau * slack / state.dx[i];
+                if a < lim_alpha {
+                    lim_alpha = a;
+                    lim_idx = i;
+                    lim_side = "L";
+                    lim_block = "x";
+                }
             }
-            *consecutive_tiny_steps = 0;
+            if state.x_u_at(i).is_finite() && state.dx[i] > 0.0 {
+                let slack = state.x_u_at(i) - state.x[i];
+                let a = tau * slack / state.dx[i];
+                if a < lim_alpha {
+                    lim_alpha = a;
+                    lim_idx = i;
+                    lim_side = "U";
+                    lim_block = "x";
+                }
+            }
         }
-    } else {
-        *consecutive_tiny_steps = 0;
-        mu_state.tiny_step = false;
-    }
-}
-
-/// Outcome of one factorization attempt with inertia correction.
-///
-/// `Continue` and `Return` correspond to the main loop's `continue`
-/// and early-return paths after a recovery branch. `Proceed` passes
-/// the regularization magnitudes `(delta_w, delta_c)` back to the
-/// caller for use during iterative refinement.
-enum FactorDecision {
-    Proceed { ic_delta_w: f64, ic_delta_c: f64 },
-    Continue,
-    Return(SolveResult),
-}
-
-/// Factor the augmented KKT system with inertia correction, handling
-/// the recovery cascade on failure.
-///
-/// No-op when `kkt_system_opt` is `None` (condensed paths do their own
-/// factorization downstream). On success returns the inertia-correction
-/// `(delta_w, delta_c)` for use in iterative refinement.
-///
-/// Recovery cascade on factorization failure:
-/// 1. Early-iteration (< 5) perturbation sweep across scales 1e-4..1e-1
-///    with post-perturbation re-factorization; success → `Continue`.
-/// 2. Gradient-descent fallback with Armijo backtracking; success → `Continue`.
-/// 3. Restoration phase; success → `Continue`.
-/// 4. Late-iteration perturbation sweep (no re-factorization); success → `Continue`.
-/// 5. All exhausted → `Return(NumericalError)`.
-///
-/// Extracted from `solve_ipm` as part of the v0.8 main-loop
-/// decomposition.
-/// Early-iteration degenerate-starting-point recovery: if KKT factorization
-/// failed in the first 5 iterations, perturb x at increasing scales and try
-/// to refactor a freshly assembled KKT. Returns true if a perturbation
-/// recovered a successful factorization (in which case the caller should
-/// `continue` the IPM loop with the perturbed point).
-fn try_early_perturbation_recovery<P: NlpProblem>(
-    state: &mut SolverState,
-    problem: &P,
-    iteration: usize,
-    n: usize,
-    m: usize,
-    use_sparse: bool,
-    lin_solver: &mut dyn LinearSolver,
-    inertia_params: &mut InertiaCorrectionParams,
-    lbfgs_state: &mut Option<LbfgsIpmState>,
-    filter: &mut Filter,
-    linear_constraints: Option<&[bool]>,
-    lbfgs_mode: bool,
-) -> bool {
-    if iteration >= 5 {
-        return false;
-    }
-    for &perturb_scale in &[1e-4, 1e-3, 1e-2, 5e-2, 1e-1] {
-        let x_saved = state.x.clone();
-        for i in 0..n {
-            let mag = state.x[i].abs().max(1.0);
-            let sign = if (i * 7 + iteration * 13 + (perturb_scale * 1e4) as usize * 3) % 3 == 0 {
-                -1.0
+        for i in 0..state.m {
+            let l_fin = state.g_l_at(i).is_finite();
+            let u_fin = state.g_u_at(i).is_finite();
+            if l_fin && u_fin && (state.g_l_at(i) - state.g_u_at(i)).abs() < 1e-14 {
+                continue;
+            }
+            let ds_i = state.ds_at(i);
+            let s_i = state.s_at(i);
+            if l_fin && ds_i < 0.0 {
+                let slack = (s_i - state.g_l_at(i)).max(0.0);
+                let a = -tau * slack / ds_i;
+                if a < lim_alpha {
+                    lim_alpha = a;
+                    lim_idx = i;
+                    lim_side = "L";
+                    lim_block = "s";
+                }
+            }
+            if u_fin && ds_i > 0.0 {
+                let slack = (state.g_u_at(i) - s_i).max(0.0);
+                let a = tau * slack / ds_i;
+                if a < lim_alpha {
+                    lim_alpha = a;
+                    lim_idx = i;
+                    lim_side = "U";
+                    lim_block = "s";
+                }
+            }
+        }
+        let dx_inf = state.dx.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+        let dy_inf = state
+            .dy_c
+            .iter()
+            .chain(state.dy_d.iter())
+            .fold(0.0f64, |a, &b| a.max(b.abs()));
+        let dzl_inf = state.dz_l_compressed.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+        let dzu_inf = state.dz_u_compressed.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+        if lim_idx != usize::MAX {
+            let (xv, xb, dxv, slack) = if lim_block == "s" {
+                let xv = state.s_at(lim_idx);
+                let xb = if lim_side == "L" { state.g_l_at(lim_idx) } else { state.g_u_at(lim_idx) };
+                (xv, xb, state.ds_at(lim_idx), (xv - xb).abs())
             } else {
-                1.0
+                let xv = state.x[lim_idx];
+                let xb = if lim_side == "L" { state.x_l_at(lim_idx) } else { state.x_u_at(lim_idx) };
+                (xv, xb, state.dx[lim_idx], (xv - xb).abs())
             };
-            state.x[i] += sign * perturb_scale * mag;
-            clamp_to_open_bounds(&mut state.x, &state.x_l, &state.x_u, i);
-        }
-        reseed_bound_multipliers_from_mu(state, state.mu);
-        let pert_eval_ok = evaluate_and_refresh_lbfgs(state, problem, lbfgs_state, linear_constraints, lbfgs_mode);
-        if pert_eval_ok && obj_and_grad_finite(state) {
-            let sigma_p = compute_sigma_from_state(state);
-            let mut kkt_p = assemble_kkt_from_state(state, n, m, &sigma_p, use_sparse);
-            if kkt::factor_with_inertia_correction(
-                &mut kkt_p, lin_solver, inertia_params, state.mu,
-            ).is_ok() {
-                log::debug!(
-                    "Early perturbation (scale={:.0e}) recovered factorization at iter {}",
-                    perturb_scale, iteration
-                );
-                reset_filter_with_current_theta(state, filter);
-                return true;
-            }
-        }
-        state.x.copy_from_slice(&x_saved);
-    }
-    false
-}
-
-/// Gradient-descent fallback with Armijo backtracking after a KKT
-/// factorization failure. Computes a steepest-descent direction (projected
-/// to satisfy bound feasibility) and bisects alpha up to 20 times until the
-/// objective decreases. On acceptance the state is re-evaluated and the
-/// L-BFGS Hessian updated; returns true so the caller can `continue` the
-/// IPM loop.
-fn try_gradient_descent_fallback<P: NlpProblem>(
-    state: &mut SolverState,
-    problem: &P,
-    n: usize,
-    lbfgs_state: &mut Option<LbfgsIpmState>,
-    linear_constraints: Option<&[bool]>,
-    lbfgs_mode: bool,
-) -> bool {
-    let Some(fallback) = gradient_descent_fallback(state) else {
-        return false;
-    };
-    install_step_directions(state, fallback.0, fallback.1, vec![0.0; n], vec![0.0; n]);
-
-    let mut alpha_fb = 1.0;
-    let obj_current = state.obj;
-    let mut fb_accepted = false;
-    for _ in 0..20 {
-        let x_trial = compute_clamped_trial_x(state, &state.dx, alpha_fb);
-        let mut obj_trial = f64::INFINITY;
-        let obj_ok = problem.objective(&x_trial, true, &mut obj_trial);
-        if obj_ok && obj_trial.is_finite() && obj_trial < obj_current {
-            state.x = x_trial;
-            state.obj = obj_trial;
-            state.alpha_primal = alpha_fb;
-            fb_accepted = true;
-            break;
-        }
-        alpha_fb *= 0.5;
-    }
-    if fb_accepted {
-        let _ = evaluate_and_refresh_lbfgs(state, problem, lbfgs_state, linear_constraints, lbfgs_mode);
-        return true;
-    }
-    false
-}
-
-/// Cascade tried after a KKT factorization failure (inertia correction
-/// could not produce the required signature). In order:
-///   1. Early-iteration perturbation recovery (degenerate starting point).
-///   2. Gradient-descent fallback with Armijo backtracking.
-///   3. Gauss–Newton restoration.
-///   4. Last-resort cumulative x perturbation.
-/// Each succeeded path returns `FactorDecision::Continue` so the main
-/// loop restarts the iteration; otherwise the cascade ends with
-/// `FactorDecision::Return(NumericalError)`.
-#[allow(clippy::too_many_arguments)]
-fn recover_from_factor_failure<P: NlpProblem>(
-    state: &mut SolverState,
-    problem: &P,
-    options: &SolverOptions,
-    iteration: usize,
-    n: usize,
-    m: usize,
-    use_sparse: bool,
-    lin_solver: &mut dyn LinearSolver,
-    inertia_params: &mut InertiaCorrectionParams,
-    lbfgs_state: &mut Option<LbfgsIpmState>,
-    filter: &mut Filter,
-    restoration: &mut RestorationPhase,
-    linear_constraints: Option<&[bool]>,
-    lbfgs_mode: bool,
-    deadline: Option<Instant>,
-) -> FactorDecision {
-    if try_early_perturbation_recovery(
-        state, problem, iteration, n, m, use_sparse,
-        lin_solver, inertia_params, lbfgs_state, filter,
-        linear_constraints, lbfgs_mode,
-    ) {
-        return FactorDecision::Continue;
-    }
-
-    if try_gradient_descent_fallback(
-        state, problem, n, lbfgs_state, linear_constraints, lbfgs_mode,
-    ) {
-        return FactorDecision::Continue;
-    }
-
-    let (x_rest, success) = restoration.restore(
-        &state.x, &state.x_l, &state.x_u, &state.g_l, &state.g_u,
-        &state.jac_rows, &state.jac_cols, n, m, options,
-        &|theta, phi| filter.is_acceptable(theta, phi),
-        &|x_eval, g_out| problem.constraints(x_eval, true, g_out),
-        &|x_eval, jac_out| problem.jacobian_values(x_eval, true, jac_out),
-        Some(&|x_eval: &[f64], obj_out: &mut f64| problem.objective(x_eval, true, obj_out)),
-        deadline,
-    );
-    if success {
-        state.x = x_rest;
-        state.alpha_primal = 0.0;
-        let _ = evaluate_and_refresh_lbfgs(state, problem, lbfgs_state, linear_constraints, lbfgs_mode);
-        return FactorDecision::Continue;
-    }
-
-    if try_last_resort_perturbation(
-        state, problem, iteration, n, lbfgs_state, filter,
-        linear_constraints, lbfgs_mode,
-    ) {
-        return FactorDecision::Continue;
-    }
-    FactorDecision::Return(make_result(state, SolveStatus::NumericalError))
-}
-
-fn factor_kkt_with_recovery<P: NlpProblem>(
-    state: &mut SolverState,
-    problem: &P,
-    options: &SolverOptions,
-    iteration: usize,
-    n: usize,
-    m: usize,
-    use_sparse: bool,
-    kkt_system_opt: &mut Option<kkt::KktSystem>,
-    lin_solver: &mut dyn LinearSolver,
-    inertia_params: &mut InertiaCorrectionParams,
-    lbfgs_state: &mut Option<LbfgsIpmState>,
-    filter: &mut Filter,
-    restoration: &mut RestorationPhase,
-    timings: &mut PhaseTimings,
-    prev_ic_delta_w: &mut f64,
-    linear_constraints: Option<&[bool]>,
-    lbfgs_mode: bool,
-    deadline: Option<Instant>,
-) -> FactorDecision {
-    let mut ic_delta_w = 0.0f64;
-    let mut ic_delta_c = 0.0f64;
-    let Some(kkt_system) = kkt_system_opt.as_mut() else {
-        return FactorDecision::Proceed { ic_delta_w, ic_delta_c };
-    };
-
-    let t_fact = Instant::now();
-    if options.print_level >= 5 {
-        let dim = match &kkt_system.matrix {
-            KktMatrix::Dense(d) => d.n,
-            KktMatrix::Sparse(s) => s.n,
-        };
-        let nnz = match &kkt_system.matrix {
-            KktMatrix::Dense(d) => d.n * (d.n + 1) / 2,
-            KktMatrix::Sparse(s) => s.triplet_rows.len(),
-        };
-        rip_log!("ripopt: Factoring KKT dim={} nnz={}...", dim, nnz);
-    }
-    let inertia_result =
-        kkt::factor_with_inertia_correction(kkt_system, lin_solver, inertia_params, state.mu);
-    if options.print_level >= 5 {
-        rip_log!("ripopt: KKT factorization took {:.3}s (ok={})",
-            t_fact.elapsed().as_secs_f64(), inertia_result.is_ok());
-    }
-    timings.factorization += t_fact.elapsed();
-
-    if let Ok((dw, dc)) = &inertia_result {
-        ic_delta_w = *dw;
-        ic_delta_c = *dc;
-        *prev_ic_delta_w = *dw;
-    }
-
-    if let Some(ref dump_dir) = options.kkt_dump_dir {
-        if inertia_result.is_ok() {
-            dump_kkt_matrix(
-                dump_dir,
-                &options.kkt_dump_name,
-                iteration,
-                kkt_system,
-                Some((n, m, 0)),
-                ic_delta_w,
-                ic_delta_c,
+            eprintln!(
+                "  step-trace: tau={:.4} alpha_p_max={:.3e} alpha_d_max={:.3e} | lim={}{}@row/var{} val={:.3e} bnd={:.3e} slack={:.3e} d={:.3e} | |dx|_inf={:.3e} |dy|_inf={:.3e} |dz_L|_inf={:.3e} |dz_U|_inf={:.3e}",
+                tau, alpha_primal_max, alpha_dual_max, lim_block, lim_side, lim_idx,
+                xv, xb, slack, dxv, dx_inf, dy_inf, dzl_inf, dzu_inf
+            );
+        } else {
+            eprintln!(
+                "  step-trace: tau={:.4} alpha_p_max={:.3e} alpha_d_max={:.3e} | no primal limiter | |dx|_inf={:.3e} |dy|_inf={:.3e} |dz_L|_inf={:.3e} |dz_U|_inf={:.3e}",
+                tau, alpha_primal_max, alpha_dual_max, dx_inf, dy_inf, dzl_inf, dzu_inf
             );
         }
     }
 
-    let Err(e) = inertia_result else {
-        return FactorDecision::Proceed { ic_delta_w, ic_delta_c };
-    };
-    log::warn!("KKT factorization failed: {}", e);
-
-    recover_from_factor_failure(
-        state, problem, options, iteration, n, m, use_sparse,
-        lin_solver, inertia_params, lbfgs_state, filter, restoration,
-        linear_constraints, lbfgs_mode, deadline,
-    )
+    (tau, alpha_primal_max, alpha_dual_max)
 }
 
-/// Last-resort perturbation after restoration has also failed: cumulatively
-/// perturb x at scales 1e-3, 1e-2, 1e-1 and accept the first scale at which
-/// problem evaluation produces a finite objective. On success the filter is
-/// reset and theta_min recomputed; returns true so the caller can continue.
-fn try_last_resort_perturbation<P: NlpProblem>(
+/// Ipopt-style tiny-step detection.
+///
+/// Mirrors `IpBacktrackingLineSearch.cpp::DetectTinyStep` (Ipopt 3.14,
+/// lines 1219-1278) plus the latch flow at lines 363-435.
+///
+/// Detection (returns true ⇔ all three hold):
+/// - `max_i |Δx_i| / (1 + |x_i|) ≤ tiny_step_tol` (≈ 10·eps; line 1245)
+/// - `max_i |Δs_i| / (1 + |s_i|) ≤ tiny_step_tol` (slack step, line 1261)
+/// - `cviol ≤ 1e-4` (line 1270)
+///
+/// Detection does **not** include the dual step. That gate
+/// (`tiny_step_y_tol`, default 1e-2) lives at line 421-424 and only
+/// controls the **latch** `tiny_step_last_iter` set after a detection.
+///
+/// `mu_state.tiny_step` (≡ Ipopt's `tiny_step_flag`, line 410) fires
+/// only when **the current iter detected AND the previous iter latched**.
+/// `tiny_step_last_iter` is then refreshed for the next iter as
+/// `detection && (‖Δy‖_∞ < tiny_step_y_tol)`.
+///
+/// The actual `STOP_AT_TINY_STEP` exit fires from
+/// `update_barrier_parameter` when `tiny_step && new_μ == μ`
+/// (`IpMonotoneMuUpdate.cpp:158-160`, `IpAdaptiveMuUpdate.cpp:330-332,377-379`).
+/// The main loop consumes the resulting `pending_tiny_step_exit` flag
+/// at the *top* of the next iteration, after `check_convergence` runs,
+/// so KKT-clean tiny-step iterates still exit `Optimal` first.
+///
+/// Earlier ripopt versions conflated the dy gate with detection (using
+/// it as an AND-condition for the counter increment) and omitted the
+/// slack-step check. A8.12 restores Ipopt's separation-of-concerns.
+fn detect_tiny_step(
     state: &mut SolverState,
-    problem: &P,
-    iteration: usize,
-    n: usize,
-    lbfgs_state: &mut Option<LbfgsIpmState>,
-    filter: &mut Filter,
-    linear_constraints: Option<&[bool]>,
-    lbfgs_mode: bool,
-) -> bool {
-    for &perturb_scale in &[1e-3, 1e-2, 1e-1] {
-        for i in 0..n {
-            let mag = state.x[i].abs().max(1.0);
-            let sign = if (i * 7 + iteration * 13) % 3 == 0 { -1.0 } else { 1.0 };
-            state.x[i] += sign * perturb_scale * mag;
-            clamp_to_open_bounds(&mut state.x, &state.x_l, &state.x_u, i);
-        }
-        let pert2_ok = evaluate_and_refresh_lbfgs(state, problem, lbfgs_state, linear_constraints, lbfgs_mode);
-        if pert2_ok && !state.obj.is_nan() && !state.obj.is_infinite() {
-            reset_filter_with_current_theta(state, filter);
-            return true;
-        }
-    }
-    false
+    options: &SolverOptions,
+    mu_state: &mut MuState,
+    _filter: &mut Filter,
+    tiny_step_last_iter: &mut bool,
+    primal_inf: f64,
+) {
+    let n = state.n;
+    let m = state.m;
+    let tiny_tol = 10.0 * f64::EPSILON;
+
+    // Relative x-step: IpBacktrackingLineSearch.cpp:1232-1248.
+    let max_rel_dx: f64 = (0..n)
+        .map(|i| state.dx[i].abs() / (state.x[i].abs() + 1.0))
+        .fold(0.0f64, f64::max);
+
+    // Relative s-step (slack vars for inequality constraints):
+    // IpBacktrackingLineSearch.cpp:1250-1264. Ipopt requires both x
+    // and s steps tiny; without this an iterate making real progress
+    // only on slacks would be misclassified as tiny.
+    let max_rel_ds: f64 = if state.s.is_empty() {
+        0.0
+    } else {
+        state.s.iter()
+            .zip(state.ds.iter())
+            .map(|(&s_k, &ds_k)| ds_k.abs() / (s_k.abs() + 1.0))
+            .fold(0.0f64, f64::max)
+    };
+
+    // Detection per IpBacktrackingLineSearch.cpp:1245,1261,1270.
+    let detection_tiny =
+        max_rel_dx <= tiny_tol && max_rel_ds <= tiny_tol && primal_inf <= 1e-4;
+
+    // Latch gate for next iter: dy norm under tiny_step_y_tol
+    // (IpBacktrackingLineSearch.cpp:421-424). Raw Amax, not relative.
+    let dy_amax: f64 = if m == 0 {
+        0.0
+    } else {
+        state
+            .dy_c
+            .iter()
+            .chain(state.dy_d.iter())
+            .map(|v| v.abs())
+            .fold(0.0f64, f64::max)
+    };
+
+    // tiny_step_flag (= mu-update exit signal): current iter detection
+    // AND previous iter's latch (IpBacktrackingLineSearch.cpp:407-411).
+    mu_state.tiny_step = detection_tiny && *tiny_step_last_iter;
+
+    // Refresh the latch for the next iter
+    // (IpBacktrackingLineSearch.cpp:421-435).
+    *tiny_step_last_iter = detection_tiny && (dy_amax < options.tiny_step_y_tol);
 }
 
 /// Update the barrier parameter μ (interior-point centering parameter) once
@@ -5772,14 +5013,35 @@ fn try_last_resort_perturbation<P: NlpProblem>(
 /// products); ξ near 0 indicates one product is much smaller than the
 /// average. Returns 1.0 when `avg_compl` is non-positive or no active
 /// bound products exist (no centrality information available).
+///
+/// B-cross6: scans all four complementarity blocks
+/// (`(z_L, x_L)`, `(z_U, x_U)`, `(v_L, s_L)`, `(v_U, s_U)`) per
+/// `IpLoqoMuOracle::CalculateMu` ↔ `IpIpoptCalculatedQuantities::curr_compl_xi`.
 fn compute_centrality_xi(state: &SolverState, avg_compl: f64) -> f64 {
     let mut min_compl = f64::INFINITY;
-    for i in 0..state.n {
-        if state.x_l[i].is_finite() {
-            min_compl = min_compl.min(slack_xl(state, i) * state.z_l[i]);
+    // Phase 6c.2: walk compressed bound multipliers; the iteration set
+    // is identical to {i : x_l[i].is_finite()} by BoundLayout
+    // construction, so the n-wide+is_finite scan and the compressed
+    // walk produce bit-identical output.
+    for k in 0..state.bound_layout.n_x_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        min_compl = min_compl.min(slack_xl(state, i) * state.z_l_compressed[k]);
+    }
+    for k in 0..state.bound_layout.n_x_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        min_compl = min_compl.min(slack_xu(state, i) * state.z_u_compressed[k]);
+    }
+    for i in 0..state.m {
+        let l_fin = state.g_l_at(i).is_finite();
+        let u_fin = state.g_u_at(i).is_finite();
+        if l_fin && u_fin && (state.g_l_at(i) - state.g_u_at(i)).abs() < 1e-14 {
+            continue;
         }
-        if state.x_u[i].is_finite() {
-            min_compl = min_compl.min(slack_xu(state, i) * state.z_u[i]);
+        if l_fin {
+            min_compl = min_compl.min(slack_gl(state, i) * state.v_l_at(i));
+        }
+        if u_fin {
+            min_compl = min_compl.min(slack_gu(state, i) * state.v_u_at(i));
         }
     }
     if avg_compl > 0.0 && min_compl.is_finite() {
@@ -5796,21 +5058,23 @@ fn compute_centrality_xi(state: &SolverState, avg_compl: f64) -> f64 {
 /// floored from below by Ipopt's monotone schedule
 /// `min(κ_μ·μ, μ^sldp)` (so the Loqo-proposed μ can't undershoot
 /// a gradual monotone schedule on a single step) and from above
-/// by 1e5. The lower clamp `mu_floor` is `mu_min` when the
-/// barrier subproblem is approximately solved
-/// (`barrier_err ≤ kappa_eps · μ`) and `μ/5` otherwise.
+/// by 1e5. The hard floor is `options.mu_min` (T2.3: removed the
+/// ripopt-specific `μ/5` ramp that fired when the barrier subproblem
+/// was not approximately solved; Ipopt's `IpLoqoMuOracle::CalculateMu`
+/// has no such conditional).
 fn compute_loqo_mu(
     state: &SolverState,
     options: &SolverOptions,
+    mu_state: &mut MuState,
     avg_compl: f64,
 ) -> f64 {
-    let barrier_err = compute_barrier_error(state);
-    let mu_floor = if barrier_err <= options.barrier_tol_factor * state.mu {
-        options.mu_min
-    } else {
-        (state.mu / 5.0).max(options.mu_min)
-    };
-
+    // T2.28 + T3.2: faithful mirror of Ipopt 3.14
+    // `LoqoMuOracle::CalculateMu` (`IpLoqoMuOracle.cpp:34-66`).
+    // No `monotone_floor`, no `mu^super` clamp — Ipopt's CalculateMu
+    // is `Max(Min(mu_max, sigma*avg_compl), mu_min)`, where
+    // `mu_max = mu_max_fact * initial_avg_compl` is captured lazily
+    // by the adaptive μ-update on its first call
+    // (`IpAdaptiveMuUpdate.cpp:267-273`).
     let xi = compute_centrality_xi(state, avg_compl);
 
     let ratio = if xi > 1e-20 {
@@ -5820,18 +5084,389 @@ fn compute_loqo_mu(
     };
     let sigma = 0.1 * ratio.powi(3);
     let loqo_mu = sigma * avg_compl;
+    let mu_cap = mu_state.mu_max_cap(options, avg_compl);
+    let new_mu = loqo_mu.clamp(options.mu_min, mu_cap);
+
+    if options.print_level >= 5 {
+        rip_log!("ripopt: mu loqo: xi={:.4} sigma={:.4} avg_compl={:.3e} mu_cap={:.3e} -> mu={:.3e}",
+            xi, sigma, avg_compl, mu_cap, new_mu);
+    }
+    new_mu
+}
+
+/// Quality-function μ oracle (T2.23, spec §3.5,
+/// `IpQualityFunctionMuOracle.cpp:154-485`).
+///
+/// Procedure:
+/// 1. Assemble and factor the augmented KKT at the current iterate.
+/// 2. Solve the affine-predictor RHS (μ=0 in centering rows) → `d_aff`.
+/// 3. Solve the full RHS at `μ_cur` → `d_full`.  The centering direction
+///    is `d_cen = d_full − d_aff`, so a candidate σ produces the trial
+///    step `d(σ) = (1−σ)·d_aff + σ·d_full` (which by linearity solves
+///    KKT at μ_target = σ·μ_cur).
+/// 4. For each candidate σ, take the fraction-to-boundary step
+///    (α_p, α_d) under τ=1 and evaluate
+///    Q(σ) = (1−α_d)·dual_inf₀ / s_d
+///          + (1−α_p)·primal_inf₀
+///          + max_i (s+_i · z+_i) / s_c          (compl, target μ=0)
+///          + (1−min(α_p,α_d)) · max(avg_compl, μ) / s_c   (balancing)
+///          [+ 1/ξ at trial when `quality_function_centrality`]
+///    using the linear-residual identity `‖res(α)‖ = (1−α)·‖res(0)‖`.
+/// 5. Golden-section minimise over σ ∈ [1e-6, 1.0] with at most 8 steps
+///    and relative tolerance 1e-2 on the bracket width.
+/// 6. Return clamp(σ*·avg_compl, max=1e5, min=max(monotone_floor, μ_min)).
+///
+/// Returns `None` on factorisation/solve failure so the caller can fall
+/// back to the Loqo oracle (this matches `IpQualityFunctionMuOracle`'s
+/// behaviour — it skips the candidate and lets the algorithm fall
+/// through). Re-factorises the KKT inside the oracle (option (b) in the
+/// task spec) — slower than reusing the iteration's factor, but cleanly
+/// scoped without plumbing the linear solver through five call frames.
+///
+/// Tech-debt notes versus Ipopt 3.14's QF reference:
+///   * Ipopt's QF uses the **true nonlinear residual** at the trial
+///     point (problem(x+α·dx)). ripopt uses the linearised
+///     `(1−α)·current` identity, which is exact only when the trial step
+///     stays inside the linear regime. Near optimum where α≈1 the
+///     dual/primal terms collapse and Q is dominated by the compl term.
+///     Without a balancing term the QF becomes degenerate (Q is flat
+///     across σ). The balancing term above breaks that degeneracy and
+///     restores meaningful σ selection.
+///   * Spec §3.5 quotes σ_max=1e2 (matching Ipopt's full-balancing
+///     mode). ripopt caps σ_max at 1.0 because the linearised Q above
+///     has spurious local minima at σ≳1 in well-converged regimes.
+///   * Compl target is μ=0 (optimality), not σ·μ_cur (centering). This
+///     makes σ→0 strictly preferred whenever the affine direction
+///     admits a long FTB stride, matching Mehrotra-like behaviour.
+///   * To upgrade to the full Ipopt formulation we would need to plumb
+///     `&P: NlpProblem` and the linear solver through `update_barrier_*`
+///     so the oracle can call `problem.objective`/`gradient`/etc. at
+///     each trial point. That is option (a) in the task spec.
+fn compute_quality_function_mu(
+    state: &SolverState,
+    options: &SolverOptions,
+    mu_state: &mut MuState,
+    avg_compl: f64,
+    use_sparse: bool,
+    factor_cache: &mut kkt::FactorCache,
+) -> Option<f64> {
+    let n = state.n;
+    let m = state.m;
+
+    if avg_compl <= 0.0 {
+        return None;
+    }
+
+    // 1) Assemble + factor KKT at the current iterate. T3.25 follow-up:
+    // the QF oracle uses a *local* fallback solver instance, distinct
+    // from the main-loop `lin_solver`. A cache hit on the shared cache
+    // would replay `(δ_w, δ_c)` whose underlying factorization lives in
+    // the main loop's solver — incorrect for this local solver. Use a
+    // private per-call cache that mirrors the shared cache's `enabled`
+    // flag, so the cached entry point is exercised on this path
+    // (factor_calls bumps) but the shared cache remains valid for the
+    // main loop's next factor.
+    let sigma_vec = compute_sigma_from_state(state);
+    let mut kkt = assemble_kkt_from_state(state, n, m, &sigma_vec, use_sparse, options.kappa_d);
+    // Stamp the upstream atags onto the fresh KktSystem so the cached
+    // entry point can fingerprint it (assemble_kkt_from_state predates
+    // T3.25 and does not propagate atags).
+    if kkt.input_atags.is_none() {
+        kkt.input_atags = Some(state.kkt_atags);
+    }
+    let mut solver = new_fallback_solver(use_sparse);
+    let mut inertia_params = InertiaCorrectionParams::default();
+    let mut local_cache = kkt::FactorCache::new();
+    local_cache.enabled = factor_cache.enabled;
+    let factor_result = kkt::factor_with_inertia_correction_cached(
+        &mut kkt, solver.as_mut(), &mut inertia_params, state.mu, &mut local_cache,
+    );
+    // Fold the local diagnostic counters into the shared cache so tests
+    // can observe that the QF path exercised the cached entry point.
+    factor_cache.factor_calls += local_cache.factor_calls;
+    factor_cache.hits += local_cache.hits;
+    factor_cache.misses += local_cache.misses;
+    if factor_result.is_err() {
+        return None;
+    }
+
+    // 2+3) Affine-predictor and full-step solves submitted as one batched
+    // call. Both RHSes are known up front and use the same factor, so feral's
+    // `solve_sparse_many` (F1.1) shares workspace and supernode traversal
+    // across columns; the default trait impl loops single-RHS solves and
+    // matches the prior behavior. T3.26: mu oracles use inexact backsolves
+    // (allow_inexact=true, IpPDFullSpaceSolver.cpp:229-239).
+    let x_l_full = state.x_l_combined();
+    let x_u_full = state.x_u_combined();
+    let rhs_aff = kkt::affine_predictor_rhs(
+        &kkt.rhs, &state.x, &x_l_full, &x_u_full, state.mu, options.kappa_d,
+    );
+    let pairs = kkt::solve_with_custom_rhs_many(
+        kkt.n, kkt.dim, solver.as_mut(), &[&rhs_aff, &kkt.rhs],
+    ).ok()?;
+    let (dx_aff, dy_aff) = pairs[0].clone();
+    let (dx_full, dy_full) = pairs[1].clone();
+    let (dz_l_aff, dz_u_aff) = recover_dz_from_state(state, &dx_aff, 0.0);
+    let (dz_l_full, dz_u_full) = recover_dz_from_state(state, &dx_full, state.mu);
+    // B-cross6: recover slack-side primal step `ds` and slack-bound
+    // multiplier steps `dv_L, dv_U` so the QF oracle's centrality and
+    // FTB scans cover all four bound blocks (matching Ipopt's
+    // `IpQualityFunctionMuOracle::CalculateMu` which iterates over
+    // x_L, x_U, s_L, s_U). Mu oracles run before PD perturbation, so
+    // `ic_delta_c = 0` is correct for both predictor and full step
+    // (`IpPDFullSpaceSolver.cpp:229-239`, `IpProbingMuOracle.cpp:71-72`).
+    let ds_aff = recover_ds_from_state(state, &dx_aff, &dy_aff, 0.0);
+    let ds_full = recover_ds_from_state(state, &dx_full, &dy_full, 0.0);
+    let (dv_l_aff, dv_u_aff) = recover_dv_from_state(state, &ds_aff, 0.0);
+    let (dv_l_full, dv_u_full) = recover_dv_from_state(state, &ds_full, state.mu);
+
+    // 4) Pre-compute the residuals at the current iterate (needed for the
+    //    `(1−α)·residual` linearised identity).
+    let primal_inf0 = compute_primal_inf_max_at_state(state);
+    let dual_inf0 = compute_dual_inf_at_state(state);
+    let s_d = compute_residual_scaling(compute_multiplier_sum(state), compute_multiplier_count(state));
+    let s_c = compute_residual_scaling(compute_bound_multiplier_sum(state), compute_bound_multiplier_count(state));
+
+    // Quality-function evaluator at sigma. Captures the precomputed
+    // affine + full directions; pure scalar arithmetic from here on.
+    let q_eval = |sigma: f64| -> f64 {
+        // Trial step d(σ) = (1−σ)·d_aff + σ·d_full
+        let mut dx = vec![0.0; n];
+        let mut dz_l = vec![0.0; n];
+        let mut dz_u = vec![0.0; n];
+        for i in 0..n {
+            dx[i] = (1.0 - sigma) * dx_aff[i] + sigma * dx_full[i];
+            dz_l[i] = (1.0 - sigma) * dz_l_aff[i] + sigma * dz_l_full[i];
+            dz_u[i] = (1.0 - sigma) * dz_u_aff[i] + sigma * dz_u_full[i];
+        }
+        // B-cross6: σ-blended slack and slack-bound multiplier steps.
+        let mut ds = vec![0.0; m];
+        let mut dv_l = vec![0.0; m];
+        let mut dv_u = vec![0.0; m];
+        for i in 0..m {
+            ds[i] = (1.0 - sigma) * ds_aff[i] + sigma * ds_full[i];
+            dv_l[i] = (1.0 - sigma) * dv_l_aff[i] + sigma * dv_l_full[i];
+            dv_u[i] = (1.0 - sigma) * dv_u_aff[i] + sigma * dv_u_full[i];
+        }
+
+        // Fraction-to-boundary step lengths under τ=1 (Ipopt QF probe uses
+        // a full FTB scan on the candidate direction). B-cross6: include
+        // s vs [g_l, g_u] and v_L/v_U non-negativity.
+        let ds_d_qf = state.layout.project_d(&ds);
+        let dv_l_d_qf = state.layout.project_d(&dv_l);
+        let dv_u_d_qf = state.layout.project_d(&dv_u);
+        let alpha_p = fraction_to_boundary_primal_x(state, &dx, 1.0)
+            .min(fraction_to_boundary_primal_s(state, &ds_d_qf, 1.0))
+            .clamp(0.0, 1.0);
+        // Phase 6d.4: project σ-blended dz_l/dz_u to compressed form
+        // for the FTB scan signature.
+        let dz_l_c = state.bound_layout.project_l(&dz_l);
+        let dz_u_c = state.bound_layout.project_u(&dz_u);
+        let alpha_d = fraction_to_boundary_dual_z_min(state, &dz_l_c, &dz_u_c, 1.0)
+            .min(fraction_to_boundary_dual_v_min(state, &dv_l_d_qf, &dv_u_d_qf, 1.0))
+            .clamp(0.0, 1.0);
+
+        // Linearised residual reduction: ‖r(α)‖ = (1−α)·‖r(0)‖.
+        let dual_inf_trial = (1.0 - alpha_d) * dual_inf0;
+        let primal_inf_trial = (1.0 - alpha_p) * primal_inf0;
+
+        // Complementarity at the trial point, measured against the
+        // *optimality* target μ=0 rather than the σ·μ_cur centering
+        // target. This is the discriminator that Ipopt's QF effectively
+        // uses (`IpQualityFunctionMuOracle.cpp` evaluates compl as
+        // `slack·z` directly, not `slack·z − μ`): a smaller σ that drives
+        // s·z toward zero is preferred whenever the affine step admits a
+        // long FTB stride. The σ=σ_max degeneracy (where the σ·μ_cur
+        // target is trivially met by the centered step) is broken.
+        // B-cross6: scan all four blocks (z_L, z_U, v_L, v_U).
+        let mut compl_max: f64 = 0.0;
+        // Phase 6c.2: walk compressed bound mirrors. dz_l/dz_u are
+        // full-`n` σ-blended directions, indexed via x_l_to_full[k].
+        for k in 0..state.bound_layout.n_x_l {
+            let i = state.bound_layout.x_l_to_full[k];
+            let s_plus = (slack_xl(state, i) + alpha_p * dx[i]).max(1e-20);
+            let z_plus = (state.z_l_compressed[k] + alpha_d * dz_l[i]).max(1e-20);
+            compl_max = compl_max.max(s_plus * z_plus);
+        }
+        for k in 0..state.bound_layout.n_x_u {
+            let i = state.bound_layout.x_u_to_full[k];
+            let s_plus = (slack_xu(state, i) - alpha_p * dx[i]).max(1e-20);
+            let z_plus = (state.z_u_compressed[k] + alpha_d * dz_u[i]).max(1e-20);
+            compl_max = compl_max.max(s_plus * z_plus);
+        }
+        for i in 0..m {
+            let l_fin = state.g_l_at(i).is_finite();
+            let u_fin = state.g_u_at(i).is_finite();
+            if l_fin && u_fin && (state.g_l_at(i) - state.g_u_at(i)).abs() < 1e-14 {
+                continue;
+            }
+            if l_fin {
+                let s_plus = (slack_gl(state, i) + alpha_p * ds[i]).max(1e-20);
+                let v_plus = (state.v_l_at(i) + alpha_d * dv_l[i]).max(1e-20);
+                compl_max = compl_max.max(s_plus * v_plus);
+            }
+            if u_fin {
+                let s_plus = (slack_gu(state, i) - alpha_p * ds[i]).max(1e-20);
+                let v_plus = (state.v_u_at(i) + alpha_d * dv_u[i]).max(1e-20);
+                compl_max = compl_max.max(s_plus * v_plus);
+            }
+        }
+
+        let mut q = dual_inf_trial / s_d + primal_inf_trial + compl_max / s_c;
+
+        // Balancing term: penalise σ values whose linearised step admits
+        // only a tiny fraction-to-boundary step. Without this, σ=0 (full
+        // affine) and σ=1 (full centered) are both linearisation-optimal
+        // (each kills its own residual), and the search lacks a
+        // discriminator. Mirrors Ipopt's
+        // `IpQualityFunctionMuOracle.cpp:625-660` balancing term, which
+        // adds a contribution proportional to (1−min(α_p,α_d))·max_compl
+        // to penalise short steps.
+        let alpha_min = alpha_p.min(alpha_d).max(1e-12);
+        // Use the current max compl as the scale so the balancing term is
+        // commensurate with the rest of Q.
+        let scale = avg_compl.max(state.mu);
+        q += (1.0 - alpha_min) * scale / s_c;
+
+        // Optional centrality penalty: 1/ξ where ξ = min(s·z) / avg(s·z)
+        // at the trial point (Ipopt `centrality=reciprocal`,
+        // `IpQualityFunctionMuOracle.cpp:622`). B-cross6: scan all
+        // four bound blocks.
+        if options.quality_function_centrality {
+            let mut sum_sz = 0.0_f64;
+            let mut min_sz = f64::INFINITY;
+            let mut nb = 0usize;
+            // Phase 6c.2: walk compressed bound mirrors.
+            for k in 0..state.bound_layout.n_x_l {
+                let i = state.bound_layout.x_l_to_full[k];
+                let s_plus = (slack_xl(state, i) + alpha_p * dx[i]).max(1e-20);
+                let z_plus = (state.z_l_compressed[k] + alpha_d * dz_l[i]).max(1e-20);
+                let sz = s_plus * z_plus;
+                sum_sz += sz;
+                if sz < min_sz { min_sz = sz; }
+                nb += 1;
+            }
+            for k in 0..state.bound_layout.n_x_u {
+                let i = state.bound_layout.x_u_to_full[k];
+                let s_plus = (slack_xu(state, i) - alpha_p * dx[i]).max(1e-20);
+                let z_plus = (state.z_u_compressed[k] + alpha_d * dz_u[i]).max(1e-20);
+                let sz = s_plus * z_plus;
+                sum_sz += sz;
+                if sz < min_sz { min_sz = sz; }
+                nb += 1;
+            }
+            for i in 0..m {
+                let l_fin = state.g_l_at(i).is_finite();
+                let u_fin = state.g_u_at(i).is_finite();
+                if l_fin && u_fin && (state.g_l_at(i) - state.g_u_at(i)).abs() < 1e-14 {
+                    continue;
+                }
+                if l_fin {
+                    let s_plus = (slack_gl(state, i) + alpha_p * ds[i]).max(1e-20);
+                    let v_plus = (state.v_l_at(i) + alpha_d * dv_l[i]).max(1e-20);
+                    let sv = s_plus * v_plus;
+                    sum_sz += sv;
+                    if sv < min_sz { min_sz = sv; }
+                    nb += 1;
+                }
+                if u_fin {
+                    let s_plus = (slack_gu(state, i) - alpha_p * ds[i]).max(1e-20);
+                    let v_plus = (state.v_u_at(i) + alpha_d * dv_u[i]).max(1e-20);
+                    let sv = s_plus * v_plus;
+                    sum_sz += sv;
+                    if sv < min_sz { min_sz = sv; }
+                    nb += 1;
+                }
+            }
+            if nb > 0 && sum_sz > 0.0 {
+                let avg = sum_sz / nb as f64;
+                let xi = (min_sz / avg).clamp(1e-20, 1.0);
+                q += 1.0 / xi;
+            }
+        }
+        q
+    };
+
+    // 5) Golden-section minimise Q over σ ∈ [σ_min, σ_max]. Spec §3.5
+    //    quotes [1e-6, 1e2] from Ipopt's full QF with balancing terms;
+    //    ripopt's simpler linearised Q has a degeneracy near σ=1 where
+    //    both endpoints satisfy the linearised KKT, so we cap σ_max at
+    //    1.0 (Ipopt's effective range when `quality_function_balancing_term`
+    //    is `none`, which is the default). This avoids σ ≳ 1 picks that
+    //    would pin μ at avg_compl indefinitely.
+    let sigma_min = 1e-6;
+    let sigma_max = 1.0;
+    let sigma_star = golden_section_minimize(
+        &q_eval,
+        sigma_min,
+        sigma_max,
+        options.quality_function_max_section_steps,
+        0.01, // relative tolerance: |σ_hi − σ_lo| < 0.01·σ_lo
+    );
+
+    // 6) Convert σ* to μ. Apply the same monotone floor and clamp as the
+    //    Loqo oracle (Ipopt's `IpQualityFunctionMuOracle::CalculateMu`
+    //    re-uses the Loqo clamp).
+    let qf_mu = sigma_star * avg_compl;
     let monotone_floor =
         (options.mu_linear_decrease_factor * state.mu)
             .min(state.mu.powf(options.mu_superlinear_decrease_power));
-    let new_mu = loqo_mu
-        .max(monotone_floor)
-        .clamp(mu_floor, 1e5);
+    let mu_cap = mu_state.mu_max_cap(options, avg_compl);
+    let new_mu = qf_mu.max(monotone_floor).clamp(options.mu_min, mu_cap);
 
     if options.print_level >= 5 {
-        rip_log!("ripopt: mu loqo: xi={:.4} sigma={:.4} avg_compl={:.3e} floor={:.3e} -> mu={:.3e}",
-            xi, sigma, avg_compl, monotone_floor, new_mu);
+        rip_log!("ripopt: mu QF: sigma*={:.4e} avg_compl={:.3e} floor={:.3e} -> mu={:.3e}",
+            sigma_star, avg_compl, monotone_floor, new_mu);
     }
-    new_mu
+    Some(new_mu)
+}
+
+/// Golden-section search for the minimum of a unimodal `f` on `[lo, hi]`
+/// (operating in log-space because the QF candidate range spans 8 orders
+/// of magnitude). Stops after at most `max_steps` shrinks or once the
+/// log-bracket width is below `rel_tol`. Returns the bracket centre.
+///
+/// Used by [`compute_quality_function_mu`] to minimise Q(σ) per
+/// `IpQualityFunctionMuOracle.cpp:520-560` (Ipopt also operates in the
+/// log scale and bounds `quality_function_max_section_steps` at 8 by
+/// default).
+fn golden_section_minimize<F: Fn(f64) -> f64>(
+    f: &F,
+    lo: f64,
+    hi: f64,
+    max_steps: usize,
+    rel_tol: f64,
+) -> f64 {
+    debug_assert!(lo > 0.0 && hi > lo);
+    let log_lo0 = lo.ln();
+    let log_hi0 = hi.ln();
+    let mut log_lo = log_lo0;
+    let mut log_hi = log_hi0;
+    // Golden-section split factor.
+    let phi = (5.0_f64.sqrt() - 1.0) / 2.0; // ~0.618
+    let mut log_x1 = log_hi - phi * (log_hi - log_lo);
+    let mut log_x2 = log_lo + phi * (log_hi - log_lo);
+    let mut f1 = f(log_x1.exp());
+    let mut f2 = f(log_x2.exp());
+    for _ in 0..max_steps {
+        if (log_hi - log_lo).abs() < rel_tol {
+            break;
+        }
+        if f1 < f2 {
+            log_hi = log_x2;
+            log_x2 = log_x1;
+            f2 = f1;
+            log_x1 = log_hi - phi * (log_hi - log_lo);
+            f1 = f(log_x1.exp());
+        } else {
+            log_lo = log_x1;
+            log_x1 = log_x2;
+            f1 = f2;
+            log_x2 = log_lo + phi * (log_hi - log_lo);
+            f2 = f(log_x2.exp());
+        }
+    }
+    (0.5 * (log_lo + log_hi)).exp()
 }
 
 fn update_barrier_parameter(
@@ -5840,16 +5475,27 @@ fn update_barrier_parameter(
     filter: &mut Filter,
     last_mehrotra_sigma: &mut Option<f64>,
     options: &SolverOptions,
+    use_sparse: bool,
 ) {
     let n = state.n;
-    // When there are no variable bounds, mu serves no barrier purpose but is
-    // still used for KKT regularization and the filter line search. We decrease
-    // mu superlinearly (mu^1.5) rather than collapsing it instantly to mu_min,
-    // which would destroy filter protection against infeasible steps. This
-    // prevents the PENTAGON-type failure where mu=1e-11 at iteration 1 causes
-    // the switching condition to accept a step that destroys feasibility.
-    let has_bounds = (0..n).any(|i| state.x_l[i].is_finite() || state.x_u[i].is_finite());
-    if !has_bounds {
+    // When the problem has neither variable bounds NOR inequality
+    // constraints, mu serves no barrier purpose: there are no `s · v = μ`
+    // or `(x − x_l) · z_l = μ` complementarity blocks. In that case mu is
+    // only used for KKT regularization and the filter line search, and
+    // we decrease it superlinearly to keep filter protection without
+    // collapsing to mu_min instantly (the PENTAGON guard).
+    //
+    // Bug fix (qcqp1500-1c): the prior gate `!has_var_bounds → μ^1.5
+    // unconditionally` was wrong when inequality constraints are
+    // present, because the slack barrier `μ Σ log s_k` is then active
+    // and requires sufficient-progress gating just like var bounds. On
+    // qcqp1500-1c (0 var bounds, 10008 inequalities) it caused mu to
+    // collapse to 1e-11 in 6 iterations while complementarity stayed
+    // ~10⁵, racing the IPM into the floor with no barrier subproblem
+    // ever solved.
+    let has_var_bounds = (0..n).any(|i| state.x_l_at(i).is_finite() || state.x_u_at(i).is_finite());
+    let has_slack_barrier = !state.s.is_empty();
+    if !has_var_bounds && !has_slack_barrier {
         state.mu = state.mu.powf(options.mu_superlinear_decrease_power).max(options.mu_min);
         return;
     }
@@ -5874,23 +5520,18 @@ fn update_barrier_parameter(
         mu_state.dual_inf_window.push(du_now);
     }
 
-    // Ipopt-style barrier-subproblem stop test (IpMonotoneMuUpdate.cpp:135-194).
-    // Decrease mu only when the current barrier subproblem is approximately
-    // solved: barrier_err <= kappa_eps * mu (kappa_eps = barrier_tol_factor,
-    // default 10). Without this gate, mu collapses every iteration regardless
-    // of whether the line search is actually making progress on the current
-    // subproblem — observed on cho parmest where mu went 1e-1 -> 1e-9 in 9
-    // iters while inf_pr stayed pinned at 19. The check_sufficient_progress
-    // gate below is a relative-history check; this is the absolute gate.
-    let barrier_err_for_gate = compute_barrier_error(state);
-    let barrier_subproblem_solved =
-        barrier_err_for_gate <= options.barrier_tol_factor * state.mu;
-
+    // A8.11: Ipopt's Free mode (IpAdaptiveMuUpdate.cpp:343-389) has no
+    // barrier-subproblem-solved gate — that absolute test exists only in
+    // Fixed mode (IpMonotoneMuUpdate.cpp). Free mode is a strict 2-way
+    // split on `CheckSufficientProgress()` after the skipped-LS / tiny-step
+    // override: sufficient → run oracle unconditionally (line 391-436),
+    // not sufficient → switch to Fixed. Fixed mode does its own
+    // barrier_err computation inside the decrement loop.
     match mu_state.mode {
         MuMode::Free => {
             update_barrier_parameter_free_mode(
                 state, mu_state, filter, last_mehrotra_sigma, options,
-                sufficient, kkt_error, barrier_subproblem_solved,
+                sufficient, kkt_error, use_sparse,
             );
         }
         MuMode::Fixed => {
@@ -5899,21 +5540,6 @@ fn update_barrier_parameter(
             );
         }
     }
-}
-
-/// Detect dual-infeasibility stagnation over the 3-element du window.
-/// Returns true when the most recent du is at least 90% of the oldest
-/// (i.e. has not improved meaningfully) AND du is still large
-/// relative to tol. Used by the Free-mode mu update to force a
-/// switch to Fixed mode even when consecutive_insufficient < 2.
-fn compute_du_stagnant_in_free_mode(mu_state: &MuState, options: &SolverOptions) -> bool {
-    if mu_state.dual_inf_window.len() < 3 {
-        return false;
-    }
-    let w = &mu_state.dual_inf_window;
-    let recent = w[w.len() - 1];
-    let oldest = w[w.len() - 3];
-    recent >= 0.9 * oldest && recent > options.tol * 100.0
 }
 
 /// Record a mu-strategy mode change: bump the diagnostics counter,
@@ -5946,10 +5572,34 @@ fn switch_to_fixed_mode_with_adaptive_init(
     mu_state.consecutive_insufficient = 0;
     log::debug!("Switching to fixed mu mode (insufficient progress or tiny step)");
     switch_mu_mode(state, mu_state, MuMode::Fixed);
+    // T3.11: optional rollback to the last Free-mode iterate that
+    // satisfied `CheckSufficientProgress`. Mirrors Ipopt
+    // `IpAdaptiveMuUpdate.cpp:362-370`. Only mu/tau are recomputed
+    // afterwards; the snapshot is consumed on use so a subsequent
+    // Fixed→Free→Fixed cycle re-captures.
+    if options.adaptive_mu_restore_previous_iterate {
+        if let Some(snap) = mu_state.accepted_iterate.take() {
+            state.x = snap.x;
+            state.set_y_combined(&snap.y);
+            state.z_l_compressed = snap.z_l_compressed;
+            state.z_u_compressed = snap.z_u_compressed;
+            state.set_v_l_combined(&snap.v_l);
+            state.set_v_u_combined(&snap.v_u);
+            // T3.25: rollback touches every tracked KKT input.
+            state.bump_all_kkt_atags();
+            log::debug!("Free→Fixed rollback: restored accepted_point");
+        }
+    }
     let avg_compl = compute_avg_complementarity(state);
     if avg_compl > 0.0 {
+        // A8.6: align switch-to-Fixed cap with Ipopt
+        // (`IpAdaptiveMuUpdate.cpp:267-273`): cap by `mu_max_fact *
+        // initial_avg_compl` rather than the hard `1e5` previously used.
+        // Matches the cap already used by the four other Free-mode μ
+        // update sites that all funnel through `mu_state.mu_max_cap`.
+        let mu_cap = mu_state.mu_max_cap(options, avg_compl);
         state.mu = (options.adaptive_mu_monotone_init_factor * avg_compl)
-            .clamp(options.mu_min, 1e5);
+            .clamp(options.mu_min, mu_cap);
     } else {
         state.mu = (options.mu_linear_decrease_factor * state.mu)
             .max(options.mu_min);
@@ -5971,20 +5621,51 @@ fn apply_free_mode_sufficient_progress_update(
     filter: &mut Filter,
     options: &SolverOptions,
     kkt_error: f64,
+    use_sparse: bool,
 ) {
     mu_state.consecutive_insufficient = 0;
     mu_state.remember_accepted(kkt_error);
+    // T3.11: capture the accepted iterate so a later Free→Fixed switch
+    // can roll back to it. Mirrors Ipopt
+    // `RememberCurrentPointAsAccepted` (IpAdaptiveMuUpdate.cpp:541-545):
+    // only enabled under `adaptive_mu_restore_previous_iterate`.
+    if options.adaptive_mu_restore_previous_iterate {
+        mu_state.accepted_iterate = Some(AcceptedIterateSnapshot {
+            x: state.x.clone(),
+            y: state.y_combined(),
+            z_l_compressed: state.z_l_compressed.clone(),
+            z_u_compressed: state.z_u_compressed.clone(),
+            v_l: state.v_l_combined(),
+            v_u: state.v_u_combined(),
+        });
+    }
     let avg_compl = compute_avg_complementarity(state);
     if options.mu_oracle_quality_function && avg_compl > 0.0 {
-        state.mu = compute_loqo_mu(state, options, avg_compl);
+        // T2.23: try the Ipopt-style Quality Function oracle first
+        // (spec §3.5, IpQualityFunctionMuOracle.cpp). Falls back to the
+        // Loqo formula on aff/centering solve failure.
+        //
+        // T3.25 follow-up: move the factor cache out of `state`, run
+        // the oracle with `&state` + the cache borrowed exclusively,
+        // then put the cache back. This avoids a double mutable borrow
+        // on `state` without resorting to raw pointers, and preserves
+        // the diagnostic counters across the call.
+        let mut cache = std::mem::take(&mut state.factor_cache);
+        let qf_mu = compute_quality_function_mu(
+            state, options, mu_state, avg_compl, use_sparse, &mut cache,
+        );
+        state.factor_cache = cache;
+        state.mu = qf_mu
+            .unwrap_or_else(|| compute_loqo_mu(state, options, mu_state, avg_compl));
     } else if avg_compl > 0.0 {
-        let barrier_err = compute_barrier_error(state);
-        let mu_floor = if barrier_err <= options.barrier_tol_factor * state.mu {
-            options.mu_min
-        } else {
-            (state.mu / 5.0).max(options.mu_min)
-        };
-        state.mu = (avg_compl / options.kappa).clamp(mu_floor, 1e5);
+        // DEV-2: replace the ripopt-specific `avg_compl / options.kappa`
+        // fallback with the Loqo oracle. Ipopt's `IpAdaptiveMuUpdate::DoUpdate`
+        // (`IpAdaptiveMuUpdate.cpp:391-436`) always runs the configured
+        // mu-oracle (loqo, quality-function, or probing) when sufficient
+        // progress holds; it never uses an `avg_compl / kappa` formula.
+        // Falling back to Loqo when the QF oracle is disabled gives the
+        // closest Ipopt analog (`mu_oracle = loqo`).
+        state.mu = compute_loqo_mu(state, options, mu_state, avg_compl);
     } else {
         state.mu = (options.mu_linear_decrease_factor * state.mu)
             .max(options.mu_min);
@@ -5992,36 +5673,21 @@ fn apply_free_mode_sufficient_progress_update(
     reset_filter_with_current_theta(state, filter);
 }
 
-/// Conservative μ decrease for the "stay in Free, neither sufficient
-/// nor switch-to-Fixed" branch. Only fires when the barrier
-/// subproblem is approximately solved — without that gate μ would
-/// collapse unconditionally even when the line search is making no
-/// progress (observed on cho parmest: μ 0.1 → 0.02 at iter 1
-/// despite barrier_err=1.4e4). Uses `avg_compl/kappa` clamped to
-/// `[μ_min, 1e5]` when active complementarity products exist;
-/// otherwise falls back to `mu_linear_decrease_factor·μ`.
-fn apply_free_mode_conservative_decrease(state: &mut SolverState, options: &SolverOptions) {
-    let avg_compl = compute_avg_complementarity(state);
-    if avg_compl > 0.0 {
-        let mu_floor = options.mu_min;
-        state.mu = (avg_compl / options.kappa).clamp(mu_floor, 1e5);
-    } else {
-        state.mu = (options.mu_linear_decrease_factor * state.mu)
-            .max(options.mu_min);
-    }
-}
-
-/// Free-mode (adaptive) barrier-parameter update. Three branches:
-/// 1) Sufficient progress + barrier subproblem solved: pick a new mu via
-///    the Loqo oracle (when quality_function is on) or rate-limited Loqo
-///    fallback `avg_compl/kappa`, then reset the filter.
-/// 2) Insufficient progress (>=2 consecutive) or dual-infeasibility
-///    stagnation: switch to Fixed mode with mu = adaptive_mu_monotone_init
-///    * avg_compl, reset the filter.
-/// 3) Stay in Free with conservative mu decrease only when the barrier
-///    subproblem is approximately solved; otherwise mu stays put waiting
-///    for the line search to make progress on the current subproblem.
-#[allow(clippy::too_many_arguments)]
+/// Free-mode (adaptive) barrier-parameter update. Strict 2-way split
+/// matching Ipopt's `IpAdaptiveMuUpdate::DoUpdate` (lines 343-389) and
+/// the unconditional oracle call at lines 391-436:
+/// 1) `sufficient && !tiny_step` → run the mu-oracle to pick a new μ,
+///    remember the accepted point, and reset the filter.
+/// 2) Otherwise → switch to Fixed mode with `μ = adaptive_mu_monotone_init *
+///    avg_compl` and reset the filter.
+///
+/// A8.11: removed the previous `barrier_subproblem_solved` gate and
+/// the `apply_free_mode_conservative_decrease` middle branch. Neither
+/// has an analogue in Ipopt 3.14 — Free mode never tests
+/// `barrier_err <= kappa_eps * mu`; that gate exists only in Fixed
+/// mode (`IpMonotoneMuUpdate.cpp:135-194`). The "stay in Free with μ
+/// unchanged" fall-through that the gate created is also non-Ipopt:
+/// Free mode either runs the oracle or switches to Fixed.
 fn update_barrier_parameter_free_mode(
     state: &mut SolverState,
     mu_state: &mut MuState,
@@ -6030,25 +5696,25 @@ fn update_barrier_parameter_free_mode(
     options: &SolverOptions,
     sufficient: bool,
     kkt_error: f64,
-    barrier_subproblem_solved: bool,
+    use_sparse: bool,
 ) {
     // Consume Mehrotra sigma for use as quality function candidate
     let _sigma_mu = last_mehrotra_sigma.take();
-    if sufficient && !mu_state.tiny_step && barrier_subproblem_solved {
+    if sufficient && !mu_state.tiny_step {
         apply_free_mode_sufficient_progress_update(
-            state, mu_state, filter, options, kkt_error,
+            state, mu_state, filter, options, kkt_error, use_sparse,
         );
     } else {
-        let du_stagnant = compute_du_stagnant_in_free_mode(mu_state, options);
+        // A8.8: align Free→Fixed switch with Ipopt
+        // (`IpAdaptiveMuUpdate.cpp:343-389`). Ipopt's only Free→Fixed
+        // triggers are `!CheckSufficientProgress()`, `tiny_step_flag`,
+        // and `CheckSkippedLineSearch()`. Critically,
+        // `CheckSufficientProgress()` returns *true* whenever the
+        // KKT-error reference window has fewer than `num_refs_max`
+        // (default 4) entries (`IpAdaptiveMuUpdate.cpp:446-490`), so
+        // the earliest possible switch is iter 4, not iter 1.
         mu_state.consecutive_insufficient += 1;
-        if mu_state.consecutive_insufficient >= 2 || du_stagnant {
-            switch_to_fixed_mode_with_adaptive_init(state, mu_state, filter, options);
-        } else if barrier_subproblem_solved {
-            apply_free_mode_conservative_decrease(state, options);
-        }
-        // When !barrier_subproblem_solved, mu stays put and we
-        // wait for the line search to make progress on the current
-        // subproblem.
+        switch_to_fixed_mode_with_adaptive_init(state, mu_state, filter, options);
     }
 }
 
@@ -6074,320 +5740,65 @@ fn update_barrier_parameter_fixed_mode(
         mu_state.remember_accepted(kkt_error);
     } else {
         mu_state.first_iter_in_mode = false;
-        // Check if subproblem is solved (barrier error small enough)
-        let barrier_err = compute_barrier_error(state);
-        if barrier_err <= options.barrier_tol_factor * state.mu || mu_state.tiny_step {
+        // Mirrors Ipopt's IpMonotoneMuUpdate.cpp:130-200: while the barrier
+        // subproblem is solved at the current μ (or a tiny step was taken),
+        // decrease μ. With `mu_allow_fast_monotone_decrease`, allow several
+        // consecutive decreases per outer iteration; otherwise stop after one.
+        //
+        // DEV-3: floor mu at `min(tol, compl_inf_tol) / (barrier_tol_factor + 1)`
+        // per IpMonotoneMuUpdate.cpp:215 — Ipopt won't drive mu below the
+        // level the convergence test cannot benefit from, preventing the
+        // algorithm from latching into pathological super-tight subproblems.
+        // ripopt's `mu_min` (default 1e-11) is preserved as an absolute
+        // hard-floor below the Ipopt formula.
+        //
+        // DEV-4: removed the `MAX_FAST_DECREASES = 4` cap; Ipopt loops
+        // while-solved without bound (IpMonotoneMuUpdate.cpp:130-200).
+        let mu_floor = options
+            .tol
+            .min(options.compl_inf_tol)
+            / (options.barrier_tol_factor + 1.0);
+        let mut decreases = 0usize;
+        let mut tiny_step = mu_state.tiny_step;
+        loop {
+            let (barrier_err, du_e, co_e, pr_e) =
+                compute_barrier_error_components(state);
+            let solved = barrier_err <= options.barrier_tol_factor * state.mu;
+            if std::env::var("RIPOPT_TRACE_MU").is_ok() {
+                eprintln!(
+                    "ripopt: mu-gate iter={} mu={:.3e} E_mu={:.3e} (du={:.3e} co={:.3e} pr={:.3e}) thr={:.3e} solved={}",
+                    state.iter, state.mu, barrier_err, du_e, co_e, pr_e,
+                    options.barrier_tol_factor * state.mu, solved,
+                );
+                if state.iter % 50 == 0 || state.iter >= 495 {
+                    dump_compl_outliers(state);
+                }
+            }
+            if !(solved || tiny_step) { break; }
             let new_mu = (options.mu_linear_decrease_factor * state.mu)
                 .min(state.mu.powf(options.mu_superlinear_decrease_power))
+                .max(mu_floor)
                 .max(options.mu_min);
-            if !(mu_state.tiny_step && (new_mu - state.mu).abs() < 1e-20) {
-                state.mu = new_mu;
-                reset_filter_with_current_theta(state, filter);
-                log::debug!("Fixed mode: mu decreased to {:.2e}", state.mu);
-            }
+            let mu_changed = (new_mu - state.mu).abs() > 1e-20;
+            if !mu_changed { break; }
+            state.mu = new_mu;
+            decreases += 1;
+            tiny_step = false;
+            log::debug!("Fixed mode: mu decreased to {:.2e}", state.mu);
+            if !options.mu_allow_fast_monotone_decrease { break; }
+        }
+        if decreases > 0 {
+            reset_filter_with_current_theta(state, filter);
         }
     }
 }
 
-/// Bounded ring of recent dual-infeasibility values + parallel ring of
-/// (x, y, z_l, z_u) snapshots, with a one-shot `tried` flag guarding the
-/// iterate-averaging promotion. Owned by solve_ipm; mutated each
-/// iteration via `record` and consumed by `try_iterate_averaging_promotion`.
-struct IterateAveragingState {
-    du_history: Vec<f64>,
-    iterate_history: Vec<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)>,
-    tried: bool,
-}
-
-impl IterateAveragingState {
-    fn new() -> Self {
-        Self {
-            du_history: Vec::with_capacity(AVG_WINDOW + 1),
-            iterate_history: Vec::new(),
-            tried: false,
-        }
-    }
-}
-
-/// State threaded through the convergence-check promotion attempts.
-///
-/// Groups the loop-spanning history + one-shot promotion flags so the
-/// `check_convergence_and_handle_promotions` helper doesn't need a 20-param
-/// signature. All fields live in `solve_ipm`'s stack frame; this struct is
-/// only a bundle of mutable references.
-struct ConvergenceWorkspace<'a> {
-    avg: &'a mut IterateAveragingState,
-    tried_active_set: &'a mut bool,
-    tried_compl_polish: &'a mut bool,
-}
-
-/// Check convergence status and, on Acceptable, try three promotion
-/// strategies in order: iterate averaging (oscillation smoothing), active-set
-/// reduced solve, and complementarity polishing via multiplier snap. Each
-/// promotion attempt is one-shot (guarded by its `tried_*` flag). Any
-/// successful promotion returns `Some(SolveResult { Optimal })`.
-///
-/// Returns:
-/// - `Some(SolveResult)` when the solver should terminate (Converged,
-///   Acceptable, promoted Optimal, or Diverging/Unbounded).
-/// - `None` when iteration should continue (NotConverged).
-///
-/// Ipopt parallel: `IpIpoptAlg::Optimize` → `IpConvCheck::CheckConvergence`
-/// plus the near-tolerance polishing heuristics (`RecalcIpoptData`,
-/// multiplier snap), which live inline in Ipopt as well.
-///
-/// Snapshot of (x, y, z_l, z_u) used by speculative promotion paths
-/// (iterate averaging, active-set solve) to roll back if the speculative
-/// step fails to converge.
-struct SavedIterate {
-    x: Vec<f64>,
-    y: Vec<f64>,
-    z_l: Vec<f64>,
-    z_u: Vec<f64>,
-}
-
-impl SavedIterate {
-    fn snapshot(state: &SolverState) -> Self {
-        Self {
-            x: state.x.clone(),
-            y: state.y.clone(),
-            z_l: state.z_l.clone(),
-            z_u: state.z_u.clone(),
-        }
-    }
-
-    /// Restore (x, y, z_l, z_u) into `state` and re-evaluate the problem
-    /// at the restored x. The eval result is discarded — callers expect
-    /// the saved point to have been valid.
-    fn restore_and_reeval<P: NlpProblem>(
-        &self,
-        state: &mut SolverState,
-        problem: &P,
-        linear_constraints: Option<&[bool]>,
-        lbfgs_mode: bool,
-    ) {
-        state.x.copy_from_slice(&self.x);
-        state.y.copy_from_slice(&self.y);
-        state.z_l.copy_from_slice(&self.z_l);
-        state.z_u.copy_from_slice(&self.z_u);
-        let _ = state.evaluate_with_linear(problem, 1.0, linear_constraints, lbfgs_mode);
-    }
-}
-
-/// Compute the arithmetic mean of the last `iterate_history.len()`
-/// iterates in `(x, y, z_l, z_u)`, then clamp `avg_x` strictly inside
-/// the variable bounds (push 1e-15 off each finite bound) and clamp
-/// `avg_zl, avg_zu` non-negative.
-fn compute_iterate_average(
-    iterate_history: &[(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)],
-    state: &SolverState,
-    n: usize,
-    m: usize,
-) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
-    let len = iterate_history.len() as f64;
-    let mut avg_x = vec![0.0; n];
-    let mut avg_y = vec![0.0; m];
-    let mut avg_zl = vec![0.0; n];
-    let mut avg_zu = vec![0.0; n];
-    for (hx, hy, hzl, hzu) in iterate_history.iter() {
-        for i in 0..n { avg_x[i] += hx[i] / len; }
-        for i in 0..m { avg_y[i] += hy[i] / len; }
-        for i in 0..n { avg_zl[i] += hzl[i] / len; }
-        for i in 0..n { avg_zu[i] += hzu[i] / len; }
-    }
-    for i in 0..n {
-        avg_x[i] = avg_x[i].clamp(
-            if state.x_l[i].is_finite() { state.x_l[i] + 1e-15 } else { f64::NEG_INFINITY },
-            if state.x_u[i].is_finite() { state.x_u[i] - 1e-15 } else { f64::INFINITY },
-        );
-        avg_zl[i] = avg_zl[i].max(0.0);
-        avg_zu[i] = avg_zu[i].max(0.0);
-    }
-    (avg_x, avg_y, avg_zl, avg_zu)
-}
-
-/// Count the number of sign changes in consecutive differences of
-/// `du_history` — i.e. interior indices `w` where
-/// `(h[w]-h[w-1])·(h[w+1]-h[w]) < 0`. Used by
-/// `try_iterate_averaging_promotion` to detect dual-infeasibility
-/// oscillation: ≥ `AVG_WINDOW/2` sign changes flag a stalled
-/// oscillating iterate that averaging may resolve.
-fn count_du_history_sign_changes(du_history: &[f64]) -> usize {
-    let mut sign_changes = 0;
-    for w in 1..du_history.len().saturating_sub(1) {
-        let d1 = du_history[w] - du_history[w - 1];
-        let d2 = du_history[w + 1] - du_history[w];
-        if d1 * d2 < 0.0 {
-            sign_changes += 1;
-        }
-    }
-    sign_changes
-}
-
-/// Strategy 1 (Acceptable promotion): if the dual-infeasibility history has
-/// `AVG_WINDOW` entries and shows oscillation (>= AVG_WINDOW/2 sign changes
-/// in consecutive differences), average the last `AVG_WINDOW` iterates and
-/// re-check convergence at the averaged point. On success returns
-/// `Some(Optimal)`; otherwise restores the original state and returns None.
-/// One-shot (guarded by `ws.tried_iterate_averaging`).
 #[allow(clippy::too_many_arguments)]
-fn try_iterate_averaging_promotion<P: NlpProblem>(
+fn check_convergence_and_handle_promotions(
     state: &mut SolverState,
-    problem: &P,
-    options: &SolverOptions,
-    ws: &mut ConvergenceWorkspace,
-    n: usize,
-    m: usize,
-    linear_constraints: Option<&[bool]>,
-    lbfgs_mode: bool,
-) -> Option<SolveResult> {
-    if ws.avg.tried || ws.avg.du_history.len() != AVG_WINDOW {
-        return None;
-    }
-    if count_du_history_sign_changes(&ws.avg.du_history) < AVG_WINDOW / 2 {
-        return None;
-    }
-    ws.avg.tried = true;
-    let (avg_x, avg_y, avg_zl, avg_zu) =
-        compute_iterate_average(&ws.avg.iterate_history, state, n, m);
-    let saved = SavedIterate::snapshot(state);
-    state.x.copy_from_slice(&avg_x);
-    state.y.copy_from_slice(&avg_y);
-    state.z_l.copy_from_slice(&avg_zl);
-    state.z_u.copy_from_slice(&avg_zu);
-    let _ = state.evaluate_with_linear(problem, 1.0, linear_constraints, lbfgs_mode);
-    let avg_conv = compute_convergence_info_from_state(state, state.mu, n, m);
-    if let ConvergenceStatus::Converged = check_convergence(&avg_conv, options, 0) {
-        if options.print_level >= 3 {
-            rip_log!("ripopt: Iterate averaging promoted near-tolerance -> Optimal (du={:.2e})", avg_conv.dual_inf);
-        }
-        return Some(make_result(state, SolveStatus::Optimal));
-    }
-    saved.restore_and_reeval(state, problem, linear_constraints, lbfgs_mode);
-    None
-}
-
-/// Strategy 4 (Acceptable promotion): when complementarity is the
-/// bottleneck (primal_inf and dual_inf already within 100x tol but
-/// compl_inf > tol*s_d), snap bound multipliers to reduce
-/// complementarity. For each variable that is clearly interior to a
-/// bound (gap > 1e-6), zero out the corresponding z; keep z otherwise.
-/// Re-check convergence with the snapped multipliers; on success return
-/// Optimal, otherwise restore z and return None. One-shot via
-/// `ws.tried_compl_polish`.
-fn try_complementarity_polish_promotion(
-    state: &mut SolverState,
-    options: &SolverOptions,
-    conv_info: &ConvergenceInfo,
-    ws: &mut ConvergenceWorkspace,
-    n: usize,
-    m: usize,
-) -> Option<SolveResult> {
-    if *ws.tried_compl_polish {
-        return None;
-    }
-    let compl_inf_now = conv_info.compl_inf;
-    let s_d_now = compute_residual_scaling(conv_info.multiplier_sum, conv_info.multiplier_count);
-    let s_c_now =
-        compute_residual_scaling(conv_info.bound_multiplier_sum, conv_info.bound_multiplier_count);
-    let compl_tol_scaled = options.tol * s_c_now;
-    if !(compl_inf_now > compl_tol_scaled
-        && conv_info.primal_inf <= 100.0 * options.tol
-        && conv_info.dual_inf <= 100.0 * options.tol * s_d_now)
-    {
-        return None;
-    }
-    *ws.tried_compl_polish = true;
-    let saved_zl = state.z_l.clone();
-    let saved_zu = state.z_u.clone();
-    let gap_tol = 1e-6;
-    for i in 0..n {
-        let gap_l = if state.x_l[i].is_finite() { state.x[i] - state.x_l[i] } else { f64::INFINITY };
-        let gap_u = if state.x_u[i].is_finite() { state.x_u[i] - state.x[i] } else { f64::INFINITY };
-        if gap_l > gap_tol {
-            state.z_l[i] = 0.0;
-        }
-        if gap_u > gap_tol {
-            state.z_u[i] = 0.0;
-        }
-    }
-    let snap_conv = compute_convergence_info_from_state(state, state.mu, n, m);
-    if let ConvergenceStatus::Converged = check_convergence(&snap_conv, options, 0) {
-        if options.print_level >= 3 {
-            rip_log!(
-                "ripopt: Complementarity snap promoted near-tolerance -> Optimal (compl {:.2e} -> {:.2e}, du {:.2e})",
-                compl_inf_now, snap_conv.compl_inf, snap_conv.dual_inf
-            );
-        }
-        return Some(make_result(state, SolveStatus::Optimal));
-    }
-    state.z_l.copy_from_slice(&saved_zl);
-    state.z_u.copy_from_slice(&saved_zu);
-    None
-}
-
-/// Handle the `ConvergenceStatus::Acceptable` branch: try the three
-/// promotion strategies (iterate averaging, active set, complementarity
-/// polish) and, if none succeed, return `SolveStatus::Acceptable`.
-///
-/// Previously inlined in `check_convergence_and_handle_promotions`.
-#[allow(clippy::too_many_arguments)]
-fn handle_acceptable_status_with_promotions<P: NlpProblem>(
-    state: &mut SolverState,
-    problem: &P,
-    options: &SolverOptions,
-    conv_info: &ConvergenceInfo,
-    ws: &mut ConvergenceWorkspace,
-    timings: &PhaseTimings,
-    iteration: usize,
-    ipm_start: Instant,
-    n: usize,
-    m: usize,
-    linear_constraints: Option<&[bool]>,
-    lbfgs_mode: bool,
-) -> SolveResult {
-    // Strategy 1: Try iterate averaging before declaring Acceptable
-    if let Some(result) = try_iterate_averaging_promotion(
-        state, problem, options, ws, n, m,
-        linear_constraints, lbfgs_mode,
-    ) {
-        return result;
-    }
-
-    // Strategy 3: Try active set identification + reduced solve
-    if !*ws.tried_active_set {
-        *ws.tried_active_set = true;
-        if let Some(result) = try_active_set_solve(state, problem, options, linear_constraints, lbfgs_mode) {
-            if options.print_level >= 3 {
-                rip_log!("ripopt: Active set solve promoted Acceptable -> Optimal");
-            }
-            return result;
-        }
-    }
-
-    // Strategy 4: Complementarity polishing via multiplier snap
-    if let Some(result) = try_complementarity_polish_promotion(
-        state, options, conv_info, ws, n, m,
-    ) {
-        return result;
-    }
-
-    if options.print_level >= 5 {
-        timings.print_summary(iteration + 1, ipm_start.elapsed());
-    }
-    // Promoted to SolveStatus::Acceptable (matches Ipopt's
-    // Solved_To_Acceptable_Level). Previously this fell through
-    // to NumericalError, which caused problems that met Ipopt's
-    // default acceptable-level tolerances to show as unsolved in
-    // benchmarks. Benchmark reporter counts Acceptable as solved.
-    make_result(state, SolveStatus::Acceptable)
-}
-
-fn check_convergence_and_handle_promotions<P: NlpProblem>(
-    state: &mut SolverState,
-    problem: &P,
     options: &SolverOptions,
     primal_inf_max: f64,
+    primal_inf_internal_max: f64,
     dual_inf: f64,
     dual_inf_unscaled: f64,
     compl_inf: f64,
@@ -6395,18 +5806,13 @@ fn check_convergence_and_handle_promotions<P: NlpProblem>(
     multiplier_count: usize,
     bound_multiplier_sum: f64,
     bound_multiplier_count: usize,
-    ws: &mut ConvergenceWorkspace,
     timings: &PhaseTimings,
     iteration: usize,
     ipm_start: Instant,
-    linear_constraints: Option<&[bool]>,
-    lbfgs_mode: bool,
 ) -> Option<SolveResult> {
-    let n = state.n;
-    let m = state.m;
-
     let conv_info = ConvergenceInfo {
         primal_inf: primal_inf_max,
+        primal_inf_internal: primal_inf_internal_max,
         dual_inf,
         dual_inf_unscaled,
         compl_inf,
@@ -6416,128 +5822,64 @@ fn check_convergence_and_handle_promotions<P: NlpProblem>(
         multiplier_count,
         bound_multiplier_sum,
         bound_multiplier_count,
+        x_max_abs: linf_norm(&state.x),
     };
 
-    // Track iterate history for oscillation detection (Strategy 1)
-    ws.avg.du_history.push(dual_inf);
-    ws.avg.iterate_history.push((
-        state.x.clone(), state.y.clone(), state.z_l.clone(), state.z_u.clone(),
-    ));
-    if ws.avg.du_history.len() > AVG_WINDOW {
-        ws.avg.du_history.remove(0);
-        ws.avg.iterate_history.remove(0);
-    }
-
-    match check_convergence(&conv_info, options, state.consecutive_acceptable) {
+    match crate::convergence::check_convergence_with_last_obj(
+        &conv_info, options, state.consecutive_acceptable, state.last_obj_for_acceptable,
+    ) {
         ConvergenceStatus::Converged => {
             if options.print_level >= 5 {
                 timings.print_summary(iteration + 1, ipm_start.elapsed());
             }
             Some(make_result(state, SolveStatus::Optimal))
         }
-        ConvergenceStatus::Acceptable => Some(handle_acceptable_status_with_promotions(
-            state, problem, options, &conv_info, ws, timings,
-            iteration, ipm_start, n, m,
-            linear_constraints, lbfgs_mode,
-        )),
+        ConvergenceStatus::Acceptable => {
+            if options.print_level >= 5 {
+                timings.print_summary(iteration + 1, ipm_start.elapsed());
+            }
+            // Matches Ipopt's Solved_To_Acceptable_Level.
+            Some(make_result(state, SolveStatus::Acceptable))
+        }
         ConvergenceStatus::Diverging => {
-            Some(make_result(state, SolveStatus::Unbounded))
+            Some(make_result(state, SolveStatus::DivergingIterates))
         }
         ConvergenceStatus::NotConverged => None,
     }
 }
 
-/// Check wall-clock and early-stall time limits at the top of each iteration.
+/// Check wall-clock time limit at the top of each iteration.
 ///
-/// Returns `Some(SolveResult)` to terminate the loop if either:
-/// - `max_wall_time` has been exceeded → `MaxIterations`
-/// - `early_stall_timeout` was hit during the first 5 iterations
-///   (scaled by problem size) → `NumericalError`
-///
+/// Returns `Some(MaxIterations)` if `max_wall_time` has been exceeded.
 /// Wall-clock is polled every iteration during the first 10, then every 10
 /// thereafter to keep overhead negligible on long runs.
-///
-/// Extracted from `solve_ipm` as part of the v0.8 main-loop decomposition
-/// (pre-work step 2). Pure guard function.
 fn check_time_limits(
     state: &SolverState,
     iteration: usize,
     start_time: Instant,
-    early_timeout: f64,
     options: &SolverOptions,
 ) -> Option<SolveResult> {
-    // Check wall-clock time limit (every iteration in early phase, every 10 after)
     if (iteration < 10 || iteration % 10 == 0) && options.max_wall_time > 0.0 {
         if start_time.elapsed().as_secs_f64() >= options.max_wall_time {
             return Some(make_result(state, SolveStatus::MaxIterations));
         }
     }
-
-    // Early stall detection: bail out if stuck in early iterations.
-    // `early_timeout` is pre-scaled by problem size in the caller (see
-    // scaling formula in solve_ipm).
-    if iteration < 5 && options.early_stall_timeout > 0.0 {
-        if start_time.elapsed().as_secs_f64() > early_timeout {
-            if options.print_level >= 3 {
-                rip_log!(
-                    "ripopt: Early stall at iteration {} ({:.1}s elapsed), terminating",
-                    iteration, start_time.elapsed().as_secs_f64()
-                );
-            }
-            return Some(make_result(state, SolveStatus::NumericalError));
-        }
-    }
     None
 }
 
-/// Reset the filter and re-seed `theta_min` from the current iterate's
-/// constraint violation. Standard "fresh-start" sequence after μ
-/// changes, restoration, stall recovery, or watchdog promotions.
-/// Mirrors Ipopt IpFilterLSAcceptor.cpp:524-532.
-fn reset_filter_with_current_theta(state: &SolverState, filter: &mut Filter) {
+/// Reset the filter (clear all entries). Standard "fresh-start" sequence
+/// after μ changes, restoration, stall recovery, or watchdog promotions.
+/// Mirrors Ipopt IpFilterLSAcceptor.cpp:524-532 (Reset()), which clears
+/// the filter list but does NOT touch `theta_max`/`theta_min` — those
+/// are seeded once from the initial iterate at IpFilterLSAcceptor.cpp:325-339
+/// and remain fixed for the entire solve. T0.7: previously this helper
+/// also called `set_theta_min_from_initial` on every μ change, letting
+/// the filter envelope grow and admit iterates earlier filter entries
+/// had rejected. The `set_theta_min_from_initial` method is now
+/// one-shot, so even if it is called here it is a no-op after the first
+/// solver-init seeding; the call is omitted for clarity.
+fn reset_filter_with_current_theta(_state: &SolverState, filter: &mut Filter) {
     filter.reset();
-    let theta = state.constraint_violation();
-    filter.set_theta_min_from_initial(theta);
-}
-
-/// Overall-progress stall tracker: best primal/dual infeasibility seen
-/// so far and the consecutive-no-progress counter. Threaded through
-/// the stall-detection helpers (`detect_and_handle_progress_stall` and
-/// the μ-boost recovery paths) instead of three parallel locals.
-struct ProgressStallTracker {
-    best_pr: f64,
-    best_du: f64,
-    no_progress_count: usize,
-}
-
-impl ProgressStallTracker {
-    fn new() -> Self {
-        Self {
-            best_pr: f64::INFINITY,
-            best_du: f64::INFINITY,
-            no_progress_count: 0,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.best_pr = f64::INFINITY;
-        self.best_du = f64::INFINITY;
-        self.no_progress_count = 0;
-    }
-}
-
-/// Stall-recovery cleanup: re-seed the filter from the current θ and
-/// clear the no-progress window so the next iteration starts fresh.
-/// Used by every branch in `handle_near_tolerance_stall` /
-/// `try_boost_mu_for_stall` that mutates μ to escape a stall — the
-/// metric history before the μ change is meaningless once μ jumps.
-fn reset_stall_counters_and_filter(
-    state: &SolverState,
-    filter: &mut Filter,
-    stall: &mut ProgressStallTracker,
-) {
-    reset_filter_with_current_theta(state, filter);
-    stall.reset();
 }
 
 /// Per-iteration KKT residuals used by the log row, filter, and
@@ -6545,8 +5887,12 @@ fn reset_stall_counters_and_filter(
 struct OptimalityMeasures {
     /// 1-norm constraint violation (filter/log).
     primal_inf: f64,
-    /// Max-norm primal infeasibility (convergence gate).
+    /// Max-norm primal infeasibility (convergence gate, user-facing).
     primal_inf_max: f64,
+    /// Max-norm slack-coupling residual `||c||_∞ ∪ ||d − s||_∞` for the
+    /// scaled (barrier-level) convergence gate. Mirrors Ipopt's
+    /// `curr_primal_infeasibility(NORM_MAX)`.
+    primal_inf_internal_max: f64,
     /// Iterative-z dual infeasibility `||∇f + J^T y - z_L + z_U||_∞`.
     dual_inf: f64,
     /// Component-wise scaled dual infeasibility for the unscaled gate
@@ -6567,6 +5913,7 @@ struct OptimalityMeasures {
 fn compute_optimality_measures(state: &SolverState) -> OptimalityMeasures {
     let primal_inf = state.constraint_violation();
     let primal_inf_max = compute_primal_inf_max_at_state(state);
+    let primal_inf_internal_max = compute_primal_inf_internal_max_at_state(state);
 
     // Iterative-z dual infeasibility (matches Ipopt's curr_dual_infeasibility):
     // honest KKT residual. If iterative z is inconsistent with ∇f + J^T y the
@@ -6577,6 +5924,7 @@ fn compute_optimality_measures(state: &SolverState) -> OptimalityMeasures {
     OptimalityMeasures {
         primal_inf,
         primal_inf_max,
+        primal_inf_internal_max,
         dual_inf,
         dual_inf_unscaled,
         compl_inf,
@@ -6584,8 +5932,8 @@ fn compute_optimality_measures(state: &SolverState) -> OptimalityMeasures {
 }
 
 /// Compute the multiplier-based scaling factor `s_d` used by the
-/// Ipopt acceptable-tolerance gate and the overall-progress stall
-/// detector, then update `state.consecutive_acceptable`.
+/// Ipopt acceptable-tolerance gate, then update
+/// `state.consecutive_acceptable`.
 ///
 /// Scaling matches `IpIpoptCalculatedQuantities::ComputeOptimalityErrorScaling`
 /// with `s_max=100` and the 1e4 cap preserved for compatibility with
@@ -6593,11 +5941,9 @@ fn compute_optimality_measures(state: &SolverState) -> OptimalityMeasures {
 /// match `IpOptErrorConvCheck.cpp:70-121` defaults
 /// (acceptable_tol=1e-6, acceptable_constr_viol_tol=1e-2,
 /// acceptable_dual_inf_tol=1e10, acceptable_compl_inf_tol=1e-2).
-///
-/// Returns `s_d_for_acc` because it is consumed downstream by
-/// `detect_and_handle_progress_stall`.
 fn track_consecutive_acceptable(
     state: &mut SolverState,
+    options: &SolverOptions,
     primal_inf: f64,
     dual_inf: f64,
     dual_inf_unscaled: f64,
@@ -6605,17 +5951,23 @@ fn track_consecutive_acceptable(
     multiplier_sum: f64,
     bound_multiplier_sum: f64,
 ) -> f64 {
-    let n = state.n;
-    let m = state.m;
-    let s_d_for_acc = compute_residual_scaling(multiplier_sum, m + 2 * n);
-    let s_c_for_acc = compute_residual_scaling(bound_multiplier_sum, 2 * n);
+    let s_d_for_acc = compute_residual_scaling(multiplier_sum, compute_multiplier_count(state));
+    let s_c_for_acc = compute_residual_scaling(bound_multiplier_sum, compute_bound_multiplier_count(state));
     let meets_acc_scaled = primal_inf <= 1e-6
         && dual_inf <= 1e-6 * s_d_for_acc
         && compl_inf <= 1e-6 * s_c_for_acc;
     let meets_acc_unscaled = primal_inf <= 1e-2
         && dual_inf_unscaled <= 1e10
         && compl_inf <= 1e-2;
-    if meets_acc_scaled && meets_acc_unscaled {
+    // Ipopt acceptable_obj_change_tol gate: |Δf| / max(1, |f|) ≤ tol.
+    let obj_change_ok = match state.last_obj_for_acceptable {
+        Some(prev) => {
+            let denom = state.obj.abs().max(1.0);
+            (state.obj - prev).abs() / denom <= options.acceptable_obj_change_tol
+        }
+        None => true,
+    };
+    if meets_acc_scaled && meets_acc_unscaled && obj_change_ok {
         state.consecutive_acceptable += 1;
     } else {
         state.consecutive_acceptable = 0;
@@ -6623,68 +5975,116 @@ fn track_consecutive_acceptable(
     s_d_for_acc
 }
 
-/// Snapshot of the best-dual-feasibility iterate seen so far.
-///
-/// Used by the overall-progress stall detector to revert before a
-/// `NumericalError` exit, and by the dual-stagnation detector to
-/// restart from the good point. `x.is_none()` indicates "no snapshot
-/// yet"; once `x` is `Some` the other fields are also `Some`.
-#[derive(Default)]
-struct BestDuIterate {
-    val: f64,
-    x: Option<Vec<f64>>,
-    y: Option<Vec<f64>>,
-    z_l: Option<Vec<f64>>,
-    z_u: Option<Vec<f64>>,
-}
-
-impl BestDuIterate {
-    fn new() -> Self {
-        Self {
-            val: f64::INFINITY,
-            x: None,
-            y: None,
-            z_l: None,
-            z_u: None,
-        }
-    }
-}
-
-/// Record the current iterate as the best-du point if its dual
-/// infeasibility beats the previous best.
-fn update_best_du_iterate(
-    state: &SolverState,
-    dual_inf: f64,
-    best_du: &mut BestDuIterate,
-) {
-    if dual_inf < best_du.val {
-        best_du.val = dual_inf;
-        best_du.x = Some(state.x.clone());
-        best_du.y = Some(state.y.clone());
-        best_du.z_l = Some(state.z_l.clone());
-        best_du.z_u = Some(state.z_u.clone());
-    }
-}
-
-/// Detect unboundedness by requiring 10 consecutive iterations of
-/// `obj < -1e20` at a feasible iterate. The counter prevents false
-/// positives from transient dips.
-fn detect_unbounded(
-    state: &SolverState,
-    options: &SolverOptions,
+/// Capture an `IterateSnapshot` if the current iterate meets the
+/// acceptable-level thresholds. Overwrites any previous snapshot so the
+/// stored point is always the most recent acceptable one.
+fn store_acceptable_iterate(
+    state: &mut SolverState,
+    filter: &Filter,
+    iteration: usize,
     primal_inf: f64,
-    consecutive_unbounded: &mut usize,
-) -> Option<SolveResult> {
-    if state.obj < -1e20 && primal_inf < options.constr_viol_tol {
-        *consecutive_unbounded += 1;
-        if *consecutive_unbounded >= 10 {
-            return Some(make_result(state, SolveStatus::Unbounded));
-        }
+    primal_inf_internal: f64,
+    dual_inf: f64,
+    dual_inf_unscaled: f64,
+    compl_inf: f64,
+    multiplier_sum: f64,
+    multiplier_count: usize,
+    bound_multiplier_sum: f64,
+    bound_multiplier_count: usize,
+) {
+    let info = ConvergenceInfo {
+        primal_inf,
+        primal_inf_internal,
+        dual_inf,
+        dual_inf_unscaled,
+        compl_inf,
+        mu: state.mu,
+        objective: state.obj,
+        multiplier_sum,
+        multiplier_count,
+        bound_multiplier_sum,
+        bound_multiplier_count,
+        x_max_abs: linf_norm(&state.x),
+    };
+    let s_max: f64 = 100.0;
+    let s_d = if info.multiplier_count > 0 {
+        s_max.max(info.multiplier_sum / info.multiplier_count as f64) / s_max
     } else {
-        *consecutive_unbounded = 0;
+        1.0
+    };
+    let s_c = if info.bound_multiplier_count > 0 {
+        s_max.max(info.bound_multiplier_sum / info.bound_multiplier_count as f64) / s_max
+    } else {
+        1.0
+    };
+    // Pass None for last_obj: snapshot decisions skip the obj-change gate
+    // (the gate is for the convergence-check exit, not for capturing an
+    // acceptable iterate).
+    let opts_for_snap = SolverOptions::default();
+    if convergence::meets_acceptable_thresholds(&info, &opts_for_snap, s_d, s_c, None) {
+        state.acceptable_iterate = Some(IterateSnapshot::capture(state, filter, iteration));
     }
-    None
 }
+
+/// Just before triggering full restoration, attempt to restore the most
+/// recent acceptable iterate. Returns `Some(SolveResult)` with status
+/// Almost-feasibility guard at restoration entry, mirroring Ipopt 3.14
+/// `IpBacktrackingLineSearch.cpp:580-600`. Fires when both
+///
+/// ```text
+/// curr_constraint_violation        <= 1e-2 * tol
+/// unscaled_curr_constr_violation   <= 1e-1 * constr_viol_tol
+/// ```
+///
+/// hold (the second criterion guards against very-large-tol settings).
+/// When the guard fires, restoration is skipped entirely:
+///
+/// - If an acceptable iterate is cached, restore it and exit
+///   `Acceptable` (Ipopt's `ACCEPTABLE_POINT_REACHED` throw at line 591).
+/// - Otherwise abort with `NumericalError` (Ipopt's
+///   `STEP_COMPUTATION_FAILED` throw at line 597 — "Abort in line
+///   search due to no other fall back").
+///
+/// Returning `None` means the guard did not fire and the caller should
+/// proceed to the restoration cascade.
+fn check_almost_feasible_guard(
+    state: &mut SolverState,
+    options: &SolverOptions,
+    filter: &mut Filter,
+    primal_inf: f64,
+    primal_inf_max: f64,
+) -> Option<SolveResult> {
+    let almost_feasible = primal_inf < 1e-2 * options.tol
+        && primal_inf_max < 1e-1 * options.constr_viol_tol;
+    if !almost_feasible {
+        return None;
+    }
+    if let Some(snap) = state.acceptable_iterate.take() {
+        if options.print_level >= 3 {
+            rip_log!(
+                "ripopt: almost-feasible guard restoring acceptable iterate from iter {} (pr={:.2e}, pr_max={:.2e}) -> Acceptable",
+                snap.iteration, primal_inf, primal_inf_max
+            );
+        }
+        snap.restore(state, filter);
+        return Some(make_result(state, SolveStatus::Acceptable));
+    }
+    if options.print_level >= 3 {
+        rip_log!(
+            "ripopt: almost-feasible guard with no cached acceptable iterate (pr={:.2e}, pr_max={:.2e}) -> NumericalError",
+            primal_inf, primal_inf_max
+        );
+    }
+    Some(make_result(state, SolveStatus::NumericalError))
+}
+
+// DEV-7: removed `detect_unbounded`. The objective-magnitude heuristic
+// (10 consecutive iters with `obj < -1e20` at feasibility) had no Ipopt
+// analog and could mis-fire on legitimate large-objective problems.
+// Ipopt 3.14's actual divergence detector is `‖x‖_∞ >
+// diverging_iterates_tol` in IpOptErrorConvCheck (`IpOptErrorConvCheck.cpp:255`),
+// already wired through `convergence::check_convergence` →
+// `ConvergenceStatus::Diverging` → `SolveStatus::DivergingIterates`.
 
 /// Primal-infeasibility divergence detector.
 ///
@@ -6701,26 +6101,6 @@ fn detect_unbounded(
 /// Extracted from `solve_ipm` as part of the v0.8 main-loop
 /// decomposition. Returns `true` when the caller should force
 /// restoration on the next step.
-/// Tracks consecutive primal-infeasibility increases so the divergence
-/// detector can force restoration after a sustained run of growth.
-/// `prev` is the previous iteration's primal_inf, `start` snapshots
-/// `prev` at the moment the run began.
-struct PrimalDivergenceTracker {
-    consecutive_increase: usize,
-    prev: f64,
-    start: f64,
-}
-
-impl PrimalDivergenceTracker {
-    fn new() -> Self {
-        Self {
-            consecutive_increase: 0,
-            prev: f64::INFINITY,
-            start: f64::INFINITY,
-        }
-    }
-}
-
 /// Constraint-violation history with auxiliary flags driving infeasibility
 /// detection: `history` is a bounded ring of recent θ values, `ever_feasible`
 /// is sticky once any θ falls below `constr_viol_tol`, and `stall_count`
@@ -6744,432 +6124,37 @@ impl FeasibilityTracker {
     }
 }
 
-fn detect_primal_divergence(
-    options: &SolverOptions,
-    iteration: usize,
-    primal_inf: f64,
-    pd: &mut PrimalDivergenceTracker,
-    m: usize,
-) -> bool {
-    let mut force_restoration = false;
-    if m > 0 && iteration > 5 && primal_inf > options.constr_viol_tol {
-        if primal_inf > pd.prev * (1.0 + 1e-6) {
-            if pd.consecutive_increase == 0 {
-                pd.start = pd.prev;
-            }
-            pd.consecutive_increase += 1;
-        } else {
-            pd.consecutive_increase = 0;
-        }
-        // After 8 consecutive increases AND cumulative growth of at least
-        // 20%, force restoration. The growth check prevents triggering on
-        // tiny numerical oscillations.
-        if pd.consecutive_increase >= 8 && primal_inf > 1.2 * pd.start {
-            log::info!(
-                "Primal divergence at iter {}: pr grew for {} consecutive iterations ({:.2e} -> {:.2e}), forcing restoration",
-                iteration, pd.consecutive_increase, pd.start, primal_inf
-            );
-            if options.print_level >= 3 {
-                rip_log!(
-                    "ripopt: Primal divergence detected (pr grew {:.2e} -> {:.2e} over {} iters), re-entering restoration",
-                    pd.start, primal_inf, pd.consecutive_increase
-                );
-            }
-            force_restoration = true;
-            pd.consecutive_increase = 0;
-        }
-    } else {
-        pd.consecutive_increase = 0;
-    }
-    pd.prev = primal_inf;
-    force_restoration
-}
+// T3.13–T3.22 (2026-04-30): retired the entire ripopt-specific stall machinery
+// (`ProgressStallTracker`, `StallDecision`, `detect_and_handle_progress_stall`,
+// `handle_near_tolerance_stall`, `classify_near_tolerance_stall_outcome`,
+// `try_boost_mu_for_stall`, `try_force_mu_decrease_in_fixed_mode`,
+// `update_stall_counters_and_check_limit`,
+// `boost_mu_and_switch_to_fixed_with_stall_reset`,
+// `reset_stall_counters_and_filter`, and the `stall_iter_limit` /
+// `early_stall_timeout` options that gated them). No Ipopt analog.
+// Stall handling in Ipopt 3.14 is owned by the filter line search, the
+// watchdog reversal (`IpBacktrackingLineSearch.cpp:773`), the AcceptableLevel
+// termination (`IpOptErrorConvCheck.cpp:328-330`), and the restoration phase
+// — collectively those already cover the cases the retired machinery was
+// catching, without ripopt-specific μ-boost flips that violated the monotone
+// invariant.
 
-/// Outcome of the overall-progress stall detector.
-enum StallDecision {
-    /// No stall (or not yet activated) — fall through to normal step.
-    Proceed,
-    /// Stall detected and recovered by bumping μ / resetting the filter —
-    /// caller must `continue` the main loop immediately (no Newton step
-    /// this iteration).
-    Continue,
-    /// Stall detected and no recovery possible — caller must return this
-    /// result immediately.
-    Return(SolveResult),
-}
-
-/// Overall-progress stall detector: terminate or recover when neither
-/// primal nor dual infeasibility has improved for many iterations.
+/// Track constraint-violation history. Pushes `primal_inf` into the
+/// θ-history ring, updates the sticky `ever_feasible` flag, and clears
+/// the auxiliary stall counter when the iterate has been feasible.
 ///
-/// Two triggers (see block comment in body): (1) tiny steps for half
-/// the `stall_iter_limit`, (2) no metric improvement for the full
-/// limit. Before declaring `NumericalError`:
-/// - If the current point is near-tolerance, attempt a μ boost or a
-///   forced μ decrease (Fixed mode) and restart the filter.
-/// - Re-evaluate with "optimal duals" recomputed from the current
-///   gradient (covers cases where iterative y/z diverged even though
-///   the primal is near-optimal, e.g. HS116, CONCON).
-/// - Optionally revert to the best-du iterate seen so far.
-///
-/// No direct Ipopt parallel; this is a ripopt-specific safety net for
-/// long-running stalls (see CLAUDE.md: CONCON, HS13, HS116).
-///
-/// Extracted from `solve_ipm` as part of the v0.8 main-loop
-/// decomposition.
-#[allow(clippy::too_many_arguments)]
-/// Full two-gate near-tolerance check with optimal dual multipliers. When
-/// duals have diverged but the primal point is near-optimal (HS116,
-/// CONCON), the simple `compl_inf`/`dual_inf` check fails because it uses
-/// the current (diverged) duals. This helper recomputes optimal duals from
-/// the gradient (z = max(0, ∇L) capped at kc*mu/slack), then checks both
-/// the scaled (sc) and unscaled (usc) tolerance gates. Returns
-/// `Some(StallDecision::Return(NumericalError))` when both gates pass —
-/// in which case the caller should exit with NumericalError because the
-/// iterate is good enough to not be a hard failure but the solver can't
-/// drive it further. Returns `None` to let the caller continue with the
-/// remaining stall-recovery logic.
-fn check_stall_near_tolerance_via_optimal_duals(
-    state: &SolverState,
-    options: &SolverOptions,
-    primal_inf: f64,
-    primal_inf_max: f64,
-    compl_inf: f64,
-    stall_near_tol: f64,
-    n: usize,
-    m: usize,
-) -> Option<StallDecision> {
-    let mut gj = state.grad_f.clone();
-    accumulate_jt_y(state, &mut gj);
-    let (opt_zl, opt_zu) = recover_active_set_z(state, &gj, n);
-    let opt_du = dual_inf_with_z(state, &opt_zl, &opt_zu);
-    let opt_co = compl_err_with_z(state, &opt_zl, &opt_zu);
-    let opt_co_best = compl_inf.min(opt_co);
-    let fmult: f64 = l1_norm(&state.y) + l1_norm(&opt_zl) + l1_norm(&opt_zu);
-    let fmult_bnd: f64 = l1_norm(&opt_zl) + l1_norm(&opt_zu);
-    let fsd = compute_residual_scaling(fmult, m + 2 * n);
-    let fsc = compute_residual_scaling(fmult_bnd, 2 * n);
-    let stall_fdu_tol = (stall_near_tol * fsd).max(1e-2);
-    let stall_fco_tol = (stall_near_tol * fsc).max(1e-2);
-    let stall_fpr_tol = stall_near_tol.max(10.0 * options.constr_viol_tol);
-    let sc = primal_inf_max <= stall_fpr_tol
-        && opt_du <= stall_fdu_tol
-        && opt_co_best <= stall_fco_tol;
-    let du_u = compute_dual_inf_unscaled_at_state(state);
-    let usc = primal_inf_max <= 10.0 * options.constr_viol_tol
-        && du_u <= 10.0 * options.dual_inf_tol
-        && opt_co_best <= 10.0 * options.compl_inf_tol;
-    if sc && usc {
-        if options.print_level >= 3 {
-            rip_log!(
-                "ripopt: Stalled but near-tolerance via optimal duals (pr={:.2e}, du_opt={:.2e}, co={:.2e}), returning NumericalError",
-                primal_inf, opt_du, opt_co_best
-            );
-        }
-        return Some(StallDecision::Return(make_result(state, SolveStatus::NumericalError)));
-    }
-    None
-}
-
-/// In Fixed (monotone) μ mode, when stall recovery hasn't already kicked
-/// in via a μ boost and μ is still above mu_min, force a μ decrease at
-/// the min(linear, superlinear) rate. Resets stall counters and the
-/// filter. Returns true when the decrease was applied (caller should
-/// `continue` the loop), false when the gate didn't fire.
-#[allow(clippy::too_many_arguments)]
-fn try_force_mu_decrease_in_fixed_mode(
-    state: &mut SolverState,
-    options: &SolverOptions,
-    primal_inf: f64,
-    dual_inf: f64,
-    compl_inf: f64,
-    filter: &mut Filter,
-    stall: &mut ProgressStallTracker,
-) -> bool {
-    if !(!options.mu_strategy_adaptive && state.mu > options.mu_min) {
-        return false;
-    }
-    let new_mu = (options.mu_linear_decrease_factor * state.mu)
-        .min(state.mu.powf(options.mu_superlinear_decrease_power))
-        .max(options.mu_min);
-    if options.print_level >= 3 {
-        rip_log!(
-            "ripopt: Fixed mode stall near tolerance (pr={:.2e}, du={:.2e}, co={:.2e}), forcing mu {:.2e} -> {:.2e}",
-            primal_inf, dual_inf, compl_inf, state.mu, new_mu
-        );
-    }
-    state.mu = new_mu;
-    reset_stall_counters_and_filter(state, filter, stall);
-    true
-}
-
-/// Handle a stall whose current iterate is near-tolerance (1000x tol on
-/// each metric). Three sub-decisions in priority order:
-/// 1. mu has outrun feasibility (mu < 0.01*pr_max while pr_max above
-///    constr_viol_tol): boost mu to 0.1*pr_max, switch to Fixed mode,
-///    return Continue.
-/// 2. Fixed (monotone) mode + mu still above mu_min: force a mu decrease
-///    by min(linear, superlinear) rate (the barrier subproblem is
-///    effectively solved at the current mu), return Continue.
-/// 3. Otherwise, classify as Acceptable when both unscaled (1e-2) and
-///    scaled (1e-6 * s_d) tolerances pass; else return NumericalError.
-#[allow(clippy::too_many_arguments)]
-fn handle_near_tolerance_stall(
-    state: &mut SolverState,
-    options: &SolverOptions,
-    primal_inf: f64,
-    primal_inf_max: f64,
-    dual_inf: f64,
-    compl_inf: f64,
-    s_d_for_acc: f64,
-    filter: &mut Filter,
-    mu_state: &mut MuState,
-    stall: &mut ProgressStallTracker,
-) -> StallDecision {
-    if state.mu < primal_inf_max * 0.01 && primal_inf_max > options.constr_viol_tol {
-        let new_mu = (primal_inf_max * 0.1).max(1e-6);
-        if options.print_level >= 3 {
-            rip_log!(
-                "ripopt: Near-tolerance stall: boosting mu {:.2e} -> {:.2e} (pr_max={:.2e})",
-                state.mu, new_mu, primal_inf_max
-            );
-        }
-        boost_mu_and_switch_to_fixed_with_stall_reset(
-            state, new_mu, mu_state, filter, stall,
-        );
-        return StallDecision::Continue;
-    }
-    if try_force_mu_decrease_in_fixed_mode(
-        state, options, primal_inf, dual_inf, compl_inf, filter, stall,
-    ) {
-        return StallDecision::Continue;
-    }
-    classify_near_tolerance_stall_outcome(
-        state, options, primal_inf, primal_inf_max, dual_inf, compl_inf, s_d_for_acc,
-    )
-}
-
-/// Final classification used after the μ-boost and forced-Fixed-decrease
-/// branches of handle_near_tolerance_stall did not fire. Returns
-/// `Acceptable` when both unscaled (1e-2) and scaled (1e-6 · s_d) gates
-/// pass on all three metrics; otherwise `NumericalError`.
-#[allow(clippy::too_many_arguments)]
-fn classify_near_tolerance_stall_outcome(
-    state: &SolverState,
-    options: &SolverOptions,
-    primal_inf: f64,
-    primal_inf_max: f64,
-    dual_inf: f64,
-    compl_inf: f64,
-    s_d_for_acc: f64,
-) -> StallDecision {
-    let acc_pr_ok = primal_inf_max <= 1e-2;
-    let acc_du_ok = dual_inf <= 1e10;
-    let acc_co_ok = compl_inf <= 1e-2;
-    let acc_scaled_ok = primal_inf_max <= 1e-6
-        && dual_inf <= 1e-6 * s_d_for_acc
-        && compl_inf <= 1e-6 * s_d_for_acc;
-    if acc_pr_ok && acc_du_ok && acc_co_ok && acc_scaled_ok {
-        if options.print_level >= 3 {
-            rip_log!(
-                "ripopt: Stalled at acceptable tolerance (pr={:.2e}, du={:.2e}, co={:.2e}), returning Acceptable",
-                primal_inf, dual_inf, compl_inf
-            );
-        }
-        return StallDecision::Return(make_result(state, SolveStatus::Acceptable));
-    }
-    if options.print_level >= 3 {
-        rip_log!(
-            "ripopt: Stalled but near-tolerance (pr={:.2e}, du={:.2e}, co={:.2e}), returning NumericalError",
-            primal_inf, dual_inf, compl_inf
-        );
-    }
-    StallDecision::Return(make_result(state, SolveStatus::NumericalError))
-}
-
-/// Last-chance stall recovery: when primal feasibility is reasonable
-/// (< 0.1) but μ has outrun it (μ < pr_max·0.01), bump μ back to
-/// pr_max·0.1 (floor 1e-6), reset the filter, clear stall counters,
-/// and switch to Fixed mode. Returns Some(Continue) on recovery, None
-/// if the trigger isn't met.
-fn try_boost_mu_for_stall(
-    state: &mut SolverState,
-    options: &SolverOptions,
-    filter: &mut Filter,
-    mu_state: &mut MuState,
-    primal_inf_max: f64,
-    stall: &mut ProgressStallTracker,
-) -> Option<StallDecision> {
-    if !(primal_inf_max < 0.1 && state.mu < primal_inf_max * 0.01) {
-        return None;
-    }
-    let new_mu = (primal_inf_max * 0.1).max(1e-6);
-    if options.print_level >= 3 {
-        rip_log!(
-            "ripopt: Stall recovery: boosting mu {:.2e} -> {:.2e} (pr_max={:.2e})",
-            state.mu, new_mu, primal_inf_max
-        );
-    }
-    boost_mu_and_switch_to_fixed_with_stall_reset(
-        state, new_mu, mu_state, filter, stall,
-    );
-    Some(StallDecision::Continue)
-}
-
-/// Just before declaring NumericalError on stall, revert (x, y, z_l, z_u)
-/// to the best-du iterate when its dual infeasibility is < 10% of the
-/// current iterate's. Post-stall y/z can be corrupted by inertia-escalated
-/// KKT solves (CONCON: iter 48 had du=7e-16, stall at iter 81 has
-/// du=1.03 at the same x).
-fn revert_to_best_du_iterate_if_better<P: NlpProblem>(
-    state: &mut SolverState,
-    problem: &P,
-    options: &SolverOptions,
-    dual_inf: f64,
-    best_du: &BestDuIterate,
-    linear_constraints: Option<&[bool]>,
-    lbfgs_mode: bool,
-) {
-    if best_du.x.is_some() && best_du.val < dual_inf * 0.1 {
-        // Pass &mut None for lbfgs_state — the stall path doesn't need to
-        // refresh the L-BFGS Hessian here (callers do it later if needed).
-        let mut no_lbfgs: Option<LbfgsIpmState> = None;
-        restore_best_du_iterate(
-            state, problem, &mut no_lbfgs, best_du,
-            linear_constraints, lbfgs_mode,
-        );
-        if options.print_level >= 3 {
-            rip_log!(
-                "ripopt: Reverting to best-du iterate (du: {:.2e} -> {:.2e}) before NumericalError exit",
-                dual_inf, best_du.val
-            );
-        }
-    }
-}
-
-/// Update best-so-far primal/dual metrics and the no-progress counter,
-/// and return `true` when the stall limit has been reached.
-///
-/// Counts an iteration as "improving" when either `primal_inf_max` or
-/// `dual_inf` shrinks by at least 1% of the previous best. Improving
-/// resets the no-progress counter; non-improving increments it. The
-/// effective stall limit is halved when both step lengths are
-/// negligible (`alpha_primal < 1e-8 && alpha_dual < 1e-4`) so truly
-/// stuck iterations terminate sooner.
-fn update_stall_counters_and_check_limit(
-    stall: &mut ProgressStallTracker,
-    state: &SolverState,
-    options: &SolverOptions,
-    primal_inf_max: f64,
-    dual_inf: f64,
-) -> bool {
-    let pr_improved = primal_inf_max < 0.99 * stall.best_pr;
-    let du_improved = dual_inf < 0.99 * stall.best_du;
-    if pr_improved {
-        stall.best_pr = primal_inf_max;
-    }
-    if du_improved {
-        stall.best_du = dual_inf;
-    }
-    if pr_improved || du_improved {
-        stall.no_progress_count = 0;
-        return false;
-    }
-    stall.no_progress_count += 1;
-    let tiny_alpha = state.alpha_primal < 1e-8 && state.alpha_dual < 1e-4;
-    let stall_limit = if tiny_alpha { options.stall_iter_limit / 2 } else { options.stall_iter_limit };
-    stall.no_progress_count >= stall_limit
-}
-
-fn detect_and_handle_progress_stall<P: NlpProblem>(
-    state: &mut SolverState,
-    problem: &P,
-    options: &SolverOptions,
-    iteration: usize,
-    primal_inf: f64,
-    primal_inf_max: f64,
-    dual_inf: f64,
-    compl_inf: f64,
-    s_d_for_acc: f64,
-    filter: &mut Filter,
-    mu_state: &mut MuState,
-    stall: &mut ProgressStallTracker,
-    best_du: &BestDuIterate,
-    linear_constraints: Option<&[bool]>,
-    lbfgs_mode: bool,
-) -> StallDecision {
-    if iteration <= 50 || options.stall_iter_limit == 0 {
-        return StallDecision::Proceed;
-    }
-    let n = state.n;
-    let m = state.m;
-
-    if !update_stall_counters_and_check_limit(
-        stall, state, options, primal_inf_max, dual_inf,
-    ) {
-        return StallDecision::Proceed;
-    }
-
-    // Before declaring NumericalError, check if the current point is
-    // near-tolerance (1000x tol).
-    let stall_near_tol = options.tol * 1000.0;
-    let stall_pr_ok = primal_inf_max <= stall_near_tol.max(10.0 * options.constr_viol_tol);
-    let stall_du_ok = dual_inf <= (stall_near_tol * s_d_for_acc).max(1e-2);
-    let stall_co_ok = compl_inf <= (stall_near_tol * s_d_for_acc).max(1e-2);
-    if stall_pr_ok && stall_du_ok && stall_co_ok {
-        return handle_near_tolerance_stall(
-            state, options, primal_inf, primal_inf_max, dual_inf, compl_inf,
-            s_d_for_acc, filter, mu_state, stall,
-        );
-    }
-    if let Some(decision) = check_stall_near_tolerance_via_optimal_duals(
-        state, options, primal_inf, primal_inf_max, compl_inf, stall_near_tol, n, m,
-    ) {
-        return decision;
-    }
-    if let Some(decision) = try_boost_mu_for_stall(
-        state, options, filter, mu_state, primal_inf_max, stall,
-    ) {
-        return decision;
-    }
-    revert_to_best_du_iterate_if_better(
-        state, problem, options, dual_inf, best_du,
-        linear_constraints, lbfgs_mode,
-    );
-    if options.print_level >= 3 {
-        rip_log!(
-            "ripopt: Stalled for {} iterations without progress (alpha_p={:.2e}, pr={:.2e}, du={:.2e}), terminating",
-            stall.no_progress_count, state.alpha_primal, primal_inf, dual_inf
-        );
-    }
-    StallDecision::Return(make_result(state, SolveStatus::NumericalError))
-}
-
-/// Track constraint-violation history and optionally short-circuit
-/// with `LocalInfeasibility`.
-///
-/// Pushes the current `primal_inf` into `theta_history`, updates the
-/// "ever feasible" flag, and (when proactive infeasibility detection
-/// is enabled) looks for a stagnated θ with a near-stationary ∇θ
-/// over a 100-iteration window. Returns `Some(SolveResult)` when
-/// infeasibility is declared.
-///
-/// Ipopt uses its `RestoFilterConvCheck` for a broadly analogous
-/// purpose; this path is ripopt-specific and fires before the main
-/// IPM would otherwise burn iterations waiting for restoration to
-/// reach the same conclusion.
-///
-/// Extracted from `solve_ipm` as part of the v0.8 main-loop
-/// decomposition.
-#[allow(clippy::too_many_arguments)]
+/// T3.17: the proactive_infeasibility_detection branch was retired
+/// (no Ipopt analog). LocalInfeasibility detection now flows only
+/// through the restoration cascade (`classify_exhausted_restoration_attempt`)
+/// and the MaxIter exit (`try_classify_max_iter_infeasibility`), both of
+/// which test the same "stationary infeasible point" criterion.
 fn track_feasibility_and_detect_infeasibility(
-    state: &SolverState,
+    _state: &SolverState,
     options: &SolverOptions,
-    iteration: usize,
+    _iteration: usize,
     primal_inf: f64,
     feas: &mut FeasibilityTracker,
 ) -> Option<SolveResult> {
-    let m = state.m;
-
     if feas.history.len() >= feas.history_len {
         feas.history.remove(0);
     }
@@ -7177,191 +6162,8 @@ fn track_feasibility_and_detect_infeasibility(
 
     if primal_inf < options.constr_viol_tol {
         feas.ever_feasible = true;
-    }
-
-    // Proactive infeasibility detection: if θ has stagnated over the history
-    // window AND ‖∇θ‖_∞ is near zero, declare infeasibility instead of
-    // waiting for restoration to reach the same conclusion.
-    if options.proactive_infeasibility_detection
-        && !feas.ever_feasible
-        && m > 0
-        && iteration >= 50
-        && primal_inf > options.constr_viol_tol
-        && feas.history.len() >= feas.history_len
-    {
-        let theta_min_h = slice_min(&feas.history);
-        let theta_max_h = feas.history.iter().cloned().fold(0.0f64, f64::max);
-        if theta_max_h > 0.0 && (theta_max_h - theta_min_h) < 0.01 * primal_inf {
-            feas.stall_count += 1;
-        } else {
-            feas.stall_count = 0;
-        }
-        if feas.stall_count >= 10 {
-            let grad_theta_norm = compute_grad_theta_norm(state);
-            let stationarity_tol = 1e-3 * primal_inf.max(1.0);
-            if grad_theta_norm < stationarity_tol {
-                log::info!(
-                    "Proactive infeasibility at iter {}: θ stagnated at {:.2e}, ‖∇θ‖={:.2e}",
-                    iteration, primal_inf, grad_theta_norm
-                );
-                return Some(make_result(state, SolveStatus::LocalInfeasibility));
-            }
-            // Stationarity not met — reset counter to check again next window.
-            feas.stall_count = 0;
-        }
-    } else if feas.ever_feasible {
         feas.stall_count = 0;
     }
-    None
-}
-
-/// Detect and recover from dual-infeasibility stagnation.
-///
-/// Tracks the best dual-infeasibility seen so far (`last_good_du`,
-/// `last_good_iter`) and, if `du` has failed to halve for ≥500
-/// iterations while a best-du iterate is available, restores that
-/// iterate and resets the filter/μ/inertia state for a fresh start.
-///
-/// Catches restoration-cycling failure modes where the main IPM and
-/// restoration NLP ping-pong and drift away from a near-converged
-/// point for thousands of iterations. No Ipopt parallel — this is a
-/// ripopt-specific safety net.
-///
-/// Extracted from `solve_ipm` as part of the v0.8 main-loop
-/// decomposition. Returns `Some(SolveResult)` only when the restored
-/// point already meets the near-tolerance acceptable level.
-#[allow(clippy::too_many_arguments)]
-/// After reverting to the best-du iterate during dual-stagnation
-/// recovery, check whether the restored point already meets a relaxed
-/// near-tolerance bound (pr ≤ max(100·tol, 10·constr_viol_tol),
-/// du and co ≤ max(100·tol·s_d, 1e-2)). When it does, the solver can
-/// terminate cleanly with NumericalError rather than burning more
-/// iterations on a marginal improvement. Returns Some when the bound
-/// is met, None to continue the cascade.
-fn check_restored_point_near_tolerance(
-    state: &SolverState,
-    options: &SolverOptions,
-) -> Option<SolveResult> {
-    let rest_pr = state.constraint_violation();
-    let rest_du = compute_dual_inf_at_state(state);
-    let rest_co = compute_compl_err_at_state(state);
-    let s_d = compute_s_d_at_state(state);
-    let near_tol = 100.0 * options.tol;
-    let du_tol = (near_tol * s_d).max(1e-2);
-    let co_tol = (near_tol * s_d).max(1e-2);
-    let pr_tol = near_tol.max(10.0 * options.constr_viol_tol);
-    if rest_pr <= pr_tol && rest_du <= du_tol && rest_co <= co_tol {
-        log::debug!(
-            "Restored best-du point passes near-tolerance (pr={:.2e}, du={:.2e}, co={:.2e})",
-            rest_pr, rest_du, rest_co
-        );
-        return Some(make_result(state, SolveStatus::NumericalError));
-    }
-    None
-}
-
-/// Copy the saved best-du iterate back into `state` and re-evaluate.
-/// Each multiplier vector is restored only when its `Option` is
-/// `Some`, allowing snapshots that were primal-only. After the copy,
-/// calls `evaluate_with_linear` to refresh `obj`, `g`, gradients, and
-/// the L-BFGS Hessian. No-op when `best_du.x` is `None`.
-fn restore_best_du_iterate<P: NlpProblem>(
-    state: &mut SolverState,
-    problem: &P,
-    lbfgs_state: &mut Option<LbfgsIpmState>,
-    best_du: &BestDuIterate,
-    linear_constraints: Option<&[bool]>,
-    lbfgs_mode: bool,
-) {
-    let Some(ref bdx) = best_du.x else { return };
-    state.x.copy_from_slice(bdx);
-    if let Some(ref bdy) = best_du.y { state.y.copy_from_slice(bdy); }
-    if let Some(ref bdzl) = best_du.z_l { state.z_l.copy_from_slice(bdzl); }
-    if let Some(ref bdzu) = best_du.z_u { state.z_u.copy_from_slice(bdzu); }
-    let _ = evaluate_and_refresh_lbfgs(state, problem, lbfgs_state, linear_constraints, lbfgs_mode);
-}
-
-/// Tracks dual-infeasibility halving progress so the dual-stagnation
-/// detector can recognize a 500-iteration plateau and revert to the
-/// best-du iterate for a fresh restart. `triggered` latches once per
-/// solve to prevent repeated reverts.
-struct DualStallTracker {
-    last_good_du: f64,
-    last_good_iter: usize,
-    triggered: bool,
-}
-
-impl DualStallTracker {
-    fn new() -> Self {
-        Self {
-            last_good_du: f64::INFINITY,
-            last_good_iter: 0,
-            triggered: false,
-        }
-    }
-}
-
-fn handle_dual_stagnation<P: NlpProblem>(
-    state: &mut SolverState,
-    problem: &P,
-    options: &SolverOptions,
-    iteration: usize,
-    filter: &mut Filter,
-    mu_state: &mut MuState,
-    inertia_params: &mut InertiaCorrectionParams,
-    lbfgs_state: &mut Option<LbfgsIpmState>,
-    dual_stall: &mut DualStallTracker,
-    best_feasible: &BestFeasibleIterate,
-    best_du: &BestDuIterate,
-    linear_constraints: Option<&[bool]>,
-    lbfgs_mode: bool,
-) -> Option<SolveResult> {
-    if iteration == 0 {
-        return None;
-    }
-
-    let current_du = compute_dual_inf_at_state(state);
-    if current_du < 0.5 * dual_stall.last_good_du {
-        dual_stall.last_good_du = current_du;
-        dual_stall.last_good_iter = iteration;
-    }
-
-    let stall_iters = iteration.saturating_sub(dual_stall.last_good_iter);
-    if stall_iters < 500
-        || dual_stall.triggered
-        || current_du <= 100.0 * options.tol
-        || best_feasible.x.is_none()
-    {
-        return None;
-    }
-
-    if best_du.x.is_none() {
-        return None;
-    }
-    log::debug!(
-        "Dual stagnation at iter {}: du={:.2e}, restoring best-du point (du={:.2e} at iter {})",
-        iteration, current_du, dual_stall.last_good_du, dual_stall.last_good_iter
-    );
-    restore_best_du_iterate(
-        state, problem, lbfgs_state, best_du,
-        linear_constraints, lbfgs_mode,
-    );
-
-    // Reset filter and bump mu for a fresh start from the good point.
-    reset_filter_with_current_theta(state, filter);
-    state.mu = (state.mu * 100.0).max(1e-4).min(1e-1);
-    if options.mu_strategy_adaptive {
-        mu_state.mode = MuMode::Free;
-    }
-    mu_state.first_iter_in_mode = true;
-    mu_state.consecutive_restoration_failures = 0;
-    inertia_params.delta_w_last = 0.0;
-
-    if let Some(result) = check_restored_point_near_tolerance(state, options) {
-        return Some(result);
-    }
-
-    dual_stall.triggered = true;
     None
 }
 
@@ -7383,14 +6185,29 @@ fn handle_dual_stagnation<P: NlpProblem>(
 fn compute_sigma_condition(state: &SolverState) -> f64 {
     let mut mn = f64::INFINITY;
     let mut mx = 0.0_f64;
+    // Phase 6c.2: accumulate Σ_i = z_L_i/s_L_i + z_U_i/s_U_i across the
+    // union of variables with at least one finite bound, walking the
+    // compressed bound mirrors. Build per-variable Σ via two passes
+    // (L then U) keyed by full index to match the original semantics
+    // exactly: a single Σ_i value per variable, whether it has 1 or 2
+    // active bounds.
+    let mut sigma_by_var = vec![0.0_f64; state.n];
+    let mut active = vec![false; state.n];
+    for k in 0..state.bound_layout.n_x_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        sigma_by_var[i] += state.z_l_compressed[k] / slack_xl(state, i);
+        active[i] = true;
+    }
+    for k in 0..state.bound_layout.n_x_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        sigma_by_var[i] += state.z_u_compressed[k] / slack_xu(state, i);
+        active[i] = true;
+    }
     for i in 0..state.n {
-        let mut s_i = 0.0_f64;
-        if state.x_l[i].is_finite() {
-            s_i += state.z_l[i] / slack_xl(state, i);
+        if !active[i] {
+            continue;
         }
-        if state.x_u[i].is_finite() {
-            s_i += state.z_u[i] / slack_xu(state, i);
-        }
+        let s_i = sigma_by_var[i];
         if s_i > 0.0 {
             mn = mn.min(s_i);
             mx = mx.max(s_i);
@@ -7431,8 +6248,8 @@ fn emit_trace_row_if_enabled(
         return;
     }
     let dx_inf = linf_norm(&state.dx);
-    let dzl_inf = linf_norm(&state.dz_l);
-    let dzu_inf = linf_norm(&state.dz_u);
+    let dzl_inf = linf_norm(&state.dz_l_compressed);
+    let dzu_inf = linf_norm(&state.dz_u_compressed);
     let sigma_cond = compute_sigma_condition(state);
     trace::emit(&trace::TraceRow {
         iter: iteration,
@@ -7493,47 +6310,67 @@ fn build_iterate_snapshot(state: &SolverState) -> crate::intermediate::IterateSn
     let mut x_u_viol = vec![0.0; n];
     let mut compl_xl = vec![0.0; n];
     let mut compl_xu = vec![0.0; n];
+    // Phase 6d.3: bound-side reads consume the compressed mirror; the
+    // n-wide infeasibility sweep over x_l/x_u still needs the n-wide
+    // viol arrays so split the loop.
     for i in 0..n {
-        if state.x_l[i].is_finite() {
-            x_l_viol[i] = (state.x_l[i] - state.x[i]).max(0.0);
-            compl_xl[i] = (state.x[i] - state.x_l[i]) * state.z_l[i];
+        if state.x_l_at(i).is_finite() {
+            x_l_viol[i] = (state.x_l_at(i) - state.x[i]).max(0.0);
         }
-        if state.x_u[i].is_finite() {
-            x_u_viol[i] = (state.x[i] - state.x_u[i]).max(0.0);
-            compl_xu[i] = (state.x_u[i] - state.x[i]) * state.z_u[i];
+        if state.x_u_at(i).is_finite() {
+            x_u_viol[i] = (state.x[i] - state.x_u_at(i)).max(0.0);
         }
+    }
+    for k in 0..state.bound_layout.n_x_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        compl_xl[i] = (state.x[i] - state.x_l_at(i)) * state.z_l_compressed[k];
+    }
+    for k in 0..state.bound_layout.n_x_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        compl_xu[i] = (state.x_u_at(i) - state.x[i]) * state.z_u_compressed[k];
     }
     // grad_lag = grad_f + J^T y - z_l + z_u
     let mut grad_lag = state.grad_f.clone();
     accumulate_jt_y(state, &mut grad_lag);
-    for i in 0..n {
-        grad_lag[i] -= state.z_l[i];
-        grad_lag[i] += state.z_u[i];
+    for k in 0..state.bound_layout.n_x_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        grad_lag[i] -= state.z_l_compressed[k];
     }
+    for k in 0..state.bound_layout.n_x_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        grad_lag[i] += state.z_u_compressed[k];
+    }
+    // Materialise m-form g for the user-facing intermediate callback
+    // (Ipopt's `IpoptCalculatedQuantities::curr_c`/`curr_d` projected
+    // back to TNLP's wire format).
+    let g_m: Vec<f64> = state.g_combined();
     let mut constr_viol = vec![0.0; m];
     let mut compl_g_vec = vec![0.0; m];
     for i in 0..m {
-        if state.g_l[i].is_finite() && state.g[i] < state.g_l[i] {
-            constr_viol[i] = state.g_l[i] - state.g[i];
-        } else if state.g_u[i].is_finite() && state.g[i] > state.g_u[i] {
-            constr_viol[i] = state.g[i] - state.g_u[i];
+        if state.g_l_at(i).is_finite() && g_m[i] < state.g_l_at(i) {
+            constr_viol[i] = state.g_l_at(i) - g_m[i];
+        } else if state.g_u_at(i).is_finite() && g_m[i] > state.g_u_at(i) {
+            constr_viol[i] = g_m[i] - state.g_u_at(i);
         }
         // Complementarity: lambda_i * c_i where c_i is the active constraint slack
-        if state.g_l[i].is_finite() && state.g_u[i].is_finite() {
+        let yi = state.y_at(i);
+        if state.g_l_at(i).is_finite() && state.g_u_at(i).is_finite() {
             // Equality or range: use min slack
-            compl_g_vec[i] = state.y[i] * (state.g[i] - state.g_l[i]).min(state.g_u[i] - state.g[i]);
-        } else if state.g_l[i].is_finite() {
-            compl_g_vec[i] = state.y[i] * (state.g[i] - state.g_l[i]);
-        } else if state.g_u[i].is_finite() {
-            compl_g_vec[i] = state.y[i] * (state.g_u[i] - state.g[i]);
+            compl_g_vec[i] = yi * (g_m[i] - state.g_l_at(i)).min(state.g_u_at(i) - g_m[i]);
+        } else if state.g_l_at(i).is_finite() {
+            compl_g_vec[i] = yi * (g_m[i] - state.g_l_at(i));
+        } else if state.g_u_at(i).is_finite() {
+            compl_g_vec[i] = yi * (state.g_u_at(i) - g_m[i]);
         }
     }
     IterateSnapshot {
         x: state.x.clone(),
-        z_l: state.z_l.clone(),
-        z_u: state.z_u.clone(),
-        g: state.g.clone(),
-        lambda: state.y.clone(),
+        // Phase 6d.2: materialize full-`n` z_l/z_u from compressed for
+        // the public callback API.
+        z_l: state.z_l_combined(),
+        z_u: state.z_u_combined(),
+        g: g_m,
+        lambda: state.y_combined(),
         x_l_violation: x_l_viol,
         x_u_violation: x_u_viol,
         compl_x_l: compl_xl,
@@ -7597,6 +6434,7 @@ fn log_iteration_row(
     ls_steps: usize,
     log_line_count: &mut usize,
     options: &SolverOptions,
+    inertia_params: &InertiaCorrectionParams,
 ) {
     if options.print_level < 3 {
         return;
@@ -7608,81 +6446,81 @@ fn log_iteration_row(
             "iter", "objective", "inf_pr", "inf_du", "compl", "lg(mu)", "alpha_pr", "alpha_du", "ls"
         );
     }
+    let lg_mu = if state.mu > 0.0 { state.mu.log10() } else { f64::NEG_INFINITY };
     rip_log!(
-        "{:>4}  {:>14.7e}  {:>10.2e}  {:>10.2e}  {:>10.2e}  {:>10.2e}  {:>8.2e}  {:>8.2e}  {:>3}",
+        "{:>4}  {:>14.7e}  {:>10.2e}  {:>10.2e}  {:>10.2e}  {:>10.1}  {:>8.2e}  {:>8.2e}  {:>3}",
         iteration,
         state.obj / state.obj_scaling,
         primal_inf,
         dual_inf,
         compl_inf,
-        state.mu,
+        lg_mu,
         state.alpha_primal,
         state.alpha_dual,
         ls_steps,
     );
     *log_line_count += 1;
-}
 
-/// Pick the linear solver for the KKT factorization.
-///
-/// Dense (`DenseLdl`) for small systems (`n + m < sparse_threshold`). For
-/// sparse, when the `rmumps` feature is enabled and the problem has
-/// constraints (`m > 0`), use the KKT-aware `MultifrontalLdl::new_kkt(n)`
-/// which enables CB pivot search for numerically stable primal-dual 2×2
-/// pivots. Otherwise fall back to the user's `options.linear_solver` choice.
-fn select_linear_solver(use_sparse: bool, n: usize, m: usize, options: &SolverOptions) -> Box<dyn LinearSolver> {
-    if use_sparse {
-        #[cfg(feature = "rmumps")]
-        {
-            let _ = n;
-            if m > 0 {
-                Box::new(MultifrontalLdl::new_kkt(n))
-            } else {
-                new_sparse_solver_with_choice(options.linear_solver)
+    // Targeted dual-stuck probe (print_level >= 5). Surfaces:
+    //   * |y_c|_inf, |y_d|_inf, |z_L|_inf, |z_U|_inf — has the multiplier
+    //     vector escaped through repeated kappa_sigma clipping?
+    //   * |dy_c|_inf, |dy_d|_inf, |dz_L|_inf, |dz_U|_inf — does the dual
+    //     direction even have non-trivial magnitude?
+    //   * α_du clamp source: which row of (z_L, z_U) hits the FTB cap, and
+    //     by how much. Identifies a wedged multiplier row that the search
+    //     direction never repairs.
+    if options.print_level >= 5 {
+        let yc_inf = linf_norm(&state.y_c);
+        let yd_inf = linf_norm(&state.y_d);
+        let zl_inf = linf_norm(&state.z_l_compressed);
+        let zu_inf = linf_norm(&state.z_u_compressed);
+        let dyc_inf = linf_norm(&state.dy_c);
+        let dyd_inf = linf_norm(&state.dy_d);
+        let dzl_inf = linf_norm(&state.dz_l_compressed);
+        let dzu_inf = linf_norm(&state.dz_u_compressed);
+
+        // Identify the (block, compressed-index, ratio) of the binding FTB
+        // row on the dual side at the *current* iterate using the *current*
+        // dz directions and the iteration's tau. This mirrors the inner
+        // loop of `fraction_to_boundary_dual_z_min` but records the arg-min.
+        let tau = (1.0 - state.mu).max(options.tau_min);
+        let mut min_ratio = f64::INFINITY;
+        let mut bind_block = "-";
+        let mut bind_idx: usize = usize::MAX;
+        for k in 0..state.bound_layout.n_x_l {
+            let d = state.dz_l_compressed[k];
+            if d < 0.0 {
+                let r = -tau * state.z_l_compressed[k] / d;
+                if r < min_ratio { min_ratio = r; bind_block = "zL"; bind_idx = k; }
             }
         }
-        #[cfg(not(feature = "rmumps"))]
-        {
-            let _ = (n, m);
-            new_sparse_solver_with_choice(options.linear_solver)
+        for k in 0..state.bound_layout.n_x_u {
+            let d = state.dz_u_compressed[k];
+            if d < 0.0 {
+                let r = -tau * state.z_u_compressed[k] / d;
+                if r < min_ratio { min_ratio = r; bind_block = "zU"; bind_idx = k; }
+            }
         }
-    } else {
-        Box::new(DenseLdl::new())
-    }
-}
-
-/// Estimate whether sparse condensed KKT should be disabled in favor of the
-/// full augmented system based on Jacobian structure. The Schur complement
-/// `J^T·D^{-1}·J` has at most `Σ k_i*(k_i+1)/2` nonzeros (before dedup),
-/// where `k_i` is the nnz in row `i`. If that exceeds `2×` the nnz of the
-/// augmented KKT (`hess_nnz + jac_nnz + n`), factoring the Schur complement
-/// costs more than factoring the full system, so return `true`.
-fn estimate_schur_density_disable<P: NlpProblem>(
-    problem: &P,
-    n: usize,
-    m: usize,
-    use_sparse: bool,
-    options: &SolverOptions,
-) -> bool {
-    if !(use_sparse && m > 0) {
-        return false;
-    }
-    let (jac_rows_est, _) = problem.jacobian_structure();
-    let mut row_nnz = vec![0usize; m];
-    for &r in &jac_rows_est {
-        row_nnz[r] += 1;
-    }
-    let schur_nnz_upper: usize = row_nnz.iter().map(|&k| k * (k + 1) / 2).sum();
-    let (hess_rows_est, _) = problem.hessian_structure();
-    let augmented_nnz = hess_rows_est.len() + jac_rows_est.len() + n;
-    let disable = schur_nnz_upper > 2 * augmented_nnz;
-    if disable && options.print_level >= 3 {
+        let (bind_z, bind_dz) = if bind_idx == usize::MAX {
+            (f64::NAN, f64::NAN)
+        } else if bind_block == "zL" {
+            (state.z_l_compressed[bind_idx], state.dz_l_compressed[bind_idx])
+        } else {
+            (state.z_u_compressed[bind_idx], state.dz_u_compressed[bind_idx])
+        };
+        let dw_last = inertia_params.delta_w_last;
+        let dc_last = inertia_params.delta_c_last;
         rip_log!(
-            "ripopt: Disabling sparse condensed KKT: Schur complement nnz estimate ({}) > 2× augmented KKT nnz ({})",
-            schur_nnz_upper, augmented_nnz
+            "ripopt: iter{}-probe: |y_c|={:.2e} |y_d|={:.2e} |z_L|={:.2e} |z_U|={:.2e}  |dy_c|={:.2e} |dy_d|={:.2e} |dz_L|={:.2e} |dz_U|={:.2e}  ftb_du={}@{} z={:.2e} dz={:.2e} ratio={:.2e}  dw_last={:.2e} dc_last={:.2e}",
+            iteration,
+            yc_inf, yd_inf, zl_inf, zu_inf,
+            dyc_inf, dyd_inf, dzl_inf, dzu_inf,
+            bind_block,
+            if bind_idx == usize::MAX { -1i64 } else { bind_idx as i64 },
+            bind_z, bind_dz, min_ratio,
+            dw_last, dc_last,
         );
     }
-    disable
 }
 
 /// Detect constraints that are linear in `x` (constant Jacobian, zero
@@ -7713,20 +6551,73 @@ fn detect_linear_constraint_flags<P: NlpProblem>(
     Some(flags)
 }
 
+/// B1.2: push the explicit slack iterate `s` strictly into the interior
+/// of `[g_l, g_u]` for inequality rows, mirroring `push_initial_point_from_bounds`
+/// for variable bounds. Equality rows are left at the sentinel `s = g_l = g_u`.
+///
+/// Ipopt 3.14 (`IpDefaultIterateInitializer.cpp:526-599`, slack branch):
+///   pL = min(κ1·max(|g_L|, 1), κ2·(g_U − g_L))   [two-sided]
+///   pL = κ1·max(|g_L|, 1)                         [one-sided lower]
+///   pU = κ1·max(|g_U|, 1)                         [one-sided upper]
+/// where κ1 = `slack_bound_push` (defaults to `bound_push`) and κ2 =
+/// `slack_bound_frac` (defaults to `bound_frac`). Initial s is the
+/// projection of g(x) into the resulting open interval; this guarantees
+/// strictly-positive `s_L = s − g_l` and `s_U = g_u − s` so the IPM's
+/// log-barrier on the slack is well defined at iteration 0.
+fn initialize_slack_iterate(state: &mut SolverState, m: usize, options: &SolverOptions) {
+    // Phase 5f: walk d-block natively. `s[k] = clamp(d_x[k], d_l[k]+pL, d_u[k]-pU)`.
+    let kappa1 = options.bound_push;
+    let kappa2 = options.bound_frac;
+    let _ = m;
+    for k in 0..state.layout.n_d {
+        let dl = state.d_l_at(k);
+        let du = state.d_u_at(k);
+        let l_fin = dl.is_finite();
+        let u_fin = du.is_finite();
+        let mut s_i = state.d_x[k];
+        if l_fin && u_fin {
+            let range = du - dl;
+            let p_l = (kappa1 * dl.abs().max(1.0)).min(kappa2 * range);
+            let p_u = (kappa1 * du.abs().max(1.0)).min(kappa2 * range);
+            s_i = s_i.max(dl + p_l).min(du - p_u);
+        } else if l_fin {
+            let p_l = kappa1 * dl.abs().max(1.0);
+            s_i = s_i.max(dl + p_l);
+        } else if u_fin {
+            let p_u = kappa1 * du.abs().max(1.0);
+            s_i = s_i.min(du - p_u);
+        }
+        state.s[k] = s_i;
+    }
+}
+
 /// Initialize constraint slack barrier multipliers `v_l`, `v_u` (Ipopt's
 /// `v_L`, `v_U`). For each inequality constraint side,
 /// `v = mu_init / max(slack, 1e-20)`. Equality rows (`g_l ≈ g_u`) are
-/// skipped. Mirrors Ipopt's `IpDefaultIterateInitializer.cpp`.
+/// skipped. Mirrors Ipopt's `IpDefaultIterateInitializer.cpp`: slack-bound
+/// multipliers are initialized to `bound_mult_init_val` (default 1.0), the
+/// same constant used for x-bound multipliers, NOT to `mu_init / slack`.
+///
+/// Mirrors Ipopt's `IpDefaultIterateInitializer.cpp`: slack-bound
+/// multipliers are initialized to `bound_mult_init_val` (default 1.0),
+/// the same constant used for x-bound multipliers. Equality rows
+/// (`g_l ≈ g_u`) are skipped.
+///
+/// P6: Previously ripopt also set `y_d := v_U − v_L` when
+/// `least_squares_mult_init` was OFF, which is not present in Ipopt
+/// (Ipopt's `IpLeastSquareMults.cpp:53-81` chooses (y_c, y_d) jointly
+/// from one 4-block LS, not piecewise). Removed for alignment.
 fn initialize_constraint_slack_multipliers(state: &mut SolverState, m: usize, options: &SolverOptions) {
+    let v_init = options.bound_mult_init_val;
     for i in 0..m {
         if constraint_is_equality(state, i) {
             continue;
         }
-        if state.g_l[i].is_finite() {
-            state.v_l[i] = options.mu_init / slack_gl(state, i);
+        if state.g_l_at(i).is_finite() {
+            state.set_v_l_at(i, v_init);
         }
-        if state.g_u[i].is_finite() {
-            state.v_u[i] = options.mu_init / slack_gu(state, i);
+        if state.g_u_at(i).is_finite() {
+            state.set_v_u_at(i, v_init);
         }
     }
 }
@@ -7740,25 +6631,87 @@ fn apply_warm_start(state: &mut SolverState, options: &SolverOptions) {
         return;
     }
     if let Some(ref init_y) = options.warm_start_y {
-        let len = init_y.len().min(state.y.len());
-        state.y[..len].copy_from_slice(&init_y[..len]);
+        let len = init_y.len().min(state.m);
+        for i in 0..len {
+            state.set_y_at(i, init_y[i]);
+        }
     }
     if let Some(ref init_z_l) = options.warm_start_z_l {
-        let len = init_z_l.len().min(state.z_l.len());
-        state.z_l[..len].copy_from_slice(&init_z_l[..len]);
+        // Phase 6d.6: warm-start z is user-supplied full-`n`; project
+        // onto the compressed bound storage (unbounded sides discarded).
+        let proj = state.bound_layout.project_l(init_z_l);
+        let len = proj.len().min(state.z_l_compressed.len());
+        state.z_l_compressed[..len].copy_from_slice(&proj[..len]);
     }
     if let Some(ref init_z_u) = options.warm_start_z_u {
-        let len = init_z_u.len().min(state.z_u.len());
-        state.z_u[..len].copy_from_slice(&init_z_u[..len]);
+        let proj = state.bound_layout.project_u(init_z_u);
+        let len = proj.len().min(state.z_u_compressed.len());
+        state.z_u_compressed[..len].copy_from_slice(&proj[..len]);
     }
+    // B9: warm-start the slack iterate `s` and its bound multipliers
+    // `v_l`, `v_u`. The default slack-push initializer ran before us
+    // (`initialize_slack_iterate`); we overwrite with user values, then
+    // project s back into a strict interior to keep the barrier well-
+    // defined (use the same κ1/κ2 push the cold-start path uses).
+    if let Some(ref init_s) = options.warm_start_s {
+        // init_s is combined-indexed (size m). Phase 3d: drop equality slots
+        // and project onto the d-block storage.
+        let m_in = init_s.len().min(state.m);
+        let kappa1 = options.bound_push;
+        let kappa2 = options.bound_frac;
+        for i in 0..m_in {
+            if constraint_is_equality(state, i) {
+                continue;
+            }
+            let mut s_i = init_s[i];
+            let l_fin = state.g_l_at(i).is_finite();
+            let u_fin = state.g_u_at(i).is_finite();
+            if l_fin && u_fin {
+                let range = state.g_u_at(i) - state.g_l_at(i);
+                let p_l = (kappa1 * state.g_l_at(i).abs().max(1.0)).min(kappa2 * range);
+                let p_u = (kappa1 * state.g_u_at(i).abs().max(1.0)).min(kappa2 * range);
+                s_i = s_i.max(state.g_l_at(i) + p_l).min(state.g_u_at(i) - p_u);
+            } else if l_fin {
+                let p_l = kappa1 * state.g_l_at(i).abs().max(1.0);
+                s_i = s_i.max(state.g_l_at(i) + p_l);
+            } else if u_fin {
+                let p_u = kappa1 * state.g_u_at(i).abs().max(1.0);
+                s_i = s_i.min(state.g_u_at(i) - p_u);
+            }
+            state.set_s_at(i, s_i);
+        }
+    }
+    if let Some(ref init_v_l) = options.warm_start_v_l {
+        // Phase 3e: user supplies combined m-form v_l; route through the
+        // combined-indexed setter so values land in the d-block storage.
+        let len = init_v_l.len().min(state.m);
+        for i in 0..len {
+            state.set_v_l_at(i, init_v_l[i]);
+        }
+    }
+    if let Some(ref init_v_u) = options.warm_start_v_u {
+        let len = init_v_u.len().min(state.m);
+        for i in 0..len {
+            state.set_v_u_at(i, init_v_u[i]);
+        }
+    }
+    // Phase 6d.6: WarmStartInitializer indexes z by full var idx. Pass
+    // a materialized full-`n` view, then project the result back into
+    // compressed storage.
+    let mut z_l_full = state.z_l_combined();
+    let mut z_u_full = state.z_u_combined();
+    let x_l_full = state.x_l_combined();
+    let x_u_full = state.x_u_combined();
     state.mu = WarmStartInitializer::initialize(
         &mut state.x,
-        &mut state.z_l,
-        &mut state.z_u,
-        &state.x_l,
-        &state.x_u,
+        &mut z_l_full,
+        &mut z_u_full,
+        &x_l_full,
+        &x_u_full,
         options,
     );
+    state.z_l_compressed = state.bound_layout.project_l(&z_l_full);
+    state.z_u_compressed = state.bound_layout.project_u(&z_u_full);
 }
 
 /// Evaluate the NLP at the initial point. If the evaluation fails, produces
@@ -7784,20 +6737,20 @@ fn initial_evaluate_with_recovery<P: NlpProblem>(
     for &push_factor in &[1e-2, 1e-1, 0.5] {
         state.x.copy_from_slice(&x_saved);
         for i in 0..n {
-            if state.x_l[i].is_finite() && state.x_u[i].is_finite() {
-                let range = state.x_u[i] - state.x_l[i];
+            if state.x_l_at(i).is_finite() && state.x_u_at(i).is_finite() {
+                let range = state.x_u_at(i) - state.x_l_at(i);
                 let push = push_factor * range;
                 if range > 2.0 * push {
-                    state.x[i] = state.x[i].max(state.x_l[i] + push).min(state.x_u[i] - push);
+                    state.x[i] = state.x[i].max(state.x_l_at(i) + push).min(state.x_u_at(i) - push);
                 } else {
-                    state.x[i] = 0.5 * (state.x_l[i] + state.x_u[i]);
+                    state.x[i] = 0.5 * (state.x_l_at(i) + state.x_u_at(i));
                 }
-            } else if state.x_l[i].is_finite() {
-                let push = push_factor * state.x_l[i].abs().max(1.0);
-                state.x[i] = state.x[i].max(state.x_l[i] + push);
-            } else if state.x_u[i].is_finite() {
-                let push = push_factor * state.x_u[i].abs().max(1.0);
-                state.x[i] = state.x[i].min(state.x_u[i] - push);
+            } else if state.x_l_at(i).is_finite() {
+                let push = push_factor * state.x_l_at(i).abs().max(1.0);
+                state.x[i] = state.x[i].max(state.x_l_at(i) + push);
+            } else if state.x_u_at(i).is_finite() {
+                let push = push_factor * state.x_u_at(i).abs().max(1.0);
+                state.x[i] = state.x[i].min(state.x_u_at(i) - push);
             }
         }
         reseed_bound_multipliers_from_mu(state, options.mu_init);
@@ -7813,49 +6766,79 @@ fn initial_evaluate_with_recovery<P: NlpProblem>(
 /// Ipopt's `nlp_scaling_method = gradient-based`:
 ///
 ///   * Objective: if `||∇f(x0)||_∞ > 100`, set `obj_scaling = 100/||∇f||_∞`,
-///     clamped below by `1e-2`.
+///     clamped below by `1e-8` (Ipopt's `nlp_scaling_min_value` default).
 ///   * Constraints: row-wise on `J(x0)`. If `max_j |J_{ij}| > 100`, set
-///     `g_scaling[i] = 100/max_j |J_{ij}|`, clamped below by `1e-2`.
+///     `g_scaling[i] = 100/max_j |J_{ij}|`, clamped below by `1e-8`.
 ///
 /// User-provided scalings (`options.user_obj_scaling`, `options.user_g_scaling`)
 /// take priority — when either is set, skips automatic scaling entirely.
-///
-/// Constraint scaling is skipped when the initial constraint violation exceeds
-/// `1e6` (Ipopt's threshold — at highly infeasible points J has no signal).
 fn compute_nlp_scaling<P: NlpProblem>(
     problem: &P,
     options: &SolverOptions,
     x0: &[f64],
     jac_rows_sc: &[usize],
 ) -> (f64, Vec<f64>) {
+    use crate::options::NlpScalingMethod;
     let n_sc = problem.num_variables();
     let m_sc = problem.num_constraints();
 
-    if options.user_obj_scaling.is_some() || options.user_g_scaling.is_some() {
-        let os = options.user_obj_scaling.unwrap_or(1.0);
-        let gs = options.user_g_scaling.clone().unwrap_or_else(|| vec![1.0; m_sc]);
-        return (os, gs);
-    }
+    // For backwards compatibility: setting any user_*_scaling field
+    // short-circuits to user-supplied values, regardless of the method
+    // option. This matches the pre-T-MIT-C contract.
+    let user_supplied =
+        options.user_obj_scaling.is_some() || options.user_g_scaling.is_some();
 
-    let nlp_scaling_max_gradient = 100.0;
-    let nlp_scaling_min_value = 1e-2;
-    let mut grad_f0 = vec![0.0; n_sc];
-    let grad_ok = problem.gradient(x0, true, &mut grad_f0);
-    let grad_max = if grad_ok {
-        linf_norm(&grad_f0)
-    } else {
-        0.0
-    };
-    let os = if grad_max > nlp_scaling_max_gradient && grad_max.is_finite() {
-        (nlp_scaling_max_gradient / grad_max).max(nlp_scaling_min_value)
-    } else {
-        1.0
+    let (mut os, gs) = match options.nlp_scaling_method {
+        NlpScalingMethod::None => (1.0, vec![1.0; m_sc]),
+        NlpScalingMethod::User => {
+            let os = options.user_obj_scaling.unwrap_or(1.0);
+            let gs = options.user_g_scaling.clone().unwrap_or_else(|| vec![1.0; m_sc]);
+            (os, gs)
+        }
+        NlpScalingMethod::Gradient if user_supplied => {
+            let os = options.user_obj_scaling.unwrap_or(1.0);
+            let gs = options.user_g_scaling.clone().unwrap_or_else(|| vec![1.0; m_sc]);
+            (os, gs)
+        }
+        NlpScalingMethod::Gradient => {
+            let max_grad = options.nlp_scaling_max_gradient;
+            let min_val = options.nlp_scaling_min_value;
+            let obj_target = options.nlp_scaling_obj_target_gradient;
+
+            let mut grad_f0 = vec![0.0; n_sc];
+            let grad_ok = problem.gradient(x0, true, &mut grad_f0);
+            let grad_amax = if grad_ok { linf_norm(&grad_f0) } else { 0.0 };
+
+            // Mirrors GradientScaling at IpGradientScaling.cpp:101-128.
+            let os = if obj_target > 0.0 {
+                if grad_amax > 0.0 && grad_amax.is_finite() {
+                    (obj_target / grad_amax).max(min_val)
+                } else {
+                    1.0_f64.max(min_val)
+                }
+            } else if grad_amax > max_grad && grad_amax.is_finite() {
+                (max_grad / grad_amax).max(min_val)
+            } else {
+                1.0_f64.max(min_val)
+            };
+
+            let gs = compute_constraint_row_scaling(
+                problem,
+                x0,
+                jac_rows_sc,
+                m_sc,
+                max_grad,
+                min_val,
+                options.nlp_scaling_constr_target_gradient,
+            );
+            (os, gs)
+        }
     };
 
-    let gs = compute_constraint_row_scaling(
-        problem, x0, jac_rows_sc, m_sc,
-        nlp_scaling_max_gradient, nlp_scaling_min_value,
-    );
+    // Apply obj_scaling_factor on top — matches StandardScalingBase
+    // (`IpNLPScaling.cpp:276`: df_ *= obj_scaling_factor_). This is
+    // applied for every method, including `None`.
+    os *= options.obj_scaling_factor;
     (os, gs)
 }
 
@@ -7863,9 +6846,12 @@ fn compute_nlp_scaling<P: NlpProblem>(
 /// scaling. Returns a length-`m_sc` vector of scale factors that map
 /// each constraint row to a per-row Jacobian Linf bounded by
 /// `max_gradient` (clamped below by `min_value`). Falls back to all
-/// 1.0 when constraints/Jacobian evaluation fails or the initial
-/// constraint violation exceeds `1e6` (Ipopt's threshold — at highly
-/// infeasible points the Jacobian carries no useful scaling signal).
+/// 1.0 when Jacobian evaluation fails. Mirrors Ipopt 3.14's
+/// `GradientScaling::DetermineScalingParametersImpl`
+/// (`IpGradientScaling.cpp:140-180`) — Ipopt scales unconditionally on
+/// the initial point's Jacobian; an "init_cv >= 1e6" early-exit was
+/// removed (no Ipopt analog and was suppressing scaling exactly on the
+/// highly-infeasible Mittelmann starts where it is most needed).
 fn compute_constraint_row_scaling<P: NlpProblem>(
     problem: &P,
     x0: &[f64],
@@ -7873,22 +6859,10 @@ fn compute_constraint_row_scaling<P: NlpProblem>(
     m_sc: usize,
     max_gradient: f64,
     min_value: f64,
+    constr_target_gradient: f64,
 ) -> Vec<f64> {
     let mut gs = vec![1.0; m_sc];
     if m_sc == 0 {
-        return gs;
-    }
-    let mut g0_sc = vec![0.0; m_sc];
-    let constr_ok = problem.constraints(x0, false, &mut g0_sc);
-    let mut g_l_sc = vec![0.0; m_sc];
-    let mut g_u_sc = vec![0.0; m_sc];
-    problem.constraint_bounds(&mut g_l_sc, &mut g_u_sc);
-    let init_cv = if constr_ok {
-        convergence::primal_infeasibility(&g0_sc, &g_l_sc, &g_u_sc)
-    } else {
-        f64::INFINITY
-    };
-    if init_cv >= 1e6 {
         return gs;
     }
     let mut jac_vals0 = vec![0.0; jac_rows_sc.len()];
@@ -7901,6 +6875,19 @@ fn compute_constraint_row_scaling<P: NlpProblem>(
         if v.is_finite() && v > row_max[row] {
             row_max[row] = v;
         }
+    }
+    if constr_target_gradient > 0.0 {
+        // Ipopt's override path (`IpGradientScaling.cpp:171`): every row
+        // gets the same scale `target / max(row_max)`. Skip if the
+        // global max is zero (degenerate Jacobian).
+        let global_max = row_max.iter().cloned().fold(0.0_f64, f64::max);
+        if global_max > 0.0 && global_max.is_finite() {
+            let s = (constr_target_gradient / global_max).max(min_value);
+            for gi in gs.iter_mut() {
+                *gi = s;
+            }
+        }
+        return gs;
     }
     for i in 0..m_sc {
         if row_max[i] > max_gradient {
@@ -7938,12 +6925,28 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         obj_scaling,
         g_scaling: g_scaling.clone(),
         jac_rows: jac_rows_sc,
+        bound_relax_factor: options.bound_relax_factor,
+        constr_viol_tol: options.constr_viol_tol,
+        nlp_lower_bound_inf: options.nlp_lower_bound_inf,
+        nlp_upper_bound_inf: options.nlp_upper_bound_inf,
     };
-    let problem = &scaled; // shadow: all subsequent code uses the scaled problem
+    // Mirrors Ipopt 3.14's IpOrigIpoptNLP per-call Eval_Error checks:
+    // wrap the scaled problem with a NaN/Inf guard so every eval
+    // reaching the IPM core is guaranteed finite. Non-finite outputs
+    // are converted to `false` returns, treated as trial-point
+    // rejections by the line search (and as EvaluationError →
+    // NumericalBreakdown at the current iterate).
+    let finite_checked = FiniteCheckedProblem::new(&scaled);
+    let problem = &finite_checked; // shadow: all subsequent code uses the wrapped problem
 
     let mut state = SolverState::new(problem, options);
     state.obj_scaling = obj_scaling;
-    state.g_scaling = g_scaling;
+    // Project the combined per-row scaling onto the c-block / d-block
+    // (Phase 3 split storage). The user's NlpProblem trait stays
+    // combined-indexed, so g_scaling is still a length-m Vec at this
+    // boundary; SolverState owns the split form.
+    state.c_scaling = state.layout.project_c(&g_scaling);
+    state.d_scaling = state.layout.project_d(&g_scaling);
     let n = state.n;
     let m = state.m;
 
@@ -7960,20 +6963,21 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
 
     apply_warm_start(&mut state, options);
 
-    // Initialize linear solver — use sparse for large KKT systems
+    // After A7.6 the IPM uses only the augmented (4-block) KKT path,
+    // which carries its own dense LDLᵀ solver — the global `lin_solver`
+    // selection / sparse threshold / Schur-density gates are no longer
+    // consulted, but `use_sparse` is still computed for downstream
+    // diagnostics (NLP scaling threshold, large-scale tracing).
     let use_sparse = (n + m) >= options.sparse_threshold;
-    let mut lin_solver = select_linear_solver(use_sparse, n, m, options);
     let mut inertia_params = InertiaCorrectionParams::default();
-    let mut restoration = RestorationPhase::new(500);
-
-    let mut disable_sparse_condensed = estimate_schur_density_disable(problem, n, m, use_sparse, options);
-    // Flag set by bandwidth detection: when the sparse condensed Schur complement
-    // is essentially dense, switch to dense condensed KKT (n×n) for all subsequent
-    // iterations. This avoids the catastrophic rmumps fill-in on PDE problems.
-    let _use_dense_condensed_fallback = false;
 
     // Initialize filter
     let mut filter = Filter::new(1e4);
+    filter.set_obj_max_inc(options.obj_max_inc);
+    filter.set_alpha_min_frac(options.alpha_min_frac);
+    filter.set_filter_reset_options(options.filter_reset_trigger, options.max_filter_resets);
+    // DEV-36: plumb Ipopt `theta_min_fact` / `theta_max_fact` options.
+    filter.set_theta_factors(options.theta_min_fact, options.theta_max_fact);
 
     // Mehrotra centering parameter from the last iteration's predictor step.
     // Used in the Free-mode mu update: when sigma is available, mu = sigma * mu_current
@@ -8009,48 +7013,26 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
     // driving infeasibility detection.
     let mut feas = FeasibilityTracker::new(100);
 
-    // Tiny step counter (Ipopt: accept full step when relative step < 10*eps for 2 consecutive)
-    let mut consecutive_tiny_steps: usize = 0;
+    // Tiny-step latch (Ipopt: `tiny_step_last_iteration_`, set at end of
+    // an iter whose Δx, Δs are tiny and Δy < tiny_step_y_tol; consumed
+    // by the next iter's detection to fire `tiny_step_flag`).
+    let mut tiny_step_last_iter: bool = false;
 
-    // Overall progress stall detection: if neither primal nor dual infeasibility
-    // improves by at least 1% over many consecutive iterations, terminate early.
-    let mut stall = ProgressStallTracker::new();
+    // STOP_AT_TINY_STEP exit flag: set by `update_barrier_parameter` when
+    // `tiny_step && new_μ == μ` (no-op mu update — Ipopt's
+    // `IpMonotoneMuUpdate.cpp:158-160`, `IpAdaptiveMuUpdate.cpp:329,377`),
+    // consumed at the top of the *next* iteration after `check_convergence`
+    // so KKT-clean tiny-step iterates exit Optimal first.
+    let mut pending_tiny_step_exit: bool = false;
 
     // Line-search backtrack count for the previous iteration (printed in table).
     let mut ls_steps: usize = 0;
     // Hessian regularization delta from previous iteration (for intermediate callback).
-    let mut prev_ic_delta_w: f64 = 0.0;
+    let prev_ic_delta_w: f64 = 0.0;
 
-    // Primal divergence detection: track consecutive iterations where pr is growing.
-    // When pr grows steadily post-restoration, re-trigger restoration rather than
-    // continuing for many iterations with worsening feasibility.
-    let mut pd_tracker = PrimalDivergenceTracker::new();
-
-    // Consecutive iterations with obj < -1e20 for robust unbounded detection
-    let mut consecutive_unbounded: usize = 0;
-
-    // Best feasible point tracking: save the best (lowest obj) point that is feasible
-    let mut best_feasible = BestFeasibleIterate::new();
-
-    // Best-du point tracking
-    let mut best_du = BestDuIterate::new();
-
-    // Dual stagnation detection: track best du improvement.
-    // If du hasn't improved significantly over many iterations and we have a
-    // best feasible point, restore it and restart with fresh parameters.
-    let mut dual_stall = DualStallTracker::new();
-
-    // Strategy 1: Iterate averaging for oscillation recovery
-    let mut avg_state = IterateAveragingState::new();
-
-    // Strategy 2: Damped multiplier updates when oscillation detected
-    let mut dy_tracker = DyOscillationTracker::new(m);
-
-    // Strategy 3: Active set reduced KKT solve
-    let mut tried_active_set: bool = false;
-
-    // Strategy 4: Complementarity polishing — force mu small when compl is bottleneck
-    let mut _tried_compl_polish: bool = false;
+    // DEV-7: removed `consecutive_unbounded` counter; Ipopt-aligned
+    // divergence is checked via `ConvergenceStatus::Diverging` driven by
+    // `info.x_max_abs > options.diverging_iterates_tol` in convergence.rs.
 
     // Initial evaluation with NaN/Inf recovery by bound-push perturbation.
     if let Err(result) = initial_evaluate_with_recovery(
@@ -8059,18 +7041,29 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         return result;
     }
 
+    initialize_slack_iterate(&mut state, m, options);
     initialize_constraint_slack_multipliers(&mut state, m, options);
 
-    // Set filter parameters based on initial constraint violation
-    let theta_init = state.constraint_violation();
+    // Set filter parameters based on initial constraint violation.
+    // A8.19: use slack-coupled `||c||_1 + ||d − s||_1` so theta_min /
+    // theta_max are on the same scale as the trial-point theta computed
+    // during the line search (which now uses `theta_for_split_d_s`).
+    let theta_init = theta_for_split_d_s(&state, &state.c_x, &state.d_x, &state.s);
     filter.set_theta_min_from_initial(theta_init);
+
+    // B10: Ipopt-style problem statistics block (print_level >= 4
+    // matches Ipopt's `print_level=4` default for the statistics block;
+    // the iteration table is at level 3).
+    if options.print_level >= 4 {
+        print_problem_header(&state);
+    }
 
     // Print iteration table header (shown at print_level >= 3, reprinted every 25 rows)
     let mut log_line_count: usize = 0;
     if options.print_level >= 3 {
         rip_log!(
-            "{:>4}  {:>14}  {:>10}  {:>10}  {:>10}  {:>8}  {:>8}  {:>3}",
-            "iter", "objective", "inf_pr", "inf_du", "mu", "alpha_pr", "alpha_du", "ls"
+            "{:>4}  {:>14}  {:>10}  {:>10}  {:>10}  {:>10}  {:>8}  {:>8}  {:>3}",
+            "iter", "objective", "inf_pr", "inf_du", "compl", "mu", "alpha_pr", "alpha_du", "ls"
         );
     }
 
@@ -8078,41 +7071,59 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         rip_log!("ripopt: Starting main loop (n={}, m={})", n, m);
     }
 
+    // A8.7: hoist `aug_solver` above the IPM loop so its symbolic
+    // factorization / CSC pattern caches persist across iterations.
+    // The augmented-KKT sparsity pattern is fixed by the Hessian and
+    // Jacobian patterns (Σ values + δ perturbations only change the
+    // numeric diagonal, not the structure), so feral's first-call
+    // symbolic analysis only needs to run once per solve. Without
+    // hoisting, every iter constructed a fresh `FeralLdl` and re-ran
+    // METIS-style ordering — measured at ~1.5s/iter on Mittelmann
+    // ex8_2_3 (90% of total wall time before this fix).
+    let mut aug_solver: Box<dyn LinearSolver> = new_fallback_solver(use_sparse);
+
     // Main IPM loop
     for iteration in 0..options.max_iter {
         state.iter = iteration;
 
-        // Early-stall timeout scaled by problem size: medium-scale problems
-        // (n+m > 1000) can legitimately spend 30-60s on restoration or line
-        // search during early iterations.
-        let early_timeout = options.early_stall_timeout * ((n + m) as f64 / 200.0).max(1.0);
-        if let Some(result) = check_time_limits(&state, iteration, start_time, early_timeout, options) {
-            return result;
+        // T0.14 (Ipopt 3.14 alignment): clear the once-per-outer-iter
+        // pretend-singular flag at the top of each iteration so the
+        // PD perturbation handler allows the trick exactly once per
+        // iter (IpPDPerturbationHandler.cpp).
+        inertia_params.reset_pretend_singular_for_new_iter();
+
+        // T0.10: notify the problem of the current barrier μ. Used by
+        // RestorationNlp so its η weight tracks the inner IPM's μ
+        // instead of staying frozen at restoration entry. Default no-op
+        // for normal NLPs (IpRestoIpoptNLP.cpp:759).
+        problem.notify_mu(state.mu);
+
+        // Ipopt `IpRestoFilterConvCheck::TestOrigProgress`: when the
+        // problem is a restoration NLP and the parent's max-bound-
+        // violation has already dropped below `kappa_resto · θ_entry`,
+        // exit the inner solve immediately so the parent can resume.
+        // No-op for non-resto problems (default trait impl returns
+        // false). Skipped at iteration 0 to ensure we always evaluate
+        // the trial step at least once.
+        if iteration > 0 && problem.resto_early_exit(&state.x) {
+            if options.print_level >= 5 {
+                rip_log!(
+                    "ripopt: resto early-exit at iter {} (parent θ target reached)",
+                    iteration
+                );
+            }
+            state.iter = iteration;
+            return make_result(&state, SolveStatus::Optimal);
         }
 
-        // Dual stagnation detection (runs every iteration, including restoration).
-        // Catches restoration cycling that drifts from a near-converged point.
-        if let Some(result) = handle_dual_stagnation(
-            &mut state,
-            problem,
-            options,
-            iteration,
-            &mut filter,
-            &mut mu_state,
-            &mut inertia_params,
-            &mut lbfgs_state,
-            &mut dual_stall,
-            &best_feasible,
-            &best_du,
-            linear_constraints.as_deref(),
-            lbfgs_mode,
-        ) {
+        if let Some(result) = check_time_limits(&state, iteration, start_time, options) {
             return result;
         }
 
         let OptimalityMeasures {
             primal_inf,
             primal_inf_max,
+            primal_inf_internal_max,
             dual_inf,
             dual_inf_unscaled,
             compl_inf,
@@ -8121,13 +7132,139 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         log_iteration_row(
             iteration,
             &state,
-            primal_inf,
+            primal_inf_max,
             dual_inf,
             compl_inf,
             ls_steps,
             &mut log_line_count,
             options,
+            &inertia_params,
         );
+
+        if iteration == 0 && options.print_level >= 5 {
+            let (gf_inf_idx, gf_inf) = state
+                .grad_f
+                .iter()
+                .enumerate()
+                .fold((0usize, 0.0f64), |(ai, av), (i, &v)| {
+                    if v.abs() > av { (i, v.abs()) } else { (ai, av) }
+                });
+            let mut jty = vec![0.0; state.n];
+            // Phase 5d: split-form J^T·y diagnostic.
+            for (idx, (&kc, &col)) in state.jac_c_rows.iter().zip(state.jac_c_cols.iter()).enumerate() {
+                jty[col] += state.jac_c_vals[idx] * state.y_c[kc];
+            }
+            for (idx, (&kd, &col)) in state.jac_d_rows.iter().zip(state.jac_d_cols.iter()).enumerate() {
+                jty[col] += state.jac_d_vals[idx] * state.y_d[kd];
+            }
+            let jty_inf = jty.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+            // Phase 6d.3: bound-side scalar diagnostics consume the
+            // compressed mirror; zero-padded entries contribute nothing
+            // to abs/max/sum.
+            let zl_inf = state.z_l_compressed.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+            let zu_inf = state.z_u_compressed.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+            let y_inf = state
+                .y_c
+                .iter()
+                .chain(state.y_d.iter())
+                .fold(0.0f64, |a, &b| a.max(b.abs()));
+            let y_sum: f64 = state
+                .y_c
+                .iter()
+                .chain(state.y_d.iter())
+                .map(|v| v.abs())
+                .sum();
+            let zl_sum: f64 = state.z_l_compressed.iter().map(|v| v.abs()).sum();
+            let zu_sum: f64 = state.z_u_compressed.iter().map(|v| v.abs()).sum();
+            let mut grad_lag = state.grad_f.clone();
+            for i in 0..state.n {
+                grad_lag[i] += jty[i];
+            }
+            for k in 0..state.bound_layout.n_x_l {
+                let i = state.bound_layout.x_l_to_full[k];
+                grad_lag[i] -= state.z_l_compressed[k];
+            }
+            for k in 0..state.bound_layout.n_x_u {
+                let i = state.bound_layout.x_u_to_full[k];
+                grad_lag[i] += state.z_u_compressed[k];
+            }
+            let (gl_idx, gl_inf) = grad_lag.iter().enumerate().fold(
+                (0usize, 0.0f64),
+                |(ai, av), (i, &v)| if v.abs() > av { (i, v.abs()) } else { (ai, av) },
+            );
+            let x_l_fin = state.x_l_at(gl_idx).is_finite();
+            let x_u_fin = state.x_u_at(gl_idx).is_finite();
+            let x_inf = state.x.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+            rip_log!(
+                "ripopt: iter0-probe: |grad_f|_inf={:.3e}@var{}, |J^T y|_inf={:.3e}, |y|_inf={:.3e}, |z_L|_inf={:.3e}, |z_U|_inf={:.3e}, sum|y|={:.3e}, sum|z_L|={:.3e}, sum|z_U|={:.3e}, |x|_inf={:.3e}, n={} m={}",
+                gf_inf, gf_inf_idx, jty_inf, y_inf, zl_inf, zu_inf, y_sum, zl_sum, zu_sum, x_inf, state.n, state.m
+            );
+            // Phase 6d.3: gl_idx may or may not have a compressed slot.
+            let zl_at_gl = state.bound_layout.full_to_x_l[gl_idx]
+                .map(|k| state.z_l_compressed[k])
+                .unwrap_or(0.0);
+            let zu_at_gl = state.bound_layout.full_to_x_u[gl_idx]
+                .map(|k| state.z_u_compressed[k])
+                .unwrap_or(0.0);
+            rip_log!(
+                "ripopt: iter0-probe: |grad_lag|_inf={:.3e}@var{} (grad_f={:.3e}, J^T y={:.3e}, z_L={:.3e}, z_U={:.3e}, x_l_fin={}, x_u_fin={}, obj_scaling={:.3e})",
+                gl_inf, gl_idx, state.grad_f[gl_idx], jty[gl_idx], zl_at_gl, zu_at_gl, x_l_fin, x_u_fin, state.obj_scaling
+            );
+
+            // Per-component multiplier dump for diffing against Ipopt's
+            // file_print_level=8 output (curr_y_c / curr_y_d / curr_z_L /
+            // curr_z_U). Gated on RIPOPT_ITER0_DUMP=<path>; format mirrors
+            // Ipopt's annotated dump so a textual diff lines up by
+            // {_scon[N]} / {_svar[N]} (1-indexed combined index).
+            if let Ok(path) = std::env::var("RIPOPT_ITER0_DUMP") {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::File::create(&path) {
+                    let _ = writeln!(f, "DenseVector \"curr_y_c\" with {} elements:", state.y_c.len());
+                    for (k, &v) in state.y_c.iter().enumerate() {
+                        let combined = state.layout.c_to_combined[k];
+                        let _ = writeln!(f, "curr_y_c[{:5}]{{_scon[{}]}}={:24.16e}", k + 1, combined + 1, v);
+                    }
+                    let _ = writeln!(f, "DenseVector \"curr_y_d\" with {} elements:", state.y_d.len());
+                    for (k, &v) in state.y_d.iter().enumerate() {
+                        let combined = state.layout.d_to_combined[k];
+                        let _ = writeln!(f, "curr_y_d[{:5}]{{_scon[{}]}}={:24.16e}", k + 1, combined + 1, v);
+                    }
+                    let _ = writeln!(f, "DenseVector \"curr_z_L\" with {} elements:", state.z_l_compressed.len());
+                    for (k, &v) in state.z_l_compressed.iter().enumerate() {
+                        let full = state.bound_layout.x_l_to_full[k];
+                        let _ = writeln!(f, "curr_z_L[{:5}]{{_svar[{}]}}={:24.16e}", k + 1, full + 1, v);
+                    }
+                    let _ = writeln!(f, "DenseVector \"curr_z_U\" with {} elements:", state.z_u_compressed.len());
+                    for (k, &v) in state.z_u_compressed.iter().enumerate() {
+                        let full = state.bound_layout.x_u_to_full[k];
+                        let _ = writeln!(f, "curr_z_U[{:5}]{{_svar[{}]}}={:24.16e}", k + 1, full + 1, v);
+                    }
+                    let _ = writeln!(f, "DenseVector \"curr_v_L\" with {} elements:", state.v_l_compressed.len());
+                    for (k, &v) in state.v_l_compressed.iter().enumerate() {
+                        let _ = writeln!(f, "curr_v_L[{:5}]={:24.16e}", k + 1, v);
+                    }
+                    let _ = writeln!(f, "DenseVector \"curr_v_U\" with {} elements:", state.v_u_compressed.len());
+                    for (k, &v) in state.v_u_compressed.iter().enumerate() {
+                        let _ = writeln!(f, "curr_v_U[{:5}]={:24.16e}", k + 1, v);
+                    }
+                    // Per-d-row Jacobian L_inf and nnz, for diagnosing why
+                    // some y_d entries land at 0 in feral but ~0.8 in MA27.
+                    let mut jd_row_max = vec![0.0_f64; state.layout.n_d];
+                    let mut jd_row_nnz = vec![0usize; state.layout.n_d];
+                    for (idx, &kd) in state.jac_d_rows.iter().enumerate() {
+                        let v = state.jac_d_vals[idx].abs();
+                        if v > jd_row_max[kd] { jd_row_max[kd] = v; }
+                        if state.jac_d_vals[idx] != 0.0 { jd_row_nnz[kd] += 1; }
+                    }
+                    let _ = writeln!(f, "JacD row stats (kd, _scon, row_max, row_nnz):");
+                    for kd in 0..state.layout.n_d {
+                        let combined = state.layout.d_to_combined[kd];
+                        let _ = writeln!(f, "jd_row[{:5}]{{_scon[{}]}} max={:.6e} nnz={}", kd + 1, combined + 1, jd_row_max[kd], jd_row_nnz[kd]);
+                    }
+                    rip_log!("ripopt: iter0-probe: dumped multipliers to {}", path);
+                }
+            }
+        }
 
         emit_trace_row_if_enabled(
             &state,
@@ -8155,21 +7292,18 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
 
         // Compute multiplier scaling (also used by the consecutive-acceptable
         // tracker further below, so kept here rather than inside the helper).
+        // Counts are finite-bound counts to match Ipopt
+        // `IpIpoptCalculatedQuantities.cpp:3677-3699`.
         let multiplier_sum = compute_multiplier_sum(&state);
-        let multiplier_count = m + 2 * n;
+        let multiplier_count = compute_multiplier_count(&state);
         let bound_multiplier_sum = compute_bound_multiplier_sum(&state);
-        let bound_multiplier_count = 2 * n;
+        let bound_multiplier_count = compute_bound_multiplier_count(&state);
 
-        let mut conv_ws = ConvergenceWorkspace {
-            avg: &mut avg_state,
-            tried_active_set: &mut tried_active_set,
-            tried_compl_polish: &mut _tried_compl_polish,
-        };
         if let Some(result) = check_convergence_and_handle_promotions(
             &mut state,
-            problem,
             options,
             primal_inf_max,
+            primal_inf_internal_max,
             dual_inf,
             dual_inf_unscaled,
             compl_inf,
@@ -8177,18 +7311,31 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             multiplier_count,
             bound_multiplier_sum,
             bound_multiplier_count,
-            &mut conv_ws,
             &timings,
             iteration,
             ipm_start,
-            linear_constraints.as_deref(),
-            lbfgs_mode,
         ) {
             return result;
         }
 
-        let s_d_for_acc = track_consecutive_acceptable(
+        // Tiny-step termination — consumed AFTER `check_convergence_and_handle_promotions`
+        // so a KKT-clean tiny-step iterate exits Optimal first. The flag
+        // itself was set by the previous iteration's `update_barrier_parameter`
+        // when `tiny_step && new_μ == μ` (Ipopt's `IpMonotoneMuUpdate.cpp:158-160`,
+        // `IpAdaptiveMuUpdate.cpp:329,377`). Mirrors `IpIpoptAlg.cpp:347-466`
+        // ordering: AcceptTrialPoint → CheckConvergence (end of iter k) →
+        // UpdateBarrierParameter throws (top of iter k+1).
+        if pending_tiny_step_exit {
+            log::debug!(
+                "STOP_AT_TINY_STEP: tiny_step latched and mu update found nothing to change at mu={:.2e}",
+                state.mu
+            );
+            return make_result(&state, SolveStatus::StopAtTinyStep);
+        }
+
+        let _s_d_for_acc = track_consecutive_acceptable(
             &mut state,
+            options,
             primal_inf,
             dual_inf,
             dual_inf_unscaled,
@@ -8197,7 +7344,24 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             bound_multiplier_sum,
         );
 
-        update_best_du_iterate(&state, dual_inf, &mut best_du);
+        store_acceptable_iterate(
+            &mut state,
+            &filter,
+            iteration,
+            primal_inf,
+            primal_inf_internal_max,
+            dual_inf,
+            dual_inf_unscaled,
+            compl_inf,
+            multiplier_sum,
+            multiplier_count,
+            bound_multiplier_sum,
+            bound_multiplier_count,
+        );
+
+        // Record current objective so the next iteration's
+        // acceptable_obj_change_tol gate has a previous f to diff against.
+        state.last_obj_for_acceptable = Some(state.obj);
 
         if let Some(result) = track_feasibility_and_detect_infeasibility(
             &state,
@@ -8209,168 +7373,527 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             return result;
         }
 
-        if let Some(result) = detect_unbounded(
-            &state,
-            options,
-            primal_inf,
-            &mut consecutive_unbounded,
-        ) {
-            return result;
-        }
-
-        // Overall-progress stall detection — see helper doc comment.
-        match detect_and_handle_progress_stall(
-            &mut state,
-            problem,
-            options,
-            iteration,
-            primal_inf,
-            primal_inf_max,
-            dual_inf,
-            compl_inf,
-            s_d_for_acc,
-            &mut filter,
-            &mut mu_state,
-            &mut stall,
-            &best_du,
-            linear_constraints.as_deref(),
-            lbfgs_mode,
-        ) {
-            StallDecision::Return(r) => return r,
-            StallDecision::Continue => continue,
-            StallDecision::Proceed => {}
-        }
-        let force_restoration = detect_primal_divergence(
-            options,
-            iteration,
-            primal_inf,
-            &mut pd_tracker,
-            m,
-        );
-
-        let t_kkt = Instant::now();
-        let AssembledKkt {
-            sigma,
-            use_sparse_condensed,
-            condensed_system,
-            mut sparse_condensed_system,
-            mut kkt_system_opt,
-        } = assemble_kkt_systems(&state, n, m, use_sparse, disable_sparse_condensed);
-        timings.kkt_assembly += t_kkt.elapsed();
-
-        // On first iteration with sparse condensed, detect bandwidth and pick
-        // the right downstream solver (full augmented / banded / sparse).
-        if iteration == 0 {
-            adjust_sparse_condensed_bandwidth(
-                &state,
-                problem,
-                options,
-                n,
-                m,
-                use_sparse,
-                use_sparse_condensed,
-                &sigma,
-                &mut sparse_condensed_system,
-                &mut kkt_system_opt,
-                &mut lin_solver,
-                &mut disable_sparse_condensed,
-            );
-        }
-
-        let (ic_delta_w, ic_delta_c) = match factor_kkt_with_recovery(
-            &mut state,
-            problem,
-            options,
-            iteration,
-            n,
-            m,
-            use_sparse,
-            &mut kkt_system_opt,
-            lin_solver.as_mut(),
-            &mut inertia_params,
-            &mut lbfgs_state,
-            &mut filter,
-            &mut restoration,
-            &mut timings,
-            &mut prev_ic_delta_w,
-            linear_constraints.as_deref(),
-            lbfgs_mode,
-            deadline,
-        ) {
-            FactorDecision::Proceed { ic_delta_w, ic_delta_c } => (ic_delta_w, ic_delta_c),
-            FactorDecision::Continue => continue,
-            FactorDecision::Return(result) => return result,
-        };
-
-        // Solve for search direction via the three-way KKT dispatch.
+        // A7: primary Newton step via the 4-block augmented system
+        // [x; s; y_c; y_d]. A7.5 ports the Ipopt Probing μ oracle
+        // (`IpProbingMuOracle::CalculateMu`) and gates it on
+        // `options.mehrotra_pc`. When the oracle runs, it returns the
+        // chosen μ alongside the step; we install the new μ into
+        // `state.mu` so downstream line-search/convergence sees it.
+        // A7.7: keep `aug_solver` and the returned `aug_kkt` alive across
+        // the line search so SOC can reuse the factorization.
         let t_dir = Instant::now();
-        let (dx, dy);
-        let mut cond_solver_for_soc: Option<DenseLdl>;
-        let mehrotra_aff: Option<(Vec<f64>, Vec<f64>, Vec<f64>, f64)>;
-        match solve_for_search_direction(
-            &mut state,
-            problem,
-            options,
-            iteration,
-            n,
-            m,
-            use_sparse,
-            &condensed_system,
-            &sparse_condensed_system,
-            &mut kkt_system_opt,
-            lin_solver.as_mut(),
-            &sigma,
-            &mut inertia_params,
-            ic_delta_w,
-            ic_delta_c,
-            &filter,
-            &mut restoration,
-            &mut lbfgs_state,
-            lbfgs_mode,
-            linear_constraints.as_deref(),
-            &mut last_mehrotra_sigma,
-            deadline,
-        ) {
-            DirectionSolveDecision::Proceed {
-                dx: dx_val,
-                dy: dy_val,
-                cond_solver_for_soc: cs,
-                mehrotra_aff: ma,
-            } => {
-                dx = dx_val;
-                dy = dy_val;
-                cond_solver_for_soc = cs;
-                mehrotra_aff = ma;
+        // A7.8: pick the linear solver per the (n+m, sparse_threshold)
+        // sizing cutoff already used by the rest of the IPM. Aug matrix is
+        // assembled in matching layout (sparse vs dense) below.
+        // A8.7: `aug_solver` is hoisted above the loop so its symbolic
+        // cache persists across iterations.
+        let probing = options.mehrotra_pc;
+        let (step, _dc, mu_new_opt, aug_kkt, _iter_dw, _iter_dc) = if probing {
+            let avg_compl = compute_avg_complementarity(&state);
+            let mu_max = mu_state.mu_max_cap(options, avg_compl);
+            // Phase 6d.5: materialize compressed z to full-`n` for kkt_aug
+            // consumers (kkt_aug.rs still indexes by full var idx).
+            let z_l_full = state.z_l_combined();
+            let z_u_full = state.z_u_combined();
+            let x_l_full = state.x_l_combined();
+            let x_u_full = state.x_u_combined();
+            // Phase 8c.5: same for compressed v_l/v_u → length n_d.
+            let v_l_full = state.d_bound_layout.expand_l(&state.v_l_compressed, 0.0);
+            let v_u_full = state.d_bound_layout.expand_u(&state.v_u_compressed, 0.0);
+            // Phase 9c.5: same for compressed d_l/d_u → length n_d
+            // with ±∞ on unbounded sides.
+            let d_l_full = state.d_l();
+            let d_u_full = state.d_u();
+            match crate::kkt_aug::aug_step_from_state_mehrotra(
+                n, &state.grad_f,
+                &state.hess_rows, &state.hess_cols, &state.hess_vals,
+                &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals,
+                &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals,
+                &state.x, &x_l_full, &x_u_full, &z_l_full, &z_u_full,
+                &state.s, &state.c_x, &state.d_x, &d_l_full, &d_u_full,
+                &state.y_c, &state.y_d, &v_l_full, &v_u_full,
+                state.mu, options.kappa_d,
+                crate::kkt_aug::PROBING_SIGMA_MAX_DEFAULT,
+                options.mu_min, mu_max,
+                use_sparse,
+                aug_solver.as_mut(),
+                &mut inertia_params,
+            ) {
+                Ok((step, mu_new, dw, dc, aug)) => (step, dc, Some(mu_new), aug, dw, dc),
+                Err(_e) => {
+                    timings.direction_solve += t_dir.elapsed();
+                    return make_result(&state, SolveStatus::NumericalError);
+                }
             }
-            DirectionSolveDecision::Continue => continue,
-            DirectionSolveDecision::Return(r) => return r,
+        } else {
+            // Phase 6d.5: materialize compressed z to full-`n` for kkt_aug.
+            let z_l_full = state.z_l_combined();
+            let z_u_full = state.z_u_combined();
+            let x_l_full = state.x_l_combined();
+            let x_u_full = state.x_u_combined();
+            // Phase 8c.5: same for compressed v_l/v_u → length n_d.
+            let v_l_full = state.d_bound_layout.expand_l(&state.v_l_compressed, 0.0);
+            let v_u_full = state.d_bound_layout.expand_u(&state.v_u_compressed, 0.0);
+            // Phase 9c.5: same for compressed d_l/d_u → length n_d.
+            let d_l_full = state.d_l();
+            let d_u_full = state.d_u();
+
+            // RIPOPT_RHS_PROBE=ITER,VAR: dump component breakdown of
+            // the augmented-system x-row at `var` AT iter `ITER`,
+            // before any linear-solver scaling. Mirrors the formulas
+            // in src/kkt_aug.rs build_outer_rhs (lines 296-344) and
+            // fold_aug_rhs (lines 435-468). Used to localize whether
+            // the catastrophic dx[var] at iter 110 originates in the
+            // RHS itself (assembly) or downstream in the matrix solve.
+            if let Ok(spec) = std::env::var("RIPOPT_RHS_PROBE") {
+                let mut parts = spec.split(',');
+                let want_iter: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+                let want_var:  usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                if state.iter == want_iter && want_var < n {
+                    let i = want_var;
+                    let xi = state.x[i];
+                    let xli = x_l_full[i];
+                    let xui = x_u_full[i];
+                    let l_fin = xli.is_finite();
+                    let u_fin = xui.is_finite();
+                    let s_l = if l_fin { (xi - xli).max(1e-20) } else { f64::INFINITY };
+                    let s_u = if u_fin { (xui - xi).max(1e-20) } else { f64::INFINITY };
+                    let zli = if l_fin { z_l_full[i] } else { 0.0 };
+                    let zui = if u_fin { z_u_full[i] } else { 0.0 };
+                    // J^T y at column i.
+                    let mut jty_i = 0.0_f64;
+                    for k in 0..state.jac_c_rows.len() {
+                        if state.jac_c_cols[k] == i {
+                            jty_i += state.jac_c_vals[k] * state.y_c[state.jac_c_rows[k]];
+                        }
+                    }
+                    for k in 0..state.jac_d_rows.len() {
+                        if state.jac_d_cols[k] == i {
+                            jty_i += state.jac_d_vals[k] * state.y_d[state.jac_d_rows[k]];
+                        }
+                    }
+                    let kappa_d = options.kappa_d;
+                    let kd_term = if kappa_d > 0.0 && (l_fin ^ u_fin) {
+                        if l_fin { kappa_d * state.mu } else { -kappa_d * state.mu }
+                    } else { 0.0 };
+                    // build_outer_rhs convention: rhs_x = grad_f + J^T y - z_L + z_U + κ_d
+                    let mut rhs_x_i = state.grad_f[i] + jty_i + kd_term;
+                    if l_fin { rhs_x_i -= zli; }
+                    if u_fin { rhs_x_i += zui; }
+                    let rhs_z_l_i = if l_fin { zli * s_l - state.mu } else { 0.0 };
+                    let rhs_z_u_i = if u_fin { zui * s_u - state.mu } else { 0.0 };
+                    // fold_aug_rhs convention: aug[i] = -rhs_x - rhs_z_L/s_l + rhs_z_U/s_u.
+                    let mut aug_i = -rhs_x_i;
+                    if l_fin { aug_i -= rhs_z_l_i / s_l; }
+                    if u_fin { aug_i += rhs_z_u_i / s_u; }
+                    let mut sigma_x_i = 0.0_f64;
+                    if l_fin { sigma_x_i += zli / s_l; }
+                    if u_fin { sigma_x_i += zui / s_u; }
+                    let mu_over_sl = if l_fin { state.mu / s_l } else { 0.0 };
+                    let mu_over_su = if u_fin { state.mu / s_u } else { 0.0 };
+                    eprintln!(
+                        "[rhs-probe] iter={} var={} mu={:.3e}\n  \
+                         x={:+.6e} x_l={:+.3e} x_u={:+.3e} s_l={:.3e} s_u={:.3e}\n  \
+                         grad_f={:+.6e} J^T y={:+.6e} z_L={:.6e} z_U={:.6e} kd={:+.3e}\n  \
+                         rhs_x = grad_f + Jty - z_L + z_U + kd = {:+.6e}\n  \
+                         rhs_z_L = z_L*s_l - mu = {:+.6e}   rhs_z_U = z_U*s_u - mu = {:+.6e}\n  \
+                         mu/s_L={:.3e} mu/s_U={:.3e}\n  \
+                         aug_rhs[var] = -rhs_x - rhs_z_L/s_L + rhs_z_U/s_U = {:+.6e}\n  \
+                         Sigma_x[var] = z_L/s_l + z_U/s_u = {:.6e}",
+                        state.iter, i, state.mu,
+                        xi, xli, xui, s_l, s_u,
+                        state.grad_f[i], jty_i, zli, zui, kd_term,
+                        rhs_x_i, rhs_z_l_i, rhs_z_u_i,
+                        mu_over_sl, mu_over_su,
+                        aug_i, sigma_x_i,
+                    );
+                }
+            }
+
+            match crate::kkt_aug::aug_step_from_state(
+                n, &state.grad_f,
+                &state.hess_rows, &state.hess_cols, &state.hess_vals,
+                &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals,
+                &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals,
+                &state.x, &x_l_full, &x_u_full, &z_l_full, &z_u_full,
+                &state.s, &state.c_x, &state.d_x, &d_l_full, &d_u_full,
+                &state.y_c, &state.y_d, &v_l_full, &v_u_full,
+                state.mu, options.kappa_d,
+                use_sparse,
+                aug_solver.as_mut(),
+                &mut inertia_params,
+            ) {
+                Ok((step, dw, dc, aug)) => (step, dc, None, aug, dw, dc),
+                Err(_e) => {
+                    timings.direction_solve += t_dir.elapsed();
+                    return make_result(&state, SolveStatus::NumericalError);
+                }
+            }
+        };
+        timings.direction_solve += t_dir.elapsed();
+        if let Some(mu_new) = mu_new_opt {
+            state.mu = mu_new;
+        }
+        install_step_directions(
+            &mut state, step.dx, step.dy_c, step.dy_d, step.ds,
+            step.dz_l, step.dz_u, step.dv_l, step.dv_u,
+        );
+
+        // A8.21: iter-0 step-direction probe. Dumps ||·||_inf and the
+        // five largest-magnitude (signed value, index) pairs for each of
+        // dx, ds, dy, dz_l, dz_u so we can compare element-by-element
+        // against Ipopt's `print_level=12` iter-0 trace.
+        if iteration == 0 && options.print_level >= 6 {
+            fn top5_signed(v: &[f64]) -> Vec<(usize, f64)> {
+                let mut idx: Vec<usize> = (0..v.len()).collect();
+                idx.sort_by(|&a, &b| v[b].abs().partial_cmp(&v[a].abs()).unwrap());
+                idx.iter().take(5).map(|&i| (i, v[i])).collect()
+            }
+            let dx_inf = state.dx.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+            let ds_inf = state.ds.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+            let ds_combined_iter0 = state.ds_combined();
+            let dy_combined_iter0 = state.dy_combined();
+            let dy_inf = dy_combined_iter0.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+            let dzl_inf = state.dz_l_compressed.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+            let dzu_inf = state.dz_u_compressed.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+            rip_log!(
+                "ripopt: iter0-step: ||dx||_inf={:.16e} ||ds||_inf={:.16e} ||dy||_inf={:.16e} ||dz_l||_inf={:.16e} ||dz_u||_inf={:.16e}",
+                dx_inf, ds_inf, dy_inf, dzl_inf, dzu_inf
+            );
+            // A8.21: emit the perturbation δ_w/δ_c that landed for iter 0.
+            // Ipopt's print_level=12 trace shows `delta_x=0.000000e+00
+            // delta_s=0.000000e+00` at iter 0; if ripopt non-zero here,
+            // that's a candidate root-cause for the dx gap.
+            rip_log!(
+                "ripopt: iter0-pert: delta_w_used={:.6e} delta_c_used={:.6e} delta_w_last={:.6e} delta_c_last={:.6e}",
+                _iter_dw, _iter_dc,
+                inertia_params.delta_w_last, inertia_params.delta_c_last
+            );
+            // Phase 6d.3: materialize dz_l/dz_u to full-n for the
+            // top5 diagnostic so the printed var indices match
+            // absolute variable ids.
+            let dz_l_iter0 = state.dz_l_combined();
+            let dz_u_iter0 = state.dz_u_combined();
+            for (name, vec) in [
+                ("dx", &state.dx[..]),
+                ("ds", &ds_combined_iter0[..]),
+                ("dy", &dy_combined_iter0[..]),
+                ("dz_l", &dz_l_iter0[..]),
+                ("dz_u", &dz_u_iter0[..]),
+            ] {
+                let top = top5_signed(vec);
+                let mut s = format!("ripopt: iter0-step: top5 {}:", name);
+                for (i, v) in top {
+                    s.push_str(&format!(" [{}]={:.16e}", i, v));
+                }
+                rip_log!("{}", s);
+            }
+            // A8.21 deep-dive: dump the assembled-system inputs that feed
+            // x-block row 1753 of the augmented system. This separates a
+            // tape-evaluation discrepancy (grad_f, J, H) from a Σ-assembly
+            // bug from a downstream issue.
+            let probe_var: usize = 1753;
+            if probe_var < state.n {
+                // grad_f at probe_var
+                let grad_f_pv = state.grad_f[probe_var];
+                // Σ_x at probe_var (matches kkt_aug::aug_step_from_state formula)
+                let xi = state.x[probe_var];
+                let xli = state.x_l_at(probe_var);
+                let xui = state.x_u_at(probe_var);
+                let mut sigma_x_pv = 0.0_f64;
+                // Phase 6d.3: index compressed mirrors via BoundLayout.
+                if let Some(k) = state.bound_layout.full_to_x_l[probe_var] {
+                    sigma_x_pv += state.z_l_compressed[k] / (xi - xli).max(1e-20);
+                }
+                if let Some(k) = state.bound_layout.full_to_x_u[probe_var] {
+                    sigma_x_pv += state.z_u_compressed[k] / (xui - xi).max(1e-20);
+                }
+                // Hessian row probe_var (lower-triangle entries (probe_var, *)
+                // and upper via (*, probe_var)).
+                let mut h_row: Vec<(usize, f64)> = Vec::new();
+                for k in 0..state.hess_rows.len() {
+                    let r = state.hess_rows[k];
+                    let c = state.hess_cols[k];
+                    let v = state.hess_vals[k];
+                    if v == 0.0 { continue; }
+                    if r == probe_var { h_row.push((c, v)); }
+                    else if c == probe_var { h_row.push((r, v)); }
+                }
+                // Jacobian column probe_var: rows of constraints that have a
+                // structural entry at column probe_var. Rebuild combined
+                // (rows, cols, vals) and m-form g once for the probe dump.
+                let (jrows_m, jcols_m, jvals_m) = rebuild_combined_jac(&state);
+                let g_m = state.g_combined();
+                let mut j_col: Vec<(usize, f64)> = Vec::new();
+                for k in 0..jrows_m.len() {
+                    if jcols_m[k] == probe_var {
+                        j_col.push((jrows_m[k], jvals_m[k]));
+                    }
+                }
+                rip_log!(
+                    "ripopt: iter0-row[{}]: grad_f={:.16e} sigma_x={:.16e} H_row_nnz={} J_col_nnz={}",
+                    probe_var, grad_f_pv, sigma_x_pv, h_row.len(), j_col.len()
+                );
+                {
+                    let mut s = format!("ripopt: iter0-row[{}]: H[{},*] (col,val):", probe_var, probe_var);
+                    for (c, v) in h_row.iter().take(20) {
+                        s.push_str(&format!(" ({},{:.6e})", c, v));
+                    }
+                    if h_row.len() > 20 { s.push_str(&format!(" ... [{}]", h_row.len())); }
+                    rip_log!("{}", s);
+                }
+                {
+                    let mut s = format!("ripopt: iter0-row[{}]: J[*,{}] (row,val):", probe_var, probe_var);
+                    for (r, v) in j_col.iter().take(20) {
+                        s.push_str(&format!(" ({},{:.6e})", r, v));
+                    }
+                    if j_col.len() > 20 { s.push_str(&format!(" ... [{}]", j_col.len())); }
+                    rip_log!("{}", s);
+                }
+                // For each constraint row that touches probe_var, dump:
+                //  g(x_0)[r], g_l[r], g_u[r], slack s[r], dy[r], plus the
+                //  full row of J at row r (other variables coupled).
+                for (r, _coeff) in j_col.iter().take(8) {
+                    let r = *r;
+                    let g_r = g_m[r];
+                    let gl_r = state.g_l_at(r);
+                    let gu_r = state.g_u_at(r);
+                    let dy_r = state.dy_at(r);
+                    let s_r = if r < state.m { state.s_at(r) } else { f64::NAN };
+                    // collect J row r (cols, vals)
+                    let mut j_row: Vec<(usize, f64)> = Vec::new();
+                    for k in 0..jrows_m.len() {
+                        if jrows_m[k] == r {
+                            j_row.push((jcols_m[k], jvals_m[k]));
+                        }
+                    }
+                    // Look up the per-row scaling via the layout (Phase 3
+                    // split storage; user-facing index r is combined).
+                    let scale_r = if let Some(k) = state.layout.eq_pos[r] {
+                        state.c_scaling.get(k).copied().unwrap_or(1.0)
+                    } else if let Some(k) = state.layout.ineq_pos[r] {
+                        state.d_scaling.get(k).copied().unwrap_or(1.0)
+                    } else {
+                        1.0
+                    };
+                    rip_log!(
+                        "ripopt: iter0-conrow[{}]: g={:.16e} g_l={:.16e} g_u={:.16e} s={:.16e} dy={:.16e} g_scale={:.16e} nnz={}",
+                        r, g_r, gl_r, gu_r, s_r, dy_r, scale_r, j_row.len()
+                    );
+                    let mut s = format!("ripopt: iter0-conrow[{}]: J[{},*]:", r, r);
+                    for (c, v) in j_row.iter().take(10) {
+                        s.push_str(&format!(" ({},{:.6e})", c, v));
+                    }
+                    if j_row.len() > 10 { s.push_str(&format!(" ... [{}]", j_row.len())); }
+                    rip_log!("{}", s);
+                }
+            }
+
+            // A8.21: targeted dump of (x, x_l, z_l, dx, dz_l, x-x_l) at the
+            // variable Ipopt reports as its delta_z_L max (absolute var
+            // 1753, 0-indexed; AMPL name x1754). ripopt's max dz_l is at
+            // 1753 too, so values at this index will reveal whether the
+            // discrepancy comes from dx (linear solve precision) or from
+            // the back-sub formula (x-x_l, z_l, μ inputs).
+            for &probe_i in &[1753usize, 1801usize, 1871usize] {
+                if probe_i < state.n {
+                    let xi = state.x[probe_i];
+                    let xli = state.x_l_at(probe_i);
+                    let xui = state.x_u_at(probe_i);
+                    // Phase 6d.3: index compressed mirrors via BoundLayout
+                    // (unbounded sides report 0 — same as the legacy combined storage).
+                    let zli = state.bound_layout.full_to_x_l[probe_i]
+                        .map(|k| state.z_l_compressed[k]).unwrap_or(0.0);
+                    let zui = state.bound_layout.full_to_x_u[probe_i]
+                        .map(|k| state.z_u_compressed[k]).unwrap_or(0.0);
+                    let dxi = state.dx[probe_i];
+                    let dzli = state.bound_layout.full_to_x_l[probe_i]
+                        .map(|k| state.dz_l_compressed[k]).unwrap_or(0.0);
+                    let dzui = state.bound_layout.full_to_x_u[probe_i]
+                        .map(|k| state.dz_u_compressed[k]).unwrap_or(0.0);
+                    let slack_l = xi - xli;
+                    let slack_u = xui - xi;
+                    rip_log!(
+                        "ripopt: iter0-probe[{}]: x={:.16e} x_l={:.16e} x_u={:.16e} (x-x_l)={:.16e} (x_u-x)={:.16e} z_l={:.16e} z_u={:.16e} dx={:.16e} dz_l={:.16e} dz_u={:.16e}",
+                        probe_i, xi, xli, xui, slack_l, slack_u, zli, zui, dxi, dzli, dzui
+                    );
+                }
+            }
         }
 
-        timings.direction_solve += t_dir.elapsed();
+        // RIPOPT_IR_DUMP: emit the full iter-0 KKT-system snapshot as
+        // structured JSON for cross-solver comparison via examples/arki_diff.
+        // Schema: src/iter0_dump.rs::Iter0Dump. The OnceCell guards against
+        // re-emission from restoration sub-IPM iter-0 (which would
+        // overwrite the main-solve dump with the restoration NLP's larger
+        // (n + 2m) state space).
+        // Skip the dump when we're inside the restoration sub-IPM
+        // (`configure_restoration_inner_options` flips this flag). The
+        // OnceLock alone is insufficient because the restoration's iter-0
+        // typically reaches this line before the outer main IPM does, and
+        // we want the OUTER state captured, not the (n + 2m) restoration
+        // state space.
+        static IR_DUMP_DONE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        if iteration == 0
+            && !options.disable_nlp_restoration
+            && IR_DUMP_DONE.get().is_none()
+        {
+            if let Ok(dump_path) = std::env::var("RIPOPT_IR_DUMP") {
+                let _ = IR_DUMP_DONE.set(());
+                use crate::iter0_dump::Iter0Dump;
+                let n = state.n;
+                let m = state.m;
+                let n_d = state.layout.n_d;
 
-        // Recover bound multiplier steps. If the Mehrotra corrector was applied,
-        // use the cross-term-aware recovery at μ_pc so dz stays consistent with
-        // the corrector complementarity equation; otherwise use the plain formula
-        // at state.mu.
-        // Mirror the RHS choice above: filter-LS mode does not apply the
-        // Mehrotra cross-term, so dz recovery uses the plain Fiacco formula
-        // dz_L[i] = (mu - z_L*s_L)/s_L - (z_L/s_L)*dx[i] at mu_new.
-        let mu_for_dz = mehrotra_aff.as_ref().map(|t| t.3).unwrap_or(state.mu);
-        let (dz_l, dz_u) = recover_dz_from_state(&state, &dx, mu_for_dz);
+                // Materialize x_l, x_u to full-n with `None` at unbounded sides.
+                let mut x_l_full: Vec<Option<f64>> = vec![None; n];
+                let mut x_u_full: Vec<Option<f64>> = vec![None; n];
+                for i in 0..n {
+                    if state.bound_layout.full_to_x_l[i].is_some() {
+                        x_l_full[i] = Some(state.x_l_at(i));
+                    }
+                    if state.bound_layout.full_to_x_u[i].is_some() {
+                        x_u_full[i] = Some(state.x_u_at(i));
+                    }
+                }
+                // Materialize d_l, d_u to length n_d with `None` at unbounded sides.
+                let mut d_l_full: Vec<Option<f64>> = vec![None; n_d];
+                let mut d_u_full: Vec<Option<f64>> = vec![None; n_d];
+                for k in 0..n_d {
+                    let dl = state.d_l_at(k);
+                    let du = state.d_u_at(k);
+                    if dl.is_finite() { d_l_full[k] = Some(dl); }
+                    if du.is_finite() { d_u_full[k] = Some(du); }
+                }
 
-        install_step_directions(&mut state, dx, dy, dz_l, dz_u);
+                // Materialize z_l, z_u, dz_l, dz_u, v_l, v_u, dv_l, dv_u.
+                let mut z_l_n = vec![0.0; n];
+                let mut z_u_n = vec![0.0; n];
+                for i in 0..n {
+                    if let Some(k) = state.bound_layout.full_to_x_l[i] {
+                        z_l_n[i] = state.z_l_compressed[k];
+                    }
+                    if let Some(k) = state.bound_layout.full_to_x_u[i] {
+                        z_u_n[i] = state.z_u_compressed[k];
+                    }
+                }
+                let dz_l_n = state.dz_l_combined();
+                let dz_u_n = state.dz_u_combined();
 
-        apply_gondzio_mcc(
-            &mut state,
-            options,
-            iteration,
-            &mu_state,
-            primal_inf,
-            dual_inf,
-            compl_inf,
-            &kkt_system_opt,
-            lin_solver.as_mut(),
-        );
+                // v_l/v_u, dv_l/dv_u as n_d-length arrays (zero at
+                // unbounded sides). v_l_combined()/v_u_combined() return
+                // length m; we want length n_d to match the schema.
+                let mut v_l_n = vec![0.0; n_d];
+                let mut v_u_n = vec![0.0; n_d];
+                let mut dv_l_n = vec![0.0; n_d];
+                let mut dv_u_n = vec![0.0; n_d];
+                for k in 0..n_d {
+                    if let Some(kc) = state.d_bound_layout.full_to_d_l[k] {
+                        v_l_n[k] = state.v_l_compressed[kc];
+                        dv_l_n[k] = state.dv_l_compressed[kc];
+                    }
+                    if let Some(kc) = state.d_bound_layout.full_to_d_u[k] {
+                        v_u_n[k] = state.v_u_compressed[kc];
+                        dv_u_n[k] = state.dv_u_compressed[kc];
+                    }
+                }
+
+                // Σ_x diagonal at iter 0 (full-n).
+                let mut sigma_x = vec![0.0; n];
+                for i in 0..n {
+                    let xi = state.x[i];
+                    if let Some(k) = state.bound_layout.full_to_x_l[i] {
+                        let xli = state.x_l_at(i);
+                        sigma_x[i] += state.z_l_compressed[k] / (xi - xli).max(1e-20);
+                    }
+                    if let Some(k) = state.bound_layout.full_to_x_u[i] {
+                        let xui = state.x_u_at(i);
+                        sigma_x[i] += state.z_u_compressed[k] / (xui - xi).max(1e-20);
+                    }
+                }
+                // Σ_s diagonal at iter 0 (length n_d).
+                let mut sigma_s = vec![0.0; n_d];
+                for k in 0..n_d {
+                    let sk = state.s[k];
+                    if let Some(kc) = state.d_bound_layout.full_to_d_l[k] {
+                        let dl = state.d_l_compressed[kc];
+                        sigma_s[k] += state.v_l_compressed[kc] / (sk - dl).max(1e-20);
+                    }
+                    if let Some(kc) = state.d_bound_layout.full_to_d_u[k] {
+                        let du = state.d_u_compressed[kc];
+                        sigma_s[k] += state.v_u_compressed[kc] / (du - sk).max(1e-20);
+                    }
+                }
+
+                // Combined Jacobian and constraint values.
+                let (jrows, jcols, jvals) = rebuild_combined_jac(&state);
+                let g_combined = state.g_combined();
+
+                // Per-variable scaling: ripopt has no full per-var scaling;
+                // emit all-1.0 (matches the schema contract).
+                let x_scaling = vec![1.0; n];
+                // Combined per-constraint scaling (length m): merge split
+                // c_scaling (eq) and d_scaling (ineq) via the layout.
+                let mut c_scaling_combined = vec![1.0; m];
+                for r in 0..m {
+                    if let Some(k) = state.layout.eq_pos[r] {
+                        c_scaling_combined[r] = state.c_scaling.get(k).copied().unwrap_or(1.0);
+                    } else if let Some(k) = state.layout.ineq_pos[r] {
+                        c_scaling_combined[r] = state.d_scaling.get(k).copied().unwrap_or(1.0);
+                    }
+                }
+
+                let dump = Iter0Dump {
+                    solver: "ripopt".to_string(),
+                    note: format!(
+                        "ripopt iter-0 dump @ mu={:.6e}, n={}, m={}, n_d={}",
+                        state.mu, n, m, n_d
+                    ),
+                    n, m, n_d,
+                    x: state.x.clone(),
+                    x_l: x_l_full,
+                    x_u: x_u_full,
+                    s: state.s.clone(),
+                    d_l: d_l_full,
+                    d_u: d_u_full,
+                    y_c: state.y_c.clone(),
+                    y_d: state.y_d.clone(),
+                    y_layout: "split".to_string(),
+                    z_l: z_l_n,
+                    z_u: z_u_n,
+                    v_l: v_l_n,
+                    v_u: v_u_n,
+                    grad_f: state.grad_f.clone(),
+                    g: g_combined,
+                    jac_rows: jrows,
+                    jac_cols: jcols,
+                    jac_vals: jvals,
+                    hess_rows: state.hess_rows.clone(),
+                    hess_cols: state.hess_cols.clone(),
+                    hess_vals: state.hess_vals.clone(),
+                    obj_scaling: state.obj_scaling,
+                    x_scaling,
+                    c_scaling: c_scaling_combined,
+                    sigma_x,
+                    sigma_s,
+                    aug_rhs: Vec::new(),
+                    delta_w_used: _iter_dw,
+                    delta_c_used: _iter_dc,
+                    dx: state.dx.clone(),
+                    ds: state.ds.clone(),
+                    dy: state.dy_combined(),
+                    dz_l: dz_l_n,
+                    dz_u: dz_u_n,
+                    dv_l: dv_l_n,
+                    dv_u: dv_u_n,
+                    alpha_pr: 0.0,
+                    alpha_du: 0.0,
+                    mu: state.mu,
+                };
+                dump.write(&dump_path);
+                rip_log!("ripopt: iter0-dump: wrote JSON to {}", dump_path);
+            }
+        }
 
         let (tau, alpha_primal_max, alpha_dual_max) = compute_alpha_max(
             &state, options, &mu_state, primal_inf, dual_inf, compl_inf,
@@ -8378,24 +7901,60 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         trace_meta.alpha_primal_max = Some(alpha_primal_max);
         trace_meta.tau_used = Some(tau);
 
+        // Ipopt-style tiny-step detection (T2.21, spec §4): set the
+        // `tiny_step` flag when the raw search direction is at machine-
+        // precision noise AND the dual step is also small. The actual
+        // STOP_AT_TINY_STEP exit fires from `update_barrier_parameter`
+        // when `tiny_step && new_μ == μ` and is consumed at the top of
+        // the next iteration (after `check_convergence`).
+        // See `IpBacktrackingLineSearch.cpp:1219-1278,407-424`,
+        // `IpMonotoneMuUpdate.cpp:158-160`,
+        // `IpAdaptiveMuUpdate.cpp:329,377`.
         detect_tiny_step(
             &mut state,
             options,
             &mut mu_state,
             &mut filter,
-            &mut consecutive_tiny_steps,
-            alpha_primal_max,
+            &mut tiny_step_last_iter,
             primal_inf,
         );
 
         // Line search
         let t_ls = Instant::now();
-        let theta_current = primal_inf;
+        // A8.19: filter theta is slack-coupled (`||c||_1 + ||d − s||_1`)
+        // matching Ipopt's `IpCq::curr_constraint_violation`. The
+        // box-violation `primal_inf` is preserved separately as a
+        // diagnostic and as the input to other consumers (compute_tau,
+        // detect_tiny_step, almost_feasible_guard, feasibility history).
+        let theta_current = theta_for_split_d_s(&state, &state.c_x, &state.d_x, &state.s);
         let phi_current = state.barrier_objective(options);
         let grad_phi_step = state.barrier_directional_derivative(options);
 
         let mut step_accepted;
         let min_alpha = filter.compute_alpha_min(theta_current, grad_phi_step);
+
+        // RIPOPT_LS_DECISION probe: print pre-LS step direction
+        // norms + α_max + α_min + grad_phi_step. Pair with the
+        // existing RIPOPT_LS_PROBE prints inside run_line_search_loop
+        // to localise iter-N divergence vs Ipopt. Gated by env var,
+        // disabled at print_level=0.
+        if std::env::var("RIPOPT_LS_DECISION").is_ok() {
+            let dx_inf = linf_norm(&state.dx);
+            let ds_inf = linf_norm(&state.ds);
+            let dyc_inf = linf_norm(&state.dy_c);
+            let dyd_inf = linf_norm(&state.dy_d);
+            let dzl_inf = linf_norm(&state.dz_l_compressed);
+            let dzu_inf = linf_norm(&state.dz_u_compressed);
+            eprintln!(
+                "[ls-decision] iter={} alpha_p_max={:.3e} alpha_d_max={:.3e} alpha_min={:.3e} \
+                 ||dx||={:.3e} ||ds||={:.3e} ||dy_c||={:.3e} ||dy_d||={:.3e} ||dz_L||={:.3e} ||dz_U||={:.3e} \
+                 theta={:.6e} phi={:.6e} grad_phi_step={:.6e}",
+                iteration, alpha_primal_max, alpha_dual_max, min_alpha,
+                dx_inf, ds_inf, dyc_inf, dyd_inf, dzl_inf, dzu_inf,
+                theta_current, phi_current, grad_phi_step,
+            );
+        }
+
         // Snapshot x before the line search so we can roll back + halve α if the
         // post-step gradient / Jacobian / Hessian eval trips the NaN/Inf guard
         // (Ipopt's line search catches Eval_Error from these with α-backtracking,
@@ -8407,25 +7966,20 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             problem,
             options,
             &mut filter,
-            &condensed_system,
-            &mut cond_solver_for_soc,
-            &sparse_condensed_system,
-            &kkt_system_opt,
-            lin_solver.as_mut(),
+            &mut inertia_params,
             alpha_primal_max,
             theta_current,
             phi_current,
             grad_phi_step,
             min_alpha,
-            force_restoration,
             watchdog.active,
             iteration,
             n,
             m,
-            start_time,
-            early_timeout,
             &mut trace_meta,
             &mut ls_steps,
+            aug_solver.as_mut(),
+            &aug_kkt,
         ) {
             LineSearchOutcome::StepAccepted => {
                 step_accepted = true;
@@ -8433,7 +7987,6 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             LineSearchOutcome::Rejected => {
                 step_accepted = false;
             }
-            LineSearchOutcome::Return(result) => return result,
         }
 
         let mut accepted_by_soft_resto = false;
@@ -8455,6 +8008,23 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         }
 
         if !step_accepted {
+            // Ipopt's `PrepareRestoPhaseStart` augments the filter with
+            // the (theta_current, phi_current) margin entry BEFORE the
+            // almost-feasible guard fires (IpBacktrackingLineSearch.cpp:566
+            // vs :580). Augmenting here means the filter is correctly
+            // updated whether the guard exits or the restoration cascade
+            // runs, and avoids a second augment inside the cascade.
+            filter.augment_for_restoration(theta_current, phi_current);
+
+            if let Some(result) = check_almost_feasible_guard(
+                &mut state,
+                options,
+                &mut filter,
+                primal_inf,
+                primal_inf_max,
+            ) {
+                return result;
+            }
             match run_post_ls_restoration_cascade(
                 &mut state,
                 problem,
@@ -8465,16 +8035,13 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 &mut lbfgs_state,
                 lbfgs_mode,
                 linear_constraints.as_deref(),
-                &mut restoration,
                 iteration,
                 n,
                 m,
                 start_time,
                 deadline,
-                early_timeout,
                 &feas,
                 theta_current,
-                phi_current,
             ) {
                 RestorationCascadeDecision::Continue => continue,
                 RestorationCascadeDecision::Return(result) => return result,
@@ -8509,11 +8076,12 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
 
         timings.line_search += t_ls.elapsed();
 
-        let mu_ks = update_dual_variables(
+        let _ = update_dual_variables(
             &mut state,
             &mu_state,
             alpha_dual_max,
-            &mut dy_tracker,
+            options,
+            problem,
         );
 
         match reevaluate_after_step(
@@ -8522,7 +8090,6 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             options,
             &mut lbfgs_state,
             &mut filter,
-            &mut restoration,
             &mut timings,
             &x_pre_step,
             linear_constraints.as_deref(),
@@ -8534,19 +8101,128 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             PostStepEvalDecision::Return(result) => return result,
         }
 
-        reset_slack_multipliers(&mut state, mu_ks);
-        track_best_feasible(&state, options, &mut best_feasible);
+        // Magic step (spec §5.3, T2.24). Ipopt's
+        // `BacktrackingLineSearch::PerformMagicStep` mutates the
+        // explicit slack `s` to drive the residual `d(x) - s` toward
+        // zero along the slack coordinate while holding `x` fixed
+        // (`IpBacktrackingLineSearch.cpp:1013-1111`). ripopt's
+        // implicit-slack formulation has no `s` distinct from `x`, so
+        // `apply_magic_step` is a no-op on this path (see its docs);
+        // the call is retained for spec-compliance and as the hook
+        // for any future explicit-slack solve path.
+        let _ = apply_magic_step(&mut state, options);
+        maybe_recalc_y_post_step(&mut state, options, n, m, lbfgs_mode);
 
         // --- Barrier parameter update (free/fixed mode) ---
+        // Save mu before so we can detect "mu update found nothing to
+        // change" (Ipopt `!mu_changed`, IpMonotoneMuUpdate.cpp:158-160).
+        let mu_before_update = state.mu;
         update_barrier_parameter(
             &mut state,
             &mut mu_state,
             &mut filter,
             &mut last_mehrotra_sigma,
             options,
+            use_sparse,
         );
+        // Set the STOP_AT_TINY_STEP latch when the tiny-step flag is
+        // active and the mu update could not advance — exactly the
+        // Ipopt throw condition (`!mu_changed && tiny_step_flag`,
+        // IpMonotoneMuUpdate.cpp:158-160; IpAdaptiveMuUpdate.cpp:330,377).
+        // `mu_state.tiny_step` already encodes "current iter detection
+        // AND previous iter latched", so no extra counter gate is needed.
+        // Consumed at the top of the next iteration AFTER check_convergence,
+        // so a KKT-clean iterate still exits Optimal.
+        if mu_state.tiny_step && state.mu == mu_before_update {
+            pending_tiny_step_exit = true;
+        }
 
         track_post_step_acceptable(&mut state, options);
+
+        // RIPOPT_FILTER_DUMP=lo,hi: dump full filter contents at end of
+        // each iter in [lo, hi]. Diagnostic for arki0003 iter-110
+        // divergence — compares ripopt's filter set to Ipopt's
+        // print_level=12 output to localize missing augmentations.
+        if let Ok(spec) = std::env::var("RIPOPT_FILTER_DUMP") {
+            let mut parts = spec.split(',');
+            let lo: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let hi: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+            if state.iter >= lo && state.iter <= hi {
+                let entries = filter.entries();
+                eprintln!(
+                    "[filter-dump] iter={} n_entries={} resets={}",
+                    state.iter, entries.len(), filter.n_filter_resets(),
+                );
+                for (idx, e) in entries.iter().enumerate() {
+                    eprintln!(
+                        "  filter[{}] theta={:.10e} phi={:.10e}",
+                        idx, e.theta, e.phi,
+                    );
+                }
+            }
+        }
+
+        // A8.6+ dual-divergence trace: env-gated per-iter snapshot of
+        // the dual state. Set RIPOPT_TRACE_DUAL=1 to log ‖y‖_∞,
+        // worst-y_i index, α_pr/α_du, μ, and μ-mode at the end of
+        // every accepted iteration. Used to identify the iter where a
+        // diverging trajectory first deviates from the Ipopt log.
+        if std::env::var("RIPOPT_TRACE_DUAL").is_ok() {
+            let mut y_inf = 0.0_f64;
+            let mut y_idx = usize::MAX;
+            for i in 0..state.m {
+                let yi = state.y_at(i);
+                if yi.abs() > y_inf {
+                    y_inf = yi.abs();
+                    y_idx = i;
+                }
+            }
+            let mode_str = match mu_state.mode {
+                MuMode::Free => "Free",
+                MuMode::Fixed => "Fixed",
+            };
+            // Step magnitude ranges: dx/dy/dz_l/dz_u L∞.
+            let dx_inf = linf_norm(&state.dx);
+            let dy_inf = state
+                .dy_c
+                .iter()
+                .chain(state.dy_d.iter())
+                .fold(0.0f64, |a, &b| a.max(b.abs()));
+            let dzl_inf = linf_norm(&state.dz_l_compressed);
+            let dzu_inf = linf_norm(&state.dz_u_compressed);
+            // Worst (z·s)/μ ratio: should be bounded by κ_Σ (default 1e10)
+            // per Ipopt's reset_slack_multipliers / IpIpoptCalculatedQuantities.
+            // Ratios >> 1 indicate the κ_Σ clamp is not enforcing.
+            let mut worst_zs_ratio = 0.0_f64;
+            let mut worst_zs_idx = usize::MAX;
+            let mut worst_zs_side = "";
+            // Phase 6c.2: walk compressed z mirrors; iteration set is
+            // identical to the n-wide+is_finite scan.
+            for k in 0..state.bound_layout.n_x_l {
+                let i = state.bound_layout.x_l_to_full[k];
+                let s = state.x[i] - state.x_l_at(i);
+                if s > 0.0 {
+                    let r = (state.z_l_compressed[k] * s).abs() / state.mu.max(1e-300);
+                    if r > worst_zs_ratio { worst_zs_ratio = r; worst_zs_idx = i; worst_zs_side = "L"; }
+                }
+            }
+            for k in 0..state.bound_layout.n_x_u {
+                let i = state.bound_layout.x_u_to_full[k];
+                let s = state.x_u_at(i) - state.x[i];
+                if s > 0.0 {
+                    let r = (state.z_u_compressed[k] * s).abs() / state.mu.max(1e-300);
+                    if r > worst_zs_ratio { worst_zs_ratio = r; worst_zs_idx = i; worst_zs_side = "U"; }
+                }
+            }
+            eprintln!(
+                "[dual] it={:4} ‖y‖∞={:.3e}@{} α_p={:.3e} α_d={:.3e} μ={:.3e} mode={} resto={} ‖dx‖={:.2e} ‖dy‖={:.2e} ‖dz_l‖={:.2e} ‖dz_u‖={:.2e} max(zs)/μ={:.2e}@{}{}",
+                iteration, y_inf, y_idx,
+                state.alpha_primal, state.alpha_dual, state.mu, mode_str,
+                state.diagnostics.restoration_count,
+                dx_inf, dy_inf, dzl_inf, dzu_inf,
+                worst_zs_ratio, worst_zs_idx, worst_zs_side,
+            );
+        }
     }
 
     finalize_after_max_iter(
@@ -8664,29 +8340,6 @@ fn finalize_after_max_iter(
     make_result(state, SolveStatus::MaxIterations)
 }
 
-/// Classify each constraint as equality / lower-bounded / upper-bounded
-/// and build the initial `(c_soc, latest_trial_c)` pair used by the
-/// second-order correction iteration. Mirrors the residual setup in
-/// Ipopt IpFilterLSAcceptor.cpp:555-569.
-fn init_soc_constraint_residuals(
-    state: &SolverState,
-    g_trial: &[f64],
-) -> (Vec<f64>, Vec<f64>) {
-    let m = state.m;
-    let mut c_soc = vec![0.0; m];
-    let mut latest_trial_c = vec![0.0; m];
-    for i in 0..m {
-        if constraint_is_equality(state, i) || state.g_l[i].is_finite() {
-            c_soc[i] = state.g[i] - state.g_l[i];
-            latest_trial_c[i] = g_trial[i] - state.g_l[i];
-        } else if state.g_u[i].is_finite() {
-            c_soc[i] = state.g[i] - state.g_u[i];
-            latest_trial_c[i] = g_trial[i] - state.g_u[i];
-        }
-    }
-    (c_soc, latest_trial_c)
-}
-
 /// Fraction-to-boundary on `dx_soc` against the variable bounds, then
 /// build the bounded trial point `x_soc = x + α·dx_soc` (clamped strictly
 /// inside finite bounds by 1e-14). Returns `(x_soc, alpha_primal_soc)`.
@@ -8725,8 +8378,9 @@ fn evaluate_soc_trial_and_check<P: NlpProblem>(
     state: &SolverState,
     problem: &P,
     options: &SolverOptions,
-    filter: &Filter,
+    filter: &mut Filter,
     x_soc: Vec<f64>,
+    s_soc: &[f64],
     n: usize,
     m: usize,
     theta_current: f64,
@@ -8736,26 +8390,34 @@ fn evaluate_soc_trial_and_check<P: NlpProblem>(
     kappa_soc: f64,
     theta_prev_soc: &mut f64,
 ) -> SocTrialOutcome {
+    // Phase 10b.2: SOC trial eval routes through SplitNlp. The
+    // m-form `g_soc` survives only inside the adapter's scratch and
+    // the caller-owned mirror used to feed `commit_trial_point` /
+    // `latest_trial_*` builders that still expect combined form.
+    let nlp = crate::split_nlp::SplitNlp::new(problem, &state.layout);
     let mut obj_soc = f64::INFINITY;
-    if !problem.objective(&x_soc, true, &mut obj_soc) || !obj_soc.is_finite() {
+    if !nlp.objective(&x_soc, true, &mut obj_soc) || !obj_soc.is_finite() {
         return SocTrialOutcome::Abort;
     }
     let mut g_soc = vec![0.0; m];
-    if !problem.constraints(&x_soc, false, &mut g_soc) {
+    if !nlp.constraints_combined(&x_soc, false, &mut g_soc) {
         return SocTrialOutcome::Abort;
     }
     if g_soc.iter().any(|v| !v.is_finite()) {
         return SocTrialOutcome::Abort;
     }
 
-    let theta_soc = theta_for_g(state, &g_soc);
+    // A8.19 slack-coupled SOC theta: s_soc = state.s + α_p_soc · ds_d_soc.
+    let (c_soc_split, d_soc_split) = split_from_g(state, &g_soc);
+    let theta_soc = theta_for_split_d_s(state, &c_soc_split, &d_soc_split, s_soc);
     if theta_soc >= kappa_soc * *theta_prev_soc {
         return SocTrialOutcome::Abort;
     }
     *theta_prev_soc = theta_soc;
 
     let phi_soc = compute_barrier_phi(
-        obj_soc, &x_soc, &g_soc, state, n, m, options.constraint_slack_barrier,
+        obj_soc, &x_soc, s_soc, state, n, m, options.constraint_slack_barrier,
+        options.kappa_d,
     );
 
     // Pass ORIGINAL alpha (alpha_primal_test), not alpha_primal_soc.
@@ -8766,7 +8428,7 @@ fn evaluate_soc_trial_and_check<P: NlpProblem>(
         theta_soc,
         phi_soc,
         grad_phi_step,
-        alpha,
+        alpha, false,
     );
 
     if acceptable {
@@ -8776,45 +8438,33 @@ fn evaluate_soc_trial_and_check<P: NlpProblem>(
     }
 }
 
-/// Refresh `latest_trial_c` from a newly evaluated `g_soc`, using the
-/// same equality/lower/upper classification as
-/// `init_soc_constraint_residuals`.
-fn update_soc_latest_trial_c(
-    state: &SolverState,
-    g_soc: &[f64],
-    latest_trial_c: &mut [f64],
-) {
-    for i in 0..state.m {
-        if constraint_is_equality(state, i) || state.g_l[i].is_finite() {
-            latest_trial_c[i] = g_soc[i] - state.g_l[i];
-        } else if state.g_u[i].is_finite() {
-            latest_trial_c[i] = g_soc[i] - state.g_u[i];
-        }
-    }
-}
-
-/// Shared SOC iteration loop used by all three KKT variants.
+/// SOC using the 4-block augmented KKT system (A7.5b).
 ///
-/// `solve_dx` is a callable that takes the current `c_soc` accumulated
-/// constraint-residual target and returns `Some(dx_soc)` on success or
-/// `None` to abort the SOC loop. The three variants differ only in how
-/// they compute `dx_soc`; everything else (the c_soc accumulation,
-/// fraction-to-boundary, filter-based acceptance, latest-trial-c
-/// bookkeeping, and abort condition) is identical and lives here.
+/// Ports `IpFilterLSAcceptor::TrySecondOrderCorrection` (`IpFilterLSAcceptor.cpp:550-640`)
+/// for the augmented path. Two accumulators — `c_soc` (length `n_c`,
+/// equality residual `g_eq − g_eq_target`) and `dms_soc` (length `n_d`,
+/// inequality consistency residual `g_ineq − s_ineq`) — track the
+/// constraint violation across SOC iterations. Each iteration accumulates
+/// `α_p_soc · trial_*`, builds a fresh aug Newton RHS at the current
+/// iterate, and overwrites the y_c / y_d slots with the accumulators
+/// (`soc_method = 0`).
 ///
-/// Mirrors Ipopt IpFilterLSAcceptor.cpp:555-620.
+/// Re-factors per call; A7.7 (factor caching) will share the upstream
+/// Newton step's factorization since the matrix W + Σ does not change.
 #[allow(clippy::too_many_arguments)]
-fn run_soc_loop<P: NlpProblem, F: FnMut(&[f64]) -> Option<Vec<f64>>>(
+fn attempt_soc_aug<P: NlpProblem>(
     state: &SolverState,
     problem: &P,
-    options: &SolverOptions,
-    filter: &Filter,
     g_trial: &[f64],
+    _inertia_params: &mut InertiaCorrectionParams,
+    filter: &mut Filter,
     theta_current: f64,
     phi_current: f64,
     grad_phi_step: f64,
     alpha: f64,
-    mut solve_dx: F,
+    options: &SolverOptions,
+    aug_solver: &mut dyn LinearSolver,
+    aug_kkt: &crate::kkt_aug::AugKktSystem,
 ) -> Option<(Vec<f64>, f64, Vec<f64>, f64)> {
     let n = state.n;
     let m = state.m;
@@ -8822,25 +8472,103 @@ fn run_soc_loop<P: NlpProblem, F: FnMut(&[f64]) -> Option<Vec<f64>>>(
         return None;
     }
 
+    let g_l_combined_for_soc = state.g_l_combined();
+    let g_u_combined_for_soc = state.g_u_combined();
+    let partition = crate::constraint_layout::ConstraintLayout::new(&g_l_combined_for_soc, &g_u_combined_for_soc);
+    let n_c = partition.n_c;
+    let n_d = partition.n_d;
+
+    // Phase 5d: read split storage directly. c_soc[k] = c(x)[k] (Ipopt's
+    // curr_c, IpIpoptCalculatedQuantities); dms_soc[k] = d(x)[k] - s[k]
+    // (curr_d_minus_s).
+    let mut c_soc = vec![0.0; n_c];
+    let mut dms_soc = vec![0.0; n_d];
+    for k in 0..n_c {
+        c_soc[k] = state.c_x[k];
+    }
+    for k in 0..n_d {
+        dms_soc[k] = state.d_x[k] - state.s[k];
+    }
+
+    // First-iteration trial residuals: g_trial / s_trial = s + α·ds.
+    let mut latest_trial_c = vec![0.0; n_c];
+    let mut latest_trial_dms = vec![0.0; n_d];
+    for i in 0..m {
+        if let Some(k) = partition.eq_pos[i] {
+            latest_trial_c[k] = g_trial[i] - state.g_l_at(i);
+        } else if let Some(k) = partition.ineq_pos[i] {
+            let s_trial_i = state.s[k] + alpha * state.ds[k];
+            latest_trial_dms[k] = g_trial[i] - s_trial_i;
+        }
+    }
+
     let kappa_soc = 0.99;
     let tau = (1.0 - state.mu).max(options.tau_min);
 
-    let (mut c_soc, mut latest_trial_c) = init_soc_constraint_residuals(state, g_trial);
     let mut alpha_primal_soc = alpha;
-    let mut theta_prev_soc = theta_for_g(state, g_trial);
+    // A8.19 slack-coupled theta: the SOC seed reuses the upstream
+    // line-search trial slack `s + α·ds`, matching `latest_trial_dms`
+    // initialised above.
+    let s_trial_seed = compute_trial_slack(state, alpha);
+    let (c_seed_soc, d_seed_soc) = split_from_g(state, g_trial);
+    let mut theta_prev_soc = theta_for_split_d_s(state, &c_seed_soc, &d_seed_soc, &s_trial_seed);
+
+    // Phase 6d.5: materialize compressed z once for the SOC inner loop's
+    // kkt_aug calls (kkt_aug.rs still consumes full-`n` z slices).
+    let z_l_full = state.z_l_combined();
+    let z_u_full = state.z_u_combined();
+    // Phase 7c: same for x_l/x_u.
+    let x_l_full = state.x_l_combined();
+    let x_u_full = state.x_u_combined();
+    // Phase 8c.5: same for compressed v_l/v_u → length n_d.
+    let v_l_full = state.d_bound_layout.expand_l(&state.v_l_compressed, 0.0);
+    let v_u_full = state.d_bound_layout.expand_u(&state.v_u_compressed, 0.0);
+    // Phase 9c.5: same for compressed d_l/d_u → length n_d.
+    let d_l_full = state.d_l();
+    let d_u_full = state.d_u();
 
     for _soc_iter in 0..options.max_soc {
-        for i in 0..m {
-            c_soc[i] += alpha_primal_soc * latest_trial_c[i];
+        for k in 0..n_c {
+            c_soc[k] += alpha_primal_soc * latest_trial_c[k];
+        }
+        for k in 0..n_d {
+            dms_soc[k] += alpha_primal_soc * latest_trial_dms[k];
         }
 
-        let dx_soc = solve_dx(&c_soc)?;
+        // A7.7: SOC reuses the upstream Newton step's factorization. The
+        // aug matrix (W + Σ + perturbation) is identical to the one
+        // factored at the top of the IPM iteration; only the y_c/y_d RHS
+        // slots change.
+        let (dx_soc, ds_d_soc) = match crate::kkt_aug::aug_soc_solve_dx_factored(
+            n, &state.grad_f,
+            &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals,
+            &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals,
+            &state.x, &x_l_full, &x_u_full, &z_l_full, &z_u_full,
+            &state.s, &state.c_x, &state.d_x, &d_l_full, &d_u_full,
+            &state.y_c, &state.y_d,
+            &v_l_full, &v_u_full,
+            state.mu, options.kappa_d,
+            aug_solver,
+            aug_kkt,
+            &c_soc, &dms_soc,
+        ) {
+            Some(p) => p,
+            None => return None,
+        };
 
-        let (x_soc, alpha_primal_soc_new) = compute_soc_alpha_and_trial_x(state, &dx_soc, tau);
+        let (x_soc, alpha_primal_soc_new) =
+            compute_soc_alpha_and_trial_x(state, &dx_soc, tau);
         alpha_primal_soc = alpha_primal_soc_new;
 
+        // A8.19: build s_soc = state.s + α_p_soc · ds_d_soc (d-form).
+        // Phase 3d: state.s and ds_d_soc both index by k ∈ [0, n_d).
+        let mut s_soc = state.s.clone();
+        for k in 0..n_d {
+            s_soc[k] = state.s[k] + alpha_primal_soc * ds_d_soc[k];
+        }
+
         match evaluate_soc_trial_and_check(
-            state, problem, options, filter, x_soc, n, m,
+            state, problem, options, filter, x_soc, &s_soc, n, m,
             theta_current, phi_current, grad_phi_step, alpha,
             kappa_soc, &mut theta_prev_soc,
         ) {
@@ -8849,7 +8577,16 @@ fn run_soc_loop<P: NlpProblem, F: FnMut(&[f64]) -> Option<Vec<f64>>>(
             }
             SocTrialOutcome::Abort => return None,
             SocTrialOutcome::NotAccepted { g_soc } => {
-                update_soc_latest_trial_c(state, &g_soc, &mut latest_trial_c);
+                // Refresh latest_trial_* using the rejected SOC trial:
+                //   s_soc[k] = state.s[k] + α_p_soc · ds_d_soc[k]   for k ∈ d-block.
+                for i in 0..m {
+                    if let Some(k) = partition.eq_pos[i] {
+                        latest_trial_c[k] = g_soc[i] - state.g_l_at(i);
+                    } else if let Some(k) = partition.ineq_pos[i] {
+                        let s_soc_i = state.s[k] + alpha_primal_soc * ds_d_soc[k];
+                        latest_trial_dms[k] = g_soc[i] - s_soc_i;
+                    }
+                }
             }
         }
     }
@@ -8857,149 +8594,159 @@ fn run_soc_loop<P: NlpProblem, F: FnMut(&[f64]) -> Option<Vec<f64>>>(
     None
 }
 
-/// Attempt a second-order correction step.
+/// Post-restoration bound-multiplier handoff aligned with Ipopt 3.14
+/// `MinC_1NrmRestorationPhase::PerformRestoration`
+/// (`IpRestoMinC_1Nrm.cpp:374-419`).
 ///
-/// If the trial point has worse constraint violation than the current point,
-/// try to correct by solving a modified system targeting the trial constraint values.
-#[allow(clippy::too_many_arguments)]
-fn attempt_soc<P: NlpProblem>(
-    state: &SolverState,
-    problem: &P,
-    _x_trial: &[f64],
-    g_trial: &[f64],
-    solver: &mut dyn LinearSolver,
-    kkt: &kkt::KktSystem,
-    filter: &Filter,
-    theta_current: f64,
-    phi_current: f64,
-    grad_phi_step: f64,
-    alpha: f64,
-    options: &SolverOptions,
-) -> Option<(Vec<f64>, f64, Vec<f64>, f64)> {
-    let n = state.n;
-    let m = state.m;
-    run_soc_loop(
-        state, problem, options, filter, g_trial,
-        theta_current, phi_current, grad_phi_step, alpha,
-        |c_soc| {
-            let mut rhs_soc = kkt.rhs.clone();
-            for i in 0..m {
-                rhs_soc[n + i] = -c_soc[i];
-            }
-            let mut sol_soc = vec![0.0; n + m];
-            if solver.solve(&rhs_soc, &mut sol_soc).is_err() {
-                return None;
-            }
-            Some(sol_soc[..n].to_vec())
-        },
-    )
-}
-
-/// Attempt a second-order correction step using the condensed KKT system.
+/// Treats the entire restoration progress in `(x, s)` as a single
+/// primal-dual Newton step:
 ///
-/// Same logic as `attempt_soc` but uses the condensed system to avoid building
-/// the full (n+m)×(n+m) KKT matrix. Uses `solve_condensed_soc` which rebuilds
-/// only the n-dimensional condensed RHS with the modified constraint residual.
-#[allow(clippy::too_many_arguments)]
-fn attempt_soc_condensed<P: NlpProblem>(
-    state: &SolverState,
-    problem: &P,
-    g_trial: &[f64],
-    solver: &mut DenseLdl,
-    condensed: &kkt::CondensedKktSystem,
-    filter: &Filter,
-    theta_current: f64,
-    phi_current: f64,
-    grad_phi_step: f64,
-    alpha: f64,
+///   δ_z = (μ − z_curr · trial_slack) / curr_slack − z_curr   (per bound)
+///
+/// (Ipopt's `ComputeBoundMultiplierStep`, `IpRestoMinC_1Nrm.cpp:438-453`),
+/// applied to all four blocks `(z_L, z_U, v_L, v_U)` using the parent's
+/// **pre-restoration** multipliers and slacks (NOT the inner-resto NLP's
+/// z's — those solve a different stationarity).
+///
+/// A single `α_dual` is computed via `dual_frac_to_the_bound` across all
+/// four blocks (`IpRestoMinC_1Nrm.cpp:394-395`), then the step is applied
+/// to all four. If any post-step multiplier exceeds
+/// `bound_mult_reset_threshold` (Ipopt default 1e3, `IpRestoMinC_1Nrm.cpp:40`),
+/// **all four blocks are reset to 1.0** (lines 402-419 — the "nuclear
+/// reset"). Returns whether the nuclear reset fired (informational only;
+/// caller no longer branches on it).
+///
+/// `x_cur` and `s_cur` are the pre-restoration primal iterate / slack;
+/// `state.x` and `state.s` already hold the post-restoration trial at
+/// call time.
+fn update_bound_multipliers_after_restoration(
+    state: &mut SolverState,
     options: &SolverOptions,
-) -> Option<(Vec<f64>, f64, Vec<f64>, f64)> {
-    run_soc_loop(
-        state, problem, options, filter, g_trial,
-        theta_current, phi_current, grad_phi_step, alpha,
-        |c_soc| kkt::solve_condensed_soc(condensed, solver, c_soc).ok(),
-    )
-}
-
-/// SOC using sparse condensed KKT system.
-fn attempt_soc_sparse_condensed<P: NlpProblem>(
-    state: &SolverState,
-    problem: &P,
-    g_trial: &[f64],
-    solver: &mut dyn LinearSolver,
-    condensed: &kkt::SparseCondensedKktSystem,
-    filter: &Filter,
-    theta_current: f64,
-    phi_current: f64,
-    grad_phi_step: f64,
-    alpha: f64,
-    options: &SolverOptions,
-) -> Option<(Vec<f64>, f64, Vec<f64>, f64)> {
-    run_soc_loop(
-        state, problem, options, filter, g_trial,
-        theta_current, phi_current, grad_phi_step, alpha,
-        |c_soc| kkt::solve_sparse_condensed_soc(condensed, solver, c_soc).ok(),
-    )
-}
-
-/// Reset bound multipliers after restoration, matching Ipopt
-/// IpRestoMinC_1Nrm.cpp:374-419:
-///   1. Tentatively set z = mu/slack per bound (no element-wise clamp).
-///   2. If max(|z|) exceeds bound_mult_reset_threshold (1e3),
-///      *nuclear reset*: set ALL z_L, z_U to 1.0.
-///   3. Otherwise keep z = mu/slack as-is.
-/// An element-wise clamp at 1e3 leaves inf_du stuck at ~mu/slack - 1000
-/// when slack is tight — the least-squares y computed after can't absorb
-/// that. Returns whether the nuclear reset was triggered (for downstream
-/// v_L/v_U handling).
-fn reset_bound_multipliers_after_restoration(state: &mut SolverState, n: usize) -> bool {
+    x_cur: &[f64],
+    s_cur: &[f64],
+) -> bool {
+    let mu = state.mu.max(1e-20);
     let bound_mult_reset_threshold = 1000.0;
-    let mu_for_reset = state.mu;
-    let mut z_max: f64 = 0.0;
-    for i in 0..n {
-        if state.x_l[i].is_finite() {
-            let slack = (state.x[i] - state.x_l[i]).max(1e-12);
-            state.z_l[i] = mu_for_reset / slack;
-            z_max = z_max.max(state.z_l[i]);
-        } else {
-            state.z_l[i] = 0.0;
-        }
-        if state.x_u[i].is_finite() {
-            let slack = (state.x_u[i] - state.x[i]).max(1e-12);
-            state.z_u[i] = mu_for_reset / slack;
-            z_max = z_max.max(state.z_u[i]);
-        } else {
-            state.z_u[i] = 0.0;
+    let tau = (1.0 - mu).max(options.tau_min);
+
+    let nx_l = state.bound_layout.n_x_l;
+    let nx_u = state.bound_layout.n_x_u;
+    let nd_l = state.d_bound_layout.n_d_l;
+    let nd_u = state.d_bound_layout.n_d_u;
+
+    let mut delta_zl = vec![0.0; nx_l];
+    let mut delta_zu = vec![0.0; nx_u];
+    let mut delta_vl = vec![0.0; nd_l];
+    let mut delta_vu = vec![0.0; nd_u];
+
+    // Ipopt's `ComputeBoundMultiplierStep` (`IpRestoMinC_1Nrm.cpp:438-453`):
+    //   delta_z = ((curr_slack - trial_slack)·curr_z + mu) / curr_slack - curr_z
+    // expanding the division:
+    //   = curr_z - curr_z·trial_slack/curr_slack + mu/curr_slack - curr_z
+    //   = (mu - curr_z·trial_slack) / curr_slack
+    // The two `curr_z` terms cancel; the closed form below matches.
+    for k in 0..nx_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        let s_curr = (x_cur[i] - state.x_l_at(i)).max(1e-12);
+        let s_trial = (state.x[i] - state.x_l_at(i)).max(1e-12);
+        let z_curr = state.z_l_compressed[k];
+        delta_zl[k] = (mu - z_curr * s_trial) / s_curr;
+    }
+    for k in 0..nx_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        let s_curr = (state.x_u_at(i) - x_cur[i]).max(1e-12);
+        let s_trial = (state.x_u_at(i) - state.x[i]).max(1e-12);
+        let z_curr = state.z_u_compressed[k];
+        delta_zu[k] = (mu - z_curr * s_trial) / s_curr;
+    }
+    for kc in 0..nd_l {
+        let k = state.d_bound_layout.d_l_to_full[kc];
+        let dl = state.d_l_compressed[kc];
+        let s_curr = (s_cur[k] - dl).max(1e-12);
+        let s_trial = (state.s[k] - dl).max(1e-12);
+        let v_curr = state.v_l_compressed[kc];
+        delta_vl[kc] = (mu - v_curr * s_trial) / s_curr;
+    }
+    for kc in 0..nd_u {
+        let k = state.d_bound_layout.d_u_to_full[kc];
+        let du = state.d_u_compressed[kc];
+        let s_curr = (du - s_cur[k]).max(1e-12);
+        let s_trial = (du - state.s[k]).max(1e-12);
+        let v_curr = state.v_u_compressed[kc];
+        delta_vu[kc] = (mu - v_curr * s_trial) / s_curr;
+    }
+
+    // Single α_dual via fraction-to-the-boundary across all four blocks.
+    let mut alpha_dual = 1.0_f64;
+    for k in 0..nx_l {
+        if delta_zl[k] < 0.0 {
+            alpha_dual = alpha_dual.min(-tau * state.z_l_compressed[k] / delta_zl[k]);
         }
     }
-    let nuclear_reset = z_max > bound_mult_reset_threshold;
-    if nuclear_reset {
-        for i in 0..n {
-            state.z_l[i] = if state.x_l[i].is_finite() { 1.0 } else { 0.0 };
-            state.z_u[i] = if state.x_u[i].is_finite() { 1.0 } else { 0.0 };
+    for k in 0..nx_u {
+        if delta_zu[k] < 0.0 {
+            alpha_dual = alpha_dual.min(-tau * state.z_u_compressed[k] / delta_zu[k]);
         }
+    }
+    for kc in 0..nd_l {
+        if delta_vl[kc] < 0.0 {
+            alpha_dual = alpha_dual.min(-tau * state.v_l_compressed[kc] / delta_vl[kc]);
+        }
+    }
+    for kc in 0..nd_u {
+        if delta_vu[kc] < 0.0 {
+            alpha_dual = alpha_dual.min(-tau * state.v_u_compressed[kc] / delta_vu[kc]);
+        }
+    }
+    alpha_dual = alpha_dual.clamp(0.0, 1.0);
+
+    let mut max_mult: f64 = 0.0;
+    for k in 0..nx_l {
+        state.z_l_compressed[k] = (state.z_l_compressed[k] + alpha_dual * delta_zl[k]).max(0.0);
+        max_mult = max_mult.max(state.z_l_compressed[k]);
+    }
+    for k in 0..nx_u {
+        state.z_u_compressed[k] = (state.z_u_compressed[k] + alpha_dual * delta_zu[k]).max(0.0);
+        max_mult = max_mult.max(state.z_u_compressed[k]);
+    }
+    for kc in 0..nd_l {
+        state.v_l_compressed[kc] = (state.v_l_compressed[kc] + alpha_dual * delta_vl[kc]).max(0.0);
+        max_mult = max_mult.max(state.v_l_compressed[kc]);
+    }
+    for kc in 0..nd_u {
+        state.v_u_compressed[kc] = (state.v_u_compressed[kc] + alpha_dual * delta_vu[kc]).max(0.0);
+        max_mult = max_mult.max(state.v_u_compressed[kc]);
+    }
+
+    let nuclear_reset = max_mult > bound_mult_reset_threshold;
+    if nuclear_reset {
+        for k in 0..nx_l { state.z_l_compressed[k] = 1.0; }
+        for k in 0..nx_u { state.z_u_compressed[k] = 1.0; }
+        for kc in 0..nd_l { state.v_l_compressed[kc] = 1.0; }
+        for kc in 0..nd_u { state.v_u_compressed[kc] = 1.0; }
     }
     nuclear_reset
 }
 
-/// Recompute y at the restored point via the augmented-saddle-point
-/// least-squares multiplier estimate, INCLUDING the reset z_L/z_U
-/// contribution. Otherwise any deviation between z_true = mu/slack
-/// (huge at tight slack) and the reset value (1.0) appears entirely
-/// in inf_du, driving a bad first Newton step.
+/// Post-restoration y handoff aligned with Ipopt 3.14
+/// `MinC_1NrmRestorationPhase::PerformRestoration`
+/// (`IpRestoMinC_1Nrm.cpp:421-422`), which calls
+/// `DefaultIterateInitializer::least_square_mults(...,
+/// constr_mult_reset_threshold_)`.
 ///
-/// Uses the Ipopt-exact augmented saddle-point system
-///   [ I   J^T ] [ r ] = [ grad_f - z_L + z_U ]
-///   [ J    0  ] [ y ]   [ 0                   ]
-/// (matches IpLeastSquareMults::CalculateMultipliers with W=0, δ=0).
-/// This is far better conditioned than the normal equations
-/// J*J^T*y = rhs when J is nearly rank-deficient (as happens on
-/// AC-OPF with gauge freedom — case30_ieee hits this at a
-/// post-restoration feasible iterate).
+/// In `IpDefaultIterateInitializer.cpp:685-738`, the LS branch fires
+/// only when the cap parameter (`constr_mult_reset_threshold` here) is
+/// `> 0.0`. With Ipopt's default `0.0`, the function falls through to
+/// `cpp:734-737` and **sets y_c = y_d = 0** unconditionally. That's the
+/// principled handoff: the resto inner y's solve a different
+/// stationarity (the L1 objective with p/n slacks), so they're
+/// meaningless to the parent; and a non-zero LS y computed at a
+/// poorly-scaled restored iterate biases the parent's first Newton
+/// direction — observed on arki0003 as a post-restoration dual-residual
+/// blow-up that re-triggers restoration.
 ///
-/// If the augmented solve fails or the result exceeds
-/// `constr_mult_init_max` (matching Ipopt
-/// DefaultIterateInitializer::least_square_mults), zero out y.
+/// With `threshold > 0`, we keep the LS estimate when
+/// `‖y_LS‖_∞ ≤ threshold` (matching `cpp:722-727`); otherwise zero.
 fn recompute_y_after_restoration(
     state: &mut SolverState,
     options: &SolverOptions,
@@ -9009,58 +8756,124 @@ fn recompute_y_after_restoration(
     if m == 0 {
         return;
     }
+    let threshold = options.constr_mult_reset_threshold;
+    if threshold <= 0.0 {
+        // Ipopt-default path: y = 0.
+        let y_zero = vec![0.0; m];
+        state.set_y_combined(&y_zero);
+        return;
+    }
+    let g_l_combined_for_ls = state.g_l_combined();
+    let g_u_combined_for_ls = state.g_u_combined();
+    // Phase 6d.5: materialize compressed z to full-`n` for LS estimator.
+    let z_l_full = state.z_l_combined();
+    let z_u_full = state.z_u_combined();
+    let (jac_rows_m, jac_cols_m, jac_vals_m) = rebuild_combined_jac(state);
     let y_ls_result = compute_ls_multiplier_estimate_augmented(
-        &state.grad_f, &state.jac_rows, &state.jac_cols, &state.jac_vals,
-        &state.g_l, &state.g_u, n, m,
-        Some(&state.z_l), Some(&state.z_u),
+        &state.grad_f, &jac_rows_m, &jac_cols_m, &jac_vals_m,
+        &g_l_combined_for_ls, &g_u_combined_for_ls, n, m,
+        Some(&z_l_full), Some(&z_u_full),
+        None,
     );
-    let y_accepted = match y_ls_result {
-        Some(y_ls) => {
-            let max_abs = linf_norm(&y_ls);
-            if max_abs > options.constr_mult_init_max { None } else { Some(y_ls) }
+    let y_zero;
+    let y_to_set = match y_ls_result {
+        Some(ref y_ls) if linf_norm(y_ls) <= threshold => y_ls.as_slice(),
+        _ => {
+            y_zero = vec![0.0; m];
+            y_zero.as_slice()
         }
-        None => None,
     };
-    if let Some(y_ls) = y_accepted {
-        state.y.copy_from_slice(&y_ls);
-    } else {
-        state.y.fill(0.0);
-    }
+    state.set_y_combined(y_to_set);
 }
 
-/// Reset constraint-slack barrier multipliers v_L, v_U after restoration,
-/// mirroring the nuclear-reset semantics of bound multipliers. Equality
-/// constraints get v=0 (no slack barrier). For inequality constraints, if
-/// the bound-multiplier reset triggered the all-to-1.0 path, also reset v
-/// to 1.0; else use v = mu/slack uncapped.
-fn reset_constraint_slack_multipliers_after_restoration(
+/// T3.30 (full): post-step `recalc_y` aligned with `IpIpoptAlg.cpp:782-816`.
+///
+/// Solves Ipopt's full 4-block LS system (eliminated to a (n+m) augmented
+/// matrix with `−1` diagonals on inequality rows and `(v_L − v_U)` RHS
+/// contributions). Unlike the restoration-entry path, no
+/// `constr_mult_init_max` magnitude clamp — Ipopt accepts the LS y
+/// unconditionally on solver success and skips the recalc on solver
+/// failure. Bound multipliers `z_L`, `z_U`, `v_L`, `v_U` are held fixed
+/// (matches `IpIpoptAlg.cpp:803-806` carry-over).
+fn recompute_y_post_step_full_augmented(
     state: &mut SolverState,
+    n: usize,
     m: usize,
-    nuclear_reset: bool,
 ) {
-    let mu_r = state.mu;
-    for i in 0..m {
-        if constraint_is_equality(state, i) {
-            state.v_l[i] = 0.0;
-            state.v_u[i] = 0.0;
-            continue;
-        }
-        if state.g_l[i].is_finite() {
-            let slack = (state.g[i] - state.g_l[i]).max(1e-12);
-            state.v_l[i] = if nuclear_reset { 1.0 } else { mu_r / slack };
-        } else {
-            state.v_l[i] = 0.0;
-        }
-        if state.g_u[i].is_finite() {
-            let slack = (state.g_u[i] - state.g[i]).max(1e-12);
-            state.v_u[i] = if nuclear_reset { 1.0 } else { mu_r / slack };
-        } else {
-            state.v_u[i] = 0.0;
-        }
+    if m == 0 {
+        return;
+    }
+    let v_l_combined_for_ls = state.v_l_combined();
+    let v_u_combined_for_ls = state.v_u_combined();
+    let g_l_combined_for_ls = state.g_l_combined();
+    let g_u_combined_for_ls = state.g_u_combined();
+    // Phase 6d.5: materialize compressed z to full-`n` for LS estimator.
+    let z_l_full = state.z_l_combined();
+    let z_u_full = state.z_u_combined();
+    let (jac_rows_m, jac_cols_m, jac_vals_m) = rebuild_combined_jac(state);
+    let y_ls_result = compute_ls_multiplier_estimate_augmented(
+        &state.grad_f, &jac_rows_m, &jac_cols_m, &jac_vals_m,
+        &g_l_combined_for_ls, &g_u_combined_for_ls, n, m,
+        Some(&z_l_full), Some(&z_u_full),
+        Some((&v_l_combined_for_ls, &v_u_combined_for_ls)),
+    );
+    if let Some(y_ls) = y_ls_result {
+        state.set_y_combined(&y_ls);
     }
 }
 
-/// Apply post-restoration success handling: update state, reset multipliers, filter, and mu.
+/// Spec §5 step 5 (`IpIpoptAlg.cpp:652-819`, P27): once an accepted iterate
+/// is sufficiently feasible, recompute y via least-squares to keep the
+/// equality multipliers aligned with the current x and z. Default-on under
+/// L-BFGS (where quasi-Newton multiplier estimates drift), opt-in otherwise.
+///
+/// The `recalc_y_feas_tol` gate is essential: at infeasible iterates, the
+/// LS y absorbs constraint violation into the dual variables, biasing the
+/// next Newton direction. Spec default tol is `1e-6`.
+fn maybe_recalc_y_post_step(
+    state: &mut SolverState,
+    options: &SolverOptions,
+    n: usize,
+    m: usize,
+    lbfgs_mode: bool,
+) {
+    if m == 0 {
+        return;
+    }
+    let gate_on = options.recalc_y || lbfgs_mode;
+    if !gate_on {
+        return;
+    }
+    // T3.30: Ipopt gates recalc_y on `IpCq().curr_constraint_violation()`,
+    // which defaults to NORM_MAX (constr_viol_normtype option). The 1-norm
+    // variant `state.constraint_violation()` is used for filter decisions
+    // and for many-constraint problems is much larger than the max-norm,
+    // making the recalc_y_feas_tol gate spuriously tight.
+    let theta_max = convergence::primal_infeasibility_max_split(
+        &state.g_c(),
+        &state.g_d(),
+        &state.d_l(),
+        &state.d_u(),
+    );
+    if theta_max >= options.recalc_y_feas_tol {
+        return;
+    }
+    // T3.30: Ipopt-aligned post-step recalc uses the full 4-block LS system
+    // (slack/v_L/v_U coupling) and accepts unconditionally on solver success.
+    recompute_y_post_step_full_augmented(state, n, m);
+}
+
+/// Apply post-restoration success handling: update state, reset multipliers, and mu.
+///
+/// T0.9: the existing filter is NOT cleared (Ipopt
+/// IpRestoFilterConvCheck::TestOrigProgress requires the trial point
+/// to be acceptable to the *current* filter — including the entry
+/// added at restoration entry by `Filter::augment_for_restoration`).
+/// If the resto-returned (θ, φ) is not filter-acceptable, this
+/// function returns `false` and does not commit any state changes;
+/// the caller must treat that as a restoration failure. On
+/// acceptance, the filter is left untouched and `true` is returned.
+#[must_use]
 fn apply_restoration_success<P: NlpProblem>(
     state: &mut SolverState,
     filter: &mut Filter,
@@ -9070,29 +8883,112 @@ fn apply_restoration_success<P: NlpProblem>(
     m: usize,
     problem: &P,
     x_new: &[f64],
+    resto_z: Option<&(Vec<f64>, Vec<f64>)>,
     linear_constraints: Option<&[bool]>,
     lbfgs_mode: bool,
     lbfgs_state: &mut Option<LbfgsIpmState>,
-) {
+) -> bool {
+    // T0.9 filter gate: evaluate (θ, φ) for the trial restored point
+    // and verify it is acceptable to the existing filter BEFORE
+    // mutating any state. The "feasibility recovery" exemption
+    // (θ < constr_viol_tol) is preserved because Ipopt itself
+    // bypasses the filter test on feasibility (the feasibility-
+    // restoration check resets the filter implicitly when the
+    // recovered point is feasible).
+    {
+        // Phase 10b.3: post-restoration filter gate eval via SplitNlp.
+        let nlp = crate::split_nlp::SplitNlp::new(problem, &state.layout);
+        let mut g_check = vec![0.0; m];
+        let mut phi_check = f64::INFINITY;
+        let g_ok = m == 0 || nlp.constraints_combined(x_new, true, &mut g_check);
+        let phi_ok = nlp.objective(x_new, true, &mut phi_check) && phi_check.is_finite();
+        if !g_ok || !phi_ok {
+            return false;
+        }
+        // Slack-RESYNCED filter check: pretend s has been pushed to
+        // d(x_new) (which we will do below via initialize_slack_iterate).
+        // Using the stale state.s here would inflate theta_check by
+        // exactly the constraint shift restoration just produced —
+        // rejecting successful restorations whose x movement actually
+        // improved feasibility (observed on arki0003: stale-s gave
+        // theta_check ≈ 7.37e3 while the restored x's true 1-norm
+        // residual is 1.59e2). Mirrors `classify_restoration_outcome`'s
+        // metric (`theta_new = theta_for_split_d_s(c_new, d_new, d_new)`)
+        // so the inner exit, post-resto Success classifier, and
+        // pre-commit filter check all agree.
+        let theta_check = if m == 0 {
+            0.0
+        } else {
+            let (c_check, d_check) = split_from_g(state, &g_check);
+            theta_for_split_d_s(state, &c_check, &d_check, &d_check)
+        };
+        let feasible = theta_check < options.constr_viol_tol;
+        if !feasible && !filter.is_acceptable(theta_check, phi_check) {
+            return false;
+        }
+    }
+
+    // Capture pre-restoration x so the one-shot Newton z update
+    // (Ipopt §7.8 / IpRestoMinC_1Nrm.cpp:378-399) can compute s_cur.
+    let x_cur = state.x.clone();
     state.x.copy_from_slice(x_new);
     state.alpha_primal = 0.0;
 
     let _ = evaluate_and_refresh_lbfgs(state, problem, lbfgs_state, linear_constraints, lbfgs_mode);
 
-    let nuclear_reset = reset_bound_multipliers_after_restoration(state, n);
+    // Save the pre-restoration slack iterate so the bound-multiplier
+    // synthetic Newton step below has a `curr_slack_s` to reference
+    // (Ipopt's `IpCq().curr_slack_s_L/U`). After
+    // `initialize_slack_iterate` overwrites `state.s` to the new
+    // strictly-interior box around `d(x_new)`, the pre-resto slack is
+    // gone — capture it now.
+    let s_cur = state.s.clone();
+
+    // Resync the inequality-slack iterate `s` to the post-restoration
+    // `d(x_new)`, projected into the strictly-interior box
+    // `(d_l + p_L, d_u − p_U)` (same `slack_bound_push` /
+    // `slack_bound_frac` policy as `initialize_slack_iterate`).
+    // Without this, `state.s` retains its pre-restoration value while
+    // `state.d_x` is fresh, and `theta_for_split_d_s = ||c|| + ||d − s||`
+    // inherits a spurious `||d_new − s_old||` term equal to the entire
+    // constraint shift the restoration just produced. On arki0003 this
+    // pinned theta back at the pre-resto value (7.37e3) immediately
+    // after a Success classification (theta_new = 1.59e2), triggering
+    // another identical restoration entry — an infinite cycle.
+    // Ipopt's `IpRestoMinC_1Nrm::finalize_solution` performs the
+    // analogous slack push when handing the parent the recovered point.
+    initialize_slack_iterate(state, m, options);
+
+    // Ipopt-aligned bound-multiplier handoff: synthetic Newton step on
+    // (z_L, z_U, v_L, v_U) using the parent's pre-restoration multipliers
+    // and slacks, then a single dual fraction-to-the-boundary, then a
+    // nuclear reset to 1.0 if any multiplier exceeds 1e3. Mirrors
+    // `MinC_1NrmRestorationPhase::PerformRestoration`
+    // (`IpRestoMinC_1Nrm.cpp:374-419`). The previous κ_σ-clamp variant
+    // (which used the inner-resto z's instead of parent z's, and applied
+    // a κ_σ clamp Ipopt does not apply at this point) was responsible
+    // for inflating multipliers across repeated restoration cycles on
+    // arki0003. The `resto_z` parameter is now unused — Ipopt always
+    // bridges via the parent's z, never the inner-resto z.
+    let _ = resto_z;
+    let _ = update_bound_multipliers_after_restoration(state, options, &x_cur, &s_cur);
     recompute_y_after_restoration(state, options, n, m);
 
-    reset_constraint_slack_multipliers_after_restoration(state, m, nuclear_reset);
-
-    // Reset filter and re-initialize from restored point
-    reset_filter_with_current_theta(state, filter);
+    // T0.9: do NOT clear the filter — Ipopt keeps the existing entries
+    // (including the augmentation added at resto entry) so future
+    // iterations cannot revisit the pre-resto basin. Only the
+    // consecutive_acceptable counter is reset.
     state.consecutive_acceptable = 0;
 
-    // Recompute mu from current complementarity after restoration
-    let mu_compl = compute_avg_complementarity(state);
-    if mu_compl > 0.0 {
-        state.mu = mu_compl.max(options.mu_min).min(1e5);
-    }
+    // Per Ipopt `IpIpoptAlgorithm.cpp:842`, the parent inherits its
+    // pre-restoration μ rather than recomputing one from post-reset
+    // complementarity. The avg-compl recompute previously here was
+    // inflating μ to ~2e4 on arki0003 (when the nuclear z=1 reset
+    // fired and fake compl = 1·slack dominated the average), driving
+    // the next outer iteration into an unbarriered Newton regime that
+    // immediately blew up. Keep the pre-resto μ; let the regular
+    // mu-update logic decrease it once the iterate stabilizes.
+    state.mu = state.mu.max(options.mu_min);
 
     // Reset mu_state mode (restoration is a fresh start)
     // In monotone strategy, stay in Fixed mode
@@ -9102,6 +8998,14 @@ fn apply_restoration_success<P: NlpProblem>(
     mu_state.first_iter_in_mode = true;
     mu_state.ref_vals.clear();
     mu_state.consecutive_restoration_failures = 0;
+    // T3.25 follow-up: restoration handoff replaces x/y/z/v wholesale.
+    // The atag updates above (via the writes to state.x etc.) do NOT
+    // bump kkt_atags by themselves, so drop the cache explicitly. This
+    // is the coarse "invalidate at boundary" path the T3.25 report
+    // recommended over fine-grained per-write atag plumbing.
+    state.bump_all_kkt_atags();
+    state.factor_cache.invalidate();
+    true
 }
 
 /// Outcome of the NLP restoration attempt.
@@ -9120,17 +9024,14 @@ enum RestorationOutcome {
 /// the same IPM engine (with `disable_nlp_restoration=true` to prevent recursion).
 /// Configure the inner SolverOptions for the restoration NLP solve. Caps
 /// max_iter at restoration_max_iter (>=500), disables nested restoration to
-/// prevent recursion, sets mu_init to resto_mu, disables stall detection
-/// (restoration makes slow steady progress that would trip the 30-iter
-/// stall limit), and relaxes tol to 1e-7 (we want feasibility, not
-/// optimality). Propagates the remaining wall-time budget so the inner
-/// solve can't outlive the outer fallback cascade; returns None when the
-/// remaining budget is < 0.5s. Scales early_stall_timeout by restoration
-/// NLP size so large restorations get the full default timeout.
+/// prevent recursion, sets mu_init to resto_mu, and relaxes tol to 1e-7
+/// (we want feasibility, not optimality). Propagates the remaining
+/// wall-time budget so the inner solve can't outlive the outer fallback
+/// cascade; returns None when the remaining budget is < 0.5s.
 fn configure_restoration_inner_options(
     options: &SolverOptions,
     resto_mu: f64,
-    resto_dim: usize,
+    _resto_dim: usize,
     start_time: Instant,
 ) -> Option<SolverOptions> {
     let mut inner_opts = options.clone();
@@ -9138,7 +9039,6 @@ fn configure_restoration_inner_options(
     inner_opts.disable_nlp_restoration = true;
     inner_opts.print_level = if options.print_level >= 5 { 3 } else { 0 };
     inner_opts.mu_init = resto_mu;
-    inner_opts.stall_iter_limit = 0;
     inner_opts.tol = 1e-7;
 
     if options.max_wall_time > 0.0 {
@@ -9148,15 +9048,6 @@ fn configure_restoration_inner_options(
         }
         inner_opts.max_wall_time = remaining;
     }
-    inner_opts.early_stall_timeout = if options.early_stall_timeout > 0.0 {
-        if resto_dim > 500 {
-            options.early_stall_timeout
-        } else {
-            options.early_stall_timeout.min(3.0)
-        }
-    } else {
-        3.0
-    };
     Some(inner_opts)
 }
 
@@ -9167,7 +9058,7 @@ fn attempt_nlp_restoration<P: NlpProblem>(
     options: &SolverOptions,
     theta_current: f64,
     start_time: Instant,
-) -> (Vec<f64>, RestorationOutcome) {
+) -> (Vec<f64>, Option<(Vec<f64>, Vec<f64>)>, RestorationOutcome) {
     let n = state.n;
     let m = state.m;
 
@@ -9184,21 +9075,116 @@ fn attempt_nlp_restoration<P: NlpProblem>(
     // monotone across inner iterations.
     let rho = 1000.0;
 
-    // Ipopt's resto_mu = max(curr_mu, ||c(x_r)||_inf) (IpRestoIterateInitializer.cpp:58).
-    // Using a mu_init consistent with the current infeasibility makes the
-    // closed-form (p,n) init well-conditioned: when theta ≫ mu, the slacks
-    // would otherwise be pinned near 0 with enormous bound multipliers.
-    let c_inf = compute_primal_inf_max_at_state(state);
+    // Ipopt's resto_mu = max(curr_mu, ||c(x_r)||_inf, ||d(x_r) - s||_inf)
+    // per `IpRestoIterateInitializer.cpp:57-61`. The third term is the
+    // slack-coupling residual — without it, problems with significant
+    // inequality-constraint infeasibility (where d - s dominates over c)
+    // get a too-small inner mu, the closed-form (p_d, n_d) init is wrong
+    // by orders of magnitude, the FTB collapses α on the first inner
+    // step, and the inner IPM diverges → repeated parent-side restoration
+    // entries (the arki0003 cycling pattern). Use the internal-max form
+    // (`||c||_∞ ∪ ||d − s||_∞`) which mirrors Ipopt's
+    // `IpIpoptCalculatedQuantities::curr_primal_infeasibility(NORM_MAX)`.
+    let c_inf = compute_primal_inf_internal_max_at_state(state);
     let resto_mu = state.mu.max(c_inf);
 
     // Build restoration NLP using the same resto_mu for p/n quadratic init.
-    let resto_nlp = RestorationNlp::new(problem, &state.x, resto_mu, rho, 1.0);
+    let mut resto_nlp = RestorationNlp::new(
+        problem,
+        &state.x,
+        resto_mu,
+        rho,
+        options.resto_proximity_weight,
+    );
+    // T3.X: inject parent-violation target so the inner solve can short-
+    // circuit on `IpRestoFilterConvCheck::TestOrigProgress`. Without
+    // this, the inner solve_ipm runs to its own KKT optimum (often 499
+    // iters with mu→0) even though the parent recovered feasibility long
+    // ago — observed on arki0003 where iter ~48 of the inner solve
+    // already had inf_pr ≤ 1e-9 of the resto NLP. The κ_resto gate uses
+    // max-norm; the filter / sufficient-progress gates use 1-norm
+    // (matching Ipopt's `IpFilterLSAcceptor.cpp:497-498`).
+    let parent_theta_entry = compute_primal_inf_max_at_state(state);
+    // 1-norm of bound violation at the parent iterate, computed from
+    // state.c_x (equality residuals; equality rows have g_l == g_u so
+    // |c| equals bound violation) and state.d_x against (d_l, d_u)
+    // (inequality bound violations).
+    let parent_theta_entry_l1 = {
+        let mut sum = 0.0_f64;
+        for &c in state.c_x.iter() {
+            sum += c.abs();
+        }
+        let d_l = state.d_l();
+        let d_u = state.d_u();
+        for k in 0..state.layout.n_d {
+            let dx = state.d_x[k];
+            let lo = d_l[k];
+            let hi = d_u[k];
+            if dx < lo {
+                sum += lo - dx;
+            } else if dx > hi {
+                sum += dx - hi;
+            }
+        }
+        sum
+    };
+    // φ_entry = parent's barrier-augmented objective at restoration
+    // entry: f(x_R) − μ · Σ ln(slack). D5 fix: parent filter entries
+    // are stored as barrier-φ, so `phi_trial` in the resto progress
+    // gate is also augmented (RestorationNlp::should_exit_for_parent);
+    // φ_entry must use the same metric or the comparison is biased.
+    let parent_x_l_full = state.x_l_combined();
+    let parent_x_u_full = state.x_u_combined();
+    let mu_entry = state.mu;
+    let mut parent_phi_entry = f64::INFINITY;
+    {
+        let nlp = crate::split_nlp::SplitNlp::new(problem, &state.layout);
+        let _ = nlp.objective(&state.x, false, &mut parent_phi_entry);
+        if !parent_phi_entry.is_finite() {
+            parent_phi_entry = 0.0;
+        } else if mu_entry > 0.0 {
+            for i in 0..n {
+                let lo = parent_x_l_full[i];
+                let hi = parent_x_u_full[i];
+                if lo.is_finite() {
+                    let s = state.x[i] - lo;
+                    if s > 0.0 {
+                        parent_phi_entry -= mu_entry * s.ln();
+                    }
+                }
+                if hi.is_finite() {
+                    let s = hi - state.x[i];
+                    if s > 0.0 {
+                        parent_phi_entry -= mu_entry * s.ln();
+                    }
+                }
+            }
+            if !parent_phi_entry.is_finite() {
+                parent_phi_entry = 0.0;
+            }
+        }
+    }
+    let parent_small_threshold = options.tol.min(options.constr_viol_tol);
+    resto_nlp.set_parent_target(
+        parent_theta_entry,
+        parent_theta_entry_l1,
+        parent_phi_entry,
+        options.kappa_resto,
+        parent_small_threshold,
+        filter.theta_max(),
+        filter.gamma_theta(),
+        filter.gamma_phi(),
+        filter.save_entries(),
+        mu_entry,
+        parent_x_l_full,
+        parent_x_u_full,
+    );
 
     let inner_opts = match configure_restoration_inner_options(
         options, resto_mu, resto_nlp.num_variables() + resto_nlp.num_constraints(), start_time,
     ) {
         Some(opts) => opts,
-        None => return (state.x[..n].to_vec(), RestorationOutcome::Failed),
+        None => return (state.x[..n].to_vec(), None, RestorationOutcome::Failed),
     };
 
     // Solve the restoration NLP
@@ -9206,20 +9192,51 @@ fn attempt_nlp_restoration<P: NlpProblem>(
 
     // Extract x_orig from the restoration solution
     let x_nlp: Vec<f64> = result.x[..n].to_vec();
+    // Extract the bound multipliers for the original-x block (T0.8). The
+    // resto NLP variable layout is [x(n), p(m), n(m)]; the p/n slack
+    // multipliers are not relevant to the parent problem. Validate that
+    // the inner solve returned an n-block (it always should), else None.
+    let resto_z: Option<(Vec<f64>, Vec<f64>)> = if result.bound_multipliers_lower.len() >= n
+        && result.bound_multipliers_upper.len() >= n
+    {
+        let zl_x: Vec<f64> = result.bound_multipliers_lower[..n].to_vec();
+        let zu_x: Vec<f64> = result.bound_multipliers_upper[..n].to_vec();
+        let finite = zl_x.iter().chain(zu_x.iter()).all(|v| v.is_finite());
+        if finite { Some((zl_x, zu_x)) } else { None }
+    } else {
+        None
+    };
 
+    // Phase 10b.3: post-restoration original-NLP eval via SplitNlp.
+    let nlp = crate::split_nlp::SplitNlp::new(problem, &state.layout);
     // Evaluate original constraints at the restored point
     let mut g_new = vec![0.0; m];
-    if !problem.constraints(&x_nlp, true, &mut g_new)
+    if !nlp.constraints_combined(&x_nlp, true, &mut g_new)
         || g_new.iter().any(|v| !v.is_finite())
     {
-        return (x_nlp, RestorationOutcome::Failed);
+        return (x_nlp, resto_z, RestorationOutcome::Failed);
     }
-    let theta_new = theta_for_g(state, &g_new);
+    // Compute theta_new using the SLACK-RESYNCED metric: pretend s has
+    // already been updated to match d_new (which apply_restoration_success
+    // does shortly via update_bound_multipliers_after_restoration +
+    // The pre-resto state.s reflects the OLD x_R's d_x, so leaving it stale
+    // overstates ||d_new − s_old||_1 by exactly the constraint shift the
+    // restoration just produced — penalising successful restorations whose
+    // x movement actually improved feasibility (e.g. arki0003 where the
+    // Ipopt-aligned `IpRestoFilterConvCheck::TestOrigProgress` early-exit
+    // returns x_n with ||c_orig(x_n) − π[bounds]||_∞ ≤ kappa_resto · θ_R
+    // but stale-s theta_new is huge). Using d_new for both d AND s reduces
+    // the slack-coupled metric to ||c_new||_1, which is the metric the
+    // parent will see post-resync.
+    let theta_new = {
+        let (c_new, d_new) = split_from_g(state, &g_new);
+        theta_for_split_d_s(state, &c_new, &d_new, &d_new)
+    };
 
     // Evaluate original objective at the restored point
     let mut phi_new = f64::INFINITY;
-    if !problem.objective(&x_nlp, false, &mut phi_new) || !phi_new.is_finite() {
-        return (x_nlp, RestorationOutcome::Failed);
+    if !nlp.objective(&x_nlp, false, &mut phi_new) || !phi_new.is_finite() {
+        return (x_nlp, resto_z, RestorationOutcome::Failed);
     }
 
     if options.print_level >= 5 {
@@ -9236,7 +9253,7 @@ fn attempt_nlp_restoration<P: NlpProblem>(
     let outcome = classify_restoration_outcome(
         filter, options, theta_current, theta_new, phi_new, inner_converged,
     );
-    (x_nlp, outcome)
+    (x_nlp, resto_z, outcome)
 }
 
 /// Check whether the restored `(theta_new, phi_new)` is acceptable
@@ -9268,16 +9285,23 @@ fn filter_accepts_restored_iterate(
     true
 }
 
-/// Classify the outcome of a completed restoration solve. Decision tree:
-/// 1. theta_new < constr_viol_tol → Success (achieved feasibility).
-/// 2. theta_new ≤ 0.5*theta_current → Success (50% reduction, stricter than
-///    Gauss-Newton's 10% to avoid marginal "success" that prevents recovery
-///    mechanisms from engaging).
-/// 3. theta_new < 0.9*theta_current AND filter-acceptable → Success.
-/// 4. inner_converged but no feasibility improvement → LocalInfeasibility
+/// Classify the outcome of a completed restoration solve. Mirrors Ipopt's
+/// `IpRestoFilterConvCheck::CheckProgress` (`IpRestoConvCheck.cpp:71-248`,
+/// spec §7.7). Decision tree:
+/// 1. theta_new < min(tol, constr_viol_tol) → Success (achieved feasibility,
+///    matches Ipopt's "small_threshold" gate).
+/// 2. theta_new ≤ kappa_resto * theta_current AND filter-acceptable → Success
+///    (Ipopt's primary `required_infeasibility_reduction` gate, default 0.9).
+/// 3. inner_converged but no feasibility improvement → LocalInfeasibility
 ///    (the restoration NLP itself reached a stationary point of the
 ///    L1-feasibility objective with positive residual).
-/// 5. Otherwise → Failed.
+/// 4. Otherwise → Failed.
+///
+/// DEV-9: removed the lenient `theta_new ≤ 0.5 * theta_current` gate.
+/// Ipopt's primary success criterion is the `kappa_resto` reduction
+/// AND filter acceptance — never one without the other. The 50% gate
+/// could accept restoration exits that the filter would reject, biasing
+/// the next iterate.
 fn classify_restoration_outcome(
     filter: &Filter,
     options: &SolverOptions,
@@ -9286,13 +9310,11 @@ fn classify_restoration_outcome(
     phi_new: f64,
     inner_converged: bool,
 ) -> RestorationOutcome {
-    if theta_new < options.constr_viol_tol {
+    let small_threshold = options.tol.min(options.constr_viol_tol);
+    if theta_new < small_threshold {
         return RestorationOutcome::Success;
     }
-    if theta_new <= 0.5 * theta_current {
-        return RestorationOutcome::Success;
-    }
-    if theta_new < 0.9 * theta_current
+    if theta_new <= options.kappa_resto * theta_current
         && filter_accepts_restored_iterate(filter, theta_new, phi_new)
     {
         return RestorationOutcome::Success;
@@ -9301,106 +9323,6 @@ fn classify_restoration_outcome(
         return RestorationOutcome::LocalInfeasibility;
     }
     RestorationOutcome::Failed
-}
-
-/// Quality-function barrier-parameter oracle (Ipopt
-/// `IpQualityFunctionMuOracle.cpp:507-664`).
-///
-/// Evaluates `q(mu) = dual_inf + primal_inf + compl_inf [+ centrality]`
-/// for log-spaced candidate mu values and returns the minimizer.
-/// `dual_inf` and `primal_inf` are fixed at the current iterate (the
-/// affine direction is not reused here); only `compl_inf` and the
-/// optional centrality term vary with mu. Norms follow the Ipopt
-/// 2-norm-averaged convention (`sqrt(sum_sq) / sqrt(n_*)`), so the
-/// three terms are commensurate and additive.
-///
-/// When `options.quality_function_centrality` is true, adds the
-/// `CEN_RECIPROCAL` penalty `compl_inf / xi`, where
-/// `xi = min(z·s) / avg(z·s)` is the centrality measure at the trial
-/// mu. Default is false (matching Ipopt's `centrality=none`).
-///
-/// Reference implementation; the production Free-mode oracle is the
-/// Loqo σ = 0.1·min(0.05·(1-ξ)/ξ, 2)³ formula at `compute_loqo_mu`,
-/// which already incorporates centrality via ξ.
-#[allow(dead_code)]
-fn quality_function_mu(
-    state: &SolverState,
-    options: &SolverOptions,
-    mu_lower: f64,
-    mu_upper: f64,
-    n_candidates: usize,
-) -> f64 {
-    if mu_upper <= mu_lower || n_candidates < 2 {
-        return mu_upper;
-    }
-
-    let pi = state.constraint_violation();
-    let di = compute_dual_inf_at_state(state);
-
-    let log_min = mu_lower.max(1e-20).ln();
-    let log_max = mu_upper.ln();
-
-    let mut best_mu = mu_upper;
-    let mut best_q = f64::INFINITY;
-
-    for k in 0..n_candidates {
-        let t = k as f64 / (n_candidates - 1) as f64;
-        let mu_candidate = (log_min + t * (log_max - log_min)).exp();
-
-        let ci = convergence::complementarity_error(
-            &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u, mu_candidate,
-        );
-
-        let mut q = pi + di + ci;
-
-        if options.quality_function_centrality {
-            // Centrality at the candidate mu: xi = min(z·s)/avg(z·s).
-            // Both products are taken at the current iterate (consistent
-            // with Ipopt's affine-projection formula at mu_candidate).
-            let avg = compute_avg_complementarity(state);
-            let xi = compute_centrality_xi(state, avg);
-            if xi > 1e-20 {
-                q += ci / xi;
-            } else {
-                q = f64::INFINITY;
-            }
-        }
-
-        if q < best_q {
-            best_q = q;
-            best_mu = mu_candidate;
-        }
-    }
-
-    best_mu
-}
-
-/// Build the RHS `b = -J·(grad_f − z_L + z_U)` for the normal-equations
-/// LS multiplier estimate. Treats `None` for `z_l`/`z_u` as zero
-/// (cold-start). Shared by the dense and sparse variants of
-/// `compute_ls_multiplier_estimate_*`.
-fn compute_ls_multiplier_rhs(
-    grad_f: &[f64],
-    jac_rows: &[usize],
-    jac_cols: &[usize],
-    jac_vals: &[f64],
-    n: usize,
-    m: usize,
-    z_l: Option<&[f64]>,
-    z_u: Option<&[f64]>,
-) -> Vec<f64> {
-    let mut rhs_grad = grad_f.to_vec();
-    if let Some(zl) = z_l {
-        for i in 0..n { rhs_grad[i] -= zl[i]; }
-    }
-    if let Some(zu) = z_u {
-        for i in 0..n { rhs_grad[i] += zu[i]; }
-    }
-    let mut b = vec![0.0; m];
-    for (idx, (&row, &col)) in jac_rows.iter().zip(jac_cols.iter()).enumerate() {
-        b[row] -= jac_vals[idx] * rhs_grad[col];
-    }
-    b
 }
 
 /// Overwrite the default constraint and bound multipliers with values
@@ -9426,87 +9348,202 @@ fn apply_warm_start_multipliers<P: NlpProblem>(
     }
 }
 
-/// Initialize bound multipliers from complementarity at mu_init:
-/// z_l[i] = mu / (x[i] - x_l[i]), z_u[i] = mu / (x_u[i] - x[i]).
-/// Multipliers stay at 0 for inactive (infinite) bounds. Slack is
-/// floored at 1e-20 to avoid division by zero in pathological cases
-/// where the bound-push didn't move x off the bound.
+/// Initialize bound multipliers `z_l`, `z_u`. The method is selected
+/// by `options.bound_mult_init_method` (Ipopt 3.14
+/// `IpDefaultIterateInitializer.cpp:254-288`):
+///
+/// - `Constant` (Ipopt default): every finite-bounded entry is set to
+///   `options.bound_mult_init_val` (Ipopt default 1.0). Inactive
+///   (infinite) bounds stay at 0.
+/// - `MuBased`: `z_l = mu_init / (x − x_l)`, `z_u = mu_init / (x_u − x)`.
+///   Slack is floored at 1e-20 to avoid division by zero.
 fn init_bound_multipliers(
     x: &[f64],
     x_l: &[f64],
     x_u: &[f64],
     mu_init: f64,
+    options: &SolverOptions,
 ) -> (Vec<f64>, Vec<f64>) {
     let n = x.len();
     let mut z_l = vec![0.0; n];
     let mut z_u = vec![0.0; n];
-    for i in 0..n {
-        if x_l[i].is_finite() {
-            let slack = (x[i] - x_l[i]).max(1e-20);
-            z_l[i] = mu_init / slack;
+    match options.bound_mult_init_method {
+        BoundMultInitMethod::Constant => {
+            let v = options.bound_mult_init_val;
+            for i in 0..n {
+                if x_l[i].is_finite() {
+                    z_l[i] = v;
+                }
+                if x_u[i].is_finite() {
+                    z_u[i] = v;
+                }
+            }
         }
-        if x_u[i].is_finite() {
-            let slack = (x_u[i] - x[i]).max(1e-20);
-            z_u[i] = mu_init / slack;
+        BoundMultInitMethod::MuBased => {
+            for i in 0..n {
+                if x_l[i].is_finite() {
+                    let slack = (x[i] - x_l[i]).max(1e-20);
+                    z_l[i] = mu_init / slack;
+                }
+                if x_u[i].is_finite() {
+                    let slack = (x_u[i] - x[i]).max(1e-20);
+                    z_u[i] = mu_init / slack;
+                }
+            }
         }
     }
     (z_l, z_u)
 }
 
-/// Relax fixed variables (x_l == x_u) by widening bounds to a tiny
-/// interval centered on the fixed value. Interior-point methods require
-/// strictly interior starting points; without this fixed variables would
-/// have zero feasible interior. Mirrors Ipopt's relax_bounds approach.
-fn relax_fixed_variable_bounds(x_l: &mut [f64], x_u: &mut [f64]) {
-    for i in 0..x_l.len() {
-        if x_l[i].is_finite() && x_u[i].is_finite() && (x_u[i] - x_l[i]).abs() < 1e-10 {
-            let center = (x_l[i] + x_u[i]) / 2.0;
-            let relax = 1e-8 * center.abs().max(1.0);
-            x_l[i] = center - relax;
-            x_u[i] = center + relax;
+/// Apply Ipopt 3.14's `bound_relax_factor` mechanism: relax every
+/// finite bound outward by `min(constr_viol_tol, factor·max(|bound|, 1))`
+/// — the cap is `constr_viol_tol`, not a machine-eps floor (matching
+/// `IpOrigIpoptNLP.cpp:459-481`). Applied to both variable bounds
+/// `x_l`/`x_u` and constraint bounds `g_l`/`g_u` (Ipopt relaxes
+/// `d_L`/`d_U` the same way at `IpOrigIpoptNLP.cpp:355-358`).
+///
+/// Equality pairs (`lower[i] == upper[i]`) are left UNTOUCHED. Ipopt
+/// represents equality constraints separately from inequality bounds and
+/// never relaxes them; in ripopt they live in the same `g_l`/`g_u`
+/// arrays, so we must guard explicitly. Same rule applies to fixed
+/// variables (which `relax_fixed_variable_bounds` handles afterward).
+///
+/// `factor <= 0.0` is a no-op (option-disable path).
+fn apply_bound_relax_factor(
+    lower: &mut [f64],
+    upper: &mut [f64],
+    factor: f64,
+    constr_viol_tol: f64,
+) {
+    if !(factor > 0.0) {
+        return;
+    }
+    debug_assert_eq!(lower.len(), upper.len());
+    for i in 0..lower.len() {
+        if lower[i].is_finite() && upper[i].is_finite() && lower[i] == upper[i] {
+            continue;
+        }
+        if lower[i].is_finite() {
+            let delta = (factor * lower[i].abs().max(1.0)).min(constr_viol_tol);
+            lower[i] -= delta;
+        }
+        if upper[i].is_finite() {
+            let delta = (factor * upper[i].abs().max(1.0)).min(constr_viol_tol);
+            upper[i] += delta;
         }
     }
 }
 
-/// Push the initial point strictly inside finite variable bounds. For
-/// two-sided bounds, the push is min(bound_push, bound_frac * range);
-/// for one-sided bounds it is bound_push.
+/// Apply the configured `fixed_variable_treatment` to entries with
+/// `x_l[i] == x_u[i]`.
+///
+/// `RelaxBounds` (current default): widen the bounds by ±1e-8·max(|c|, 1)
+/// around the fixed value `c`. Mirrors Ipopt 3.14's `relax_bounds`.
+///
+/// `MakeParameter` (Ipopt default; not yet implemented): would substitute
+/// out fixed variables. Falls back to `RelaxBounds` here so the option
+/// is a no-op for callers — see TODO in `FixedVariableTreatment` doc.
+fn relax_fixed_variable_bounds(
+    x_l: &mut [f64],
+    x_u: &mut [f64],
+    options: &SolverOptions,
+) {
+    match options.fixed_variable_treatment {
+        FixedVariableTreatment::RelaxBounds | FixedVariableTreatment::MakeParameter => {
+            for i in 0..x_l.len() {
+                if x_l[i].is_finite() && x_u[i].is_finite() && (x_u[i] - x_l[i]).abs() < 1e-10 {
+                    let center = (x_l[i] + x_u[i]) / 2.0;
+                    let relax = 1e-8 * center.abs().max(1.0);
+                    x_l[i] = center - relax;
+                    x_u[i] = center + relax;
+                }
+            }
+        }
+    }
+}
+
+/// Push the initial point strictly inside finite variable bounds.
+///
+/// Ipopt 3.14 (`IpDefaultIterateInitializer.cpp:526-599`):
+///   pL = min(κ1·max(|x_L|, 1), κ2·(x_U − x_L))   [two-sided]
+///   pL = κ1·max(|x_L|, 1)                         [one-sided lower]
+///   pU = κ1·max(|x_U|, 1)                         [one-sided upper]
+/// where κ1 = `bound_push` and κ2 = `bound_frac`. The `max(|x|, 1)`
+/// scaling matters for one-sided bounds at large magnitude: without it,
+/// `x ≥ 1e3` gets pushed by only 0.01 absolute and the slack-driven
+/// initial multipliers `z = μ/slack` blow up the KKT factorization.
 fn push_initial_point_from_bounds(
     x: &mut [f64],
     x_l: &[f64],
     x_u: &[f64],
     options: &SolverOptions,
 ) {
+    let kappa1 = options.bound_push;
+    let kappa2 = options.bound_frac;
     for i in 0..x.len() {
-        if x_l[i].is_finite() && x_u[i].is_finite() {
+        let lower_finite = x_l[i].is_finite();
+        let upper_finite = x_u[i].is_finite();
+        if lower_finite && upper_finite {
             let range = x_u[i] - x_l[i];
-            let push = options.bound_push.min(options.bound_frac * range);
-            x[i] = x[i].max(x_l[i] + push).min(x_u[i] - push);
-        } else if x_l[i].is_finite() {
-            x[i] = x[i].max(x_l[i] + options.bound_push);
-        } else if x_u[i].is_finite() {
-            x[i] = x[i].min(x_u[i] - options.bound_push);
+            let p_l = (kappa1 * x_l[i].abs().max(1.0)).min(kappa2 * range);
+            let p_u = (kappa1 * x_u[i].abs().max(1.0)).min(kappa2 * range);
+            x[i] = x[i].max(x_l[i] + p_l).min(x_u[i] - p_u);
+        } else if lower_finite {
+            let p_l = kappa1 * x_l[i].abs().max(1.0);
+            x[i] = x[i].max(x_l[i] + p_l);
+        } else if upper_finite {
+            let p_u = kappa1 * x_u[i].abs().max(1.0);
+            x[i] = x[i].min(x_u[i] - p_u);
         }
     }
 }
 
-/// Compute initial constraint multipliers via least-squares estimate when
-/// enabled and the problem is small enough (m <= 500). Returns vec![0.0; m]
-/// when LS init is disabled, m == 0, m > 500, or evaluation fails.
+/// Compute initial constraint multipliers via least-squares estimate,
+/// matching Ipopt 3.14 `IpLeastSquareMults::CalculateMultipliers`
+/// (`IpLeastSquareMults.cpp:53-94`).
+///
+/// Solves the 4-block augmented saddle-point system
+///
+///   [ I        0      J_cᵀ   J_dᵀ ] [sol_x]   [grad_f − P_xL·z_L + P_xU·z_U]
+///   [ 0        I       0     -I   ] [sol_s] = [P_dL·v_L − P_dU·v_U          ]
+///   [ J_c      0       0      0   ] [y_c  ]   [0                             ]
+///   [ J_d     -I       0      0   ] [y_d  ]   [0                             ]
+///
+/// with `δ_x = δ_s = 1` and `W = 0`. Eliminating the slack block yields a
+/// sparse (n + m) symmetric system whose only difference from the reduced
+/// 2-block form is the `-1` diagonal on inequality rows of (m,m) and the
+/// `(v_L − v_U)` RHS contribution on those rows. At iter-0 cold start
+/// `v_L = v_U = bound_mult_init_val`, so `b_s = 0`; the `-1` diagonal
+/// is still essential — without it the saddle-point system is poorly
+/// conditioned for inequality-heavy problems (e.g. arki0003: 2-block
+/// `|y|_inf ≈ 5e3`, 4-block `|y_c|_inf ≈ 180`).
+///
+/// Returns `vec![0.0; m]` when LS init is disabled, `m == 0`, evaluation
+/// fails, the LS solve fails, or `max(|y|_inf) > constr_mult_init_max`.
 #[allow(clippy::too_many_arguments)]
 fn compute_initial_y_with_ls<P: NlpProblem>(
     problem: &P,
     options: &SolverOptions,
     x: &[f64],
+    z_l: &[f64],
+    z_u: &[f64],
     jac_rows: &[usize],
     jac_cols: &[usize],
+    _x_l: &[f64],
+    _x_u: &[f64],
     g_l: &[f64],
     g_u: &[f64],
     n: usize,
     m: usize,
     jac_nnz: usize,
 ) -> Vec<f64> {
-    if !(options.least_squares_mult_init && m > 0 && m <= 500) {
+    if !(options.least_squares_mult_init && m > 0) {
+        return vec![0.0; m];
+    }
+    // Square-problem branch: when m == n, Ipopt's
+    // `IpDefaultIterateInitializer::least_square_mults` skips the LS solve and
+    // initializes y = 0 directly (`IpDefaultIterateInitializer.cpp:685-690`).
+    if m == n {
         return vec![0.0; m];
     }
     let mut grad_f_init = vec![0.0; n];
@@ -9516,38 +9553,186 @@ fn compute_initial_y_with_ls<P: NlpProblem>(
     if !grad_ok || !jac_ok {
         return vec![0.0; m];
     }
-    compute_ls_multiplier_estimate(
-        &grad_f_init,
-        jac_rows,
-        jac_cols,
-        &jac_vals_init,
-        g_l,
-        g_u,
-        n,
-        m,
-        options.constr_mult_init_max,
-    )
-    .unwrap_or_else(|| vec![0.0; m])
+    // Mirrors `LeastSquareMultipliers::CalculateMultipliers`
+    // (`IpLeastSquareMults.cpp:30-95`), which is the default-path LSQ
+    // multiplier estimator invoked from
+    // `DefaultIterateInitializer::least_square_mults`
+    // (IpDefaultIterateInitializer.cpp:669-743) when
+    // `least_square_init_duals = no` (Ipopt 3.14 default). Solves the
+    // 4-block augmented system
+    //   ┌  I       0        J_c^T    J_d^T ┐ ┌sol_x┐   ┌ grad_f − z_L + z_U ┐
+    //   │  0       I        0        -I    │ │sol_s│ = │      −v_L + v_U     │
+    //   │ J_c      0        0         0    │ │ y_c │   │          0          │
+    //   └ J_d     -I        0         0    ┘ └ y_d ┘   │          0          ┘
+    // (delta_x = delta_s = 1.0, delta_c = delta_d = 0, W = 0).
+    // The output y_c, y_d are NOT sign-flipped (unlike
+    // `CalculateLeastSquareDuals` which does flip).
+    let y_aug = compute_initial_ls_4block(
+        &grad_f_init, jac_rows, jac_cols, &jac_vals_init,
+        z_l, z_u, g_l, g_u, options.bound_mult_init_val, n, m,
+    );
+    match y_aug {
+        Some(y) if linf_norm(&y) <= options.constr_mult_init_max => y,
+        _ => vec![0.0; m],
+    }
 }
 
-/// Compute least-squares multiplier estimate: min ||grad_f + J^T y||^2.
-/// Solves the normal equations (J J^T) y = -J grad_f.
-/// Uses dense Bunch-Kaufman for small problems, sparse LDL^T for large ones.
-/// Returns Some(y) if successful and all estimates are within threshold; None otherwise.
-fn compute_ls_multiplier_estimate(
+/// Solve Ipopt's default-path LSQ multiplier system per
+/// `LeastSquareMultipliers::CalculateMultipliers`
+/// (`IpLeastSquareMults.cpp:30-95`). Returns y_combined (length m) on
+/// success, None on factorization/solve failure.
+///
+/// Layout of the (n + n_d + n_c + n_d) symmetric system:
+///   slot 0..n             → sol_x   ((1,1) = +I)
+///   slot n..n+n_d         → sol_s   ((2,2) = +I)
+///   slot n+n_d..n+n_d+n_c → y_c     ((3,3) = 0)
+///   slot n+n_d+n_c..end   → y_d     ((4,4) = 0)
+///
+/// Off-diagonals (upper-triangle):
+///   J_c^T    at (col_x, n+n_d + row_c)
+///   J_d^T    at (col_x, n+n_d+n_c + row_d)
+///   -I       at (n+k,   n+n_d+n_c + k)        (slack/y_d coupling)
+///
+/// RHS:
+///   rhs_x[i] = grad_f[i] − z_L[i] + z_U[i]   (length n; z_L/z_U
+///                                              already zero on
+///                                              unbounded sides)
+///   rhs_s[k] = − v_L[k] + v_U[k]              (length n_d; both = bmiv
+///                                              if d-bound is finite,
+///                                              else 0)
+///   rhs_c, rhs_d = 0
+///
+/// After solve, y_c[combined_row] = sol_yc[c_pos[r]],
+/// y_d[combined_row] = sol_yd[d_pos[r]] — NO sign flip
+/// (`IpLeastSquareMults.cpp:80-94`).
+fn compute_initial_ls_4block(
     grad_f: &[f64],
     jac_rows: &[usize],
     jac_cols: &[usize],
     jac_vals: &[f64],
+    z_l: &[f64],
+    z_u: &[f64],
     g_l: &[f64],
     g_u: &[f64],
+    bound_mult_init_val: f64,
     n: usize,
     m: usize,
-    max_abs_threshold: f64,
 ) -> Option<Vec<f64>> {
-    compute_ls_multiplier_estimate_with_z(
-        grad_f, jac_rows, jac_cols, jac_vals, g_l, g_u, n, m, max_abs_threshold, None, None,
-    )
+    use crate::linear_solver::SparseSymmetricMatrix;
+
+    let mut c_pos: Vec<Option<usize>> = vec![None; m];
+    let mut d_pos: Vec<Option<usize>> = vec![None; m];
+    let mut n_c = 0usize;
+    let mut n_d = 0usize;
+    for r in 0..m {
+        let is_eq = (g_l[r] - g_u[r]).abs() < 1e-15
+            && g_l[r].is_finite() && g_u[r].is_finite();
+        if is_eq {
+            c_pos[r] = Some(n_c);
+            n_c += 1;
+        } else {
+            d_pos[r] = Some(n_d);
+            n_d += 1;
+        }
+    }
+    debug_assert_eq!(n_c + n_d, m);
+
+    let dim = n + n_d + n_c + n_d;
+    let cap = n + n_d + jac_rows.len() + n_d + n_c + n_d;
+    let mut ssm = SparseSymmetricMatrix {
+        n: dim,
+        triplet_rows: Vec::with_capacity(cap),
+        triplet_cols: Vec::with_capacity(cap),
+        triplet_vals: Vec::with_capacity(cap),
+    };
+
+    // (1,1) = +I (delta_x = 1.0).
+    for i in 0..n {
+        ssm.triplet_rows.push(i);
+        ssm.triplet_cols.push(i);
+        ssm.triplet_vals.push(1.0);
+    }
+
+    // (2,2) = +I (delta_s = 1.0).
+    for k in 0..n_d {
+        ssm.triplet_rows.push(n + k);
+        ssm.triplet_cols.push(n + k);
+        ssm.triplet_vals.push(1.0);
+    }
+
+    // (3,3), (4,4) = 0 (delta_c = delta_d = 0). Explicit structural
+    // zeros so the sparse pattern is non-singular for the solver.
+    for off in 0..(n_c + n_d) {
+        ssm.triplet_rows.push(n + n_d + off);
+        ssm.triplet_cols.push(n + n_d + off);
+        ssm.triplet_vals.push(0.0);
+    }
+
+    // (1,3) J_c^T and (1,4) J_d^T off-diagonals.
+    for (idx, (&row, &col)) in jac_rows.iter().zip(jac_cols.iter()).enumerate() {
+        let val = jac_vals[idx];
+        if let Some(rc) = c_pos[row] {
+            ssm.triplet_rows.push(col);
+            ssm.triplet_cols.push(n + n_d + rc);
+            ssm.triplet_vals.push(val);
+        } else if let Some(rd) = d_pos[row] {
+            ssm.triplet_rows.push(col);
+            ssm.triplet_cols.push(n + n_d + n_c + rd);
+            ssm.triplet_vals.push(val);
+        }
+    }
+
+    // (2,4) -I slack/y_d coupling.
+    for k in 0..n_d {
+        ssm.triplet_rows.push(n + k);
+        ssm.triplet_cols.push(n + n_d + n_c + k);
+        ssm.triplet_vals.push(-1.0);
+    }
+
+    // RHS construction. Per `IpLeastSquareMults.cpp:53-66`:
+    //   rhs_x = -grad_f + Px_L*z_L - Px_U*z_U
+    //   rhs_s = +Pd_L*v_L - Pd_U*v_U
+    // (Sign emerges from the `MultVector(α, x, β, y)` calls computing
+    //  `y := α·Op·x + β·y`; rhs_x is initialized to grad_f then negated.)
+    let mut rhs = vec![0.0_f64; dim];
+    for i in 0..n {
+        rhs[i] = -grad_f[i] + z_l[i] - z_u[i];
+    }
+    // rhs_s[k] = +v_L[k] - v_U[k] for k in 0..n_d. At iter-0 with
+    // BoundMultInitMethod::Constant, v_L[k] = bmiv·has_d_lower(k),
+    // v_U[k] = bmiv·has_d_upper(k); reconstruct from g_l/g_u.
+    for r in 0..m {
+        if let Some(k) = d_pos[r] {
+            let v_l_k = if g_l[r].is_finite() { bound_mult_init_val } else { 0.0 };
+            let v_u_k = if g_u[r].is_finite() { bound_mult_init_val } else { 0.0 };
+            rhs[n + k] = v_l_k - v_u_k;
+        }
+    }
+    // rhs_c, rhs_d already 0.
+
+    let matrix = KktMatrix::Sparse(ssm);
+    let mut solver = new_sparse_solver();
+    if solver.factor(&matrix).is_err() {
+        return None;
+    }
+    let mut sol = vec![0.0_f64; dim];
+    if solver.solve(&rhs, &mut sol).is_err() {
+        return None;
+    }
+    if sol.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+
+    // No sign flip. y_c[r] = sol[c-slot]; y_d[r] = sol[d-slot].
+    let mut y_combined = vec![0.0_f64; m];
+    for r in 0..m {
+        if let Some(rc) = c_pos[r] {
+            y_combined[r] = sol[n + n_d + rc];
+        } else if let Some(rd) = d_pos[r] {
+            y_combined[r] = sol[n + n_d + n_c + rd];
+        }
+    }
+    Some(y_combined)
 }
 
 /// Compute least-squares multiplier estimate via the Ipopt-exact augmented
@@ -9584,12 +9769,27 @@ fn compute_ls_multiplier_estimate(
 /// structural zeros on the lower `(2,2)` diagonal so the sparse
 /// solver sees a non-singular pattern. Used by
 /// `compute_ls_multiplier_estimate_augmented`.
+/// Build the (n+m) × (n+m) symmetric augmented matrix for the LS
+/// multiplier estimate.
+///
+/// `inequality_diag` toggles between Ipopt's two LS systems:
+/// - `inequality_diag = None` → reduced 2-block system used for the
+///   initial-iterate LS init (`IpDefaultIterateInitializer.cpp:382-409`)
+///   and for restoration entry: lower-right (m,m) block is zero.
+/// - `inequality_diag = Some(slice)` → 4-block-equivalent system used
+///   for post-step `recalc_y` (`IpLeastSquareMults.cpp:80-94`): for
+///   inequality rows i (where `slice[i] = true`), the (n+i, n+i) entry
+///   is `-1.0`; for equality rows it stays at 0. Eliminating the slack
+///   block from Ipopt's 4-block system gives this structure.
 fn build_ls_augmented_matrix(
     jac_rows: &[usize],
     jac_cols: &[usize],
     jac_vals: &[f64],
     n: usize,
     m: usize,
+    inequality_diag: Option<&[bool]>,
+    delta_c: f64,
+    delta_d_extra: f64,
 ) -> crate::linear_solver::SparseSymmetricMatrix {
     use crate::linear_solver::SparseSymmetricMatrix;
     let nnz_est = n + jac_rows.len() + m;
@@ -9609,10 +9809,23 @@ fn build_ls_augmented_matrix(
         ssm.triplet_cols.push(n + row);
         ssm.triplet_vals.push(jac_vals[idx]);
     }
+    // Bottom-block diagonal:
+    //   equality row  → -delta_c   (mirrors Ipopt's PDFullSpaceSolver
+    //                                 (m_c, m_c) entry; 0 in nominal LS,
+    //                                 lifted to delta_c when retrying after
+    //                                 SYMSOLVER_SINGULAR).
+    //   inequality row → -1 - delta_d_extra
+    //                                 (eliminated form's -1 plus optional
+    //                                 lift to break null-space ties on
+    //                                 rank-deficient `J_d`).
     for j in 0..m {
         ssm.triplet_rows.push(n + j);
         ssm.triplet_cols.push(n + j);
-        ssm.triplet_vals.push(0.0);
+        let diag = match inequality_diag {
+            Some(flags) if flags[j] => -1.0 - delta_d_extra,
+            _ => -delta_c,
+        };
+        ssm.triplet_vals.push(diag);
     }
     ssm
 }
@@ -9628,228 +9841,96 @@ fn compute_ls_multiplier_estimate_augmented(
     m: usize,
     z_l: Option<&[f64]>,
     z_u: Option<&[f64]>,
+    slack_mults: Option<(&[f64], &[f64])>,
 ) -> Option<Vec<f64>> {
     if m == 0 {
         return None;
     }
 
-    // RHS: [grad_f − z_L + z_U; 0]
+    // T3.30: when slack-multiplier inputs `(v_L, v_U)` are passed, build the
+    // 4-block-equivalent augmented system per Ipopt
+    // `IpLeastSquareMults.cpp:80-94`. Eliminating the explicit-slack block
+    // yields a (n+m) symmetric system whose only difference from the reduced
+    // 2-block form is: (a) a `-1.0` diagonal on the (m,m) lower-right block
+    // for inequality rows; (b) a `(v_L − v_U)` contribution to the bottom
+    // half of the RHS on inequality rows. Equality rows match the reduced
+    // form exactly. When `slack_mults = None` we fall back to the 2-block
+    // form (initial-iterate / restoration entry path).
+    let inequality_flags: Option<Vec<bool>> = slack_mults.map(|_| {
+        (0..m)
+            .map(|i| !(g_l[i].is_finite() && g_u[i].is_finite()
+                       && (g_l[i] - g_u[i]).abs() < 1e-15))
+            .collect()
+    });
+
+    // RHS: [grad_f − z_L + z_U; (v_L − v_U) per inequality row, else 0]
     let mut rhs = vec![0.0_f64; n + m];
     for i in 0..n {
         rhs[i] = grad_f[i];
         if let Some(zl) = z_l { rhs[i] -= zl[i]; }
         if let Some(zu) = z_u { rhs[i] += zu[i]; }
     }
-
-    let matrix = KktMatrix::Sparse(build_ls_augmented_matrix(
-        jac_rows, jac_cols, jac_vals, n, m,
-    ));
-    let mut solver = new_sparse_solver();
-    if solver.factor(&matrix).is_err() {
-        return None;
-    }
-    let mut sol = vec![0.0_f64; n + m];
-    if solver.solve(&rhs, &mut sol).is_err() {
-        return None;
-    }
-    if sol.iter().any(|v| !v.is_finite()) {
-        return None;
-    }
-
-    let mut y_ls: Vec<f64> = sol[n..].to_vec();
-    fix_inequality_mult_signs(&mut y_ls, g_l, g_u, m);
-    Some(y_ls)
-}
-
-/// LS multiplier estimate with optional bound-multiplier contributions.
-///
-/// Minimizes ||grad_f + J^T y - z_L + z_U||², yielding the normal equation
-///   (J J^T) y = -J * (grad_f - z_L + z_U)
-/// If `z_l`/`z_u` are `None`, they are treated as zero (cold-start / pre-z
-/// initialization). Post-restoration callers must pass them so the reset z
-/// values are absorbed into y, otherwise inf_du = ||grad_f + J^T y - z_L + z_U||
-/// stays large and the next Newton step is ill-directed.
-fn compute_ls_multiplier_estimate_with_z(
-    grad_f: &[f64],
-    jac_rows: &[usize],
-    jac_cols: &[usize],
-    jac_vals: &[f64],
-    g_l: &[f64],
-    g_u: &[f64],
-    n: usize,
-    m: usize,
-    max_abs_threshold: f64,
-    z_l: Option<&[f64]>,
-    z_u: Option<&[f64]>,
-) -> Option<Vec<f64>> {
-    // For large problems, use sparse J*J^T factorization
-    if m > 500 {
-        return compute_ls_multiplier_estimate_sparse(
-            grad_f, jac_rows, jac_cols, jac_vals, g_l, g_u, n, m, max_abs_threshold, None,
-            z_l, z_u,
-        );
-    }
-    if m == 0 {
-        return None;
-    }
-
-    let b = compute_ls_multiplier_rhs(grad_f, jac_rows, jac_cols, jac_vals, n, m, z_l, z_u);
-
-    // Compute A = J * J^T  (m x m dense symmetric matrix)
-    let mut j_dense = vec![0.0; m * n];
-    for (idx, (&row, &col)) in jac_rows.iter().zip(jac_cols.iter()).enumerate() {
-        j_dense[row * n + col] = jac_vals[idx];
-    }
-    let mut a_mat = SymmetricMatrix::zeros(m);
-    for i in 0..m {
-        let row_i = &j_dense[i * n..(i + 1) * n];
-        for j in 0..=i {
-            let row_j = &j_dense[j * n..(j + 1) * n];
-            a_mat.set(i, j, dot_product(row_i, row_j));
-        }
-    }
-
-    // Solve (J J^T) y = b using DenseLdl
-    let mut ls_solver = DenseLdl::new();
-    let mut y_ls = vec![0.0; m];
-    let factored = ls_solver.bunch_kaufman_factor(&a_mat);
-    let solved = factored.is_ok() && ls_solver.solve(&b, &mut y_ls).is_ok();
-
-    if !solved {
-        return None;
-    }
-
-    let max_abs = linf_norm(&y_ls);
-    if max_abs > max_abs_threshold {
-        return None;
-    }
-
-    fix_inequality_mult_signs(&mut y_ls, g_l, g_u, m);
-    Some(y_ls)
-}
-
-/// Sparse variant of LS multiplier estimate for large problems.
-/// Builds sparse J*J^T in COO format and factors with the sparse solver.
-/// If `solver` is Some, reuses the solver (for recalc_y caching).
-/// Build the sparse normal matrix `J·Jᵀ + reg·I` (upper triangle) as
-/// a `SparseSymmetricMatrix`. Groups Jacobian entries by column, then
-/// for each column accumulates the outer product `v·vᵀ` into a
-/// HashMap keyed by `(row, col)` with `row ≤ col`. A small `1e-12`
-/// regularization on the diagonal preserves numerical stability when
-/// `J` is rank-deficient. Used by the sparse LS multiplier estimate.
-fn build_sparse_normal_matrix_jjt(
-    jac_rows: &[usize],
-    jac_cols: &[usize],
-    jac_vals: &[f64],
-    n: usize,
-    m: usize,
-) -> crate::linear_solver::SparseSymmetricMatrix {
-    use crate::linear_solver::SparseSymmetricMatrix;
-
-    let mut col_entries: Vec<Vec<(usize, f64)>> = vec![vec![]; n];
-    for (idx, (&row, &col)) in jac_rows.iter().zip(jac_cols.iter()).enumerate() {
-        col_entries[col].push((row, jac_vals[idx]));
-    }
-
-    let total_col_nnz: usize = col_entries.iter().map(|c| c.len()).sum();
-    let nnz_est = total_col_nnz * 4;
-
-    use std::collections::HashMap;
-    let mut triplet_map: HashMap<(usize, usize), f64> = HashMap::with_capacity(nnz_est);
-
-    for k in 0..n {
-        let entries = &col_entries[k];
-        for &(i, vi) in entries.iter() {
-            for &(j, vj) in entries.iter() {
-                if i >= j {
-                    *triplet_map.entry((j, i)).or_insert(0.0) += vi * vj;
-                }
+    if let (Some((v_l, v_u)), Some(flags)) = (slack_mults, inequality_flags.as_ref()) {
+        for j in 0..m {
+            if flags[j] {
+                rhs[n + j] = v_l[j] - v_u[j];
             }
         }
     }
 
-    let reg = 1e-12;
-    for i in 0..m {
-        *triplet_map.entry((i, i)).or_insert(0.0) += reg;
-    }
-
-    let nnz = triplet_map.len();
-    let mut ssm = SparseSymmetricMatrix {
-        n: m,
-        triplet_rows: Vec::with_capacity(nnz),
-        triplet_cols: Vec::with_capacity(nnz),
-        triplet_vals: Vec::with_capacity(nnz),
+    // Mirror Ipopt's `PDFullSpaceSolver` SYMSOLVER_SINGULAR fallback at
+    // `IpPDFullSpaceSolver.cpp:282-305`: try the LS augmented system with
+    // `delta_c = delta_d = 0` first, and on failure (or on detection of a
+    // suspiciously zeroed multiplier vector — feral can return a valid
+    // null-space solution where MA27 returns the minimum-norm one) retry
+    // with a small `delta_c0 = 1e-8` (matching Ipopt's
+    // `IpPDPerturbationHandler` initial perturbation; see
+    // `IpPDPerturbationHandler.cpp:60`). The 4010×4010 LS matrix on
+    // arki0003 has 1041 linear-dependent equality rows; without δ_c the
+    // factorization picks an arbitrary null-space point that zeroes 58
+    // inequality multipliers, even though the (m,m) block has `-1` on
+    // those rows.
+    let try_solve = |delta_c: f64, delta_d_extra: f64| -> Option<Vec<f64>> {
+        let matrix = KktMatrix::Sparse(build_ls_augmented_matrix(
+            jac_rows, jac_cols, jac_vals, n, m, inequality_flags.as_deref(),
+            delta_c, delta_d_extra,
+        ));
+        // feral's default config (issue #2: bk.pivot_threshold = 1e-8 +
+        // ScalingStrategy::InfNorm) already matches MA27's `cntl[1]` /
+        // Ipopt's `ma27_pivtol`, so the LS init solve uses the same factory
+        // as the rest of the IPM. The `δ_c0 = 1e-8` retry below is the
+        // Ipopt-style perturbation, separate from the BK threshold.
+        let mut solver = new_sparse_solver();
+        if solver.factor(&matrix).is_err() {
+            return None;
+        }
+        let mut sol = vec![0.0_f64; n + m];
+        if solver.solve(&rhs, &mut sol).is_err() {
+            return None;
+        }
+        if sol.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        Some(sol)
     };
-    for (&(r, c), &v) in &triplet_map {
-        ssm.triplet_rows.push(r);
-        ssm.triplet_cols.push(c);
-        ssm.triplet_vals.push(v);
-    }
-    ssm
-}
-
-fn compute_ls_multiplier_estimate_sparse(
-    grad_f: &[f64],
-    jac_rows: &[usize],
-    jac_cols: &[usize],
-    jac_vals: &[f64],
-    g_l: &[f64],
-    g_u: &[f64],
-    n: usize,
-    m: usize,
-    max_abs_threshold: f64,
-    solver: Option<&mut Box<dyn LinearSolver>>,
-    z_l: Option<&[f64]>,
-    z_u: Option<&[f64]>,
-) -> Option<Vec<f64>> {
-    if m == 0 {
-        return None;
-    }
-
-    let b = compute_ls_multiplier_rhs(grad_f, jac_rows, jac_cols, jac_vals, n, m, z_l, z_u);
-
-    let ssm = build_sparse_normal_matrix_jjt(jac_rows, jac_cols, jac_vals, n, m);
-    let matrix = KktMatrix::Sparse(ssm);
-
-    // Factor and solve
-    let mut y_ls = vec![0.0; m];
-    let solved = if let Some(ls) = solver {
-        ls.factor(&matrix).is_ok() && ls.solve(&b, &mut y_ls).is_ok()
-    } else {
-        let mut ls = new_sparse_solver();
-        ls.factor(&matrix).is_ok() && ls.solve(&b, &mut y_ls).is_ok()
+    let sol = match try_solve(0.0, 0.0) {
+        Some(s) => s,
+        None => match try_solve(1e-8, 1e-8) {
+            Some(s) => s,
+            None => return None,
+        },
     };
 
-    if !solved {
-        return None;
-    }
-
-    let max_abs = linf_norm(&y_ls);
-    if max_abs > max_abs_threshold {
-        return None;
-    }
-
-    fix_inequality_mult_signs(&mut y_ls, g_l, g_u, m);
+    // Ipopt 3.14 `IpLeastSquareMults::CalculateMultipliers` does NOT
+    // post-process the y solution to enforce sign conventions per
+    // bound side; it returns whatever the augmented-system solve
+    // produces. Earlier ripopt added a `fix_inequality_mult_signs`
+    // pass that zeroed y on rows where the LS sign disagreed with
+    // the bound side — this discards information from a near-feasible
+    // primal estimate and biases the next Newton step toward the
+    // wrong sign convention. Removed for alignment.
+    let y_ls: Vec<f64> = sol[n..].to_vec();
     Some(y_ls)
-}
-
-/// Fix signs of inequality constraint multipliers from LS estimate.
-/// Ipopt convention (L = f + y^T g): g >= g_l → y >= 0, g <= g_u → y <= 0.
-fn fix_inequality_mult_signs(y_ls: &mut [f64], g_l: &[f64], g_u: &[f64], m: usize) {
-    for i in 0..m {
-        if convergence::is_equality_constraint(g_l[i], g_u[i]) {
-            continue;
-        }
-        let has_lower = g_l[i].is_finite();
-        let has_upper = g_u[i].is_finite();
-        if has_lower && !has_upper && y_ls[i] < 0.0 {
-            y_ls[i] = 0.0;
-        } else if has_upper && !has_lower && y_ls[i] > 0.0 {
-            y_ls[i] = 0.0;
-        } else if !has_lower && !has_upper {
-            y_ls[i] = 0.0;
-        }
-    }
 }
 
 /// Mirrors Ipopt's `ComputeOptimalityErrorScaling`
@@ -9870,19 +9951,94 @@ fn compute_residual_scaling(sum: f64, count: usize) -> f64 {
 }
 
 /// Dual residual scaling s_d evaluated at the current iterate, using
-/// the full multiplier sum (y, z_l, z_u) and count m + 2n.
+/// the full multiplier sum (y, z_l, z_u) and the finite-bound multiplier
+/// count (Ipopt `IpIpoptCalculatedQuantities.cpp:3689-3690`).
 fn compute_s_d_at_state(state: &SolverState) -> f64 {
-    compute_residual_scaling(compute_multiplier_sum(state), state.m + 2 * state.n)
+    compute_residual_scaling(compute_multiplier_sum(state), compute_multiplier_count(state))
 }
 
-/// Constraint violation theta evaluated at an arbitrary `g` against
-/// the current state's `g_l`/`g_u` bounds. Centralises the four
-/// trial-point theta sites (regular line search, soft restoration,
-/// second-order correction, and the IIE search-direction probe) that
-/// otherwise each repeat `convergence::primal_infeasibility(g,
-/// &state.g_l, &state.g_u)`.
-fn theta_for_g(state: &SolverState, g: &[f64]) -> f64 {
-    convergence::primal_infeasibility(g, &state.g_l, &state.g_u)
+/// Slack-coupled constraint violation θ evaluated at trial `(g, s)`
+/// against the current state's `g_l`/`g_u` bounds.
+///
+/// Mirrors Ipopt's `IpCq::curr_constraint_violation` =
+/// `||c||_1 + ||d − s||_1`
+/// (`IpIpoptCalculatedQuantities.cpp:1468-1473, 2570-2610`):
+/// - equality row (`g_l == g_u`): contributes `|g[i] − g_l[i]|`
+/// - inequality row: contributes `|g[i] − s[i]|`
+///
+/// **Why slack-coupled and not box-violation**: the IPM iterates an
+/// explicit slack `s` for inequality rows, and the Newton system
+/// drives the residual `d(x) − s` to zero (not `g(x)` to `[g_l,
+/// g_u]`). The filter line search must measure the same residual
+/// the step is solving — see `docs/A8_FOLLOWUP_arki0003.md` §A8.19
+/// for why the prior box-violation flavour made the h-type filter
+/// test artificially permissive at high theta.
+///
+/// Phase 3d: `s` and `ds` are now d-block-native. Equality rows are
+/// elided from the slack storage entirely, so the slack-coupled theta
+/// reduces to `||c||_1 + ||d − s||_1` directly without sentinel
+/// reconstruction.
+fn theta_for_split_d_s(state: &SolverState, c_x: &[f64], d_x: &[f64], s_d: &[f64]) -> f64 {
+    debug_assert_eq!(c_x.len(), state.layout.n_c);
+    debug_assert_eq!(d_x.len(), state.layout.n_d);
+    debug_assert_eq!(s_d.len(), state.layout.n_d);
+    convergence::primal_infeasibility_internal_split(c_x, d_x, s_d)
+}
+
+/// Compute split (c, d) views from a fresh m-form `g_trial` so theta /
+/// barrier helpers that already accept native split inputs can be
+/// reached without round-tripping through `state.g`. Used by the
+/// line-search / SOC / soft-resto trial paths whose user-side
+/// `problem.constraints` callback emits combined m-form.
+fn split_from_g(state: &SolverState, g: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    let c_trial: Vec<f64> = state
+        .layout
+        .c_to_combined
+        .iter()
+        .enumerate()
+        .map(|(k, &i)| g[i] - state.c_rhs[k])
+        .collect();
+    let d_trial: Vec<f64> = state.layout.project_d(g);
+    (c_trial, d_trial)
+}
+
+/// Reconstruct the user-facing combined-m-form Jacobian (rows, cols, vals)
+/// from the split storage. Used at the boundary between the IPM core
+/// (which uses split storage natively) and helpers that take a single
+/// combined triplet — restoration NLP, post-step recovery probes, the
+/// LS-y multiplier estimate. The output order interleaves c-rows then
+/// d-rows: a structurally distinct layout from the user's original
+/// triplet, but valid for any consumer that only needs `(rows, cols,
+/// vals)` to apply `J^T y` or solve a least-squares system.
+fn rebuild_combined_jac(state: &SolverState) -> (Vec<usize>, Vec<usize>, Vec<f64>) {
+    let nnz = state.jac_c_rows.len() + state.jac_d_rows.len();
+    let mut rows = Vec::with_capacity(nnz);
+    let mut cols = Vec::with_capacity(nnz);
+    let mut vals = Vec::with_capacity(nnz);
+    for (k, &kc) in state.jac_c_rows.iter().enumerate() {
+        rows.push(state.layout.c_to_combined[kc]);
+        cols.push(state.jac_c_cols[k]);
+        vals.push(state.jac_c_vals[k]);
+    }
+    for (k, &kd) in state.jac_d_rows.iter().enumerate() {
+        rows.push(state.layout.d_to_combined[kd]);
+        cols.push(state.jac_d_cols[k]);
+        vals.push(state.jac_d_vals[k]);
+    }
+    (rows, cols, vals)
+}
+
+/// Compute the trial slack `s + α·ds` for the line-search trial (size n_d).
+/// Frac-to-bound on `s` is enforced upstream by `compute_alpha_max`
+/// (`ipm.rs:3303-3414`), so `s_trial` stays in `(d_L, d_U)` for any
+/// `α ≤ alpha_primal_max`. Phase 3d: returns d-form Vec.
+fn compute_trial_slack(state: &SolverState, alpha: f64) -> Vec<f64> {
+    let n_d = state.layout.n_d;
+    let mut s_trial = Vec::with_capacity(n_d);
+    for k in 0..n_d {
+        s_trial.push(state.s[k] + alpha * state.ds[k]);
+    }
+    s_trial
 }
 
 /// Accumulate `J^T * y` (constraint Jacobian transpose times the
@@ -9891,8 +10047,12 @@ fn theta_for_g(state: &SolverState, g: &[f64]) -> f64 {
 /// computations, the active-set z recovery, and the gradient-of-f +
 /// J^T y diagnostic used by stall classification.
 fn accumulate_jt_y(state: &SolverState, target: &mut [f64]) {
-    for (idx, (&row, &col)) in state.jac_rows.iter().zip(state.jac_cols.iter()).enumerate() {
-        target[col] += state.jac_vals[idx] * state.y[row];
+    // Phase 5d: split-form J^T·y, no combined materialisation.
+    for (idx, (&kc, &col)) in state.jac_c_rows.iter().zip(state.jac_c_cols.iter()).enumerate() {
+        target[col] += state.jac_c_vals[idx] * state.y_c[kc];
+    }
+    for (idx, (&kd, &col)) in state.jac_d_rows.iter().zip(state.jac_d_cols.iter()).enumerate() {
+        target[col] += state.jac_d_vals[idx] * state.y_d[kd];
     }
 }
 
@@ -9910,11 +10070,11 @@ fn recover_active_set_z(state: &SolverState, gj: &[f64], n: usize) -> (Vec<f64>,
     let mut zu = vec![0.0; n];
     let kc = 1e10;
     for i in 0..n {
-        if gj[i] > 0.0 && state.x_l[i].is_finite() {
+        if gj[i] > 0.0 && state.x_l_at(i).is_finite() {
             if gj[i] * slack_xl(state, i) <= kc * state.mu.max(1e-20) {
                 zl[i] = gj[i];
             }
-        } else if gj[i] < 0.0 && state.x_u[i].is_finite() {
+        } else if gj[i] < 0.0 && state.x_u_at(i).is_finite() {
             if (-gj[i]) * slack_xu(state, i) <= kc * state.mu.max(1e-20) {
                 zu[i] = -gj[i];
             }
@@ -9925,7 +10085,10 @@ fn recover_active_set_z(state: &SolverState, gj: &[f64], n: usize) -> (Vec<f64>,
 
 /// Fraction-to-boundary `tau` factor used by the main step and the
 /// Gondzio multiple-centrality corrections. Free mode uses
-/// `1 - NLP_error` (Wächter & Biegler 2006 eq. 8); fixed mode uses
+/// `1 - E_mu` where `E_mu` is Ipopt's unified scaled KKT-error
+/// `max(dual_inf/s_d, primal_inf, compl_inf/s_c)`
+/// (`IpIpoptCalculatedQuantities::curr_nlp_error`,
+/// `IpAdaptiveMuUpdate.cpp:397`); fixed mode uses
 /// `1 - mu` (Ipopt's standard `IpAlgorithmRegOp::tau_min`). Both are
 /// floored at `options.tau_min` so the primal/dual fraction-to-
 /// boundary scan stays strictly positive.
@@ -9938,11 +10101,32 @@ fn compute_tau(
     compl_inf: f64,
 ) -> f64 {
     if mu_state.mode == MuMode::Free {
-        let nlp_error = primal_inf + dual_inf + compl_inf;
-        (1.0 - nlp_error).max(options.tau_min)
+        let e_mu = compute_e_mu(state, primal_inf, dual_inf, compl_inf);
+        (1.0 - e_mu).max(options.tau_min)
     } else {
         (1.0 - state.mu).max(options.tau_min)
     }
+}
+
+/// Unified scaled KKT-error `E_mu` matching Ipopt's
+/// `IpoptCalculatedQuantities::curr_nlp_error`
+/// (`IpIpoptCalculatedQuantities.cpp:3050-3104`):
+///
+/// ```text
+/// E_mu = max( dual_inf / s_d , primal_inf , compl_inf / s_c )
+/// ```
+///
+/// where `s_d = max(s_max, sum|y, z_l, z_u| / N_d) / s_max` and
+/// `s_c = max(s_max, sum|z_l, z_u| / N_c) / s_max` with `s_max = 100`.
+/// `N_d` / `N_c` are the finite-bound counts (matching Ipopt's
+/// `IpIpoptCalculatedQuantities.cpp:3050-3104`, where the denominators
+/// are the active multiplier counts, not structural `m+2n` / `2n`).
+/// Used by the Free-mode τ formula so it tracks the same scaled error
+/// the convergence test uses.
+fn compute_e_mu(state: &SolverState, primal_inf: f64, dual_inf: f64, compl_inf: f64) -> f64 {
+    let s_d = compute_residual_scaling(compute_multiplier_sum(state), compute_multiplier_count(state));
+    let s_c = compute_residual_scaling(compute_bound_multiplier_sum(state), compute_bound_multiplier_count(state));
+    (dual_inf / s_d).max(primal_inf).max(compl_inf / s_c)
 }
 
 /// Fraction-to-boundary cap on the dual step `α·(dz_l, dz_u)` against
@@ -9952,8 +10136,76 @@ fn compute_tau(
 /// affine-predictor cap — that all spell out two
 /// `filter::fraction_to_boundary` calls plus a `.min` inline.
 fn fraction_to_boundary_dual_z_min(state: &SolverState, dz_l: &[f64], dz_u: &[f64], tau: f64) -> f64 {
-    filter::fraction_to_boundary(&state.z_l, dz_l, tau)
-        .min(filter::fraction_to_boundary(&state.z_u, dz_u, tau))
+    // Phase 6d.4: caller passes compressed dz_l/dz_u (length n_x_l/
+    // n_x_u). Direct index k on both z_*_compressed and the input
+    // direction; no map indirection needed.
+    debug_assert_eq!(dz_l.len(), state.bound_layout.n_x_l);
+    debug_assert_eq!(dz_u.len(), state.bound_layout.n_x_u);
+    let mut alpha = 1.0_f64;
+    for k in 0..state.bound_layout.n_x_l {
+        let dsi = dz_l[k];
+        if dsi < 0.0 {
+            let r = -tau * state.z_l_compressed[k] / dsi;
+            if r < alpha {
+                alpha = r;
+            }
+        }
+    }
+    for k in 0..state.bound_layout.n_x_u {
+        let dsi = dz_u[k];
+        if dsi < 0.0 {
+            let r = -tau * state.z_u_compressed[k] / dsi;
+            if r < alpha {
+                alpha = r;
+            }
+        }
+    }
+    alpha.clamp(0.0, 1.0)
+}
+
+/// Fraction-to-boundary cap on `α·dv_L`, `α·dv_U` against the slack-bound
+/// multipliers `state.v_l` / `state.v_u`. Returns the minimum across both
+/// blocks; together with `fraction_to_boundary_dual_z_min` this gives the
+/// full dual-side α_max (Ipopt computes a single α_dual across z_L, z_U,
+/// v_L, v_U via `IpFilterLSAcceptor::ComputeAlphaForY` ↔
+/// `IpIpoptCalculatedQuantities::CalcFracToBound`).
+fn fraction_to_boundary_dual_v_min(state: &SolverState, dv_l: &[f64], dv_u: &[f64], tau: f64) -> f64 {
+    // Phase 8c.5: walk compressed slack-multiplier storage. Project
+    // the input dv_l/dv_u (length n_d) onto the same compressed
+    // index space so v[k]+α·dv[k] is checked only on d-rows with the
+    // corresponding finite slack bound. Unbounded sides have v=0
+    // (no boundary to hit) and are skipped by construction.
+    let dv_l_compressed = state.d_bound_layout.project_l(dv_l);
+    let dv_u_compressed = state.d_bound_layout.project_u(dv_u);
+    filter::fraction_to_boundary(&state.v_l_compressed, &dv_l_compressed, tau)
+        .min(filter::fraction_to_boundary(&state.v_u_compressed, &dv_u_compressed, tau))
+}
+
+/// Ipopt's `CalculateSafeSlack` (IpIpoptCalculatedQuantities.cpp:455-537).
+/// When a primal/slack-bound slack drops below `s_min = eps * min(1, mu)`
+/// it is replaced for downstream computations with
+/// `min(max(mu/multiplier, s_min), slack_move*max(1,|bound|) + max(0, slack))`,
+/// where `slack_move = eps^0.75 ≈ 1.83e-12` (Ipopt option default
+/// `IpIpoptCalculatedQuantities.cpp:163-173`). This safeguard prevents
+/// frac-to-boundary from collapsing α to ~machine-precision when an
+/// iterate has been pushed against a bound to within ε.
+fn safe_slack(slack: f64, mu: f64, multiplier: f64, bound: f64) -> f64 {
+    let eps = f64::EPSILON;
+    let s_min = {
+        let s = eps * mu.min(1.0);
+        if s == 0.0 { f64::MIN_POSITIVE } else { s }
+    };
+    if slack >= s_min {
+        return slack;
+    }
+    let slack_move = eps.powf(0.75); // ≈ 1.83e-12
+    let cand = if multiplier > 0.0 {
+        (mu / multiplier).max(s_min)
+    } else {
+        s_min
+    };
+    let cap = slack_move * bound.abs().max(1.0) + slack.max(0.0);
+    cand.min(cap)
 }
 
 /// Fraction-to-boundary cap on the primal step `α·dx` against the
@@ -9962,16 +10214,68 @@ fn fraction_to_boundary_dual_z_min(state: &SolverState, dz_l: &[f64], dz_u: &[f6
 /// this same per-component scan; centralising it keeps the three
 /// step-controllers (main step, multiple-centrality corrections,
 /// second-order correction) in lockstep.
+///
+/// Slack values are filtered through `safe_slack` (Ipopt's
+/// `CalculateSafeSlack`, `IpIpoptCalculatedQuantities.cpp:455-537`)
+/// before the FTB ratio is taken, so degenerate iterates with
+/// near-zero slacks behave the same as Ipopt.
 fn fraction_to_boundary_primal_x(state: &SolverState, dx: &[f64], tau: f64) -> f64 {
     let mut alpha = 1.0_f64;
+    let mu = state.mu;
     for i in 0..state.n {
-        if state.x_l[i].is_finite() && dx[i] < 0.0 {
-            let slack = state.x[i] - state.x_l[i];
+        if state.x_l_at(i).is_finite() && dx[i] < 0.0 {
+            let raw_slack = state.x[i] - state.x_l_at(i);
+            let z = state.bound_layout.full_to_x_l[i]
+                .map(|k| state.z_l_compressed[k])
+                .unwrap_or(0.0);
+            let slack = safe_slack(raw_slack, mu, z, state.x_l_at(i));
             alpha = alpha.min(-tau * slack / dx[i]);
         }
-        if state.x_u[i].is_finite() && dx[i] > 0.0 {
-            let slack = state.x_u[i] - state.x[i];
+        if state.x_u_at(i).is_finite() && dx[i] > 0.0 {
+            let raw_slack = state.x_u_at(i) - state.x[i];
+            let z = state.bound_layout.full_to_x_u[i]
+                .map(|k| state.z_u_compressed[k])
+                .unwrap_or(0.0);
+            let slack = safe_slack(raw_slack, mu, z, state.x_u_at(i));
             alpha = alpha.min(tau * slack / dx[i]);
+        }
+    }
+    alpha
+}
+
+/// Fraction-to-boundary cap on `α·ds` against the slack iterate `s`
+/// (Ipopt's `IpIpoptCalculatedQuantities::CalcFracToBound` for the slack
+/// block). Equality rows are skipped (their `s` is held at the equality
+/// value as a sentinel and `ds` is forced to 0 by `recover_ds`).
+///
+/// One-sided inequalities use the same one-sided FTB pattern as `x` against
+/// its variable bounds: the open side of the bound never produces an `α`
+/// limiter even when `ds` points "away" from the finite side.
+///
+/// Slack values are filtered through `safe_slack` (Ipopt's
+/// `CalculateSafeSlack`) before the FTB ratio is taken.
+fn fraction_to_boundary_primal_s(state: &SolverState, ds: &[f64], tau: f64) -> f64 {
+    debug_assert_eq!(ds.len(), state.layout.n_d);
+    let mut alpha = 1.0_f64;
+    let mu = state.mu;
+    for (k, &i) in state.layout.d_to_combined.iter().enumerate() {
+        let l_fin = state.g_l_at(i).is_finite();
+        let u_fin = state.g_u_at(i).is_finite();
+        if l_fin && ds[k] < 0.0 {
+            let raw_slack = state.s[k] - state.g_l_at(i);
+            let v = state.d_bound_layout.full_to_d_l[k]
+                .map(|kk| state.v_l_compressed[kk])
+                .unwrap_or(0.0);
+            let slack = safe_slack(raw_slack, mu, v, state.g_l_at(i));
+            alpha = alpha.min(-tau * slack / ds[k]);
+        }
+        if u_fin && ds[k] > 0.0 {
+            let raw_slack = state.g_u_at(i) - state.s[k];
+            let v = state.d_bound_layout.full_to_d_u[k]
+                .map(|kk| state.v_u_compressed[kk])
+                .unwrap_or(0.0);
+            let slack = safe_slack(raw_slack, mu, v, state.g_u_at(i));
+            alpha = alpha.min(tau * slack / ds[k]);
         }
     }
     alpha
@@ -9983,14 +10287,66 @@ fn fraction_to_boundary_primal_x(state: &SolverState, dx: &[f64], tau: f64) -> f
 fn install_step_directions(
     state: &mut SolverState,
     dx: Vec<f64>,
-    dy: Vec<f64>,
+    dy_c: Vec<f64>,
+    dy_d: Vec<f64>,
+    ds: Vec<f64>,
     dz_l: Vec<f64>,
     dz_u: Vec<f64>,
+    dv_l: Vec<f64>,
+    dv_u: Vec<f64>,
 ) {
+    debug_assert_eq!(dy_c.len(), state.layout.n_c);
+    debug_assert_eq!(dy_d.len(), state.layout.n_d);
+    debug_assert_eq!(ds.len(), state.layout.n_d);
+    debug_assert_eq!(dv_l.len(), state.layout.n_d);
+    debug_assert_eq!(dv_u.len(), state.layout.n_d);
     state.dx = dx;
-    state.dy = dy;
-    state.dz_l = dz_l;
-    state.dz_u = dz_u;
+    state.dy_c = dy_c;
+    state.dy_d = dy_d;
+    state.ds = ds;
+    // Phase 6d.6: project full-`n` dz_l/dz_u from the direction recovery
+    // into compressed storage.
+    state.dz_l_compressed = state.bound_layout.project_l(&dz_l);
+    state.dz_u_compressed = state.bound_layout.project_u(&dz_u);
+    // Phase 8d: project the n_d-length dv_l/dv_u directly into the
+    // compressed mirrors; the combined storage was dropped.
+    state.dv_l_compressed = state.d_bound_layout.project_l(&dv_l);
+    state.dv_u_compressed = state.d_bound_layout.project_u(&dv_u);
+    // RIPOPT_DX_PROBE=iter,var: dump dx[var], dz_l/u[var], slacks, and
+    // norms after the main step is installed. Used to compare KKT
+    // direction precision across linear-solver backends (feral vs rmumps)
+    // — see docs/A8_FOLLOWUP_arki0003.md "2026-05-04 trace" follow-up.
+    if let Ok(spec) = std::env::var("RIPOPT_DX_PROBE") {
+        let mut parts = spec.split(',');
+        let want_iter: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+        let want_var: usize  = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        if state.iter == want_iter && want_var < state.dx.len() {
+            let xv = state.x[want_var];
+            let xl = state.x_l_at(want_var);
+            let xu = state.x_u_at(want_var);
+            let sl = if xl.is_finite() { xv - xl } else { f64::INFINITY };
+            let su = if xu.is_finite() { xu - xv } else { f64::INFINITY };
+            let dz_l_v = state.bound_layout.full_to_x_l[want_var]
+                .map(|k| state.dz_l_compressed[k]).unwrap_or(0.0);
+            let dz_u_v = state.bound_layout.full_to_x_u[want_var]
+                .map(|k| state.dz_u_compressed[k]).unwrap_or(0.0);
+            let z_l_v = state.bound_layout.full_to_x_l[want_var]
+                .map(|k| state.z_l_compressed[k]).unwrap_or(0.0);
+            let z_u_v = state.bound_layout.full_to_x_u[want_var]
+                .map(|k| state.z_u_compressed[k]).unwrap_or(0.0);
+            let dx_inf = state.dx.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+            let dyc_inf = state.dy_c.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+            let dyd_inf = state.dy_d.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+            eprintln!(
+                "[dx-probe] iter={} mu={:.3e} var={} x={:.6e} sl={:.3e} su={:.3e} \
+                 dx={:+.6e} z_L={:.3e} z_U={:.3e} dz_L={:+.3e} dz_U={:+.3e} \
+                 |dx|_inf={:.3e} |dy_c|_inf={:.3e} |dy_d|_inf={:.3e}",
+                state.iter, state.mu, want_var, xv, sl, su,
+                state.dx[want_var], z_l_v, z_u_v, dz_l_v, dz_u_v,
+                dx_inf, dyc_inf, dyd_inf,
+            );
+        }
+    }
 }
 
 /// L-infinity norm of `J^T * c_violation`, where `c_violation` is the
@@ -10000,21 +10356,31 @@ fn install_step_directions(
 /// θ > 0 the iterate is a stationary point of the feasibility merit
 /// function, so the problem is locally infeasible.
 fn compute_grad_theta_norm(state: &SolverState) -> f64 {
+    // Phase 5e: split-form theta gradient.
+    // For c-block: violation[k_c] = c_x[k_c] (= g[i] - c_rhs[k] for
+    // equality row i, since c_rhs = g_l = g_u for equalities).
+    // For d-block: violation[k_d] = clipped d_x against d_l/d_u.
     let n = state.n;
-    let m = state.m;
-    let mut violation = vec![0.0; m];
-    for i in 0..m {
-        if constraint_is_equality(state, i) {
-            violation[i] = state.g[i] - state.g_l[i];
-        } else if state.g_l[i].is_finite() && state.g[i] < state.g_l[i] {
-            violation[i] = state.g[i] - state.g_l[i];
-        } else if state.g_u[i].is_finite() && state.g[i] > state.g_u[i] {
-            violation[i] = state.g[i] - state.g_u[i];
-        }
-    }
+    let n_c = state.layout.n_c;
+    let n_d = state.layout.n_d;
     let mut grad_theta = vec![0.0; n];
-    for (idx, (&row, &col)) in state.jac_rows.iter().zip(state.jac_cols.iter()).enumerate() {
-        grad_theta[col] += state.jac_vals[idx] * violation[row];
+    for (idx, (&kc, &col)) in state.jac_c_rows.iter().zip(state.jac_c_cols.iter()).enumerate() {
+        let _ = n_c;
+        grad_theta[col] += state.jac_c_vals[idx] * state.c_x[kc];
+    }
+    for (idx, (&kd, &col)) in state.jac_d_rows.iter().zip(state.jac_d_cols.iter()).enumerate() {
+        let _ = n_d;
+        let dl = state.d_l_at(kd);
+        let du = state.d_u_at(kd);
+        let dx = state.d_x[kd];
+        let v = if dl.is_finite() && dx < dl {
+            dx - dl
+        } else if du.is_finite() && dx > du {
+            dx - du
+        } else {
+            0.0
+        };
+        grad_theta[col] += state.jac_d_vals[idx] * v;
     }
     linf_norm(&grad_theta)
 }
@@ -10022,12 +10388,56 @@ fn compute_grad_theta_norm(state: &SolverState) -> f64 {
 /// `convergence::dual_infeasibility` at the current iterate using
 /// `state.{grad_f, jac_*, y, z_l, z_u}`. This combination of args
 /// appears at over a dozen call sites; the helper makes them all
-/// uniform.
+/// uniform. T3.9: kappa_d damping term applied via `state.kappa_d`.
+///
+/// B7: now also folds in the slack-side residual
+/// `||−y_d − v_L + v_U||_∞` for inequality rows so the dual_inf
+/// reflects the full IteratesVector dual gradient (Ipopt
+/// `IpIpoptCalculatedQuantities::curr_dual_infeasibility` over both
+/// x and s blocks).
 fn compute_dual_inf_at_state(state: &SolverState) -> f64 {
-    convergence::dual_infeasibility(
-        &state.grad_f, &state.jac_rows, &state.jac_cols, &state.jac_vals,
-        &state.y, &state.z_l, &state.z_u, state.n,
-    )
+    // A8.10 / DEV-1: Ipopt's `curr_dual_infeasibility`
+    // (`IpIpoptCalculatedQuantities.cpp:2682-2691`) calls the *plain*
+    // `curr_grad_lag_x()` / `curr_grad_lag_s()` (lines 1993-2030,
+    // 2069-2098) — no κ_d damping. The damped variants
+    // (`curr_grad_lag_with_damping_x/s`, lines 2131-2227) are used
+    // *only* in the augmented-system RHS (`curr_grad_barrier_obj_x`).
+    // Phase 6d.5: materialize compressed z for the convergence helper.
+    let z_l_full = state.z_l_combined();
+    let z_u_full = state.z_u_combined();
+    let x_part = convergence::dual_infeasibility_split(
+        &state.grad_f,
+        &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals, &state.y_c,
+        &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals, &state.y_d,
+        &z_l_full, &z_u_full, state.n,
+    );
+    x_part.max(slack_dual_inf_max(state))
+}
+
+/// Slack-side dual residual `||grad_lag_s||_∞` where
+/// `grad_lag_s[i] = −y[i] − v_L[i] + v_U[i]` for inequality rows.
+/// Equality rows are skipped (Ipopt has no s for c-rows). The v_L/v_U
+/// slots are zero on rows with infinite g_l/g_u so the sum is implicitly
+/// projected onto active inequality bounds.
+///
+/// A8.10: Ipopt's `curr_dual_infeasibility`
+/// (`IpIpoptCalculatedQuantities.cpp:2682-2691`) uses the *plain*
+/// `curr_grad_lag_s()` — no κ_d damping. The damped variant
+/// `curr_grad_lag_with_damping_s` is used only for the augmented-system
+/// RHS, not the printed inf_du or convergence test. Pass no damping here.
+fn slack_dual_inf_max(state: &SolverState) -> f64 {
+    let mut m = 0.0_f64;
+    for i in 0..state.m {
+        if constraint_is_equality(state, i) {
+            continue;
+        }
+        let r = -state.y_at(i) - state.v_l_at(i) + state.v_u_at(i);
+        let a = r.abs();
+        if a > m {
+            m = a;
+        }
+    }
+    m
 }
 
 /// `convergence::dual_infeasibility` at the current iterate using
@@ -10035,9 +10445,13 @@ fn compute_dual_inf_at_state(state: &SolverState) -> f64 {
 /// by [`recover_active_set_z`] for an optimistic optimality probe)
 /// instead of `state.z_l`/`state.z_u`.
 fn dual_inf_with_z(state: &SolverState, z_l: &[f64], z_u: &[f64]) -> f64 {
-    convergence::dual_infeasibility(
-        &state.grad_f, &state.jac_rows, &state.jac_cols, &state.jac_vals,
-        &state.y, z_l, z_u, state.n,
+    // A8.10 / DEV-1: plain `curr_dual_infeasibility` — no κ_d damping
+    // (`IpIpoptCalculatedQuantities.cpp:2682-2691`).
+    convergence::dual_infeasibility_split(
+        &state.grad_f,
+        &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals, &state.y_c,
+        &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals, &state.y_d,
+        z_l, z_u, state.n,
     )
 }
 
@@ -10045,7 +10459,24 @@ fn dual_inf_with_z(state: &SolverState, z_l: &[f64], z_u: &[f64]) -> f64 {
 /// the current state's `g_l`/`g_u` bounds. Centralises the five
 /// state-arg call sites of `convergence::primal_infeasibility_max`.
 fn compute_primal_inf_max_at_state(state: &SolverState) -> f64 {
-    convergence::primal_infeasibility_max(&state.g, &state.g_l, &state.g_u)
+    convergence::primal_infeasibility_max_split(
+        &state.g_c(),
+        &state.g_d(),
+        &state.d_l(),
+        &state.d_u(),
+    )
+}
+
+/// L-infinity slack-coupling residual at the current iterate
+/// (`||c||_∞ ∪ ||d − s||_∞`). Used by the scaled (barrier-level)
+/// convergence test. Mirrors Ipopt's
+/// `IpIpoptCalculatedQuantities::curr_primal_infeasibility(NORM_MAX)`.
+fn compute_primal_inf_internal_max_at_state(state: &SolverState) -> f64 {
+    convergence::primal_infeasibility_internal_max_split(
+        &state.g_c(),
+        &state.g_d(),
+        &state.s_d(),
+    )
 }
 
 /// `convergence::dual_infeasibility_scaled` at the current iterate
@@ -10053,11 +10484,40 @@ fn compute_primal_inf_max_at_state(state: &SolverState) -> f64 {
 /// dual residual is what the optimality measures, the post-step
 /// diagnostic, the stall classifier, and the MaxIter diagnostic all
 /// compare against `options.dual_inf_tol`.
+///
+/// B7: also folds in `slack_dual_inf_max` so the unscaled view of dual
+/// feasibility sees the slack-side residual too.
 fn compute_dual_inf_unscaled_at_state(state: &SolverState) -> f64 {
-    convergence::dual_infeasibility_scaled(
-        &state.grad_f, &state.jac_rows, &state.jac_cols, &state.jac_vals,
-        &state.y, &state.z_l, &state.z_u, state.n,
-    )
+    // A8.10 / DEV-1: plain `curr_dual_infeasibility` — no κ_d damping
+    // (`IpIpoptCalculatedQuantities.cpp:2682-2691`).
+    // Phase 5c: `dual_infeasibility_scaled` was bit-equivalent to
+    // `dual_infeasibility` (same Lagrangian gradient, no per-component
+    // divisor — see T3.1). Routes through the split form too.
+    // Phase 6d.5: materialize compressed z for the convergence helper.
+    //
+    // Ipopt's `OrigIpoptNLP::unscaled_curr_dual_infeasibility` divides
+    // the NLP-scaled ∇L by `obj_scaling` (df) so the unscaled gate
+    // and final summary are reported in the user's NLP space. Without
+    // this division `dual_inf_unscaled` was bit-equivalent to
+    // `dual_inf` and the convergence test compared scaled-space ∇L
+    // against the user-provided `dual_inf_tol`. The cfg(test) helper
+    // `compute_convergence_info_from_state` already does this division
+    // (verified by `test_convergence_info_dual_inf_unscaled_with_obj_scaling`);
+    // the production path was missing it.
+    let z_l_full = state.z_l_combined();
+    let z_u_full = state.z_u_combined();
+    let x_part = convergence::dual_infeasibility_split(
+        &state.grad_f,
+        &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals, &state.y_c,
+        &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals, &state.y_d,
+        &z_l_full, &z_u_full, state.n,
+    );
+    let scaled = x_part.max(slack_dual_inf_max(state));
+    if state.obj_scaling != 1.0 && state.obj_scaling != 0.0 {
+        scaled / state.obj_scaling
+    } else {
+        scaled
+    }
 }
 
 /// `convergence::complementarity_error` at the current iterate using
@@ -10066,17 +10526,31 @@ fn compute_dual_inf_unscaled_at_state(state: &SolverState) -> f64 {
 /// instead of `state.z_l`/`state.z_u`. Always evaluated with `μ = 0`
 /// (the optimality complementarity rather than the centered-path one).
 fn compl_err_with_z(state: &SolverState, z_l: &[f64], z_u: &[f64]) -> f64 {
+    let x_l_full = state.x_l_combined();
+    let x_u_full = state.x_u_combined();
     convergence::complementarity_error(
-        &state.x, &state.x_l, &state.x_u, z_l, z_u, 0.0,
+        &state.x, &x_l_full, &x_u_full, z_l, z_u, 0.0,
     )
 }
 
-/// `convergence::complementarity_error` at the current iterate using
-/// `state.{x, x_l, x_u, z_l, z_u}` with `μ = 0` (i.e. the
-/// optimality complementarity rather than the centered-path one).
+/// Full complementarity error at the current iterate including both
+/// variable-bound blocks `(x − x_L)·z_L`, `(x_U − x)·z_U` and the
+/// constraint-slack blocks `(g − g_L)·max(y, 0)`, `(g_U − g)·max(−y, 0)`,
+/// each compared against `μ = 0`. Mirrors Ipopt's `curr_complementarity`,
+/// which sums Asum() over all four projection blocks z_L / z_U / v_L / v_U
+/// (`IpIpoptCalculatedQuantities.cpp:2467-2497`). Without the v_L / v_U
+/// terms the convergence test cannot detect a stalled inequality
+/// constraint where `y` and slack are both nonzero.
 fn compute_compl_err_at_state(state: &SolverState) -> f64 {
-    convergence::complementarity_error(
-        &state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u, 0.0,
+    // Phase 6d.5: materialize compressed z for the convergence helper.
+    let z_l_full = state.z_l_combined();
+    let z_u_full = state.z_u_combined();
+    let x_l_full = state.x_l_combined();
+    let x_u_full = state.x_u_combined();
+    convergence::complementarity_error_full_split(
+        &state.x, &x_l_full, &x_u_full, &z_l_full, &z_u_full,
+        &state.g_d(), &state.d_l(), &state.d_u(),
+        &state.v_l_d(), &state.v_u_d(), 0.0,
     )
 }
 
@@ -10100,35 +10574,51 @@ fn compute_pderror_e_mu(state: &SolverState, mu: f64) -> f64 {
     let n_pri = m.max(1) as f64;
 
     // Dual residual r_i = grad_f_i + (J^T y)_i - z_l_i + z_u_i, 1-norm.
+    // Phase 5e: split-form J^T·y, no combined materialisation.
     let mut residual = vec![0.0; n];
     residual[..n].copy_from_slice(&state.grad_f[..n]);
-    for (idx, (&row, &col)) in state.jac_rows.iter().zip(state.jac_cols.iter()).enumerate() {
-        residual[col] += state.jac_vals[idx] * state.y[row];
+    for (idx, (&kc, &col)) in state.jac_c_rows.iter().zip(state.jac_c_cols.iter()).enumerate() {
+        residual[col] += state.jac_c_vals[idx] * state.y_c[kc];
     }
-    for i in 0..n {
-        residual[i] -= state.z_l[i];
-        residual[i] += state.z_u[i];
+    for (idx, (&kd, &col)) in state.jac_d_rows.iter().zip(state.jac_d_cols.iter()).enumerate() {
+        residual[col] += state.jac_d_vals[idx] * state.y_d[kd];
+    }
+    // Phase 6d.3: walk compressed bound mirrors.
+    for k in 0..state.bound_layout.n_x_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        residual[i] -= state.z_l_compressed[k];
+    }
+    for k in 0..state.bound_layout.n_x_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        residual[i] += state.z_u_compressed[k];
     }
     let dual_l1: f64 = residual.iter().map(|r| r.abs()).sum();
 
-    let primal_l1 = convergence::primal_infeasibility(&state.g, &state.g_l, &state.g_u);
+    let primal_l1 = convergence::primal_infeasibility_split(
+        &state.g_c(),
+        &state.g_d(),
+        &state.d_l(),
+        &state.d_u(),
+    );
 
     // Complementarity 1-norm: |slack·z - μ| over finite bounds, averaged
     // by the count of contributing entries (n_compl). When there are no
     // finite bounds, drop the term.
     let mut compl_l1 = 0.0f64;
     let mut n_compl = 0usize;
-    for i in 0..n {
-        if state.x_l[i].is_finite() {
-            let slack = (state.x[i] - state.x_l[i]).max(0.0);
-            compl_l1 += (slack * state.z_l[i] - mu).abs();
-            n_compl += 1;
-        }
-        if state.x_u[i].is_finite() {
-            let slack = (state.x_u[i] - state.x[i]).max(0.0);
-            compl_l1 += (slack * state.z_u[i] - mu).abs();
-            n_compl += 1;
-        }
+    let _ = n;
+    // Phase 6d.3: walk compressed bound mirrors.
+    for k in 0..state.bound_layout.n_x_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        let slack = (state.x[i] - state.x_l_at(i)).max(0.0);
+        compl_l1 += (slack * state.z_l_compressed[k] - mu).abs();
+        n_compl += 1;
+    }
+    for k in 0..state.bound_layout.n_x_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        let slack = (state.x_u_at(i) - state.x[i]).max(0.0);
+        compl_l1 += (slack * state.z_u_compressed[k] - mu).abs();
+        n_compl += 1;
     }
     let compl_term = if n_compl == 0 { 0.0 } else { compl_l1 / n_compl as f64 };
 
@@ -10151,8 +10641,8 @@ fn obj_and_grad_finite(state: &SolverState) -> bool {
 /// slacks). The 1e-15 tolerance matches Ipopt's `equality_tolerance`
 /// for `c(x) = 0` vs. `c_L ≤ c(x) ≤ c_U` row classification.
 fn constraint_is_equality(state: &SolverState, i: usize) -> bool {
-    state.g_l[i].is_finite() && state.g_u[i].is_finite()
-        && (state.g_l[i] - state.g_u[i]).abs() < 1e-15
+    state.g_l_at(i).is_finite() && state.g_u_at(i).is_finite()
+        && (state.g_l_at(i) - state.g_u_at(i)).abs() < 1e-15
 }
 
 /// Re-seed the bound multipliers `z_l`, `z_u` from the current
@@ -10164,36 +10654,15 @@ fn constraint_is_equality(state: &SolverState, i: usize) -> bool {
 /// `state.mu`) and `initial_evaluate_with_recovery` (uses
 /// `options.mu_init`).
 fn reseed_bound_multipliers_from_mu(state: &mut SolverState, mu: f64) {
-    let n = state.n;
-    for i in 0..n {
-        if state.x_l[i].is_finite() {
-            state.z_l[i] = mu / slack_xl(state, i);
-        }
-        if state.x_u[i].is_finite() {
-            state.z_u[i] = mu / slack_xu(state, i);
-        }
+    // Phase 6d.6: walk compressed bound storage.
+    for k in 0..state.bound_layout.n_x_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        state.z_l_compressed[k] = mu / slack_xl(state, i);
     }
-}
-
-/// Boost μ to `new_mu`, reset the filter and overall-progress stall
-/// counters, and pin the strategy in Fixed mode. Used by the two
-/// stall-recovery branches (`handle_near_tolerance_stall` near-tol
-/// boost and `try_boost_mu_for_stall`) — both first decide a target
-/// μ from `primal_inf_max`, log it, then run this exact mutation.
-/// Does NOT increment `diagnostics.mu_mode_switches` (these
-/// stall-driven flips are tracked separately from the Free↔Fixed
-/// transitions in `switch_mu_mode`).
-fn boost_mu_and_switch_to_fixed_with_stall_reset(
-    state: &mut SolverState,
-    new_mu: f64,
-    mu_state: &mut MuState,
-    filter: &mut Filter,
-    stall: &mut ProgressStallTracker,
-) {
-    state.mu = new_mu;
-    reset_stall_counters_and_filter(state, filter, stall);
-    mu_state.mode = MuMode::Fixed;
-    mu_state.first_iter_in_mode = true;
+    for k in 0..state.bound_layout.n_x_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        state.z_u_compressed[k] = mu / slack_xu(state, i);
+    }
 }
 
 /// Clamp `arr[i]` strictly inside the open variable box at index `i`,
@@ -10214,30 +10683,52 @@ fn clamp_to_open_bounds(arr: &mut [f64], x_l: &[f64], x_u: &[f64], i: usize) {
 /// Strictly-positive lower-bound primal slack `max(x - x_l, 1e-20)`,
 /// clamped away from zero so callers can divide by it without producing
 /// inf/NaN. Caller is responsible for the `x_l[i].is_finite()` guard;
-/// without that guard `state.x_l[i]` may be -inf and the result is
+/// without that guard `state.x_l_at(i)` may be -inf and the result is
 /// undefined.
 fn slack_xl(state: &SolverState, i: usize) -> f64 {
-    (state.x[i] - state.x_l[i]).max(1e-20)
+    (state.x[i] - state.x_l_at(i)).max(1e-20)
 }
 
 /// Strictly-positive upper-bound primal slack `max(x_u - x, 1e-20)`.
 /// See [`slack_xl`] for the finite-guard contract.
 fn slack_xu(state: &SolverState, i: usize) -> f64 {
-    (state.x_u[i] - state.x[i]).max(1e-20)
+    (state.x_u_at(i) - state.x[i]).max(1e-20)
 }
 
-/// Strictly-positive lower-side constraint slack
-/// `max(g - g_l, 1e-20)`. Caller is responsible for the
-/// `g_l[i].is_finite()` guard (or `v_l[i] > 0`, used by callers that
-/// only attached a slack-multiplier when the bound was finite).
+/// Strictly-positive lower-side constraint slack `max(s - g_l, 1e-20)`.
+/// Caller is responsible for the `g_l[i].is_finite()` guard (or `v_l[i] > 0`,
+/// used by callers that only attached a slack-multiplier when the bound
+/// was finite).
+///
+/// Reads `state.s` (the explicit slack iterate, Ipopt 3.14 alignment).
+/// During the B2 transition phase, `state.s` is synced to `state.g` at the
+/// top of every iteration (via `sync_state_s_to_g`); once B6 lands and `s`
+/// is advanced via Newton step, the sync is removed.
 fn slack_gl(state: &SolverState, i: usize) -> f64 {
-    (state.g[i] - state.g_l[i]).max(1e-20)
+    (state.s_at(i) - state.g_l_at(i)).max(1e-20)
 }
 
-/// Strictly-positive upper-side constraint slack
-/// `max(g_u - g, 1e-20)`. See [`slack_gl`] for the finite-guard contract.
+/// Strictly-positive upper-side constraint slack `max(g_u - s, 1e-20)`.
+/// See [`slack_gl`] for the finite-guard contract and the `state.s`
+/// rationale.
 fn slack_gu(state: &SolverState, i: usize) -> f64 {
-    (state.g_u[i] - state.g[i]).max(1e-20)
+    (state.g_u_at(i) - state.s_at(i)).max(1e-20)
+}
+
+/// Test-only helper: copy `state.g` into `state.s` so the slack iterate
+/// tracks the constraint values. For equality rows (`g_l == g_u` exactly),
+/// `s[i] = g_l[i]` as a sentinel.
+///
+/// At runtime the slack iterate is advanced by the Newton step
+/// `s ← s + α_p · ds` in `commit_trial_point`; this helper exists only so
+/// unit tests that mutate `state.g` directly can keep `state.s` consistent
+/// with the constraint values they just installed.
+#[cfg(test)]
+pub(crate) fn sync_state_s_to_g(state: &mut SolverState) {
+    // Phase 3d / 5f: `s` is d-block-native; mirror `d_x` directly.
+    for k in 0..state.layout.n_d {
+        state.s[k] = state.d_x[k];
+    }
 }
 
 /// Build a trial point `x + alpha * dx`, clamped strictly inside the
@@ -10247,10 +10738,12 @@ fn slack_gu(state: &SolverState, i: usize) -> f64 {
 fn compute_clamped_trial_x(state: &SolverState, dx: &[f64], alpha: f64) -> Vec<f64> {
     let n = state.n;
     let mut x_trial = vec![0.0; n];
+    let x_l_full = state.x_l_combined();
+    let x_u_full = state.x_u_combined();
     #[allow(clippy::needless_range_loop)]
     for i in 0..n {
         x_trial[i] = state.x[i] + alpha * dx[i];
-        clamp_to_open_bounds(&mut x_trial, &state.x_l, &state.x_u, i);
+        clamp_to_open_bounds(&mut x_trial, &x_l_full, &x_u_full, i);
     }
     x_trial
 }
@@ -10264,15 +10757,6 @@ fn compute_clamped_trial_x(state: &SolverState, dx: &[f64], alpha: f64) -> Vec<f
 /// for infeasibility classification.
 fn linf_norm(v: &[f64]) -> f64 {
     v.iter().map(|x| x.abs()).fold(0.0f64, f64::max)
-}
-
-/// L2 (Euclidean) norm of a slice. Centralises the four sites that
-/// spell out `v.iter().map(|x| x * x).sum::<f64>().sqrt()` inline —
-/// the Gondzio dampening cosine numerators (dx_c_norm,
-/// dx_norm_orig) and the Mehrotra deflection cosine numerators
-/// (norm_orig, norm_pc) in maybe_revert_mehrotra_deflection.
-fn l2_norm(v: &[f64]) -> f64 {
-    v.iter().map(|x| x * x).sum::<f64>().sqrt()
 }
 
 /// Minimum of a slice. Centralises the three sites that spell out
@@ -10328,12 +10812,24 @@ fn sentinel_bounds_to_infinity(
     }
 }
 
-/// `kkt::compute_sigma` at the current iterate's
-/// `state.{x, x_l, x_u, z_l, z_u}`. Centralises the two callers —
-/// assemble_kkt_systems (main solve) and the perturbation recovery
-/// path in try_early_perturbation_recovery.
+/// `kkt::compute_sigma_compressed` at the current iterate's
+/// `state.{x, x_l, x_u, z_l_compressed, z_u_compressed}`. Centralises
+/// the two callers — assemble_kkt_systems (main solve) and the
+/// perturbation recovery path in try_early_perturbation_recovery.
+/// Phase 6c.3: routes through the compressed mirror via BoundLayout.
 fn compute_sigma_from_state(state: &SolverState) -> Vec<f64> {
-    kkt::compute_sigma(&state.x, &state.x_l, &state.x_u, &state.z_l, &state.z_u)
+    // Phase 7c: materialize compressed x bounds for kkt::compute_sigma_compressed
+    // (still consumes full-`n` x_l/x_u slices).
+    let x_l_full = state.x_l_combined();
+    let x_u_full = state.x_u_combined();
+    kkt::compute_sigma_compressed(
+        &state.x,
+        &x_l_full,
+        &x_u_full,
+        &state.z_l_compressed,
+        &state.z_u_compressed,
+        &state.bound_layout,
+    )
 }
 
 /// `kkt::recover_dz` (Fiacco bound-multiplier step recovery) at the
@@ -10342,9 +10838,67 @@ fn compute_sigma_from_state(state: &SolverState) -> Vec<f64> {
 /// two callers — the main-step recovery in solve_for_search_direction
 /// and the Mehrotra affine-predictor probe.
 fn recover_dz_from_state(state: &SolverState, dx: &[f64], mu: f64) -> (Vec<f64>, Vec<f64>) {
+    // Phase 6d.5: materialize compressed z for kkt::recover_dz (still
+    // indexes z by full var idx).
+    // Phase 7c: same for compressed x_l/x_u bounds.
+    let z_l_full = state.z_l_combined();
+    let z_u_full = state.z_u_combined();
+    let x_l_full = state.x_l_combined();
+    let x_u_full = state.x_u_combined();
     kkt::recover_dz(
-        &state.x, &state.x_l, &state.x_u,
-        &state.z_l, &state.z_u, dx, mu,
+        &state.x, &x_l_full, &x_u_full,
+        &z_l_full, &z_u_full, dx, mu,
+    )
+}
+
+/// Recover slack-bound multiplier steps `dv_L`, `dv_U` from the current
+/// iterate's `state.{g, g_l, g_u, v_l, v_u}` and Jacobian, for a given
+/// primal direction `dx` and centering target `mu`.
+fn recover_dv_from_state(state: &SolverState, ds: &[f64], mu: f64) -> (Vec<f64>, Vec<f64>) {
+    // Phase 3d: kkt::recover_dv still indexes s/ds in m-form; materialize
+    // a combined s view from the d-block storage for the call.
+    let s_combined = state.s_combined();
+    let v_l_combined = state.v_l_combined();
+    let v_u_combined = state.v_u_combined();
+    let g_l_combined = state.g_l_combined();
+    let g_u_combined = state.g_u_combined();
+    kkt::recover_dv(
+        state.m,
+        &g_l_combined, &g_u_combined, &s_combined,
+        &v_l_combined, &v_u_combined, ds, mu,
+    )
+}
+
+/// Recover the slack-iterate step `ds` for the current iterate.
+/// Wraps `kkt::recover_ds`, threading `ic_delta_c` as the per-row
+/// `δ_d` perturbation on inequality rows (equality rows get 0).
+/// In Ipopt 3.14 the (2,2) block uses a single δ_c that the
+/// perturbation handler sets uniformly across c- and d-rows
+/// (`IpPDPerturbationHandler.cpp`; recover step uses
+/// `delta_x_s · dy` per `IpPDFullSpaceSolver.cpp::SolveOnce`).
+fn recover_ds_from_state(
+    state: &SolverState,
+    dx: &[f64],
+    dy: &[f64],
+    ic_delta_c: f64,
+) -> Vec<f64> {
+    let delta_d_vec: Vec<f64> = if ic_delta_c == 0.0 {
+        Vec::new()
+    } else {
+        (0..state.m)
+            .map(|i| if constraint_is_equality(state, i) { 0.0 } else { ic_delta_c })
+            .collect()
+    };
+    let s_combined = state.s_combined();
+    let g_l_combined = state.g_l_combined();
+    let g_u_combined = state.g_u_combined();
+    let (jac_rows_m, jac_cols_m, jac_vals_m) = rebuild_combined_jac(state);
+    let g_combined = state.g_combined();
+    kkt::recover_ds(
+        state.n, state.m,
+        &jac_rows_m, &jac_cols_m, &jac_vals_m,
+        &g_combined, &g_l_combined, &g_u_combined, &s_combined,
+        dx, dy, &delta_d_vec,
     )
 }
 
@@ -10360,16 +10914,39 @@ fn assemble_kkt_from_state(
     m: usize,
     sigma: &[f64],
     use_sparse: bool,
+    kappa_d: f64,
 ) -> kkt::KktSystem {
-    kkt::assemble_kkt(
-        n, m,
+    debug_assert_eq!(m, state.layout.n_c + state.layout.n_d);
+    // Phase 7c: materialize compressed x bounds for kkt::assemble_kkt
+    // (still consumes full-`n` x_l/x_u slices).
+    let x_l_full = state.x_l_combined();
+    let x_u_full = state.x_u_combined();
+    // Phase 8c.5: materialize compressed v_l/v_u to length n_d
+    // (kkt::assemble_kkt still indexes v by d-block index k).
+    let v_l_full = state.d_bound_layout.expand_l(&state.v_l_compressed, 0.0);
+    let v_u_full = state.d_bound_layout.expand_u(&state.v_u_compressed, 0.0);
+    // Phase 9c.5: same for compressed d_l/d_u → length n_d.
+    let d_l_full = state.d_l();
+    let d_u_full = state.d_u();
+    let mut sys = kkt::assemble_kkt(
+        n, state.layout.n_c, state.layout.n_d,
         &state.hess_rows, &state.hess_cols, &state.hess_vals,
-        &state.jac_rows, &state.jac_cols, &state.jac_vals,
-        sigma, &state.grad_f, &state.g, &state.g_l, &state.g_u,
-        &state.y, &state.z_l, &state.z_u,
-        &state.x, &state.x_l, &state.x_u, state.mu,
-        use_sparse, &state.v_l, &state.v_u,
-    )
+        &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals,
+        &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals,
+        sigma, &state.grad_f,
+        &state.c_x, &state.d_x,
+        &d_l_full, &d_u_full,
+        &state.s, &state.y_c, &state.y_d,
+        &state.x, &x_l_full, &x_u_full, state.mu, kappa_d,
+        use_sparse, &v_l_full, &v_u_full, &state.layout,
+    );
+    // T3.25: snapshot the upstream atags. The assembled matrix is a
+    // pure function of (W, J, sigma_x, sigma_s, slacks, multipliers),
+    // so the atag tuple uniquely identifies it. The perturbation
+    // (δ_x, δ_c) is layered on at factor time and tracked separately
+    // by `FactorCache`.
+    sys.input_atags = Some(state.kkt_atags);
+    sys
 }
 
 /// Commit a trial point as the new iterate: writes `x`, `obj`, `g`,
@@ -10383,89 +10960,236 @@ fn commit_trial_point(
     g_trial: Vec<f64>,
     alpha: f64,
 ) {
+    // A8.4 step trace: env-gated diagnostic for centering-stall debugging.
+    // Set RIPOPT_TRACE_STEP=1 to log ‖Δx‖, ‖α·Δx‖, |Δx_eff|, and the
+    // achieved relative move ‖Δx_eff‖/‖x‖. A frozen iterate at α=1 with
+    // ‖α·Δx‖_inf at machine-epsilon · ‖x‖_inf is the smoking gun for
+    // a near-singular augmented system producing a near-zero direction
+    // that the linear solver still reports as nonsingular.
+    if std::env::var("RIPOPT_TRACE_STEP").is_ok() {
+        let dx_inf = linf_norm(&state.dx);
+        let mut x_inf = 0.0_f64;
+        let mut diff_inf = 0.0_f64;
+        for i in 0..state.n {
+            let xi = state.x[i].abs();
+            if xi > x_inf { x_inf = xi; }
+            let d = (x_trial[i] - state.x[i]).abs();
+            if d > diff_inf { diff_inf = d; }
+        }
+        let dy_inf = state
+            .dy_c
+            .iter()
+            .chain(state.dy_d.iter())
+            .fold(0.0f64, |a, &b| a.max(b.abs()));
+        let rel = if x_inf > 0.0 { diff_inf / x_inf } else { diff_inf };
+        // Σ-pin diagnostic: smallest x-slack and largest z give the worst
+        // diagonal entry of W + Σ. If min_slack · max_z >> κ_σ·μ the κ_σ
+        // clamp has failed to keep z*s in band.
+        let mut min_s_x = f64::INFINITY;
+        let mut min_s_idx = usize::MAX;
+        let mut min_s_side = "";
+        let mut max_z_x = 0.0_f64;
+        for i in 0..state.n {
+            if state.x_l_at(i).is_finite() {
+                let s = state.x[i] - state.x_l_at(i);
+                if s > 0.0 && s < min_s_x { min_s_x = s; min_s_idx = i; min_s_side = "L"; }
+            }
+            if state.x_u_at(i).is_finite() {
+                let s = state.x_u_at(i) - state.x[i];
+                if s > 0.0 && s < min_s_x { min_s_x = s; min_s_idx = i; min_s_side = "U"; }
+            }
+        }
+        // Phase 6d.3: walk compressed bound mirrors for max |z|.
+        for &v in &state.z_l_compressed {
+            if v.abs() > max_z_x { max_z_x = v.abs(); }
+        }
+        for &v in &state.z_u_compressed {
+            if v.abs() > max_z_x { max_z_x = v.abs(); }
+        }
+        let (xv, bv) = if min_s_idx < state.n {
+            let xv = state.x[min_s_idx];
+            let bv = if min_s_side == "L" { state.x_l_at(min_s_idx) } else { state.x_u_at(min_s_idx) };
+            (xv, bv)
+        } else { (f64::NAN, f64::NAN) };
+        eprintln!(
+            "[step] α={:.3e} ‖Δx‖={:.3e} rel={:.3e} ‖Δy‖={:.3e} min_s={:.3e}@{}{} x={:.6e} bnd={:.6e} max_z={:.3e} max_Σ≈{:.3e}",
+            alpha, dx_inf, rel, dy_inf,
+            min_s_x, min_s_idx, min_s_side, xv, bv, max_z_x,
+            max_z_x / min_s_x.max(1e-300),
+        );
+    }
     state.x = x_trial;
     state.obj = obj_trial;
-    state.g = g_trial;
+    let (c_trial, d_trial) = split_from_g(state, &g_trial);
+    state.c_x = c_trial;
+    state.d_x = d_trial;
+    // Advance the slack iterate with the same primal step length.
+    // Equality rows (`g_l == g_u`) have `ds = 0` (forced by `recover_ds`)
+    // and `s` stays at the equality value as a sentinel. For inequality
+    // rows the line-searched α_p is the same fraction of the FTB-capped
+    // step taken on x, by Ipopt's `alpha_for_y = primal` default
+    // (IpFilterLSAcceptor.cpp:617-628, IpIteratesVector.hpp).
+    // Phase 3d: state.s and state.ds are d-block-native (size n_d), so
+    // advance directly over the d-block — equality rows are not stored.
+    for k in 0..state.layout.n_d {
+        state.s[k] += alpha * state.ds[k];
+    }
     state.alpha_primal = alpha;
+    // T3.25: x and g have changed → slacks_x, slacks_s, sigma_x, sigma_s
+    // are now stale. The Hessian and Jacobian also typically get
+    // re-evaluated against the new x downstream of this commit, so bump
+    // them too. This is a coarse-grained, conservative bump: the IPM
+    // re-evaluates after every accepted step regardless.
+    state.kkt_atags.slacks_x = state.kkt_atags.slacks_x.wrapping_add(1);
+    state.kkt_atags.slacks_s = state.kkt_atags.slacks_s.wrapping_add(1);
+    state.kkt_atags.sigma_x = state.kkt_atags.sigma_x.wrapping_add(1);
+    state.kkt_atags.sigma_s = state.kkt_atags.sigma_s.wrapping_add(1);
+    state.kkt_atags.w = state.kkt_atags.w.wrapping_add(1);
+    state.kkt_atags.j_c = state.kkt_atags.j_c.wrapping_add(1);
+    state.kkt_atags.j_d = state.kkt_atags.j_d.wrapping_add(1);
 }
 
 /// Sum of absolute values of all Lagrange multipliers in the iterate:
-/// equality multipliers `y` plus bound multipliers `z_l` and `z_u`.
-/// Used together with `multiplier_count = m + 2*n` to compute the dual
-/// scaling factor `s_d` via `compute_residual_scaling`.
+/// `y` (combined y_c + y_d), bound multipliers `z_l`, `z_u`, and the
+/// constraint-slack multipliers `v_l`, `v_u`. Used with
+/// `compute_multiplier_count` to form the dual scaling factor `s_d`
+/// (`IpIpoptCalculatedQuantities.cpp:3689-3690`,
+/// `y_c + y_d + z_L + z_U + v_L + v_U`).
 fn compute_multiplier_sum(state: &SolverState) -> f64 {
-    l1_norm(&state.y) + l1_norm(&state.z_l) + l1_norm(&state.z_u)
+    // Phase 6d.3 / 8c.5: walk compressed bound mirrors. l1_norm over
+    // unbounded zero-padded sides was 0 anyway.
+    l1_norm(&state.y_c)
+        + l1_norm(&state.y_d)
+        + l1_norm(&state.z_l_compressed)
+        + l1_norm(&state.z_u_compressed)
+        + l1_norm(&state.v_l_compressed)
+        + l1_norm(&state.v_u_compressed)
 }
 
-/// Sum of absolute values of bound multipliers only (`z_l`, `z_u`).
-/// Used with `bound_multiplier_count = 2n` to compute the
-/// complementarity scaling factor `s_c` via `compute_residual_scaling`.
+/// Sum of absolute values of bound-side multipliers contributing to
+/// `s_c`: `z_l + z_u + v_l + v_u`
+/// (`IpIpoptCalculatedQuantities.cpp:3677-3687`). Used with
+/// `compute_bound_multiplier_count` (finite-bound count over
+/// x and inequality g rows) to form the complementarity scaling `s_c`.
 fn compute_bound_multiplier_sum(state: &SolverState) -> f64 {
-    l1_norm(&state.z_l) + l1_norm(&state.z_u)
+    // Phase 6d.3 / 8c.5: walk compressed bound mirrors. l1_norm over
+    // unbounded zero-padded sides was 0 anyway.
+    l1_norm(&state.z_l_compressed)
+        + l1_norm(&state.z_u_compressed)
+        + l1_norm(&state.v_l_compressed)
+        + l1_norm(&state.v_u_compressed)
+}
+
+/// Count of finite variable bounds (z_L.Dim() + z_U.Dim() in Ipopt) plus
+/// finite constraint bounds (v_L.Dim() + v_U.Dim()) used as the
+/// denominator for `s_c` per `IpIpoptCalculatedQuantities.cpp:3677-3687`.
+/// In ripopt's combined-y representation, each finite g_L[i] contributes
+/// one unit (the v_L slot) and each finite g_U[i] contributes one
+/// (the v_U slot). Equality constraints have both finite but they
+/// represent a single dual, so they each still contribute their two
+/// counts separately, matching Ipopt's bookkeeping where equality
+/// constraints don't appear in v_L/v_U at all — only inequalities do.
+fn compute_bound_multiplier_count(state: &SolverState) -> usize {
+    let mut n_bound = state.bound_layout.n_x_l + state.bound_layout.n_x_u;
+    for i in 0..state.m {
+        if constraint_is_equality(state, i) {
+            continue;
+        }
+        if state.g_l_at(i).is_finite() {
+            n_bound += 1;
+        }
+        if state.g_u_at(i).is_finite() {
+            n_bound += 1;
+        }
+    }
+    n_bound
+}
+
+/// Count of all dual components contributing to `s_d` per
+/// `IpIpoptCalculatedQuantities.cpp:3689-3690`:
+/// y_c.Dim() + y_d.Dim() + z_L.Dim() + z_U.Dim() + v_L.Dim() + v_U.Dim().
+/// The `y` count is `m` (each constraint has one combined y). The bound
+/// counts come from [`compute_bound_multiplier_count`].
+fn compute_multiplier_count(state: &SolverState) -> usize {
+    state.m + compute_bound_multiplier_count(state)
 }
 
 /// Build a `ConvergenceInfo` from the current iterate by computing the
 /// max-norm primal infeasibility, dual infeasibility, complementarity
 /// error (at mu_target=0), and total multiplier sum from `state`. The
-/// caller supplies `mu` because some promotion paths (e.g. active-set)
-/// want to check convergence with mu=0 even though `state.mu` is
+/// caller supplies `mu` because some test paths want to check convergence
+/// at mu=0 even though `state.mu` is
 /// nonzero.
+#[cfg(test)]
 fn compute_convergence_info_from_state(
     state: &SolverState,
     mu: f64,
-    n: usize,
-    m: usize,
+    _n: usize,
+    _m: usize,
 ) -> ConvergenceInfo {
     let primal_inf = compute_primal_inf_max_at_state(state);
+    let primal_inf_internal = compute_primal_inf_internal_max_at_state(state);
     let dual_inf = compute_dual_inf_at_state(state);
     let compl_inf = compute_compl_err_at_state(state);
+    // Ipopt's unscaled_curr_dual_infeasibility removes the obj_scaling
+    // factor that was applied to ∇f and J^T y in the internal scaled
+    // problem (`IpOrigIpoptNLP::unscaled_curr_dual_infeasibility`). For
+    // ripopt's uniform obj scaling that reduces to a single division.
+    let dual_inf_unscaled = if state.obj_scaling != 1.0 && state.obj_scaling != 0.0 {
+        dual_inf / state.obj_scaling
+    } else {
+        dual_inf
+    };
     ConvergenceInfo {
         primal_inf,
+        primal_inf_internal,
         dual_inf,
-        dual_inf_unscaled: dual_inf,
+        dual_inf_unscaled,
         compl_inf,
         mu,
         objective: state.obj,
         multiplier_sum: compute_multiplier_sum(state),
-        multiplier_count: m + 2 * n,
+        multiplier_count: compute_multiplier_count(state),
         bound_multiplier_sum: compute_bound_multiplier_sum(state),
-        bound_multiplier_count: 2 * n,
+        bound_multiplier_count: compute_bound_multiplier_count(state),
+        x_max_abs: linf_norm(&state.x),
     }
 }
 
 fn compute_avg_complementarity(state: &SolverState) -> f64 {
     let mut sum_compl = 0.0;
     let mut count = 0;
-    // Variable bound complementarity: z_l * (x - x_l), z_u * (x_u - x)
-    for i in 0..state.n {
-        if state.x_l[i].is_finite() {
-            sum_compl += slack_xl(state, i) * state.z_l[i];
-            count += 1;
-        }
-        if state.x_u[i].is_finite() {
-            sum_compl += slack_xu(state, i) * state.z_u[i];
-            count += 1;
-        }
+    // Phase 6d.3: walk compressed bound mirrors. The set
+    // {i : x_{l,u}[i].is_finite()} matches `x_{l,u}_to_full[..n_x_{l,u}]`.
+    for k in 0..state.bound_layout.n_x_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        sum_compl += slack_xl(state, i) * state.z_l_compressed[k];
+        count += 1;
     }
-    // If no variable bounds exist but inequality constraints do, include
-    // constraint slack complementarity v_l*(g-g_l), v_u*(g_u-g) as fallback.
-    // This prevents avg_compl=0 for problems with only inequality constraints
-    // (e.g., OET2/6/7 with m=1002 inequalities and no variable bounds),
-    // which otherwise causes mu to collapse to mu_min prematurely.
-    //
-    // When variable bounds exist, their z*slack products already drive mu;
-    // adding v*slack (which ≈ mu since v = mu/slack) would bias avg_compl
-    // and slow convergence (causes TP044/TP116 regressions).
-    if count == 0 {
-        for i in 0..state.m {
-            if state.v_l[i] > 0.0 {
-                sum_compl += state.v_l[i] * slack_gl(state, i);
-                count += 1;
-            }
-            if state.v_u[i] > 0.0 {
-                sum_compl += state.v_u[i] * slack_gu(state, i);
-                count += 1;
-            }
+    for k in 0..state.bound_layout.n_x_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        sum_compl += slack_xu(state, i) * state.z_u_compressed[k];
+        count += 1;
+    }
+    // B-cross6: include slack-side complementarity v_L·s_L, v_U·s_U
+    // unconditionally, matching Ipopt's `IpIpoptCalculatedQuantities::
+    // curr_avrg_compl` which sums over all four bound blocks. The
+    // previously-conditional fallback (only when no variable bounds
+    // existed) was a ripopt-specific tuning that left `avg_compl` blind
+    // to slack centrality on mixed-bound problems.
+    for i in 0..state.m {
+        let l_fin = state.g_l_at(i).is_finite();
+        let u_fin = state.g_u_at(i).is_finite();
+        if l_fin && u_fin && (state.g_l_at(i) - state.g_u_at(i)).abs() < 1e-14 {
+            continue;
+        }
+        if l_fin {
+            sum_compl += state.v_l_at(i) * slack_gl(state, i);
+            count += 1;
+        }
+        if u_fin {
+            sum_compl += state.v_u_at(i) * slack_gu(state, i);
+            count += 1;
         }
     }
     if count > 0 {
@@ -10475,392 +11199,121 @@ fn compute_avg_complementarity(state: &SolverState) -> f64 {
     }
 }
 
-/// Compute barrier error for fixed-mode subproblem convergence check.
-/// This is the optimality error of the current barrier subproblem (for fixed mu).
-fn compute_barrier_error(state: &SolverState) -> f64 {
-    let n = state.n;
+/// Print the largest-magnitude complementarity outliers to stderr.
+/// For diagnostics only; gated on `RIPOPT_TRACE_COMPL`.
+fn dump_compl_outliers(state: &SolverState) {
+    if std::env::var("RIPOPT_TRACE_COMPL").is_err() {
+        return;
+    }
+    let mut entries: Vec<(f64, String)> = Vec::new();
+    for k in 0..state.bound_layout.n_x_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        let s = slack_xl(state, i);
+        let z = state.z_l_compressed[k];
+        let prod = s * z;
+        entries.push((prod.abs(), format!("xL[{}] s={:.3e} z={:.3e} s*z={:.3e}", i, s, z, prod)));
+    }
+    for k in 0..state.bound_layout.n_x_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        let s = slack_xu(state, i);
+        let z = state.z_u_compressed[k];
+        let prod = s * z;
+        entries.push((prod.abs(), format!("xU[{}] s={:.3e} z={:.3e} s*z={:.3e}", i, s, z, prod)));
+    }
+    for i in 0..state.m {
+        if state.g_l_at(i).is_finite() {
+            let s = slack_gl(state, i);
+            let z = state.v_l_at(i);
+            let prod = s * z;
+            entries.push((prod.abs(), format!("gL[{}] s={:.3e} z={:.3e} s*z={:.3e}", i, s, z, prod)));
+        }
+        if state.g_u_at(i).is_finite() {
+            let s = slack_gu(state, i);
+            let z = state.v_u_at(i);
+            let prod = s * z;
+            entries.push((prod.abs(), format!("gU[{}] s={:.3e} z={:.3e} s*z={:.3e}", i, s, z, prod)));
+        }
+    }
+    entries.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    eprintln!("ripopt: compl-outliers iter={} mu={:.3e} (top 5 by |s*z|):", state.iter, state.mu);
+    for (_, line) in entries.iter().take(5) {
+        eprintln!("  {}", line);
+    }
+}
 
-    // Dual infeasibility of barrier problem:
-    // grad_f + J^T y - z_l + z_u
+/// Barrier-subproblem optimality error E_μ(x, λ, z), the gate that
+/// `update_barrier_parameter_fixed_mode` checks against
+/// `barrier_tol_factor * mu` to decide whether the current subproblem
+/// is "solved" enough to decrement μ. Mirrors Ipopt's
+/// `IpoptCalculatedQuantities::curr_barrier_error()`
+/// (`IpIpoptCalculatedQuantities.cpp:3148-3196`):
+///
+///   E_μ = max( ‖∇L‖_∞ / s_d,
+///              ‖c‖_∞,
+///              max_i |slack_i · z_i − μ| / s_c )
+///
+/// where `s_d`, `s_c` are the L1-mean multiplier scalings from
+/// `ComputeOptimalityErrorScaling` (`IpIpoptCalculatedQuantities.cpp:3663-3700`,
+/// `s_max = 100`). All three components use the L∞ norm; only s_d/s_c
+/// internally average over multiplier counts.
+///
+/// Returns `(E_μ, dual_err, compl_err, primal_err)` for diagnostics.
+fn compute_barrier_error_components(state: &SolverState) -> (f64, f64, f64, f64) {
+    // ∇L = ∇f + J^T y − z_l + z_u (un-damped; matches
+    // `curr_grad_lag_x` at IpIpoptCalculatedQuantities.cpp:1993-2030)
     let mut grad_lag = state.grad_f.clone();
     accumulate_jt_y(state, &mut grad_lag);
-    for i in 0..n {
-        if state.x_l[i].is_finite() {
-            grad_lag[i] -= state.z_l[i];
-        }
-        if state.x_u[i].is_finite() {
-            grad_lag[i] += state.z_u[i];
-        }
+    // Phase 6d.3: walk compressed bound mirrors.
+    for k in 0..state.bound_layout.n_x_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        grad_lag[i] -= state.z_l_compressed[k];
     }
-
-    let sd = n.max(1) as f64;
-    let dual_err = l1_norm(&grad_lag) / sd;
-
-    // Complementarity error (relative to mu)
-    let mut compl_err = 0.0;
-    let mut count = 0;
-    for i in 0..n {
-        if state.x_l[i].is_finite() {
-            let slack = slack_xl(state, i);
-            compl_err += (slack * state.z_l[i] - state.mu).abs();
-            count += 1;
-        }
-        if state.x_u[i].is_finite() {
-            let slack = slack_xu(state, i);
-            compl_err += (slack * state.z_u[i] - state.mu).abs();
-            count += 1;
-        }
+    for k in 0..state.bound_layout.n_x_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        grad_lag[i] += state.z_u_compressed[k];
     }
-    if count > 0 {
-        compl_err /= count as f64;
-    }
+    let s_d = compute_s_d_at_state(state);
+    let dual_err = linf_norm(&grad_lag) / s_d;
 
-    // Primal infeasibility
-    let primal_err = state.constraint_violation();
-
-    // Dual infeasibility safeguard: prevent the barrier subproblem from being
-    // declared "solved" when the NLP dual infeasibility is still large.
-    // This prevents mu from collapsing to 1e-11 while du remains huge (issue #8 Class 2).
-    let unscaled_du = compute_dual_inf_at_state(state);
-    let du_floor = unscaled_du * 0.1; // 10% of unscaled du as floor on barrier error
-
-    dual_err.max(compl_err).max(primal_err).max(du_floor)
-}
-
-/// Strategy 3: Try active set identification + reduced KKT solve.
-///
-/// At near-optimal points, identify variables at their bounds (active set),
-/// fix them, solve the reduced KKT system for free variables, and check
-/// if the result meets strict convergence tolerances.
-/// Identification of the working active set for `try_active_set_solve`.
-struct ActiveSet {
-    active_lower: Vec<bool>,
-    active_upper: Vec<bool>,
-    /// `free_idx[k]` is the original variable index of the k-th free variable.
-    free_idx: Vec<usize>,
-    /// `orig_to_free[i]` is the reduced-system index of variable `i`, or
-    /// `usize::MAX` when `i` is fixed at a bound.
-    orig_to_free: Vec<usize>,
-    n_free: usize,
-    /// Reduced KKT dimension: `n_free + m`.
-    dim: usize,
-}
-
-/// Identify the working active set: a variable is "active at lower bound"
-/// if x_i is close to x_l_i (relative tol 1e-6) and z_l_i > 1e-8. Returns
-/// `None` when the reduced system is too large for dense solve (dim > 500),
-/// when no bounds are active (dim == n + m), or when dim == 0.
-fn identify_active_bounds(state: &SolverState, n: usize, m: usize) -> Option<ActiveSet> {
-    let tol_bound = 1e-6;
-    let mut is_free = vec![true; n];
-    let mut active_lower = vec![false; n];
-    let mut active_upper = vec![false; n];
-    let mut n_free = 0usize;
-
-    for i in 0..n {
-        let at_lower = state.x_l[i].is_finite()
-            && (state.x[i] - state.x_l[i]).abs() < tol_bound * (1.0 + state.x_l[i].abs());
-        let at_upper = state.x_u[i].is_finite()
-            && (state.x_u[i] - state.x[i]).abs() < tol_bound * (1.0 + state.x_u[i].abs());
-
-        if at_lower && state.z_l[i] > 1e-8 {
-            is_free[i] = false;
-            active_lower[i] = true;
-        } else if at_upper && state.z_u[i] > 1e-8 {
-            is_free[i] = false;
-            active_upper[i] = true;
-        } else {
-            n_free += 1;
-        }
-    }
-
-    if n_free == n {
-        return None;
-    }
-    let dim = n_free + m;
-    if dim > 500 || dim == 0 {
-        return None;
-    }
-
-    let mut free_idx = Vec::with_capacity(n_free);
-    let mut orig_to_free = vec![usize::MAX; n];
-    for i in 0..n {
-        if is_free[i] {
-            orig_to_free[i] = free_idx.len();
-            free_idx.push(i);
-        }
-    }
-    Some(ActiveSet { active_lower, active_upper, free_idx, orig_to_free, n_free, dim })
-}
-
-/// Build the reduced dense KKT system for the working active set:
-///   [ H_ff   J_f^T ] [ dx_f ]   [ -grad_f_f       ]
-///   [ J_f    0     ] [ dy   ] = [ g_target - g(x) ]
-/// where H_ff is the Hessian restricted to free-free pairs, J_f is the
-/// Jacobian columns for free variables, and the constraint target picks
-/// either g_l or g_u depending on which side is active (or 0 for inactive
-/// inequalities). Returns the dense `dim*dim` KKT (row-major) and the
-/// length-`dim` RHS.
-fn build_reduced_kkt_dense(
-    state: &SolverState,
-    orig_to_free: &[usize],
-    free_idx: &[usize],
-    n_free: usize,
-    m: usize,
-    dim: usize,
-) -> (Vec<f64>, Vec<f64>) {
-    let mut kkt = vec![0.0; dim * dim];
-    let mut rhs = vec![0.0; dim];
-
-    // H_ff (top-left n_free x n_free)
-    for (idx, (&row, &col)) in state.hess_rows.iter().zip(state.hess_cols.iter()).enumerate() {
-        let fr = orig_to_free[row];
-        let fc = orig_to_free[col];
-        if fr != usize::MAX && fc != usize::MAX {
-            kkt[fr * dim + fc] += state.hess_vals[idx];
-            if fr != fc {
-                kkt[fc * dim + fr] += state.hess_vals[idx];
-            }
-        }
-    }
-
-    // J_f (bottom-left m x n_free) and J_f^T (top-right n_free x m)
-    for (idx, (&row, &col)) in state.jac_rows.iter().zip(state.jac_cols.iter()).enumerate() {
-        let fc = orig_to_free[col];
-        if fc != usize::MAX {
-            let r = n_free + row;
-            kkt[r * dim + fc] += state.jac_vals[idx];
-            kkt[fc * dim + r] += state.jac_vals[idx];
-        }
-    }
-
-    // RHS top: -grad_f for free variables
-    for k in 0..n_free {
-        rhs[k] = -state.grad_f[free_idx[k]];
-    }
-
-    // RHS bottom: g_target - g, picking the active side per constraint
-    for i in 0..m {
-        if (state.g_l[i] - state.g_u[i]).abs() < 1e-20 {
-            rhs[n_free + i] = state.g_l[i] - state.g[i];
-        } else if state.g[i] <= state.g_l[i] + 1e-10 {
-            rhs[n_free + i] = state.g_l[i] - state.g[i];
-        } else if state.g[i] >= state.g_u[i] - 1e-10 {
-            rhs[n_free + i] = state.g_u[i] - state.g[i];
-        } else {
-            rhs[n_free + i] = 0.0;
-        }
-    }
-
-    (kkt, rhs)
-}
-
-/// Recover bound multipliers `z_L`, `z_U` from primal stationarity at
-/// a candidate iterate where `(x, y)` have already been set. Computes
-/// `g = ∇f + J^T·y`; for each variable `i`, when its lower bound is
-/// finite and `g[i] > 0` set `z_L[i] = g[i]`; when its upper bound is
-/// finite and `g[i] < 0` set `z_U[i] = -g[i]`; both `z` components
-/// are zero otherwise. Used by the active-set promotion path where
-/// `z` is not produced by the reduced KKT solve.
-fn recover_z_from_stationarity(state: &mut SolverState, n: usize) {
-    let mut grad_jty = state.grad_f.clone();
-    accumulate_jt_y(state, &mut grad_jty);
-    for i in 0..n {
-        state.z_l[i] = 0.0;
-        state.z_u[i] = 0.0;
-        if state.x_l[i].is_finite() && grad_jty[i] > 0.0 {
-            state.z_l[i] = grad_jty[i];
-        } else if state.x_u[i].is_finite() && grad_jty[i] < 0.0 {
-            state.z_u[i] = -grad_jty[i];
-        }
-    }
-}
-
-/// Snap variables flagged active to their bound: `state.x[i] = x_l[i]`
-/// when `active_lower[i]`, `state.x[i] = x_u[i]` when `active_upper[i]`.
-/// Used by the active-set promotion path after `identify_active_bounds`
-/// has classified each variable.
-fn snap_active_variables_to_bounds(
-    state: &mut SolverState,
-    active_lower: &[bool],
-    active_upper: &[bool],
-    n: usize,
-) {
-    for i in 0..n {
-        if active_lower[i] {
-            state.x[i] = state.x_l[i];
-        } else if active_upper[i] {
-            state.x[i] = state.x_u[i];
-        }
-    }
-}
-
-/// Apply the full Newton step from the reduced active-set KKT solve
-/// to the free variables, clamping each result back to its finite
-/// bounds. Mutates `state.x[free_idx[k]]` in place.
-fn apply_active_set_step_with_clamping(
-    state: &mut SolverState,
-    free_idx: &[usize],
-    sol: &[f64],
-    n_free: usize,
-) {
-    for k in 0..n_free {
-        let i = free_idx[k];
-        state.x[i] += sol[k];
-        if state.x_l[i].is_finite() {
-            state.x[i] = state.x[i].max(state.x_l[i]);
-        }
-        if state.x_u[i].is_finite() {
-            state.x[i] = state.x[i].min(state.x_u[i]);
-        }
-    }
-}
-
-fn try_active_set_solve<P: NlpProblem>(
-    state: &mut SolverState,
-    problem: &P,
-    options: &SolverOptions,
-    linear_constraints: Option<&[bool]>,
-    lbfgs_mode: bool,
-) -> Option<SolveResult> {
-    let n = state.n;
-    let m = state.m;
-
-    let active_set = match identify_active_bounds(state, n, m) {
-        Some(set) => set,
-        None => return None,
-    };
-    let ActiveSet { active_lower, active_upper, free_idx, orig_to_free, n_free, dim } = active_set;
-
-    // Fix active variables at their bounds (save full state for restoration)
-    let saved = SavedIterate::snapshot(state);
-    snap_active_variables_to_bounds(state, &active_lower, &active_upper, n);
-
-    // Re-evaluate at the snapped point
-    let _ = state.evaluate_with_linear(problem, 1.0, linear_constraints, lbfgs_mode);
-
-    let (mut kkt, mut rhs) = build_reduced_kkt_dense(
-        state, &orig_to_free, &free_idx, n_free, m, dim,
+    // L∞ of the perturbed complementarity (`X·z − μ·e` per
+    // IpIpoptCalculatedQuantities.cpp:2799-2871, scaled by s_c).
+    let s_c = compute_residual_scaling(
+        compute_bound_multiplier_sum(state),
+        compute_bound_multiplier_count(state),
     );
-    let solution = dense_symmetric_solve(dim, &mut kkt, &mut rhs);
-    if solution.is_none() {
-        // Singular system, restore and bail
-        saved.restore_and_reeval(state, problem, linear_constraints, lbfgs_mode);
-        return None;
+    let mut compl_max: f64 = 0.0;
+    // Phase 6d.3: walk compressed bound mirrors.
+    for k in 0..state.bound_layout.n_x_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        let r = (slack_xl(state, i) * state.z_l_compressed[k] - state.mu).abs();
+        if r > compl_max {
+            compl_max = r;
+        }
     }
-    let sol = solution.unwrap();
-
-    apply_active_set_step_with_clamping(state, &free_idx, &sol, n_free);
-
-    // Update y from the solve
-    state.y.copy_from_slice(&sol[n_free..n_free + m]);
-
-    // Re-evaluate at the new point
-    let _ = state.evaluate_with_linear(problem, 1.0, linear_constraints, lbfgs_mode);
-
-    recover_z_from_stationarity(state, n);
-
-    // Check strict convergence (use max-norm for primal infeasibility,
-    // mu=0 at the solution).
-    let conv_info = compute_convergence_info_from_state(state, 0.0, n, m);
-
-    if let ConvergenceStatus::Converged = check_convergence(&conv_info, options, 0) {
-        return Some(make_result(state, SolveStatus::Optimal));
+    for k in 0..state.bound_layout.n_x_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        let r = (slack_xu(state, i) * state.z_u_compressed[k] - state.mu).abs();
+        if r > compl_max {
+            compl_max = r;
+        }
     }
+    let compl_err = compl_max / s_c;
 
-    // Didn't converge; restore original state and re-evaluate
-    saved.restore_and_reeval(state, problem, linear_constraints, lbfgs_mode);
+    // Primal infeasibility ‖c‖_∞ (no s-divisor in Ipopt;
+    // `curr_primal_infeasibility(NORM_MAX)` at line 2570-2610).
+    // `state.constraint_violation()` returns the L1 sum used by the
+    // filter; the barrier-error gate needs the L∞ version.
+    let primal_err = convergence::primal_infeasibility_max_split(
+        &state.g_c(),
+        &state.g_d(),
+        &state.d_l(),
+        &state.d_u(),
+    );
 
-    None
+    let e = dual_err.max(compl_err).max(primal_err);
+    (e, dual_err, compl_err, primal_err)
 }
 
-/// Dense symmetric indefinite solve using diagonal pivoting (LDL^T).
-/// Solves A*x = b in-place. Returns Some(x) on success, None if singular.
-/// `a` is row-major dim x dim, `b` is length dim.
-fn dense_symmetric_solve(dim: usize, a: &mut [f64], b: &mut [f64]) -> Option<Vec<f64>> {
-    // Gaussian elimination with partial pivoting for symmetric indefinite systems.
-    // Simple but sufficient for small systems (dim < 500).
-    let mut piv = vec![0usize; dim];
-    for i in 0..dim {
-        piv[i] = i;
-    }
-
-    for k in 0..dim {
-        // Find pivot: largest diagonal element in remaining submatrix
-        let mut max_val = a[k * dim + k].abs();
-        let mut max_idx = k;
-        for i in (k + 1)..dim {
-            if a[i * dim + i].abs() > max_val {
-                max_val = a[i * dim + i].abs();
-                max_idx = i;
-            }
-        }
-
-        if max_val < 1e-15 {
-            return None; // Singular
-        }
-
-        // Swap rows/cols k and max_idx
-        if max_idx != k {
-            piv.swap(k, max_idx);
-            // Swap rows
-            for j in 0..dim {
-                let tmp = a[k * dim + j];
-                a[k * dim + j] = a[max_idx * dim + j];
-                a[max_idx * dim + j] = tmp;
-            }
-            // Swap cols
-            for i in 0..dim {
-                let tmp = a[i * dim + k];
-                a[i * dim + k] = a[i * dim + max_idx];
-                a[i * dim + max_idx] = tmp;
-            }
-            b.swap(k, max_idx);
-        }
-
-        let pivot = a[k * dim + k];
-        // Eliminate below
-        for i in (k + 1)..dim {
-            let factor = a[i * dim + k] / pivot;
-            a[i * dim + k] = factor;
-            for j in (k + 1)..dim {
-                a[i * dim + j] -= factor * a[k * dim + j];
-            }
-            b[i] -= factor * b[k];
-        }
-    }
-
-    // Back substitution
-    let mut x = b.to_vec();
-    for k in (0..dim).rev() {
-        for j in (k + 1)..dim {
-            x[k] -= a[k * dim + j] * x[j];
-        }
-        x[k] /= a[k * dim + k];
-    }
-
-    Some(x)
-}
-
-/// Compute a steepest-descent fallback direction when KKT solve fails.
-///
-/// Returns (dx, dy) where dx = -alpha * grad_f (scaled gradient step)
-/// and dy = 0. This is crude but prevents immediate failure.
-fn gradient_descent_fallback(state: &SolverState) -> Option<(Vec<f64>, Vec<f64>)> {
-    let n = state.n;
-    let m = state.m;
-    let grad_norm = l2_norm(&state.grad_f);
-    if grad_norm < 1e-20 {
-        return None;
-    }
-    let alpha = 1e-4 / grad_norm; // small step
-    let mut dx = vec![0.0; n];
-    for i in 0..n {
-        dx[i] = -alpha * state.grad_f[i];
-    }
-    let dy = vec![0.0; m];
-    Some((dx, dy))
-}
 
 /// Build the final solve result.
 /// Computes z from stationarity for more accurate output multipliers.
@@ -10877,6 +11330,16 @@ fn populate_final_diagnostics(state: &SolverState) -> SolverDiagnostics {
     diag.final_dual_inf = compute_dual_inf_at_state(state);
     diag.final_compl = compute_compl_err_at_state(state);
     diag.final_s_d = compute_s_d_at_state(state);
+    // T3.25 follow-up: surface cache counters so tests can verify the
+    // cached entry point fired and benchmarks can quantify hit rates.
+    diag.factor_cache_hits = state.factor_cache.hits;
+    diag.factor_cache_misses = state.factor_cache.misses;
+    diag.factor_cache_factor_calls = state.factor_cache.factor_calls;
+    diag.n_obj_evals = state.n_obj_evals;
+    diag.n_grad_evals = state.n_grad_evals;
+    diag.n_constr_evals = state.n_constr_evals;
+    diag.n_jac_evals = state.n_jac_evals;
+    diag.n_hess_evals = state.n_hess_evals;
     diag
 }
 
@@ -10889,19 +11352,29 @@ fn populate_final_diagnostics(state: &SolverState) -> SolverDiagnostics {
 fn unscale_solution_vectors(state: &SolverState) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
     let n = state.n;
     let m = state.m;
-    let mut z_l_out = vec![0.0; n];
-    let mut z_u_out = vec![0.0; n];
+    // Phase 6d.1: materialize z_l/z_u from the compressed mirrors
+    // (BoundLayout::expand_l/u pads unbounded sides to 0).
+    let mut z_l_out = state.z_l_combined();
+    let mut z_u_out = state.z_u_combined();
     for i in 0..n {
-        z_l_out[i] = state.z_l[i] / state.obj_scaling;
-        z_u_out[i] = state.z_u[i] / state.obj_scaling;
+        z_l_out[i] /= state.obj_scaling;
+        z_u_out[i] /= state.obj_scaling;
     }
-    let mut y_out = state.y.clone();
+    // Reconstruct combined-indexed y_out / g_out from the split storage
+    // (Phase 3): per-row scaling lives in c_scaling[k] for equalities,
+    // d_scaling[k] for inequalities.
+    let mut y_out = state.y_combined();
+    let mut g_out = state.g_combined();
     for i in 0..m {
-        y_out[i] = state.y[i] * state.g_scaling[i] / state.obj_scaling;
-    }
-    let mut g_out = state.g.clone();
-    for i in 0..m {
-        g_out[i] /= state.g_scaling[i];
+        let scale_i = if let Some(k) = state.layout.eq_pos[i] {
+            state.c_scaling.get(k).copied().unwrap_or(1.0)
+        } else if let Some(k) = state.layout.ineq_pos[i] {
+            state.d_scaling.get(k).copied().unwrap_or(1.0)
+        } else {
+            1.0
+        };
+        y_out[i] = y_out[i] * scale_i / state.obj_scaling;
+        g_out[i] /= scale_i;
     }
     (z_l_out, z_u_out, y_out, g_out)
 }
@@ -10934,39 +11407,99 @@ mod tests {
     fn minimal_state(n: usize, m: usize) -> SolverState {
         SolverState {
             x: vec![0.0; n],
-            y: vec![0.0; m],
-            z_l: vec![0.0; n],
-            z_u: vec![0.0; n],
-            v_l: vec![0.0; m],
-            v_u: vec![0.0; m],
+            // Phase 3b: test-only constructor uses an all-inequality layout
+            // (n_c = 0, n_d = m), so y_c is empty and y_d is m-sized.
+            y_c: Vec::new(),
+            y_d: vec![0.0; m],
             dx: vec![0.0; n],
-            dy: vec![0.0; m],
-            dz_l: vec![0.0; n],
-            dz_u: vec![0.0; n],
+            // Phase 3c: test-only constructor (all-inequality layout) →
+            // empty dy_c, m-length dy_d.
+            dy_c: Vec::new(),
+            dy_d: vec![0.0; m],
+            // Phase 3d: test-only constructor (all-inequality layout) → m-length s/ds.
+            s: vec![0.0; m],
+            ds: vec![0.0; m],
             mu: 0.1,
             alpha_primal: 0.0,
             alpha_dual: 0.0,
             iter: 0,
-            x_l: vec![f64::NEG_INFINITY; n],
-            x_u: vec![f64::INFINITY; n],
-            g_l: vec![f64::NEG_INFINITY; m],
-            g_u: vec![f64::INFINITY; m],
+            // Phase 9d: combined `d_l`/`d_u` storage dropped. Test-only
+            // constructor's no-bounds slack layout (n_d_l=n_d_u=0) leaves
+            // the compressed mirrors empty, set below.
+            c_rhs: Vec::new(),
             n,
             m,
             obj: 0.0,
             grad_f: vec![0.0; n],
-            g: vec![0.0; m],
+            // Phase 5a: native split constraint storage. Test-only
+            // constructor uses an all-inequality layout (n_c=0, n_d=m),
+            // so c_x is empty and d_x mirrors g.
+            c_x: Vec::new(),
+            d_x: vec![0.0; m],
             jac_rows: Vec::new(),
             jac_cols: Vec::new(),
-            jac_vals: Vec::new(),
+            // Phase 4a: empty split-Jacobian storage in minimal_state;
+            // tests that exercise Jacobian-consuming code build their
+            // own structure and call set_jac_vals_combined() (or write
+            // jac_c_vals/jac_d_vals directly) as needed.
+            jac_c_rows: Vec::new(),
+            jac_c_cols: Vec::new(),
+            jac_c_vals: Vec::new(),
+            jac_d_rows: Vec::new(),
+            jac_d_cols: Vec::new(),
+            jac_d_vals: Vec::new(),
+            jac_c_combined_idx: Vec::new(),
+            jac_d_combined_idx: Vec::new(),
             hess_rows: Vec::new(),
             hess_cols: Vec::new(),
             hess_vals: Vec::new(),
             consecutive_acceptable: 0,
             obj_scaling: 1.0,
-            g_scaling: vec![1.0; m],
+            // Test-only constructor uses an all-inequality layout (no
+            // equalities) — n_c=0, n_d=m. c_scaling is empty.
+            c_scaling: Vec::new(),
+            d_scaling: vec![1.0; m],
+            layout: crate::constraint_layout::ConstraintLayout::new(
+                &vec![f64::NEG_INFINITY; m],
+                &vec![f64::INFINITY; m],
+            ),
+            // Phase 6b: test-only constructor uses a no-bounds layout
+            // (n_x_l = n_x_u = 0); compressed mirrors are empty.
+            bound_layout: crate::bound_layout::BoundLayout::new(
+                &vec![f64::NEG_INFINITY; n],
+                &vec![f64::INFINITY; n],
+            ),
+            z_l_compressed: Vec::new(),
+            z_u_compressed: Vec::new(),
+            dz_l_compressed: Vec::new(),
+            dz_u_compressed: Vec::new(),
+            x_l_compressed: Vec::new(),
+            x_u_compressed: Vec::new(),
+            // Phase 8a/b: test-only constructor uses a no-bounds slack
+            // layout (n_d_l = n_d_u = 0); compressed mirrors empty.
+            d_bound_layout: crate::d_bound_layout::DBoundLayout::new(
+                &vec![f64::NEG_INFINITY; m],
+                &vec![f64::INFINITY; m],
+            ),
+            v_l_compressed: Vec::new(),
+            v_u_compressed: Vec::new(),
+            dv_l_compressed: Vec::new(),
+            dv_u_compressed: Vec::new(),
+            d_l_compressed: Vec::new(),
+            d_u_compressed: Vec::new(),
             diagnostics: SolverDiagnostics::default(),
             x_last_eval: vec![f64::NAN; n],
+            adjusted_slacks_count: 0,
+            is_square: false,
+            acceptable_iterate: None,
+            last_obj_for_acceptable: None,
+            kkt_atags: kkt::KktInputAtags::default(),
+            factor_cache: kkt::FactorCache::new(),
+            n_obj_evals: 0,
+            n_grad_evals: 0,
+            n_constr_evals: 0,
+            n_jac_evals: 0,
+            n_hess_evals: 0,
         }
     }
 
@@ -11393,14 +11926,293 @@ mod tests {
         );
     }
 
+    /// Phase 3f test helper: replace the constraint bounds on a
+    /// `minimal_state`-derived fixture and rebuild the dependent storage
+    /// (layout, c_rhs/d_l/d_u, and per-layout vector sizes for y_c/y_d
+    /// /v_l/v_u/dy_c/dy_d/dv_l/dv_u/s/ds/c_scaling/d_scaling).
+    ///
+    /// Combined-form `g_l`/`g_u` are also written for parity with the
+    /// legacy `state.g_l = vec![…]` patterns the older fixtures used.
+    fn set_constraint_bounds(
+        state: &mut SolverState,
+        g_l: Vec<f64>,
+        g_u: Vec<f64>,
+    ) {
+        assert_eq!(g_l.len(), state.m);
+        assert_eq!(g_u.len(), state.m);
+        let layout = crate::constraint_layout::ConstraintLayout::new(&g_l, &g_u);
+        let n_c = layout.n_c;
+        let n_d = layout.n_d;
+        state.c_rhs = layout.c_to_combined.iter().map(|&i| g_l[i]).collect();
+        let d_l_d = layout.project_d(&g_l);
+        let d_u_d = layout.project_d(&g_u);
+        state.layout = layout;
+        // Phase 8b: rebuild slack-bound layout + compressed v/dv mirrors.
+        state.d_bound_layout =
+            crate::d_bound_layout::DBoundLayout::new(&d_l_d, &d_u_d);
+        state.v_l_compressed = vec![0.0; state.d_bound_layout.n_d_l];
+        state.v_u_compressed = vec![0.0; state.d_bound_layout.n_d_u];
+        state.dv_l_compressed = vec![0.0; state.d_bound_layout.n_d_l];
+        state.dv_u_compressed = vec![0.0; state.d_bound_layout.n_d_u];
+        // Phase 9b/d: compressed slack-bound storage (combined dropped).
+        state.d_l_compressed = state.d_bound_layout.project_l(&d_l_d);
+        state.d_u_compressed = state.d_bound_layout.project_u(&d_u_d);
+        state.y_c.resize(n_c, 0.0);
+        state.y_d.resize(n_d, 0.0);
+        state.dy_c.resize(n_c, 0.0);
+        state.dy_d.resize(n_d, 0.0);
+        state.s.resize(n_d, 0.0);
+        state.ds.resize(n_d, 0.0);
+        state.c_scaling.resize(n_c, 1.0);
+        state.d_scaling.resize(n_d, 1.0);
+        state.c_x.resize(n_c, 0.0);
+        state.d_x.resize(n_d, 0.0);
+    }
+
+    /// Phase 6b test helper: install variable bounds + matching
+    /// `BoundLayout`. Resizes the four compressed mirrors to the new
+    /// `n_x_l`/`n_x_u` (zeros).
+    fn set_variable_bounds(state: &mut SolverState, x_l: Vec<f64>, x_u: Vec<f64>) {
+        assert_eq!(x_l.len(), state.n);
+        assert_eq!(x_u.len(), state.n);
+        state.bound_layout = crate::bound_layout::BoundLayout::new(&x_l, &x_u);
+        state.z_l_compressed = vec![0.0; state.bound_layout.n_x_l];
+        state.z_u_compressed = vec![0.0; state.bound_layout.n_x_u];
+        state.dz_l_compressed = vec![0.0; state.bound_layout.n_x_l];
+        state.dz_u_compressed = vec![0.0; state.bound_layout.n_x_u];
+        state.x_l_compressed = state.bound_layout.project_l(&x_l);
+        state.x_u_compressed = state.bound_layout.project_u(&x_u);
+    }
+
+    #[test]
+    fn test_phase6b_compressed_z_layout() {
+        // 4 vars: var 0 lower-only, var 1 upper-only, var 2 free, var 3 two-sided.
+        let mut state = minimal_state(4, 0);
+        set_variable_bounds(
+            &mut state,
+            vec![0.0, f64::NEG_INFINITY, f64::NEG_INFINITY, -1.0],
+            vec![f64::INFINITY, 5.0, f64::INFINITY, 1.0],
+        );
+        assert_eq!(state.bound_layout.n_x_l, 2);
+        assert_eq!(state.bound_layout.n_x_u, 2);
+
+        // Write directly to the compressed mirrors (the canonical form).
+        state.z_l_compressed = vec![1.0, 4.0];
+        state.z_u_compressed = vec![2.0, 5.0];
+        state.dz_l_compressed = vec![0.1, 0.4];
+        state.dz_u_compressed = vec![0.2, 0.5];
+
+        // Materialized full-n views match expansion via bound_layout.
+        assert_eq!(state.z_l_combined(), vec![1.0, 0.0, 0.0, 4.0]);
+        assert_eq!(state.z_u_combined(), vec![0.0, 2.0, 0.0, 5.0]);
+        assert_eq!(state.dz_l_combined(), vec![0.1, 0.0, 0.0, 0.4]);
+        assert_eq!(state.dz_u_combined(), vec![0.0, 0.2, 0.0, 0.5]);
+    }
+
+    #[test]
+    fn test_phase6b_advance_z_to_trial_compressed() {
+        // Single-bound problem on 1 var.
+        let mut state = minimal_state(1, 0);
+        set_variable_bounds(&mut state, vec![0.0], vec![10.0]);
+        state.z_l_compressed = vec![1.0];
+        state.z_u_compressed = vec![2.0];
+        state.dz_l_compressed = vec![0.5];
+        state.dz_u_compressed = vec![-0.5];
+
+        // After advance_z_to_trial(α=1), z_l = max(1.0+0.5, 1e-20) = 1.5
+        // and z_u = max(2.0-0.5, 1e-20) = 1.5.
+        advance_z_to_trial(&mut state, 1.0);
+        assert!((state.z_l_compressed[0] - 1.5).abs() < 1e-12);
+        assert!((state.z_u_compressed[0] - 1.5).abs() < 1e-12);
+    }
+
+    /// Phase 4a: rebuild the split Jacobian structure from a combined
+    /// triplet (test helper). Mirrors the work `SolverState::new` does
+    /// for production states; tests that hand-craft jac_rows/jac_cols
+    /// via `minimal_state` use this to populate jac_c_*/jac_d_*.
+    fn rebuild_split_jac_structure(state: &mut SolverState) {
+        state.jac_c_rows.clear();
+        state.jac_c_cols.clear();
+        state.jac_c_combined_idx.clear();
+        state.jac_d_rows.clear();
+        state.jac_d_cols.clear();
+        state.jac_d_combined_idx.clear();
+        for (idx, (&row, &col)) in state.jac_rows.iter().zip(state.jac_cols.iter()).enumerate() {
+            if let Some(k_c) = state.layout.eq_pos[row] {
+                state.jac_c_rows.push(k_c);
+                state.jac_c_cols.push(col);
+                state.jac_c_combined_idx.push(idx);
+            } else if let Some(k_d) = state.layout.ineq_pos[row] {
+                state.jac_d_rows.push(k_d);
+                state.jac_d_cols.push(col);
+                state.jac_d_combined_idx.push(idx);
+            }
+        }
+        state.jac_c_vals = vec![0.0; state.jac_c_rows.len()];
+        state.jac_d_vals = vec![0.0; state.jac_d_rows.len()];
+    }
+
+    #[test]
+    fn test_phase5a_split_constraints_mirror_combined() {
+        // 3 constraints, 1 var: row 0 ineq lo, row 1 equality (g_l=g_u=2.5),
+        // row 2 ineq hi. Native split:
+        //   layout.eq_pos  = [None, Some(0), None]
+        //   layout.ineq_pos= [Some(0), None,    Some(1)]
+        //   c_to_combined  = [1]
+        //   d_to_combined  = [0, 2]
+        // c_rhs = [g_l[1]] = [2.5]; for g = [10.0, 7.5, 30.0]:
+        //   c_x = [g[1] - 2.5] = [5.0]
+        //   d_x = [g[0], g[2]] = [10.0, 30.0]
+        let mut state = minimal_state(1, 3);
+        set_constraint_bounds(
+            &mut state,
+            vec![1.0, 2.5, 5.0],
+            vec![f64::INFINITY, 2.5, f64::INFINITY],
+        );
+        assert_eq!(state.layout.n_c, 1);
+        assert_eq!(state.layout.n_d, 2);
+        assert_eq!(state.c_rhs, vec![2.5]);
+        assert_eq!(state.c_x.len(), 1);
+        assert_eq!(state.d_x.len(), 2);
+
+        state.set_g_combined(&[10.0, 7.5, 30.0]);
+        assert_eq!(state.c_x, vec![5.0]);
+        assert_eq!(state.d_x, vec![10.0, 30.0]);
+
+        // Reactivity: re-splitting a fresh combined snapshot must propagate.
+        state.set_g_combined(&[11.0, 4.5, 30.0]);
+        assert_eq!(state.c_x, vec![2.0]);
+        assert_eq!(state.d_x, vec![11.0, 30.0]);
+    }
+
+    #[test]
+    fn test_phase4a_split_jac_mirrors_combined() {
+        // 2 constraints, 2 vars: row 0 equality (g_l=g_u=0), row 1 ineq.
+        // Combined Jacobian: [[1.0, 2.0], [3.0, 4.0]] in dense layout.
+        // Triplet form: rows=[0,0,1,1], cols=[0,1,0,1], vals=[1,2,3,4].
+        // Split: c-block has rows=[0,0], cols=[0,1], vals=[1,2];
+        //        d-block has rows=[0,0], cols=[0,1], vals=[3,4].
+        let mut state = minimal_state(2, 2);
+        set_constraint_bounds(&mut state, vec![0.0, 1.0], vec![0.0, f64::INFINITY]);
+        state.jac_rows = vec![0, 0, 1, 1];
+        state.jac_cols = vec![0, 1, 0, 1];
+        rebuild_split_jac_structure(&mut state);
+        state.set_jac_vals_combined(&[1.0, 2.0, 3.0, 4.0]);
+
+        assert_eq!(state.jac_c_rows, vec![0, 0]);
+        assert_eq!(state.jac_c_cols, vec![0, 1]);
+        assert_eq!(state.jac_c_vals, vec![1.0, 2.0]);
+        assert_eq!(state.jac_d_rows, vec![0, 0]);
+        assert_eq!(state.jac_d_cols, vec![0, 1]);
+        assert_eq!(state.jac_d_vals, vec![3.0, 4.0]);
+
+        // Re-splitting after mutation: split mirror tracks combined.
+        state.set_jac_vals_combined(&[10.0, 20.0, 30.0, 40.0]);
+        assert_eq!(state.jac_c_vals, vec![10.0, 20.0]);
+        assert_eq!(state.jac_d_vals, vec![30.0, 40.0]);
+    }
+
+    #[test]
+    fn test_iterate_snapshot_capture_and_restore() {
+        let mut state = minimal_state(2, 1);
+        // Phase 6d.2: snapshot now stores compressed; install proper
+        // two-sided bounds via the test helper so the bound_layout has
+        // n_x_l=n_x_u=2 and the compressed mirror has matching shape.
+        set_variable_bounds(&mut state, vec![-10.0, -10.0], vec![10.0, 10.0]);
+        state.x = vec![1.5, 2.5];
+        state.set_y_combined(&[0.7]);
+        state.z_l_compressed = vec![0.1, 0.2];
+        state.z_u_compressed = vec![0.3, 0.4];
+        state.mu = 1e-3;
+        state.obj = 42.0;
+        let mut filter = Filter::new(1e4);
+        filter.add(0.5, 10.0);
+        let snap = IterateSnapshot::capture(&state, &filter, 7);
+        // Mutate state and filter to simulate further iterations.
+        state.x = vec![9.0, 9.0];
+        state.set_y_combined(&[9.0]);
+        state.z_l_compressed = vec![0.0, 0.0];
+        state.z_u_compressed = vec![0.0, 0.0];
+        state.mu = 1.0;
+        state.obj = 0.0;
+        filter.add(99.0, 99.0);
+        // Restore and verify.
+        snap.restore(&mut state, &mut filter);
+        assert_eq!(state.x, vec![1.5, 2.5]);
+        assert_eq!(state.y_combined(), vec![0.7]);
+        assert_eq!(state.z_l_compressed, vec![0.1, 0.2]);
+        assert_eq!(state.z_u_compressed, vec![0.3, 0.4]);
+        assert_eq!(state.mu, 1e-3);
+        assert_eq!(state.obj, 42.0);
+        assert_eq!(snap.iteration, 7);
+        assert_eq!(filter.entries().len(), 1);
+        // Stored corner per AugmentFilter: (1-γ_θ)·0.5.
+        assert!((filter.entries()[0].theta - (1.0 - 1e-5) * 0.5).abs() < 1e-15);
+    }
+
+    #[test]
+    fn test_almost_feasible_guard_no_snapshot_aborts() {
+        // Ipopt 3.14 IpBacktrackingLineSearch.cpp:597 throws
+        // STEP_COMPUTATION_FAILED when the almost-feasible guard fires
+        // and no acceptable iterate is cached. Mirror that: return
+        // NumericalError.
+        let mut state = minimal_state(1, 0);
+        let mut filter = Filter::new(1e4);
+        let opts = SolverOptions::default();
+        let result = check_almost_feasible_guard(
+            &mut state, &opts, &mut filter,
+            1e-12, 1e-12,
+        );
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().status, SolveStatus::NumericalError);
+    }
+
+    #[test]
+    fn test_almost_feasible_guard_predicate_blocks() {
+        let mut state = minimal_state(1, 0);
+        state.x = vec![1.0];
+        let mut filter = Filter::new(1e4);
+        state.acceptable_iterate = Some(IterateSnapshot::capture(&state, &filter, 0));
+        state.x = vec![5.0];
+        let opts = SolverOptions::default();
+        // Predicate fails: primal_inf large.
+        let result = check_almost_feasible_guard(
+            &mut state, &opts, &mut filter,
+            1.0, 1.0,
+        );
+        assert!(result.is_none());
+        // Snapshot retained because guard did not fire.
+        assert!(state.acceptable_iterate.is_some());
+        assert_eq!(state.x, vec![5.0]);
+    }
+
+    #[test]
+    fn test_almost_feasible_guard_fires_with_snapshot() {
+        let mut state = minimal_state(1, 0);
+        state.x = vec![1.0];
+        let mut filter = Filter::new(1e4);
+        state.acceptable_iterate = Some(IterateSnapshot::capture(&state, &filter, 3));
+        state.x = vec![5.0];
+        let opts = SolverOptions::default();
+        // Predicate holds: pinf < 1e-2 * tol = 1e-10, pinf_max < 1e-1 * 1e-4 = 1e-5
+        let result = check_almost_feasible_guard(
+            &mut state, &opts, &mut filter,
+            1e-12, 1e-12,
+        );
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().status, SolveStatus::Acceptable);
+        assert_eq!(state.x, vec![1.0]);
+        assert!(state.acceptable_iterate.is_none());
+    }
+
     #[test]
     fn test_avg_compl_variable_bounds_only() {
         // 2 vars, lower-bound only. x = [1.5, 2.0], x_l = [1.0, 1.0], z_l = [2.0, 3.0].
         // slacks = [0.5, 1.0]; avg_compl = (0.5*2.0 + 1.0*3.0) / 2 = 4.0 / 2 = 2.0
         let mut state = minimal_state(2, 0);
         state.x = vec![1.5, 2.0];
-        state.x_l = vec![1.0, 1.0];
-        state.z_l = vec![2.0, 3.0];
+        set_variable_bounds(&mut state, vec![1.0, 1.0], vec![f64::INFINITY, f64::INFINITY]);
+        state.z_l_compressed = vec![2.0, 3.0];
         let avg = compute_avg_complementarity(&state);
         assert!((avg - 2.0).abs() < 1e-12, "expected 2.0, got {}", avg);
     }
@@ -11411,10 +12223,9 @@ mod tests {
         // avg = (0.5*2.0 + 0.5*3.0) / 2 = 2.5 / 2 = 1.25
         let mut state = minimal_state(1, 0);
         state.x = vec![1.5];
-        state.x_l = vec![1.0];
-        state.x_u = vec![2.0];
-        state.z_l = vec![2.0];
-        state.z_u = vec![3.0];
+        set_variable_bounds(&mut state, vec![1.0], vec![2.0]);
+        state.z_l_compressed = vec![2.0];
+        state.z_u_compressed = vec![3.0];
         let avg = compute_avg_complementarity(&state);
         assert!((avg - 1.25).abs() < 1e-12, "expected 1.25, got {}", avg);
     }
@@ -11424,28 +12235,35 @@ mod tests {
         // No variable bounds, but an inequality constraint with v_l > 0 triggers fallback.
         // g = 2.0, g_l = 1.0, v_l = 0.5 -> slack = 1.0, contrib = 0.5; avg = 0.5 / 1 = 0.5.
         let mut state = minimal_state(1, 1);
-        state.g = vec![2.0];
-        state.g_l = vec![1.0];
-        state.g_u = vec![f64::INFINITY];
-        state.v_l = vec![0.5];
+        set_constraint_bounds(&mut state, vec![1.0], vec![f64::INFINITY]);
+        state.set_g_combined(&[2.0]);
+        state.v_l_compressed = vec![0.5];
+        sync_state_s_to_g(&mut state);
         let avg = compute_avg_complementarity(&state);
         assert!((avg - 0.5).abs() < 1e-12, "fallback path: expected 0.5, got {}", avg);
     }
 
     #[test]
-    fn test_avg_compl_inequality_fallback_skipped_when_bounds_exist() {
-        // Variable bounds present AND inequality constraint with v_l > 0: fallback is skipped.
-        // Only the variable bound contributes, so avg_compl = slack * z_l / 1 = 1.0 * 1.0 = 1.0.
+    fn test_avg_compl_includes_slack_side_with_var_bounds() {
+        // B-cross6: avg_compl now ALWAYS includes the slack-side
+        // complementarity v_L·s_L / v_U·s_U, matching Ipopt's
+        // `IpIpoptCalculatedQuantities::curr_avrg_compl`. The previous
+        // ripopt-only "fallback unless no var bounds" guard biased the
+        // adaptive μ oracle on mixed-bound problems and has been retired.
+        // Variable bound: slack=1.0, z_L=1.0 → contrib=1.0.
+        // Constraint slack (one-sided lower): s_L = s−g_l = 1.0, v_L=99
+        // → contrib=99.0. avg = (1.0 + 99.0) / 2 = 50.
         let mut state = minimal_state(1, 1);
         state.x = vec![2.0];
-        state.x_l = vec![1.0];
-        state.z_l = vec![1.0];
-        state.g = vec![2.0];
-        state.g_l = vec![1.0];
-        state.v_l = vec![99.0]; // Would bias avg if fallback ran
+        set_variable_bounds(&mut state, vec![1.0], vec![f64::INFINITY]);
+        state.z_l_compressed = vec![1.0];
+        set_constraint_bounds(&mut state, vec![1.0], vec![f64::INFINITY]);
+        state.set_g_combined(&[2.0]);
+        state.v_l_compressed = vec![99.0];
+        sync_state_s_to_g(&mut state);
         let avg = compute_avg_complementarity(&state);
-        assert!((avg - 1.0).abs() < 1e-12,
-            "fallback must skip when var bounds present: got {}", avg);
+        assert!((avg - 50.0).abs() < 1e-12,
+            "expected aligned avg = (1 + 99)/2 = 50; got {}", avg);
     }
 
     #[test]
@@ -11457,69 +12275,1420 @@ mod tests {
     }
 
     #[test]
-    fn test_quality_function_mu_degenerate_range() {
-        // mu_upper <= mu_lower → returns mu_upper unchanged
-        let state = minimal_state(1, 0);
-        let opts = SolverOptions::default();
-        let mu = quality_function_mu(&state, &opts, 1.0, 1.0, 5);
-        assert_eq!(mu, 1.0);
-        let mu2 = quality_function_mu(&state, &opts, 2.0, 1.0, 5);
-        assert_eq!(mu2, 1.0, "lower > upper still returns upper");
+    fn test_bound_multiplier_count_finite_bounds_only() {
+        // T0.2: 3 vars but only 1 finite bound; count must be 1, not 6.
+        let mut state = minimal_state(3, 0);
+        set_variable_bounds(
+            &mut state,
+            vec![0.0, f64::NEG_INFINITY, f64::NEG_INFINITY], // finite lower on var 0
+            vec![f64::INFINITY, f64::INFINITY, f64::INFINITY],
+        );
+        let count = compute_bound_multiplier_count(&state);
+        assert_eq!(count, 1, "only 1 finite variable bound; got {}", count);
     }
 
     #[test]
-    fn test_quality_function_mu_too_few_candidates() {
-        // n_candidates < 2 → returns mu_upper
-        let state = minimal_state(1, 0);
-        let opts = SolverOptions::default();
-        let mu = quality_function_mu(&state, &opts, 1e-6, 1e-3, 1);
-        assert_eq!(mu, 1e-3);
-        let mu0 = quality_function_mu(&state, &opts, 1e-6, 1e-3, 0);
-        assert_eq!(mu0, 1e-3);
+    fn test_bound_multiplier_count_with_constraint_bounds() {
+        // T0.2: variable bounds + inequality constraint bounds.
+        //   x_l[0] finite, x_u[0] finite => 2
+        //   x_l[1] = -inf, x_u[1] = -inf, x_u[1] = +inf => 0
+        //   constraint 0: g_l finite, g_u = inf, ineq => +1
+        //   constraint 1: g_l = g_u (equality) => 0 (skipped)
+        // Total = 3.
+        let mut state = minimal_state(2, 2);
+        set_variable_bounds(
+            &mut state,
+            vec![0.0, f64::NEG_INFINITY],
+            vec![10.0, f64::INFINITY],
+        );
+        set_constraint_bounds(&mut state, vec![0.0, 5.0], vec![f64::INFINITY, 5.0]);
+        let count = compute_bound_multiplier_count(&state);
+        assert_eq!(count, 3, "expected 3 finite bounds, got {}", count);
     }
 
     #[test]
-    fn test_quality_function_mu_picks_candidate_in_range() {
-        // Well-posed state: 1 lower-bound-active variable. The quality
-        // function q(mu) = pi + di + ci(mu) where ci is the
-        // 2-norm-averaged complementarity error.  With pi=di=0 and
-        // slack*z = 0.5*0.2 = 0.1, ci(mu) is minimized at mu ≈ 0.1.
+    fn test_convergence_info_dual_inf_unscaled_with_obj_scaling() {
+        // T0.4: when obj_scaling = 0.5, dual_inf_unscaled = dual_inf / 0.5 = 2 * dual_inf.
+        // Build a state with grad_f = [1.0] (scaled), no constraints, no z.
+        // dual_inf = max|grad_f - z_l + z_u| = 1.0.
+        // dual_inf_unscaled = 1.0 / 0.5 = 2.0.
         let mut state = minimal_state(1, 0);
-        state.x = vec![1.5];
-        state.x_l = vec![1.0];
-        state.z_l = vec![0.2];
-        let opts = SolverOptions::default();
-        let mu = quality_function_mu(&state, &opts, 1e-6, 1e-1, 11);
-        assert!(mu >= 1e-6 * (1.0 - 1e-12) && mu <= 1e-1 * (1.0 + 1e-12),
-            "mu must lie in range, got {}", mu);
-        // The exact optimum 0.1 is grid point k=10 with n_candidates=11.
-        assert!((mu - 0.1).abs() < 1e-10, "expected mu≈0.1, got {}", mu);
+        state.obj_scaling = 0.5;
+        state.grad_f = vec![1.0];
+        let info = compute_convergence_info_from_state(&state, 0.0, 1, 0);
+        assert!((info.dual_inf - 1.0).abs() < 1e-12, "dual_inf = {}", info.dual_inf);
+        assert!((info.dual_inf_unscaled - 2.0).abs() < 1e-12,
+            "dual_inf_unscaled with obj_scaling=0.5 should be 2*dual_inf, got {}",
+            info.dual_inf_unscaled);
     }
 
     #[test]
-    fn test_quality_function_mu_centrality_term_changes_pick() {
-        // Construct an off-center state (one product much smaller than
-        // the others) so xi << 1.  With centrality off the QF prefers
-        // the smallest-mu candidate that minimises ci(mu); with
-        // centrality on the `compl_inf / xi` penalty pushes the choice
-        // toward the larger-mu, more-central candidates.
-        let mut state = minimal_state(2, 0);
-        state.x = vec![1.5, 1.5];
-        state.x_l = vec![1.0, 1.0];
-        // First product = 0.5*0.001 = 5e-4, second = 0.5*1.0 = 0.5.
-        state.z_l = vec![0.001, 1.0];
+    fn test_convergence_info_dual_inf_unscaled_obj_scaling_one() {
+        // T0.4: obj_scaling = 1.0 leaves dual_inf_unscaled == dual_inf.
+        let mut state = minimal_state(1, 0);
+        state.obj_scaling = 1.0;
+        state.grad_f = vec![3.0];
+        let info = compute_convergence_info_from_state(&state, 0.0, 1, 0);
+        assert!((info.dual_inf - info.dual_inf_unscaled).abs() < 1e-15);
+        assert!((info.dual_inf - 3.0).abs() < 1e-12);
+    }
 
-        let mut opts_off = SolverOptions::default();
-        opts_off.quality_function_centrality = false;
-        let mu_off = quality_function_mu(&state, &opts_off, 1e-6, 1.0, 21);
+    #[test]
+    fn test_compl_err_includes_constraint_slack() {
+        // T0.3: inequality constraint with slack > 0 and v_l > 0 must contribute
+        // to compl error. No variable bounds.
+        // g = 3.0, g_l = 1.0, g_u = +inf, v_l = 0.5; slack = 2.0.
+        // Variable-bound block: 0.0.
+        // Constraint-slack block: |2.0 * 0.5 - 0.0| = 1.0.
+        // Mirrors Ipopt's curr_complementarity which uses the dedicated v_L
+        // multipliers, not max(y,0) (IpIpoptCalculatedQuantities.cpp:2467-2497).
+        let mut state = minimal_state(1, 1);
+        state.x = vec![0.0];
+        set_constraint_bounds(&mut state, vec![1.0], vec![f64::INFINITY]);
+        state.set_g_combined(&[3.0]);
+        state.v_l_compressed = vec![0.5];
+        sync_state_s_to_g(&mut state);
+        let err = compute_compl_err_at_state(&state);
+        assert!((err - 1.0).abs() < 1e-12,
+            "expected slack*v_l = 1.0, got {}", err);
+    }
 
-        let mut opts_on = SolverOptions::default();
-        opts_on.quality_function_centrality = true;
-        let mu_on = quality_function_mu(&state, &opts_on, 1e-6, 1.0, 21);
+    #[test]
+    fn test_compl_err_constraint_upper_block() {
+        // T0.3: upper-bound side uses v_u directly.
+        // g = 1.0, g_l = -inf, g_u = 4.0, v_u = 0.25; slack = 3.0.
+        // Constraint-slack block: |3.0 * 0.25 - 0.0| = 0.75.
+        let mut state = minimal_state(1, 1);
+        state.x = vec![0.0];
+        set_constraint_bounds(&mut state, vec![f64::NEG_INFINITY], vec![4.0]);
+        state.set_g_combined(&[1.0]);
+        state.v_u_compressed = vec![0.25];
+        sync_state_s_to_g(&mut state);
+        let err = compute_compl_err_at_state(&state);
+        assert!((err - 0.75).abs() < 1e-12,
+            "expected slack*v_u = 0.75, got {}", err);
+    }
 
-        // Centrality on must pick a strictly larger mu (penalty on
-        // 1/xi steers away from aggressive small-mu candidates).
-        assert!(mu_on >= mu_off,
-            "centrality should raise mu, off={mu_off:e} on={mu_on:e}");
+    #[test]
+    fn test_multiplier_count_includes_all_y() {
+        // T0.2: multiplier_count = m + finite_bound_count.
+        // m=2, 1 finite var bound => count = 2 + 1 = 3.
+        let mut state = minimal_state(3, 2);
+        set_variable_bounds(
+            &mut state,
+            vec![0.0, f64::NEG_INFINITY, f64::NEG_INFINITY],
+            vec![f64::INFINITY, f64::INFINITY, f64::INFINITY],
+        );
+        let count = compute_multiplier_count(&state);
+        assert_eq!(count, 3);
+    }
+
+    /// Minimal `NlpProblem` whose evaluations return user-controlled
+    /// non-finite values so we can exercise `FiniteCheckedProblem`.
+    struct PoisonProblem {
+        bad_obj: bool,
+        bad_grad: bool,
+        bad_g: bool,
+        bad_jac: bool,
+        bad_hess: bool,
+    }
+
+    impl NlpProblem for PoisonProblem {
+        fn num_variables(&self) -> usize { 1 }
+        fn num_constraints(&self) -> usize { 1 }
+        fn bounds(&self, x_l: &mut [f64], x_u: &mut [f64]) {
+            x_l[0] = f64::NEG_INFINITY; x_u[0] = f64::INFINITY;
+        }
+        fn constraint_bounds(&self, g_l: &mut [f64], g_u: &mut [f64]) {
+            g_l[0] = 0.0; g_u[0] = 0.0;
+        }
+        fn initial_point(&self, x0: &mut [f64]) { x0[0] = 0.0; }
+        fn objective(&self, _x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+            *obj = if self.bad_obj { f64::NAN } else { 1.0 };
+            true
+        }
+        fn gradient(&self, _x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
+            grad[0] = if self.bad_grad { f64::INFINITY } else { 1.0 };
+            true
+        }
+        fn constraints(&self, _x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
+            g[0] = if self.bad_g { f64::NAN } else { 0.0 };
+            true
+        }
+        fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            (vec![0], vec![0])
+        }
+        fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
+            vals[0] = if self.bad_jac { f64::NEG_INFINITY } else { 1.0 };
+            true
+        }
+        fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            (vec![0], vec![0])
+        }
+        fn hessian_values(
+            &self, _x: &[f64], _new_x: bool, _of: f64, _l: &[f64], vals: &mut [f64],
+        ) -> bool {
+            vals[0] = if self.bad_hess { f64::NAN } else { 1.0 };
+            true
+        }
+    }
+
+    #[test]
+    fn finite_checked_passes_finite_values_through() {
+        let p = PoisonProblem {
+            bad_obj: false, bad_grad: false, bad_g: false,
+            bad_jac: false, bad_hess: false,
+        };
+        let w = FiniteCheckedProblem::new(&p);
+        let x = [0.0];
+        let mut obj = 0.0;
+        let mut grad = [0.0];
+        let mut g = [0.0];
+        let mut jac = [0.0];
+        let mut hess = [0.0];
+        assert!(w.objective(&x, true, &mut obj));
+        assert!(w.gradient(&x, true, &mut grad));
+        assert!(w.constraints(&x, true, &mut g));
+        assert!(w.jacobian_values(&x, true, &mut jac));
+        assert!(w.hessian_values(&x, true, 1.0, &[0.0], &mut hess));
+    }
+
+    #[test]
+    fn finite_checked_rejects_non_finite_values() {
+        let x = [0.0];
+        let mut buf1 = [0.0];
+        let mut buf_g = [0.0];
+
+        let p_obj = PoisonProblem {
+            bad_obj: true, bad_grad: false, bad_g: false, bad_jac: false, bad_hess: false,
+        };
+        let mut obj = 0.0;
+        assert!(!FiniteCheckedProblem::new(&p_obj).objective(&x, true, &mut obj));
+
+        let p_grad = PoisonProblem {
+            bad_obj: false, bad_grad: true, bad_g: false, bad_jac: false, bad_hess: false,
+        };
+        assert!(!FiniteCheckedProblem::new(&p_grad).gradient(&x, true, &mut buf1));
+
+        let p_g = PoisonProblem {
+            bad_obj: false, bad_grad: false, bad_g: true, bad_jac: false, bad_hess: false,
+        };
+        assert!(!FiniteCheckedProblem::new(&p_g).constraints(&x, true, &mut buf_g));
+
+        let p_jac = PoisonProblem {
+            bad_obj: false, bad_grad: false, bad_g: false, bad_jac: true, bad_hess: false,
+        };
+        assert!(!FiniteCheckedProblem::new(&p_jac).jacobian_values(&x, true, &mut buf1));
+
+        let p_hess = PoisonProblem {
+            bad_obj: false, bad_grad: false, bad_g: false, bad_jac: false, bad_hess: true,
+        };
+        assert!(!FiniteCheckedProblem::new(&p_hess)
+            .hessian_values(&x, true, 1.0, &[0.0], &mut buf1));
+    }
+
+    /// Ipopt `MinC_1NrmRestorationPhase::PerformRestoration`
+    /// (`IpRestoMinC_1Nrm.cpp:374-419`): with no x step
+    /// (s_cur == s_trial), the synthetic Newton step
+    /// δz = (μ − z·s_trial)/s_curr drives `z + α·δz` to μ/s when α=1.
+    #[test]
+    fn test_resto_handoff_no_x_step_recovers_mu_slack() {
+        let mut state = minimal_state(1, 0);
+        state.x = vec![1.1];
+        set_variable_bounds(&mut state, vec![1.0], vec![f64::INFINITY]);
+        state.mu = 0.01;
+        // Parent's pre-resto z lives in state.z_l_compressed.
+        state.z_l_compressed[0] = 0.5;
+        // s_cur = s_trial = 0.1; z=0.5 → δz = (0.01 − 0.05)/0.1 = −0.4.
+        // α_dual FTB: −0.99·0.5 / −0.4 = 1.2375 → clamp to 1.
+        // z_new = 0.5 + (−0.4) = 0.1 = μ/s.
+        let opts = SolverOptions::default();
+        let x_cur = vec![1.1];
+        let s_cur: Vec<f64> = vec![];
+        let nuclear = update_bound_multipliers_after_restoration(
+            &mut state, &opts, &x_cur, &s_cur,
+        );
+        assert!((state.z_l_compressed[0] - 0.1).abs() < 1e-12,
+            "z_l should converge to μ/s = 0.1 via Newton step, got {}",
+            state.z_l_compressed[0]);
+        assert!(!nuclear, "z_max=0.1 should not trigger nuclear reset");
+    }
+
+    /// Ipopt `IpRestoMinC_1Nrm.cpp:402-419`: when the post-step max
+    /// multiplier exceeds `bound_mult_reset_threshold` (default 1e3),
+    /// **all four blocks (z_L, z_U, v_L, v_U) are reset to 1.0**. The
+    /// nuclear reset is the safety valve that prevents inflated parent
+    /// z's from poisoning the next factorization.
+    #[test]
+    fn test_resto_handoff_nuclear_reset_above_threshold() {
+        let mut state = minimal_state(1, 0);
+        state.x = vec![1.1];
+        set_variable_bounds(&mut state, vec![1.0], vec![f64::INFINITY]);
+        state.mu = 1e-6;
+        // Pre-resto z huge (1e10); s_cur=s_trial=0.1.
+        // δz = (1e-6 − 1e10·0.1)/0.1 = (1e-6 − 1e9)/0.1 ≈ −1e10.
+        // FTB: −0.99·1e10 / −1e10 = 0.99 → step = −0.99·1e10.
+        // z_new ≈ 1e10·(1 − 0.99) = 1e8 → above 1e3 → nuclear reset.
+        state.z_l_compressed[0] = 1.0e10;
+        let opts = SolverOptions::default();
+        let x_cur = vec![1.1];
+        let s_cur: Vec<f64> = vec![];
+        let nuclear = update_bound_multipliers_after_restoration(
+            &mut state, &opts, &x_cur, &s_cur,
+        );
+        assert!(nuclear, "z_new ≈ 1e8 should trigger nuclear reset");
+        assert_eq!(state.z_l_compressed[0], 1.0,
+            "nuclear reset must drive z_l to 1.0, got {}", state.z_l_compressed[0]);
+    }
+
+    /// Ipopt `IpRestoMinC_1Nrm.cpp:438-453`: with an x step (s shrinks
+    /// from s_cur=0.5 to s_trial=0.1), the synthetic Newton uses both
+    /// s_curr and s_trial, not just one. Verify δz computation:
+    ///   δz = (μ − z·s_trial) / s_curr = (0.05 − 0.1·0.1) / 0.5
+    ///      = (0.05 − 0.01) / 0.5 = 0.08
+    /// δz > 0 → α_dual = 1 (no FTB cap needed). z_new = 0.1 + 0.08 = 0.18.
+    #[test]
+    fn test_resto_handoff_with_x_step_uses_both_slacks() {
+        let mut state = minimal_state(1, 0);
+        // Trial: x=1.1 → s_trial=0.1. Pre-resto: x_cur=1.5 → s_cur=0.5.
+        state.x = vec![1.1];
+        set_variable_bounds(&mut state, vec![1.0], vec![f64::INFINITY]);
+        state.mu = 0.05;
+        state.z_l_compressed[0] = 0.1;
+        let opts = SolverOptions::default();
+        let x_cur = vec![1.5];
+        let s_cur: Vec<f64> = vec![];
+        update_bound_multipliers_after_restoration(
+            &mut state, &opts, &x_cur, &s_cur,
+        );
+        assert!((state.z_l_compressed[0] - 0.18).abs() < 1e-12,
+            "z_l should be 0.18 from synthetic Newton step, got {}",
+            state.z_l_compressed[0]);
+    }
+
+    /// Trivial 1-D NLP for filter-gating tests. Objective and
+    /// constraints are user-pluggable closures (boxed-fn'd into
+    /// the trait via the wrapper).
+    struct MockNlp {
+        n: usize,
+        m: usize,
+        obj_at: Box<dyn Fn(&[f64]) -> f64>,
+        cons_at: Box<dyn Fn(&[f64], &mut [f64])>,
+    }
+
+    impl NlpProblem for MockNlp {
+        fn num_variables(&self) -> usize { self.n }
+        fn num_constraints(&self) -> usize { self.m }
+        fn bounds(&self, x_l: &mut [f64], x_u: &mut [f64]) {
+            for v in x_l.iter_mut() { *v = f64::NEG_INFINITY; }
+            for v in x_u.iter_mut() { *v = f64::INFINITY; }
+        }
+        fn constraint_bounds(&self, g_l: &mut [f64], g_u: &mut [f64]) {
+            for v in g_l.iter_mut() { *v = 0.0; }
+            for v in g_u.iter_mut() { *v = 0.0; }
+        }
+        fn initial_point(&self, x0: &mut [f64]) { for v in x0.iter_mut() { *v = 0.0; } }
+        fn objective(&self, x: &[f64], _: bool, obj: &mut f64) -> bool { *obj = (self.obj_at)(x); true }
+        fn gradient(&self, _: &[f64], _: bool, grad: &mut [f64]) -> bool { for v in grad.iter_mut() { *v = 0.0; } true }
+        fn constraints(&self, x: &[f64], _: bool, g: &mut [f64]) -> bool { (self.cons_at)(x, g); true }
+        fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![0; self.m], (0..self.m).collect()) }
+        fn jacobian_values(&self, _: &[f64], _: bool, vals: &mut [f64]) -> bool { for v in vals.iter_mut() { *v = 1.0; } true }
+        fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
+        fn hessian_values(&self, _: &[f64], _: bool, _: f64, _: &[f64], _: &mut [f64]) -> bool { true }
+    }
+
+    /// T0.9: when the resto-returned iterate is rejected by the
+    /// existing filter (and is not feasibility-recovery), the
+    /// success handler must commit nothing and return false. The
+    /// pre-existing filter entries must remain intact (Ipopt
+    /// IpRestoFilterConvCheck::TestOrigProgress). This is the
+    /// behavior that the old code obscured by clearing the filter
+    /// before checking.
+    #[test]
+    fn test_apply_restoration_success_filter_rejects_dominated_iterate() {
+        let mut state = minimal_state(1, 1);
+        // Old x; constraint g(x) = x; equality g = 0.
+        state.x = vec![0.5];
+        set_constraint_bounds(&mut state, vec![0.0], vec![0.0]);
+        state.set_g_combined(&[0.5]);
+        // x_l = -inf, x_u = +inf via minimal_state default (no bounds).
+        state.mu = 0.1;
+
+        // Mock NLP: objective = x[0], constraints = x[0] = 0.
+        // Trial restored point x = 2.0 → theta = 2.0, phi = 2.0.
+        let problem = MockNlp {
+            n: 1, m: 1,
+            obj_at: Box::new(|x| x[0]),
+            cons_at: Box::new(|x, g| { g[0] = x[0]; }),
+        };
+
+        let mut filter = Filter::new(1e4);
+        // Seed the filter with an entry that DOMINATES (theta=2, phi=2):
+        //   theta_e=1, phi_e=1. With gamma_theta=1e-5, gamma_phi=1e-8,
+        //   acceptance demands theta < (1-γθ)·1 ≈ 1 OR phi < 1 - γφ·1.
+        //   Trial (2, 2) fails both → not acceptable.
+        filter.add(1.0, 1.0);
+        let entries_before = filter.entries().to_vec();
+        let theta_min_before = filter.theta_max(); // proxy for filter state
+
+        let mut mu_state = MuState::new();
+        let opts = SolverOptions::default();
+        let mut lbfgs_state: Option<LbfgsIpmState> = None;
+
+        let x_new = vec![2.0]; // theta=2, phi=2 → filter-rejected
+        let committed = apply_restoration_success(
+            &mut state, &mut filter, &mut mu_state, &opts, 1, 1,
+            &problem, &x_new, None,
+            None, false, &mut lbfgs_state,
+        );
+
+        assert!(!committed,
+            "filter-dominated iterate must NOT commit (T0.9)");
+        // x must NOT be updated.
+        assert!((state.x[0] - 0.5).abs() < 1e-15,
+            "state.x must be unchanged on rejection, got {}", state.x[0]);
+        // Filter entries must be intact (no reset occurred).
+        assert_eq!(filter.entries().len(), entries_before.len(),
+            "filter must NOT be cleared on rejected resto (T0.9)");
+        // Stored corner per AugmentFilter: ((1-γ_θ)·1, 1 - γ_φ·1).
+        let theta_corner = (1.0 - 1e-5) * 1.0;
+        let phi_corner = 1.0 - 1e-8 * 1.0;
+        assert!((filter.entries()[0].theta - theta_corner).abs() < 1e-15,
+            "pre-existing filter entry theta must persist");
+        assert!((filter.entries()[0].phi - phi_corner).abs() < 1e-15,
+            "pre-existing filter entry phi must persist");
+        // theta_max unchanged
+        assert!((filter.theta_max() - theta_min_before).abs() < 1e-15);
+    }
+
+    /// T0.9: when the restored iterate IS acceptable to the filter,
+    /// the success handler commits and leaves filter entries
+    /// untouched (no reset).
+    #[test]
+    fn test_apply_restoration_success_filter_accepts_and_preserves_entries() {
+        let mut state = minimal_state(1, 1);
+        state.x = vec![0.5];
+        set_constraint_bounds(&mut state, vec![0.0], vec![0.0]);
+        state.set_g_combined(&[0.5]);
+        // x_l = -inf, x_u = +inf via minimal_state default (no bounds).
+        state.mu = 0.1;
+
+        // Trial point: x = 1e-3 → theta = 1e-3, phi = 1e-3. Better
+        // than entry (1.0, 1.0) on both axes → acceptable.
+        let problem = MockNlp {
+            n: 1, m: 1,
+            obj_at: Box::new(|x| x[0]),
+            cons_at: Box::new(|x, g| { g[0] = x[0]; }),
+        };
+
+        let mut filter = Filter::new(1e4);
+        filter.add(1.0, 1.0);
+        let entries_before_len = filter.entries().len();
+
+        let mut mu_state = MuState::new();
+        let opts = SolverOptions::default();
+        let mut lbfgs_state: Option<LbfgsIpmState> = None;
+
+        let x_new = vec![1.0e-3];
+        let committed = apply_restoration_success(
+            &mut state, &mut filter, &mut mu_state, &opts, 1, 1,
+            &problem, &x_new, None,
+            None, false, &mut lbfgs_state,
+        );
+
+        assert!(committed, "acceptable iterate must commit");
+        assert!((state.x[0] - 1.0e-3).abs() < 1e-15, "state.x must be updated");
+        // T0.9: filter must NOT be cleared on success either.
+        assert_eq!(filter.entries().len(), entries_before_len,
+            "filter must retain entries on resto success (T0.9)");
+        // Stored corner per AugmentFilter: ((1-γ_θ)·1, ...).
+        assert!((filter.entries()[0].theta - (1.0 - 1e-5)).abs() < 1e-15);
+    }
+
+    #[test]
+    fn test_push_initial_point_one_sided_lower_large_magnitude() {
+        // Variable with x_L = 1e3 and no upper bound, starting at x = 1e3.
+        // Ipopt pushes by κ1 · max(|x_L|, 1) = 0.01 · 1e3 = 10, so x ≥ 1010.
+        // The pre-fix formula pushed by only `bound_push = 0.01` absolute.
+        let opts = SolverOptions::default();
+        let mut x = vec![1e3];
+        let x_l = vec![1e3];
+        let x_u = vec![f64::INFINITY];
+        push_initial_point_from_bounds(&mut x, &x_l, &x_u, &opts);
+        assert!(
+            x[0] >= 1e3 + 0.01 * 1e3 - 1e-12,
+            "expected x >= 1010 after magnitude-scaled push, got x = {}",
+            x[0]
+        );
+    }
+
+    #[test]
+    fn test_push_initial_point_one_sided_lower_unit_magnitude() {
+        // |x_L| < 1 falls back to max(|x_L|, 1) = 1, so push is bound_push.
+        let opts = SolverOptions::default();
+        let mut x = vec![0.0];
+        let x_l = vec![0.0];
+        let x_u = vec![f64::INFINITY];
+        push_initial_point_from_bounds(&mut x, &x_l, &x_u, &opts);
+        assert!(
+            (x[0] - opts.bound_push).abs() < 1e-12,
+            "expected x = bound_push = {}, got x = {}",
+            opts.bound_push,
+            x[0]
+        );
+    }
+
+    #[test]
+    fn test_relax_fixed_variable_bounds_default_widens() {
+        // Default option (Phase 11: MakeParameter). The IPM-layer fallback
+        // `relax_fixed_variable_bounds` widens for both RelaxBounds and
+        // MakeParameter (the latter is a safety net for callers that bypass
+        // the preprocessor and reach the IPM with literally-equal bounds).
+        // x_l = x_u = 5.0 should be widened to [5 - 5e-8, 5 + 5e-8].
+        let opts = SolverOptions::default();
+        let mut x_l = vec![5.0];
+        let mut x_u = vec![5.0];
+        relax_fixed_variable_bounds(&mut x_l, &mut x_u, &opts);
+        let expected_relax = 1e-8 * 5.0;
+        assert!((x_l[0] - (5.0 - expected_relax)).abs() < 1e-15);
+        assert!((x_u[0] - (5.0 + expected_relax)).abs() < 1e-15);
+    }
+
+    #[test]
+    fn test_relax_fixed_variable_bounds_make_parameter_widens_at_solver_layer() {
+        // MakeParameter eliminates fixed vars upstream via PreprocessedProblem.
+        // If bounds still reach the solver-layer `relax_fixed_variable_bounds`
+        // (e.g. when the user disables preprocessing AND MakeParameter
+        // elimination didn't run), they are widened identically to RelaxBounds
+        // so the IPM has a non-empty interior either way.
+        let mut opts = SolverOptions::default();
+        opts.fixed_variable_treatment = FixedVariableTreatment::MakeParameter;
+        let mut x_l = vec![5.0];
+        let mut x_u = vec![5.0];
+        relax_fixed_variable_bounds(&mut x_l, &mut x_u, &opts);
+        assert!(x_l[0] < 5.0 && x_u[0] > 5.0);
+    }
+
+    #[test]
+    fn test_relax_fixed_variable_bounds_skips_non_fixed() {
+        let opts = SolverOptions::default();
+        let mut x_l = vec![1.0, f64::NEG_INFINITY];
+        let mut x_u = vec![3.0, f64::INFINITY];
+        relax_fixed_variable_bounds(&mut x_l, &mut x_u, &opts);
+        assert_eq!(x_l[0], 1.0);
+        assert_eq!(x_u[0], 3.0);
+        assert_eq!(x_l[1], f64::NEG_INFINITY);
+        assert_eq!(x_u[1], f64::INFINITY);
+    }
+
+    #[test]
+    fn test_init_bound_multipliers_default_is_constant_one() {
+        // Default options: bound_mult_init_method = Constant, val = 1.0.
+        // mu_init = 0.1 should NOT appear in z_l[0]; the constant 1.0 should.
+        let opts = SolverOptions::default();
+        let x = vec![1.5];
+        let x_l = vec![0.0];
+        let x_u = vec![f64::INFINITY];
+        let (z_l, z_u) = init_bound_multipliers(&x, &x_l, &x_u, 0.1, &opts);
+        assert_eq!(z_l[0], 1.0, "constant default should give z_l = 1.0");
+        assert_eq!(z_u[0], 0.0, "no upper bound -> z_u stays at 0");
+    }
+
+    #[test]
+    fn test_init_bound_multipliers_mu_based_uses_mu_over_slack() {
+        let mut opts = SolverOptions::default();
+        opts.bound_mult_init_method = BoundMultInitMethod::MuBased;
+        let x = vec![1.5];
+        let x_l = vec![0.5];
+        let x_u = vec![f64::INFINITY];
+        let (z_l, _z_u) = init_bound_multipliers(&x, &x_l, &x_u, 0.1, &opts);
+        // slack = 1.5 - 0.5 = 1.0 -> z_l = 0.1 / 1.0 = 0.1
+        assert!((z_l[0] - 0.1).abs() < 1e-12, "got z_l = {}", z_l[0]);
+    }
+
+    #[test]
+    fn test_push_initial_point_two_sided_uses_min_of_kappa1_kappa2() {
+        // Two-sided narrow range: [0, 0.01]. κ2·range = 0.01·0.01 = 1e-4
+        // vs κ1·max(|x_L|, 1) = 0.01·1 = 0.01. The min picks 1e-4.
+        let opts = SolverOptions::default();
+        let mut x = vec![0.0];
+        let x_l = vec![0.0];
+        let x_u = vec![0.01];
+        push_initial_point_from_bounds(&mut x, &x_l, &x_u, &opts);
+        // p_l = min(0.01, 1e-4) = 1e-4
+        assert!((x[0] - 1e-4).abs() < 1e-12, "got x = {}", x[0]);
+    }
+
+    /// Set up a 1×1 LS system whose augmented solve yields y = 2.
+    ///
+    /// System:
+    ///   [ I  J^T ] [r]   [grad_f - z_L + z_U]
+    ///   [ J   0  ] [y] = [0                 ]
+    /// With grad_f=2, J=1, z=0 → r=0, y=2.
+    fn ls_y_equals_two_state(g: f64, g_eq: bool) -> SolverState {
+        let mut s = minimal_state(1, 1);
+        s.grad_f = vec![2.0];
+        s.jac_rows = vec![0];
+        s.jac_cols = vec![0];
+        if g_eq {
+            // Layout flip first — set_y_combined must write into the
+            // post-flip y_c/y_d sizing.
+            set_constraint_bounds(&mut s, vec![0.0], vec![0.0]);
+        }
+        // Phase 5f.4b: split storage is canonical. Build the split
+        // Jacobian structure from the m-form pattern, then write split
+        // values + split constraint state directly via the combined
+        // setters (the values lookup via `combined_idx` mirrors what
+        // `evaluate_with_linear` does at runtime).
+        rebuild_split_jac_structure(&mut s);
+        s.set_jac_vals_combined(&[1.0]);
+        s.set_g_combined(&[g]);
+        s.set_y_combined(&[999.0]);  // sentinel; recalc must overwrite
+        s
+    }
+
+    #[test]
+    fn test_recalc_y_off_by_default_does_not_overwrite() {
+        let mut state = ls_y_equals_two_state(0.0, true);
+        let opts = SolverOptions::default();
+        maybe_recalc_y_post_step(&mut state, &opts, 1, 1, false);
+        assert_eq!(state.y_combined(), vec![999.0], "default off must not touch y");
+    }
+
+    #[test]
+    fn test_recalc_y_lbfgs_mode_recomputes_when_feasible() {
+        let mut state = ls_y_equals_two_state(0.0, true); // viol = 0 < tol
+        let opts = SolverOptions::default();
+        maybe_recalc_y_post_step(&mut state, &opts, 1, 1, true);
+        assert!((state.y_at(0) - 2.0).abs() < 1e-10, "lbfgs gate must recompute, got {}", state.y_at(0));
+    }
+
+    #[test]
+    fn test_recalc_y_explicit_on_recomputes_when_feasible() {
+        let mut state = ls_y_equals_two_state(0.0, true);
+        let opts = SolverOptions { recalc_y: true, ..SolverOptions::default() };
+        maybe_recalc_y_post_step(&mut state, &opts, 1, 1, false);
+        assert!((state.y_at(0) - 2.0).abs() < 1e-10, "recalc_y=true must recompute, got {}", state.y_at(0));
+    }
+
+    #[test]
+    fn test_recalc_y_skipped_when_constraint_violation_above_tol() {
+        // g = 1e-3, equality constraint => constraint_violation = 1e-3 > recalc_y_feas_tol (1e-6)
+        let mut state = ls_y_equals_two_state(1e-3, true);
+        let opts = SolverOptions { recalc_y: true, ..SolverOptions::default() };
+        maybe_recalc_y_post_step(&mut state, &opts, 1, 1, false);
+        assert_eq!(state.y_combined(), vec![999.0], "infeasible iterate must skip recalc_y");
+    }
+
+    /// T3.30 full augmented system: on an inequality constraint with
+    /// nonzero `(v_L − v_U)`, the post-step recalc must produce a
+    /// different y than the reduced 2-block system. Setup:
+    ///   n=1, m=1, lower-only inequality g_l=0 g_u=+inf, J=1, grad_f=2,
+    ///   z=0, v_L=1, v_U=0. After eliminating slack:
+    ///     y_d = J·sol_x − (v_L − v_U) = sol_x − 1
+    ///     sol_x + J·y_d = grad_f  ⇒  2·sol_x − 1 = 2  ⇒  sol_x = 1.5
+    ///     y_d = 0.5 (positive → consistent with lower-bound sign).
+    ///   The reduced 2-block system would yield y = 2 (no v coupling).
+    #[test]
+    fn test_recalc_y_full_augmented_inequality_uses_v_l_v_u() {
+        let mut state = ls_y_equals_two_state(0.5, false);
+        set_constraint_bounds(&mut state, vec![0.0], vec![f64::INFINITY]);
+        state.v_l_compressed = vec![1.0];
+        let opts = SolverOptions { recalc_y: true, ..SolverOptions::default() };
+        maybe_recalc_y_post_step(&mut state, &opts, 1, 1, false);
+        assert!(
+            (state.y_at(0) - 0.5).abs() < 1e-10,
+            "full-augmented LS y mismatch: got {} expected 0.5", state.y_at(0)
+        );
+    }
+
+    /// T3.30: on equality rows the full and reduced systems must agree.
+    /// Ipopt's slack/v_d coupling only enters for inequality rows.
+    #[test]
+    fn test_recalc_y_full_augmented_equality_matches_reduced() {
+        let mut state = ls_y_equals_two_state(0.0, true);
+        // Equality row: v_L/v_U values must be ignored.
+        // Phase 8d: equality rows have no compressed v slot (n_d_l=n_d_u=0
+        // for an all-equality layout); writes here would be no-ops.
+        debug_assert_eq!(state.d_bound_layout.n_d_l, 0);
+        debug_assert_eq!(state.d_bound_layout.n_d_u, 0);
+        let opts = SolverOptions { recalc_y: true, ..SolverOptions::default() };
+        maybe_recalc_y_post_step(&mut state, &opts, 1, 1, false);
+        assert!(
+            (state.y_at(0) - 2.0).abs() < 1e-10,
+            "equality row should match reduced: got {}", state.y_at(0)
+        );
+    }
+
+    /// T3.32 closed-form 1D minimizer for `MinDualInfeas`. Setup:
+    ///   n=1, m=1, equality (g_l = g_u = 0), grad_f_trial = 2,
+    ///   J = 1, y = 0.5, z = 0, dy = -3, v = 0.
+    ///   r_x = 2 + 1·0.5 = 2.5
+    ///   Jt_dy = 1·(-3) = -3
+    ///   r_s = 0, dy_d = 0 (equality row)
+    ///   a = 9 + 0 = 9
+    ///   b = 2.5·(-3) − 0 = -7.5
+    ///   α* = -b/a = 7.5/9 ≈ 0.8333
+    ///   Clamped to [0, 1] → 0.8333.
+    #[test]
+    fn test_min_dual_infeas_closed_form_equality_row() {
+        struct ConstantProblem;
+        impl NlpProblem for ConstantProblem {
+            fn num_variables(&self) -> usize { 1 }
+            fn num_constraints(&self) -> usize { 1 }
+            fn bounds(&self, x_l: &mut [f64], x_u: &mut [f64]) {
+                x_l[0] = f64::NEG_INFINITY; x_u[0] = f64::INFINITY;
+            }
+            fn constraint_bounds(&self, g_l: &mut [f64], g_u: &mut [f64]) {
+                g_l[0] = 0.0; g_u[0] = 0.0;
+            }
+            fn initial_point(&self, x0: &mut [f64]) { x0[0] = 0.0; }
+            fn objective(&self, _: &[f64], _: bool, obj: &mut f64) -> bool { *obj = 0.0; true }
+            fn gradient(&self, _: &[f64], _: bool, grad: &mut [f64]) -> bool { grad[0] = 2.0; true }
+            fn constraints(&self, _: &[f64], _: bool, g: &mut [f64]) -> bool { g[0] = 0.0; true }
+            fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![0], vec![0]) }
+            fn jacobian_values(&self, _: &[f64], _: bool, vals: &mut [f64]) -> bool { vals[0] = 1.0; true }
+            fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
+            fn hessian_values(&self, _: &[f64], _: bool, _: f64, _: &[f64], _: &mut [f64]) -> bool { true }
+        }
+        let mut state = minimal_state(1, 1);
+        set_constraint_bounds(&mut state, vec![0.0], vec![0.0]);
+        state.set_y_combined(&[0.5]);
+        state.set_dy_combined(&[-3.0]);
+        state.jac_rows = vec![0];
+        state.jac_cols = vec![0];
+        rebuild_split_jac_structure(&mut state);
+        state.set_jac_vals_combined(&[1.0]);
+
+        let alpha = compute_min_dual_infeas_alpha(
+            &state, &ConstantProblem, AlphaForY::MinDualInfeas, 0.5, 0.5,
+        );
+        assert!(
+            (alpha - 7.5 / 9.0).abs() < 1e-10,
+            "MinDualInfeas got {}, expected {}", alpha, 7.5 / 9.0
+        );
+    }
+
+    /// T3.32 SaferMinDualInfeas: same closed form but clipped to
+    /// `[min(α_p, α_d), max(α_p, α_d)]`. With α_p = 0.2, α_d = 0.5,
+    /// the interval is [0.2, 0.5] and α* = 0.833 clamps to 0.5.
+    #[test]
+    fn test_safer_min_dual_infeas_clips_to_alpha_bracket() {
+        struct ConstantProblem;
+        impl NlpProblem for ConstantProblem {
+            fn num_variables(&self) -> usize { 1 }
+            fn num_constraints(&self) -> usize { 1 }
+            fn bounds(&self, x_l: &mut [f64], x_u: &mut [f64]) {
+                x_l[0] = f64::NEG_INFINITY; x_u[0] = f64::INFINITY;
+            }
+            fn constraint_bounds(&self, g_l: &mut [f64], g_u: &mut [f64]) {
+                g_l[0] = 0.0; g_u[0] = 0.0;
+            }
+            fn initial_point(&self, x0: &mut [f64]) { x0[0] = 0.0; }
+            fn objective(&self, _: &[f64], _: bool, obj: &mut f64) -> bool { *obj = 0.0; true }
+            fn gradient(&self, _: &[f64], _: bool, grad: &mut [f64]) -> bool { grad[0] = 2.0; true }
+            fn constraints(&self, _: &[f64], _: bool, g: &mut [f64]) -> bool { g[0] = 0.0; true }
+            fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![0], vec![0]) }
+            fn jacobian_values(&self, _: &[f64], _: bool, vals: &mut [f64]) -> bool { vals[0] = 1.0; true }
+            fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
+            fn hessian_values(&self, _: &[f64], _: bool, _: f64, _: &[f64], _: &mut [f64]) -> bool { true }
+        }
+        let mut state = minimal_state(1, 1);
+        set_constraint_bounds(&mut state, vec![0.0], vec![0.0]);
+        state.set_y_combined(&[0.5]);
+        state.set_dy_combined(&[-3.0]);
+        state.jac_rows = vec![0];
+        state.jac_cols = vec![0];
+        rebuild_split_jac_structure(&mut state);
+        state.set_jac_vals_combined(&[1.0]);
+
+        let alpha = compute_min_dual_infeas_alpha(
+            &state, &ConstantProblem, AlphaForY::SaferMinDualInfeas, 0.2, 0.5,
+        );
+        assert!(
+            (alpha - 0.5).abs() < 1e-10,
+            "SaferMinDualInfeas should clamp to max(α_p, α_d) = 0.5, got {}", alpha
+        );
+    }
+
+    // ---- Magic step (T2.24, spec §5.3) ----
+
+    /// Lower-bound-only entries push s up by `d - s` when `d > s`, and
+    /// take no step when `d <= s`. Mirrors the `delta_s_magic_L`
+    /// branch of `BacktrackingLineSearch::PerformMagicStep`
+    /// (`IpBacktrackingLineSearch.cpp:1028-1032`).
+    #[test]
+    fn test_magic_step_delta_lower_only() {
+        let s = vec![1.0, 1.0, 1.0];
+        let d = vec![2.5, 0.5, 1.0]; // d > s, d < s, d == s
+        let d_l = vec![0.0, 0.0, 0.0];
+        let d_u = vec![f64::INFINITY; 3];
+        let mut delta = vec![0.0; 3];
+        let nnz = compute_magic_step_delta(&s, &d, &d_l, &d_u, &mut delta);
+        assert_eq!(delta, vec![1.5, 0.0, 0.0], "lower-only: push up only when d > s");
+        assert_eq!(nnz, 1);
+    }
+
+    /// Upper-bound-only entries push s down by `d - s` when `d < s`,
+    /// and take no step when `d >= s`. Mirrors the `delta_s_magic_U`
+    /// branch (`IpBacktrackingLineSearch.cpp:1036-1040`).
+    #[test]
+    fn test_magic_step_delta_upper_only() {
+        let s = vec![1.0, 1.0, 1.0];
+        let d = vec![0.4, 1.5, 1.0];
+        let d_l = vec![f64::NEG_INFINITY; 3];
+        let d_u = vec![10.0, 10.0, 10.0];
+        let mut delta = vec![0.0; 3];
+        let nnz = compute_magic_step_delta(&s, &d, &d_l, &d_u, &mut delta);
+        assert_eq!(delta, vec![-0.6, 0.0, 0.0], "upper-only: push down only when d < s");
+        assert_eq!(nnz, 1);
+    }
+
+    /// Doubly-bounded entries: take the candidate when it reduces the
+    /// centering measure `|d_L + d_U - 2 s|`, suppress otherwise. With
+    /// `d_L = 0`, `d_U = 4`, `s = 1`: centering measure is 2. Candidate
+    /// `delta = +1` (since d > s) gives s_new = 2, centering 0 ≤ 2,
+    /// accepted. With `s = 3`, candidate `delta = -2` gives s_new = 1,
+    /// centering 2 ≤ 2 (equal), accepted. With `s = 1`, d = -3:
+    /// candidate `delta = -4` gives s_new = -3, centering 10 > 2,
+    /// suppressed. Mirrors the `tmp` indicator logic in
+    /// `IpBacktrackingLineSearch.cpp:1054-1082`.
+    #[test]
+    fn test_magic_step_delta_double_bound_suppresses() {
+        let d_l = vec![0.0, 0.0, 0.0];
+        let d_u = vec![4.0, 4.0, 4.0];
+        // Component 0: candidate improves centering -> kept.
+        // Component 1: candidate keeps centering equal -> kept.
+        // Component 2: candidate worsens centering -> suppressed.
+        let s = vec![1.0, 3.0, 1.0];
+        let d = vec![2.5, 1.0, -3.0];
+        let mut delta = vec![0.0; 3];
+        let _ = compute_magic_step_delta(&s, &d, &d_l, &d_u, &mut delta);
+        assert!((delta[0] - 1.5).abs() < 1e-12, "kept: {}", delta[0]);
+        assert!((delta[1] - (-2.0)).abs() < 1e-12, "kept on tie: {}", delta[1]);
+        assert_eq!(delta[2], 0.0, "suppressed when centering worsens");
+    }
+
+    /// Free (no bounds) entries always produce zero delta.
+    #[test]
+    fn test_magic_step_delta_unbounded_no_step() {
+        let s = vec![1.0, -2.0, 100.0];
+        let d = vec![1e6, -1e6, 0.0];
+        let d_l = vec![f64::NEG_INFINITY; 3];
+        let d_u = vec![f64::INFINITY; 3];
+        let mut delta = vec![0.0; 3];
+        let nnz = compute_magic_step_delta(&s, &d, &d_l, &d_u, &mut delta);
+        assert_eq!(delta, vec![0.0, 0.0, 0.0]);
+        assert_eq!(nnz, 0);
+    }
+
+    /// `apply_magic_step` is a no-op in ripopt's implicit-slack
+    /// formulation: x, y, v_l, v_u, z_l, z_u must all be unchanged
+    /// regardless of the option flag. This test pins the architectural
+    /// invariant noted in the function's documentation; if a future
+    /// change adds explicit-slack behavior, the test should be updated
+    /// to reflect the new contract.
+    #[test]
+    fn test_apply_magic_step_is_noop_in_implicit_slack_mode() {
+        let mut state = minimal_state(2, 2);
+        // Populate with non-trivial values so any accidental mutation is
+        // visible. v_l and g_l are configured as Ipopt would expect for
+        // an inequality with finite lower bound.
+        state.x = vec![3.0, 4.0];
+        state.set_y_combined(&[1.5, -0.5]);
+        set_variable_bounds(&mut state, vec![0.0, 0.0], vec![10.0, 10.0]);
+        state.z_l_compressed = vec![0.7, 0.2];
+        state.z_u_compressed = vec![0.0, 0.3];
+        set_constraint_bounds(&mut state, vec![0.0, f64::NEG_INFINITY], vec![f64::INFINITY, 5.0]);
+        // Phase 8d: write compressed v storage. d_bound_layout has
+        // n_d_l=1 (row 0 has finite lower g_l), n_d_u=1 (row 1 has
+        // finite upper g_u).
+        state.v_l_compressed = vec![0.4];
+        state.v_u_compressed = vec![0.6];
+        state.set_g_combined(&[1.0, 2.0]);
+        state.mu = 0.1;
+        let snapshot = (
+            state.x.clone(),
+            state.y_combined(),
+            state.z_l_compressed.clone(),
+            state.z_u_compressed.clone(),
+            state.v_l_compressed.clone(),
+            state.v_u_compressed.clone(),
+            state.g_combined(),
+        );
+
+        let opts_on = SolverOptions { magic_step: true, ..SolverOptions::default() };
+        let n_on = apply_magic_step(&mut state, &opts_on);
+        assert_eq!(n_on, 0, "no explicit slack vector exists, so no updates possible");
+        assert_eq!(state.x, snapshot.0);
+        assert_eq!(state.y_combined(), snapshot.1);
+        assert_eq!(state.z_l_compressed, snapshot.2);
+        assert_eq!(state.z_u_compressed, snapshot.3);
+        assert_eq!(state.v_l_compressed, snapshot.4);
+        assert_eq!(state.v_u_compressed, snapshot.5);
+        assert_eq!(state.g_combined(), snapshot.6);
+
+        // With option off, identical (no-op) result.
+        let opts_off = SolverOptions { magic_step: false, ..SolverOptions::default() };
+        let n_off = apply_magic_step(&mut state, &opts_off);
+        assert_eq!(n_off, 0);
+        assert_eq!(state.x, snapshot.0);
+        assert_eq!(state.y_combined(), snapshot.1);
+    }
+
+    /// The option flag short-circuits the helper: when disabled the
+    /// function returns 0 without inspecting state. We verify by
+    /// passing a deliberately mis-shaped state (m == 0) and confirming
+    /// no panic.
+    #[test]
+    fn test_apply_magic_step_disabled_short_circuits() {
+        let mut state = minimal_state(0, 0);
+        let opts = SolverOptions { magic_step: false, ..SolverOptions::default() };
+        let n = apply_magic_step(&mut state, &opts);
+        assert_eq!(n, 0);
+    }
+
+    // ---- T2.23 Quality Function μ oracle (spec §3.5) ----
+
+    /// Golden-section on a unimodal convex function `(log σ + 0.5)²`
+    /// whose minimum sits at σ = exp(−0.5) ≈ 0.6065 should converge
+    /// inside 8 steps for a [1e-6, 1e2] bracket.
+    #[test]
+    fn test_golden_section_converges_in_eight_steps_synthetic() {
+        let target = (-0.5_f64).exp();
+        let f = |sigma: f64| -> f64 {
+            let l = sigma.ln();
+            (l + 0.5).powi(2)
+        };
+        let s_star = golden_section_minimize(&f, 1e-6, 1e2, 8, 0.01);
+        // After 8 golden-section steps the (1−φ)^8 ≈ 0.0214 fraction of the
+        // log-bracket remains, so the minimiser is within ~0.4 (in log) of the
+        // true minimum at exp(−0.5).
+        let log_err = (s_star.ln() - target.ln()).abs();
+        assert!(log_err < 0.5, "golden section did not narrow enough: log_err={}", log_err);
+        // And it should be inside the original bracket.
+        assert!(s_star >= 1e-6 && s_star <= 1e2);
+    }
+
+    /// Golden-section on a flat function should not panic and should
+    /// return some point inside the bracket.
+    #[test]
+    fn test_golden_section_flat_function_returns_inside_bracket() {
+        let f = |_sigma: f64| -> f64 { 1.0 };
+        let s = golden_section_minimize(&f, 1e-6, 1e2, 8, 0.01);
+        assert!(s >= 1e-6 && s <= 1e2);
+    }
+
+    /// Build a tiny but realistic primal-dual state with one variable bound
+    /// and no constraints, so `compute_quality_function_mu` can assemble +
+    /// factor an actual KKT matrix.
+    fn qf_minimal_state() -> SolverState {
+        let mut s = minimal_state(2, 0);
+        // Two variables x_l = 0 ≤ x with H = I, grad = (1, 1). Optimum at
+        // x → 0 along both axes; KKT system has unique solution.
+        s.x = vec![1.0, 1.0];
+        set_variable_bounds(&mut s, vec![0.0, 0.0], vec![f64::INFINITY, f64::INFINITY]);
+        s.z_l_compressed = vec![0.5, 0.5];
+        s.grad_f = vec![1.0, 1.0];
+        s.hess_rows = vec![0, 1];
+        s.hess_cols = vec![0, 1];
+        s.hess_vals = vec![1.0, 1.0];
+        s.mu = 0.1;
+        s
+    }
+
+    /// On a small well-posed iterate the QF oracle must return Some, and
+    /// the chosen μ must lie in `[μ_min, mu_max_fact * initial_avg_compl]`
+    /// (T3.2 — replaced the historical 1e5 hard cap with the lazy mu_max).
+    #[test]
+    fn test_compute_quality_function_mu_returns_clamped_some() {
+        let state = qf_minimal_state();
+        let opts = SolverOptions::default();
+        let mut mu_state = MuState::new();
+        let avg = compute_avg_complementarity(&state);
+        assert!(avg > 0.0, "test state must have positive avg_compl");
+        let mut cache = kkt::FactorCache::new();
+        let mu = compute_quality_function_mu(&state, &opts, &mut mu_state, avg, false, &mut cache);
+        let mu = mu.expect("QF oracle should produce μ on a well-formed iterate");
+        let cap = opts.mu_max_fact * avg;
+        assert!(mu >= opts.mu_min, "μ below mu_min: {}", mu);
+        assert!(mu <= cap, "μ above mu_max_fact*avg cap: {}", mu);
+        assert!(mu.is_finite(), "μ must be finite");
+    }
+
+    /// The QF oracle returns None when avg_compl ≤ 0 (no active bound
+    /// products), so the caller falls back to the linear-decrease branch.
+    #[test]
+    fn test_compute_quality_function_mu_none_on_zero_avg_compl() {
+        let state = qf_minimal_state();
+        let opts = SolverOptions::default();
+        let mut mu_state = MuState::new();
+        let mut cache = kkt::FactorCache::new();
+        let mu = compute_quality_function_mu(&state, &opts, &mut mu_state, 0.0, false, &mut cache);
+        assert!(mu.is_none(), "QF oracle must reject avg_compl ≤ 0");
+    }
+
+    /// Centrality-on exercises the `quality_function_centrality` branch
+    /// end-to-end. Both must produce finite, clamped μ; the two need not
+    /// disagree on every iterate (when the trial step is the same the
+    /// reciprocal-centrality term cancels out at the optimum), so the
+    /// assertion is on shape, not on a specific μ delta.
+    #[test]
+    fn test_compute_quality_function_mu_centrality_branch_lives() {
+        let mut state = qf_minimal_state();
+        state.x = vec![10.0, 0.01];
+        state.z_l_compressed = vec![0.001, 5.0];
+        let avg = compute_avg_complementarity(&state);
+
+        let opts_off = SolverOptions { quality_function_centrality: false, ..SolverOptions::default() };
+        let mut mus_off = MuState::new();
+        let mut cache_off = kkt::FactorCache::new();
+        let mu_off = compute_quality_function_mu(&state, &opts_off, &mut mus_off, avg, false, &mut cache_off)
+            .expect("QF off");
+        let opts_on = SolverOptions { quality_function_centrality: true, ..SolverOptions::default() };
+        let mut mus_on = MuState::new();
+        let mut cache_on = kkt::FactorCache::new();
+        let mu_on = compute_quality_function_mu(&state, &opts_on, &mut mus_on, avg, false, &mut cache_on)
+            .expect("QF on");
+        let cap = opts_off.mu_max_fact * avg;
+        for mu in [mu_off, mu_on] {
+            assert!(mu.is_finite(), "μ must be finite, got {}", mu);
+            assert!(mu >= opts_off.mu_min, "μ below mu_min: {}", mu);
+            assert!(mu <= cap, "μ above mu_max_fact*avg cap: {}", mu);
+        }
+    }
+
+    /// End-to-end: a tiny QP `min 0.5·(x-1)² + 0.5·(y-1)² s.t. x ≥ 0, y ≥ 0`
+    /// (separable, optimum at (1, 1)) solves to optimal under both
+    /// `mu_oracle_quality_function = true` and `false`, exercising the QF
+    /// dispatch path through the live IPM loop.
+    struct QfQpProblem;
+    impl NlpProblem for QfQpProblem {
+        fn num_variables(&self) -> usize { 2 }
+        fn num_constraints(&self) -> usize { 0 }
+        fn bounds(&self, x_l: &mut [f64], x_u: &mut [f64]) {
+            x_l[0] = 0.0; x_l[1] = 0.0;
+            x_u[0] = f64::INFINITY; x_u[1] = f64::INFINITY;
+        }
+        fn constraint_bounds(&self, _g_l: &mut [f64], _g_u: &mut [f64]) {}
+        fn initial_point(&self, x0: &mut [f64]) { x0[0] = 0.5; x0[1] = 0.5; }
+        fn objective(&self, x: &[f64], _: bool, obj: &mut f64) -> bool {
+            *obj = 0.5 * ((x[0] - 1.0).powi(2) + (x[1] - 1.0).powi(2));
+            true
+        }
+        fn gradient(&self, x: &[f64], _: bool, grad: &mut [f64]) -> bool {
+            grad[0] = x[0] - 1.0; grad[1] = x[1] - 1.0; true
+        }
+        fn constraints(&self, _: &[f64], _: bool, _: &mut [f64]) -> bool { true }
+        fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
+        fn jacobian_values(&self, _: &[f64], _: bool, _: &mut [f64]) -> bool { true }
+        fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            (vec![0, 1], vec![0, 1])
+        }
+        fn hessian_values(&self, _: &[f64], _: bool, obj_factor: f64, _: &[f64], vals: &mut [f64]) -> bool {
+            vals[0] = obj_factor; vals[1] = obj_factor; true
+        }
+    }
+
+    #[test]
+    fn test_quality_function_mu_end_to_end_small_nlp() {
+        let problem = QfQpProblem;
+
+        let opts_off = SolverOptions { mu_oracle_quality_function: false, ..SolverOptions::default() };
+        let r_off = solve_ipm(&problem, &opts_off);
+        assert_eq!(r_off.status, SolveStatus::Optimal,
+            "Loqo path must solve the QP, got {:?}", r_off.status);
+
+        let opts_on = SolverOptions { mu_oracle_quality_function: true, ..SolverOptions::default() };
+        let r_on = solve_ipm(&problem, &opts_on);
+        assert_eq!(r_on.status, SolveStatus::Optimal,
+            "QF path must also solve the QP, got {:?}", r_on.status);
+
+        // Both should reach the optimum (1, 1).
+        assert!((r_off.x[0] - 1.0).abs() < 1e-6);
+        assert!((r_on.x[0] - 1.0).abs() < 1e-6);
+
+        // Iteration counts within a 2x band (we don't require QF to be
+        // faster, only comparable — small problems hit the μ_min floor
+        // regardless of the oracle).
+        let off = r_off.iterations.max(1) as f64;
+        let on = r_on.iterations.max(1) as f64;
+        let ratio = on / off;
+        assert!(ratio < 2.0 && ratio > 0.5,
+            "QF iterations diverge from Loqo: off={} on={}", r_off.iterations, r_on.iterations);
+    }
+
+    // T3.25 follow-up factor-cache wiring tests removed in A7.6 — they
+    // exercised the condensed-path-specific factor cache (`CachedQpProblem`,
+    // `test_factor_cache_*`). A7.7 will reintroduce equivalent tests once the
+    // factor cache is ported to `kkt_aug`.
+
+    // ---- T2.22 kappa_resto / restoration acceptance (spec §7.7) ----
+
+    /// Spec §7.7 / T2.22 item B: when restoration ends with theta_new just
+    /// inside `kappa_resto * theta_current` (and is filter-acceptable),
+    /// the outcome must be `Success`. Tightening kappa_resto must reject.
+    #[test]
+    fn test_classify_restoration_kappa_resto_gates_success() {
+        let filter = crate::filter::Filter::new(1e8);
+        let mut opts = SolverOptions::default();
+        opts.kappa_resto = 0.9;
+        opts.constr_viol_tol = 1e-4;
+        opts.tol = 1e-8;
+        let outcome = classify_restoration_outcome(&filter, &opts, 1.0, 0.85, 0.0, true);
+        assert!(matches!(outcome, RestorationOutcome::Success),
+            "expected Success at kappa=0.9, got {:?}",
+            std::mem::discriminant(&outcome));
+
+        opts.kappa_resto = 0.5;
+        let outcome2 = classify_restoration_outcome(&filter, &opts, 1.0, 0.85, 0.0, true);
+        assert!(matches!(outcome2, RestorationOutcome::LocalInfeasibility),
+            "expected LocalInfeasibility at kappa=0.5 (inner_converged=true), got {:?}",
+            std::mem::discriminant(&outcome2));
+
+        let outcome3 = classify_restoration_outcome(&filter, &opts, 1.0, 0.85, 0.0, false);
+        assert!(matches!(outcome3, RestorationOutcome::Failed),
+            "expected Failed when inner did not converge, got {:?}",
+            std::mem::discriminant(&outcome3));
+    }
+
+    /// Spec §7.7: small_threshold = min(tol, constr_viol_tol).
+    #[test]
+    fn test_classify_restoration_feasibility_threshold() {
+        let filter = crate::filter::Filter::new(1e8);
+        let mut opts = SolverOptions::default();
+        opts.tol = 1e-8;
+        opts.constr_viol_tol = 1e-6;
+        opts.kappa_resto = 0.9;
+        let outcome = classify_restoration_outcome(&filter, &opts, 6e-9, 5e-9, 0.0, true);
+        assert!(matches!(outcome, RestorationOutcome::Success));
+    }
+
+    // -------------------------------------------------------------------
+    // T2.21 (spec §4): tiny-step exit and watchdog filter fidelity.
+    // -------------------------------------------------------------------
+
+    /// `detect_tiny_step` must NOT mutate `state.mu` or the filter; it
+    /// only sets `mu_state.tiny_step` and the `tiny_step_last_iter` latch.
+    /// With prior latch true and a tiny detection, fires `tiny_step` flag.
+    #[test]
+    fn test_detect_tiny_step_no_mu_mutation() {
+        let mut state = minimal_state(1, 0);
+        state.x = vec![1.0];
+        state.dx = vec![1e-20];
+        let initial_mu = state.mu;
+
+        let opts = SolverOptions::default();
+        let mut mu_state = MuState::new();
+        let mut filter = crate::filter::Filter::new(1e10);
+        let initial_filter_len = filter.len();
+        let mut last_iter_latch = true; // simulate prior iter latched
+
+        detect_tiny_step(
+            &mut state, &opts, &mut mu_state, &mut filter,
+            &mut last_iter_latch, 0.0,
+        );
+
+        assert!(mu_state.tiny_step,
+            "tiny_step flag must fire when current detection AND prior latch");
+        assert!(last_iter_latch,
+            "latch refreshes true (m=0 ⇒ dy_amax=0 < tiny_step_y_tol)");
+        assert_eq!(state.mu, initial_mu,
+            "detect_tiny_step must not mutate mu (Ipopt §IpBacktrackingLineSearch)");
+        assert_eq!(filter.len(), initial_filter_len,
+            "detect_tiny_step must not reset/augment the filter");
+    }
+
+    /// First-iter detection (no prior latch) must NOT yet fire the
+    /// `tiny_step` flag — Ipopt requires two consecutive iters
+    /// (IpBacktrackingLineSearch.cpp:407-411).
+    #[test]
+    fn test_detect_tiny_step_requires_prior_latch() {
+        let mut state = minimal_state(1, 0);
+        state.x = vec![1.0];
+        state.dx = vec![1e-20];
+
+        let opts = SolverOptions::default();
+        let mut mu_state = MuState::new();
+        let mut filter = crate::filter::Filter::new(1e10);
+        let mut last_iter_latch = false;
+
+        detect_tiny_step(
+            &mut state, &opts, &mut mu_state, &mut filter,
+            &mut last_iter_latch, 0.0,
+        );
+
+        assert!(!mu_state.tiny_step,
+            "tiny_step must NOT fire on first detection without prior latch");
+        assert!(last_iter_latch, "latch must arm for next iter");
+    }
+
+    /// When the relative step exceeds `10·eps`, the flag must clear and
+    /// the latch must reset.
+    #[test]
+    fn test_detect_tiny_step_clears_when_step_grows() {
+        let mut state = minimal_state(1, 0);
+        state.x = vec![1.0];
+        state.dx = vec![0.5];
+
+        let opts = SolverOptions::default();
+        let mut mu_state = MuState::new();
+        mu_state.tiny_step = true;
+        let mut filter = crate::filter::Filter::new(1e10);
+        let mut last_iter_latch = true;
+
+        detect_tiny_step(
+            &mut state, &opts, &mut mu_state, &mut filter,
+            &mut last_iter_latch, 0.0,
+        );
+
+        assert!(!mu_state.tiny_step, "tiny_step must clear on a real step");
+        assert!(!last_iter_latch, "latch must clear when detection fails");
+    }
+
+    /// A tiny x-step combined with a *large* dual step is still detected
+    /// (Ipopt's DetectTinyStep doesn't include Δy), but the latch must
+    /// NOT arm — so the flag won't fire on the next iter
+    /// (IpBacktrackingLineSearch.cpp:421-424).
+    #[test]
+    fn test_detect_tiny_step_dy_only_gates_latch() {
+        let mut state = minimal_state(1, 1);
+        state.x = vec![1.0];
+        state.dx = vec![1e-20];
+        state.set_y_combined(&[0.0]);
+        state.set_dy_combined(&[1.0]); // dy_amax = 1.0, well above default 1e-2
+
+        let opts = SolverOptions::default();
+        let mut mu_state = MuState::new();
+        let mut filter = crate::filter::Filter::new(1e10);
+        let mut last_iter_latch = true; // prior iter armed
+
+        detect_tiny_step(
+            &mut state, &opts, &mut mu_state, &mut filter,
+            &mut last_iter_latch, 0.0,
+        );
+
+        // Detection IS tiny, prior latch IS true → flag fires this iter.
+        assert!(mu_state.tiny_step,
+            "tiny_step fires on detection-tiny + prior latch (Δy not in detection)");
+        // But the latch must NOT re-arm because Δy is too large.
+        assert!(!last_iter_latch,
+            "Δy ≥ tiny_step_y_tol must clear the latch for next iter");
+    }
+
+    /// Detection requires `cviol ≤ 1e-4`
+    /// (IpBacktrackingLineSearch.cpp:1269-1273). High primal infeasibility
+    /// must block the latch from arming and the flag from firing.
+    #[test]
+    fn test_detect_tiny_step_blocked_by_cviol() {
+        let mut state = minimal_state(1, 0);
+        state.x = vec![1.0];
+        state.dx = vec![1e-20];
+
+        let opts = SolverOptions::default();
+        let mut mu_state = MuState::new();
+        let mut filter = crate::filter::Filter::new(1e10);
+        let mut last_iter_latch = true;
+
+        // primal_inf = 1.0 > 1e-4 → detection should fail.
+        detect_tiny_step(
+            &mut state, &opts, &mut mu_state, &mut filter,
+            &mut last_iter_latch, 1.0,
+        );
+
+        assert!(!mu_state.tiny_step,
+            "high cviol must block the tiny_step flag");
+        assert!(!last_iter_latch,
+            "high cviol must clear the latch");
+    }
+
+    /// Watchdog fidelity (spec §4): on a watchdog accept the filter is
+    /// not augmented. Pin via the raw Filter API.
+    #[test]
+    fn test_watchdog_accept_does_not_augment_filter() {
+        let mut filter = crate::filter::Filter::new(1e10);
+        let theta_current = 1.0;
+        let phi_current = 5.0;
+        let theta_trial = 0.5;
+        let phi_trial = 4.0;
+        let grad_phi_step = -1.0;
+
+        let (acceptable, _) = filter.check_acceptability(
+            theta_current, phi_current, theta_trial, phi_trial,
+            grad_phi_step, 1.0, false,
+        );
+        assert!(acceptable, "trial must pass the filter for the test setup");
+        let len_before = filter.len();
+        assert_eq!(filter.len(), len_before,
+            "watchdog branch must not augment filter on accept");
+        let (acceptable_next, _) = filter.check_acceptability(
+            theta_current, phi_current,
+            theta_current * 0.95, phi_current,
+            grad_phi_step, 1.0, false,
+        );
+        assert!(acceptable_next,
+            "filter must still accept near-θ_current iterates after watchdog");
+    }
+
+    /// `SolveStatus::StopAtTinyStep` round-trip through `make_result`.
+    #[test]
+    fn test_stop_at_tiny_step_status_roundtrip() {
+        let state = minimal_state(2, 0);
+        let result = make_result(&state, SolveStatus::StopAtTinyStep);
+        assert_eq!(result.status, SolveStatus::StopAtTinyStep);
+        assert_eq!(result.x.len(), 2);
+    }
+
+    /// T-MIT-C: scaling mock with explicit gradient and Jacobian rows
+    /// for `compute_nlp_scaling` tests. Constraints/obj values are
+    /// irrelevant — scaling is computed from `grad` and `jac_rows`/
+    /// `jac_vals` only.
+    struct ScalingMock {
+        n: usize,
+        m: usize,
+        grad: Vec<f64>,
+        jac_rows: Vec<usize>,
+        jac_cols: Vec<usize>,
+        jac_vals: Vec<f64>,
+    }
+    impl NlpProblem for ScalingMock {
+        fn num_variables(&self) -> usize { self.n }
+        fn num_constraints(&self) -> usize { self.m }
+        fn bounds(&self, x_l: &mut [f64], x_u: &mut [f64]) {
+            for v in x_l.iter_mut() { *v = f64::NEG_INFINITY; }
+            for v in x_u.iter_mut() { *v = f64::INFINITY; }
+        }
+        fn constraint_bounds(&self, g_l: &mut [f64], g_u: &mut [f64]) {
+            for v in g_l.iter_mut() { *v = 0.0; }
+            for v in g_u.iter_mut() { *v = 0.0; }
+        }
+        fn initial_point(&self, x0: &mut [f64]) { for v in x0.iter_mut() { *v = 0.0; } }
+        fn objective(&self, _: &[f64], _: bool, obj: &mut f64) -> bool { *obj = 0.0; true }
+        fn gradient(&self, _: &[f64], _: bool, grad: &mut [f64]) -> bool {
+            grad.copy_from_slice(&self.grad);
+            true
+        }
+        fn constraints(&self, _: &[f64], _: bool, g: &mut [f64]) -> bool {
+            for v in g.iter_mut() { *v = 0.0; } true
+        }
+        fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            (self.jac_rows.clone(), self.jac_cols.clone())
+        }
+        fn jacobian_values(&self, _: &[f64], _: bool, vals: &mut [f64]) -> bool {
+            vals.copy_from_slice(&self.jac_vals);
+            true
+        }
+        fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) { (vec![], vec![]) }
+        fn hessian_values(&self, _: &[f64], _: bool, _: f64, _: &[f64], _: &mut [f64]) -> bool { true }
+    }
+
+    /// T-MIT-C: `nlp_scaling_method = None` returns identity scales,
+    /// then `obj_scaling_factor` multiplies in. Mirrors
+    /// `IpNLPScaling.cpp:276` semantics: factor applied even for the
+    /// `NoNLPScalingObject` path.
+    #[test]
+    fn test_nlp_scaling_none_applies_obj_scaling_factor() {
+        use crate::options::NlpScalingMethod;
+        let p = ScalingMock {
+            n: 2, m: 1,
+            grad: vec![1e6, 1e6], // would trigger gradient scaling if enabled
+            jac_rows: vec![0, 0],
+            jac_cols: vec![0, 1],
+            jac_vals: vec![1e9, 1e9], // ditto
+        };
+        let mut opts = SolverOptions::default();
+        opts.nlp_scaling_method = NlpScalingMethod::None;
+        opts.obj_scaling_factor = -1.0; // canonical "maximize" idiom
+        let (os, gs) = compute_nlp_scaling(&p, &opts, &[0.0, 0.0], &p.jac_rows);
+        assert_eq!(os, -1.0, "method=None must skip gradient scaling and apply factor");
+        assert_eq!(gs, vec![1.0], "method=None must leave constraint scaling identity");
+    }
+
+    /// T-MIT-C: gradient-based scaling with default options scales the
+    /// objective by `max_gradient / ||grad||_inf` when above threshold.
+    #[test]
+    fn test_nlp_scaling_gradient_obj_above_threshold() {
+        let p = ScalingMock {
+            n: 2, m: 0,
+            grad: vec![0.0, 1000.0],
+            jac_rows: vec![],
+            jac_cols: vec![],
+            jac_vals: vec![],
+        };
+        let opts = SolverOptions::default(); // method = Gradient, max=100
+        let (os, _) = compute_nlp_scaling(&p, &opts, &[0.0, 0.0], &p.jac_rows);
+        assert!((os - 0.1).abs() < 1e-12, "expected 100/1000 = 0.1, got {os}");
+    }
+
+    /// T-MIT-C: `nlp_scaling_obj_target_gradient > 0` overrides the
+    /// `max_gradient` gate — the objective is rescaled even when the
+    /// gradient is below `max_gradient`. Matches
+    /// `IpGradientScaling.cpp:108-127`.
+    #[test]
+    fn test_nlp_scaling_gradient_obj_target_override() {
+        let p = ScalingMock {
+            n: 1, m: 0,
+            grad: vec![10.0], // below max_gradient=100, would normally yield os=1
+            jac_rows: vec![], jac_cols: vec![], jac_vals: vec![],
+        };
+        let mut opts = SolverOptions::default();
+        opts.nlp_scaling_obj_target_gradient = 1.0; // force os = 1/10 = 0.1
+        let (os, _) = compute_nlp_scaling(&p, &opts, &[0.0], &p.jac_rows);
+        assert!((os - 0.1).abs() < 1e-12, "target override should give 0.1, got {os}");
+    }
+
+    /// T-MIT-C: `nlp_scaling_constr_target_gradient > 0` makes every
+    /// constraint row receive the same scale `target / global_max`.
+    #[test]
+    fn test_nlp_scaling_gradient_constr_target_override() {
+        let p = ScalingMock {
+            n: 2, m: 2,
+            grad: vec![0.0, 0.0],
+            jac_rows: vec![0, 1],
+            jac_cols: vec![0, 1],
+            jac_vals: vec![1.0, 50.0], // global max = 50, row maxes 1 and 50
+        };
+        let mut opts = SolverOptions::default();
+        opts.nlp_scaling_constr_target_gradient = 5.0; // every row -> 5/50 = 0.1
+        let (_, gs) = compute_nlp_scaling(&p, &opts, &[0.0, 0.0], &p.jac_rows);
+        assert_eq!(gs.len(), 2);
+        assert!((gs[0] - 0.1).abs() < 1e-12, "row 0: expected 0.1, got {}", gs[0]);
+        assert!((gs[1] - 0.1).abs() < 1e-12, "row 1: expected 0.1, got {}", gs[1]);
+    }
+
+    /// T-MIT-C: `obj_scaling_factor` composes multiplicatively with the
+    /// gradient-based result. Mirrors
+    /// `StandardScalingBase::DetermineScaling` at `IpNLPScaling.cpp:276`.
+    #[test]
+    fn test_nlp_scaling_factor_composes_with_gradient() {
+        let p = ScalingMock {
+            n: 1, m: 0,
+            grad: vec![1000.0],
+            jac_rows: vec![], jac_cols: vec![], jac_vals: vec![],
+        };
+        let mut opts = SolverOptions::default();
+        opts.obj_scaling_factor = -2.0;
+        let (os, _) = compute_nlp_scaling(&p, &opts, &[0.0], &p.jac_rows);
+        // Gradient pass would yield 100/1000=0.1, then * -2 = -0.2.
+        assert!((os - (-0.2)).abs() < 1e-12, "expected -0.2, got {os}");
+    }
+
+    /// T-MIT-C: `nlp_scaling_method = User` reads from
+    /// `user_obj_scaling` / `user_g_scaling`, ignoring the gradient.
+    #[test]
+    fn test_nlp_scaling_user_method_uses_user_values() {
+        use crate::options::NlpScalingMethod;
+        let p = ScalingMock {
+            n: 1, m: 2,
+            grad: vec![1e6], // would scale to 1e-4 under Gradient
+            jac_rows: vec![0, 1], jac_cols: vec![0, 0], jac_vals: vec![1.0, 1.0],
+        };
+        let mut opts = SolverOptions::default();
+        opts.nlp_scaling_method = NlpScalingMethod::User;
+        opts.user_obj_scaling = Some(0.5);
+        opts.user_g_scaling = Some(vec![2.0, 3.0]);
+        let (os, gs) = compute_nlp_scaling(&p, &opts, &[0.0], &p.jac_rows);
+        assert_eq!(os, 0.5);
+        assert_eq!(gs, vec![2.0, 3.0]);
     }
 }

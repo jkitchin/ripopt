@@ -143,25 +143,12 @@ impl NlProblem {
             }
         }
 
-        // Add diagonal entries for all nonlinear variables (for regularization)
-        let mut all_nonlinear_vars = BTreeSet::new();
-        if let Some(ref tape) = obj_tape {
-            for &v in &tape.variables() {
-                all_nonlinear_vars.insert(v);
-            }
-        }
-        for tape in &con_tapes {
-            if let Some(tape) = tape {
-                for &v in &tape.variables() {
-                    all_nonlinear_vars.insert(v);
-                }
-            }
-        }
-        for &v in &all_nonlinear_vars {
-            hess_set.insert((v, v));
-        }
-
-        log::info!("Hessian sparsity: {} structural nonzeros (from {} nonlinear vars)", hess_set.len(), all_nonlinear_vars.len());
+        // No diagonal padding: σ_x regularization is added directly to the
+        // KKT matrix in kkt.rs (the (1,1) block diagonal), so the NLP-level
+        // Hessian only needs structural nonzeros. hessian_sparsity() is
+        // exact — padding (v,v) for vars that appear only bilinearly would
+        // emit guaranteed-zero entries (e.g. arki0003: 534 such phantoms).
+        log::info!("Hessian sparsity: {} structural nonzeros", hess_set.len());
 
         let mut hess_rows = Vec::with_capacity(hess_set.len());
         let mut hess_cols = Vec::with_capacity(hess_set.len());

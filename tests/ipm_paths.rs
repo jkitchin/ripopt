@@ -301,19 +301,16 @@ fn ipm_unbounded_detection() {
     let problem = UnboundedProblem;
     let options = SolverOptions {
         print_level: 0,
-        enable_lbfgs_fallback: false,
-        enable_al_fallback: false,
-        enable_sqp_fallback: false,
         ..SolverOptions::default()
     };
     let result = ripopt::solve(&problem, &options);
     // Without bounds, the solver may detect unboundedness, hit numerical issues,
     // reach max iterations, or declare acceptable at a large negative objective.
     assert!(
-        result.status == SolveStatus::Unbounded
+        result.status == SolveStatus::DivergingIterates
             || result.status == SolveStatus::NumericalError
             || result.status == SolveStatus::MaxIterations,
-        "Expected Unbounded/NumericalError/MaxIterations, got {:?}",
+        "Expected DivergingIterates/NumericalError/MaxIterations, got {:?}",
         result.status
     );
 }
@@ -673,7 +670,7 @@ impl NlpProblem for AuxiliaryInequalityBranchProblem {
     }
 
     fn initial_point(&self, x0: &mut [f64]) {
-        x0[0] = -1.0;
+        x0[0] = 1.5;
     }
 
     fn objective(&self, _x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
@@ -933,15 +930,12 @@ fn auxiliary_objective_coupled_branch_solves_full_space_objective() {
     let options = SolverOptions {
         print_level: 0,
         enable_preprocessing: true,
-        enable_al_fallback: false,
-        enable_sqp_fallback: false,
         max_iter: 200,
         tol: 1e-8,
         ..SolverOptions::default()
     };
 
     let result = ripopt::solve(&problem, &options);
-
     assert_eq!(result.status, SolveStatus::Optimal, "Expected Optimal, got {:?}", result.status);
     assert!(
         (result.x[1] + 2.0).abs() < 1e-5,
@@ -962,8 +956,6 @@ fn auxiliary_inequality_coupled_branch_solves_full_space_feasibly() {
     let options = SolverOptions {
         print_level: 0,
         enable_preprocessing: true,
-        enable_al_fallback: false,
-        enable_sqp_fallback: false,
         max_iter: 200,
         tol: 1e-8,
         ..SolverOptions::default()
@@ -987,8 +979,6 @@ fn auxiliary_triangular_system_solves_before_main_nlp() {
     let options = SolverOptions {
         print_level: 0,
         enable_preprocessing: true,
-        enable_al_fallback: false,
-        enable_sqp_fallback: false,
         max_iter: 200,
         tol: 1e-8,
         ..SolverOptions::default()
@@ -1010,8 +1000,6 @@ fn auxiliary_preprocessing_integrates_without_fallback_tag() {
     let options = SolverOptions {
         print_level: 0,
         enable_preprocessing: true,
-        enable_al_fallback: false,
-        enable_sqp_fallback: false,
         max_iter: 200,
         tol: 1e-8,
         ..SolverOptions::default()
@@ -1035,8 +1023,6 @@ fn auxiliary_inequality_coupled_problem_solves_on_original_path() {
     let options = SolverOptions {
         print_level: 0,
         enable_preprocessing: true,
-        enable_al_fallback: false,
-        enable_sqp_fallback: false,
         user_g_scaling: Some(vec![1.0, 0.5]),
         ..SolverOptions::default()
     };
@@ -1091,8 +1077,6 @@ fn auxiliary_failure_falls_back_to_original_nlp() {
     let options = SolverOptions {
         print_level: 0,
         enable_preprocessing: true,
-        enable_al_fallback: false,
-        enable_sqp_fallback: false,
         max_iter: 200,
         tol: 1e-8,
         ..SolverOptions::default()
@@ -1135,8 +1119,6 @@ fn auxiliary_reduced_solve_failure_falls_back_to_original_nlp() {
     let options = SolverOptions {
         print_level: 0,
         enable_preprocessing: true,
-        enable_al_fallback: false,
-        enable_sqp_fallback: false,
         max_iter: 200,
         tol: 1e-8,
         ..SolverOptions::default()
@@ -1170,8 +1152,6 @@ fn preprocessing_disabled_bypasses_auxiliary_preprocessing_in_solve() {
     let options = SolverOptions {
         print_level: 0,
         enable_preprocessing: false,
-        enable_al_fallback: false,
-        enable_sqp_fallback: false,
         max_iter: 200,
         tol: 1e-8,
         ..SolverOptions::default()
@@ -1272,8 +1252,6 @@ fn auxiliary_postsolve_recovers_equality_variable_after_reduced_solve() {
     let options = SolverOptions {
         print_level: 0,
         enable_preprocessing: true,
-        enable_al_fallback: false,
-        enable_sqp_fallback: false,
         max_iter: 200,
         tol: 1e-8,
         ..SolverOptions::default()
@@ -1306,11 +1284,8 @@ fn auxiliary_gate_options(enable_preprocessing: bool) -> SolverOptions {
     SolverOptions {
         print_level: 0,
         enable_preprocessing,
-        enable_al_fallback: false,
-        enable_sqp_fallback: false,
         max_iter: 300,
         tol: 1e-8,
-        early_stall_timeout: 0.0,
         ..SolverOptions::default()
     }
 }
@@ -1387,12 +1362,15 @@ fn status_rank(status: SolveStatus) -> u8 {
     match status {
         SolveStatus::Optimal => 0,
         SolveStatus::Acceptable => 1,
-        SolveStatus::LocalInfeasibility | SolveStatus::Infeasible | SolveStatus::Unbounded => 2,
+        SolveStatus::LocalInfeasibility
+        | SolveStatus::Infeasible
+        | SolveStatus::DivergingIterates => 2,
         SolveStatus::MaxIterations => 3,
         SolveStatus::NumericalError
         | SolveStatus::RestorationFailed
         | SolveStatus::EvaluationError
-        | SolveStatus::UserRequestedStop => 4,
+        | SolveStatus::UserRequestedStop
+        | SolveStatus::StopAtTinyStep => 4,
         SolveStatus::InternalError => 5,
     }
 }
@@ -1649,7 +1627,6 @@ fn ipm_lbfgs_fallback_unconstrained() {
     let problem = RosenbrockLbfgs;
     let options = SolverOptions {
         print_level: 0,
-        enable_lbfgs_fallback: true,
         ..SolverOptions::default()
     };
     let result = ripopt::solve(&problem, &options);

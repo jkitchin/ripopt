@@ -9,8 +9,17 @@ cutest_install.log
 # CUTEst problem data and run artifacts
 benchmarks/cutest/problems/
 benchmarks/cutest/*_stderr.txt
+benchmarks/cutest/*_stdout.txt
 benchmarks/cutest/*_results.json
+benchmarks/cutest/*_results.jsonl
 benchmarks/cutest/*_results.log
+benchmarks/cutest/results_*.json
+benchmarks/cutest/results_*.jsonl
+# But DO track tagged-version snapshots (results_vX.Y.Z.json — no suffix)
+!benchmarks/cutest/results_v[0-9].[0-9].[0-9].json
+!benchmarks/cutest/results_v[0-9].[0-9][0-9].[0-9].json
+benchmarks/cutest/results.jsonl
+benchmarks/cutest/full_results.jsonl
 benchmarks/cutest/cutest_phase1_run.log
 benchmarks/cutest/phase1_results.log
 benchmarks/cutest/results_full.txt
@@ -18,6 +27,17 @@ benchmarks/cutest/subset_test_results.txt
 benchmarks/cutest/test_failures.sh
 benchmarks/cutest/test_subset.txt
 benchmarks/cutest/fortran_open_fixed.f90
+
+# Per-suite JSONL streams from benchmarks (stream output, not artifacts)
+benchmarks/cho/cho_results.jsonl
+benchmarks/electrolyte/electrolyte_results.jsonl
+benchmarks/grid/grid_results.jsonl
+benchmarks/run_stdout.txt
+benchmarks/run_stderr.txt
+
+# arki0003 / A8 forward-walk diagnostic probes (one-off, not part of crate)
+examples/arki_*.rs
+examples/arki_*.r
 
 # HS suite artifacts
 benchmarks/hs/phase1_results.log

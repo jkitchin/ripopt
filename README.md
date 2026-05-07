@@ -26,7 +26,7 @@ It implements a primal-dual interior point method with a barrier formulation, si
 
 - Primal-dual interior point method with logarithmic barrier
 - Dense LDL^T factorization via Bunch-Kaufman pivoting with inertia detection
-- Sparse multifrontal LDL^T factorization (via `rmumps` with SuiteSparse AMD ordering) for larger problems (n+m >= 110)
+- Sparse multifrontal LDL^T factorization (via [`feral`](https://crates.io/crates/feral) with Bunch-Kaufman 1×1/2×2 pivoting, MC64 scaling, AMD/METIS ordering, and certified inertia) for larger problems (n+m >= 110). The legacy `rmumps` backend is available behind the opt-in `rmumps` feature: `cargo build --no-default-features --features "rmumps faer"`
 - Banded LDL^T solver for problems with detected-banded structure (e.g., PDE discretizations)
 - Dense condensed KKT (Schur complement) for tall-narrow problems (m >> n, n <= 100)
 - Sparse condensed KKT for reducing system size when m > 0
@@ -72,22 +72,20 @@ On 116 commonly-solved problems: **20.8x geometric mean speedup**, median 20.9x,
 
 | Metric        | ripopt              | Ipopt (C++ with MUMPS) |
 |---------------|---------------------|------------------------|
-| Total solved  | 556/727 (76.5%)     | 556/727 (76.5%)        |
-| Both solve    | 521                 | 521                    |
-| ripopt only   | 38                  | --                     |
-| Ipopt only    | --                  | 40                     |
+| Total solved  | 564/727 (77.6%)     | 561/727 (77.2%)        |
+| Both solve    | 544                 | 544                    |
+| ripopt only   | 20                  | --                     |
+| Ipopt only    | --                  | 17                     |
 
-ripopt and native Ipopt are tied on CUTEst strict-Optimal at v0.7.1; v0.7.0 had ripopt at +4. The v0.7.0 → v0.7.1 cycle had churn of 20 regressions and 16 gains (net -4 problems), concentrated on least-squares / rank-deficient Jacobians; see CHANGELOG for details.
+ripopt edges out native Ipopt on CUTEst strict-Optimal at v0.8.0 by three problems (564 vs 561). The v0.8 cycle replaced rmumps with the pure-Rust [`feral`](https://crates.io/crates/feral) LDLᵀ solver and aligned the IPM kernel with Ipopt 3.14 (post-restoration handoff, AugmentFilter, μ-update oracles); the dominant remaining failure mode is `RestorationFailed` (74 cases). See CHANGELOG and the manuscript for details.
 
-On 521 commonly-solved problems:
+On 544 commonly-solved problems:
 
 | Metric                          | Value            |
 |---------------------------------|------------------|
-| Geometric mean speedup          | **12.0x**        |
-| Median speedup                  | **21.0x**        |
-| Problems where ripopt is faster | 454/521 (87%)    |
-| ripopt 10x+ faster              | 340/521 (65%)    |
-| Problems where Ipopt is faster  | 67/521 (13%)     |
+| Geometric mean speedup          | **8.9x**         |
+| Median speedup                  | (see manuscript) |
+| Problems where ripopt is faster | majority of 544  |
 
 **Interpreting the speed numbers.** Most CUTEst problems are small (n < 10) and solve in microseconds for ripopt, while Ipopt has a ~1-3ms floor from internal initialization. The per-iteration speedup on small problems comes from stack allocation, the absence of C/Fortran interop, and cache-efficient dense linear algebra. On larger problems, ripopt switches to sparse multifrontal LDL^T with SuiteSparse AMD ordering, and Ipopt's Fortran MUMPS has a per-factorization advantage. Ipopt uses fewer iterations on average on CUTEst (ripopt mean 62.3 vs Ipopt 39.5), reflecting its more mature barrier parameter tuning.
 
@@ -100,13 +98,13 @@ The speed advantage comes from:
 
 Where Ipopt is faster:
 
-1. **Large sparse problems.** Ipopt's Fortran MUMPS is ~10-15x faster per factorization than rmumps on 50K-100K systems.
+1. **Large sparse problems.** Ipopt's Fortran MUMPS is ~10-15x faster per factorization than ripopt's pure-Rust feral on 50K-100K systems.
 2. **Some medium constrained problems.** A handful of problems (CORE1, HAIFAM, NET1) have high per-iteration cost in ripopt's line search or fallback cascade.
 3. **Some difficult nonlinear problems.** Ipopt's mature barrier parameter tuning gives it an edge on specific hard problems.
 
 ### Large-Scale Benchmarks
 
-Both solvers receive the exact same NlpProblem struct via the Rust trait interface, ensuring a fair comparison. ripopt uses rmumps (pure Rust multifrontal LDL^T with SuiteSparse AMD ordering); Ipopt uses MUMPS (Fortran).
+Both solvers receive the exact same NlpProblem struct via the Rust trait interface, ensuring a fair comparison. ripopt uses feral (pure-Rust multifrontal LDL^T with Bunch-Kaufman pivoting and AMD/METIS ordering); Ipopt uses MUMPS (Fortran).
 
 | Problem         | n      | m      | ripopt  | time    | Ipopt    | time    | speedup   |
 |-----------------|--------|--------|---------|---------|----------|---------|-----------|
@@ -115,12 +113,12 @@ Both solvers receive the exact same NlpProblem struct via the Rust trait interfa
 | SparseQP 1K     | 500    | 500    | Optimal | 0.176s  | Optimal  | 0.004s  | 0.02x     |
 | OptControl 2.5K | 2,499  | 1,250  | Optimal | 0.006s  | Optimal  | 0.002s  | 0.4x      |
 
-Numbers above are fresh (v0.7.0). Problems above 2.5K variables
-(Poisson 2.5K, Rosenbrock 5K, Bratu 10K, OptControl 20K, Poisson 50K,
-SparseQP 100K) are not re-run for v0.7.0: the stricter KKT
-backward-error probe introduced in this release causes Poisson 2.5K
-to exhaust `max_iter` instead of converging quickly, and the full
-large-scale sweep is temporarily gated behind a separate investigation.
+Numbers above are from the v0.7 sweep. The v0.8 cycle replaced the
+sparse linear solver (rmumps → feral) and aligned the IPM kernel
+with Ipopt 3.14; aggregate CUTEst pass rate went up (564 vs 561) and
+the geomean speedup on commonly-solved problems came down to 8.9x as
+feral has not yet matched MUMPS's GEMM throughput on the largest
+sparse fronts. See the manuscript for the full v0.8 analysis.
 Historical numbers from v0.6.2 are preserved in
 `benchmarks/large_scale/large_scale_results.txt` snapshots. ripopt's
 advantage is strongest on unconstrained problems (L-BFGS fallback);
@@ -502,7 +500,7 @@ Include `ripopt.h` (repo root) in your C project. It defines version macros, cal
 #include "ripopt.h"
 
 // Check version at compile time
-printf("ripopt %s\n", RIPOPT_VERSION);  // "0.7.1"
+printf("ripopt %s\n", RIPOPT_VERSION);  // "0.8.0"
 ```
 
 ### Callback signatures
@@ -857,10 +855,13 @@ src/
     mod.rs            LinearSolver trait, SymmetricMatrix, KktMatrix
     dense.rs          Dense LDL^T (Bunch-Kaufman) factorization
     banded.rs         Banded LDL^T for problems with small bandwidth
-    multifrontal.rs   Multifrontal sparse LDL^T via rmumps (default, SuiteSparse AMD ordering)
+    feral_direct.rs   Multifrontal sparse LDL^T via feral (default, Bunch-Kaufman, MC64, AMD/METIS)
+    feral_iterative.rs MINRES wrapper backed by feral (iterative-refinement variant)
+    feral_hybrid.rs   Hybrid direct/iterative wrapper for the feral backend
+    multifrontal.rs   Multifrontal sparse LDL^T via rmumps (opt-in `rmumps` feature)
     sparse.rs         Sparse LDL^T via faer (optional)
-    iterative.rs      MINRES iterative solver with incomplete LDL^T preconditioner
-    hybrid.rs         Hybrid direct/iterative solver with automatic switching
+    iterative.rs      MINRES with incomplete LDL^T preconditioner (rmumps feature)
+    hybrid.rs         Hybrid direct/iterative solver with automatic switching (rmumps feature)
 
 tests/
   correctness.rs      Integration tests (22 NLP problems)
@@ -912,7 +913,7 @@ The Jacobian is evaluated at two points to identify linear constraints (where al
 
 The solver follows the primal-dual barrier method from the Ipopt papers (Wachter & Biegler, 2006). At each iteration it:
 
-1. Assembles and factors the KKT system using dense LDL^T (Bunch-Kaufman), sparse multifrontal LDL^T (rmumps), or dense condensed Schur complement for tall-narrow problems
+1. Assembles and factors the KKT system using dense LDL^T (Bunch-Kaufman), sparse multifrontal LDL^T (feral by default; rmumps under the opt-in `rmumps` feature), or dense condensed Schur complement for tall-narrow problems
 2. Computes inertia of the factorization and applies regularization if needed
 3. Applies Mehrotra predictor-corrector with Gondzio centrality corrections (default on)
 4. Computes search directions with iterative refinement (up to 3 rounds)

@@ -1,5 +1,5 @@
 SHELL = /bin/bash
-.PHONY: help test test-c test-iterative install uninstall clean cutest-install cutest-prepare cutest-run cutest-full cutest-report cutest cutest-maxiter cutest-smoke cutest-large hs-run large-scale electrolyte-run grid-run cho-run gas-run water-run benchmark benchmark-report
+.PHONY: help test test-c test-iterative install uninstall clean cutest-install cutest-prepare cutest-run cutest-full cutest-report cutest cutest-maxiter cutest-smoke cutest-large large-scale electrolyte-run grid-run cho-run gas-run water-run benchmark benchmark-report
 
 # Show available targets
 help:
@@ -15,9 +15,8 @@ help:
 	@echo "  test-iterative   Run iterative/hybrid solver tests (release, large-scale)"
 	@echo ""
 	@echo "Benchmarks:"
-	@echo "  benchmark        Full benchmark: HS + CUTEst + domain + large-scale + report"
+	@echo "  benchmark        Full benchmark: CUTEst + domain + large-scale + report"
 	@echo "  benchmark-report Generate unified report from existing results"
-	@echo "  hs-run           Run HS suite benchmark (ripopt + ipopt)"
 	@echo "  electrolyte-run  Run electrolyte thermodynamics benchmark"
 	@echo "  grid-run         Run AC optimal power flow (electrical grid) benchmark"
 	@echo "  cho-run          Run CHO parameter estimation benchmark"
@@ -127,9 +126,8 @@ cutest-install:
 	bash install_cutest.sh
 
 # Backward-compatibility shims — real targets live in benchmarks/Makefile.
-# Each target delegates so existing workflows (e.g. `make hs-run`) keep working.
 cutest-prepare cutest-run cutest-full cutest-report cutest-smoke cutest-large cutest-maxiter cutest:
 	$(MAKE) -C benchmarks $@
 
-hs-run large-scale electrolyte-run grid-run cho-run gas-run water-run benchmark benchmark-report:
+large-scale electrolyte-run grid-run cho-run gas-run water-run benchmark benchmark-report:
 	$(MAKE) -C benchmarks $@

@@ -3,8 +3,6 @@
 Unified benchmark report for ripopt vs Ipopt.
 
 Reads results from:
-  - benchmarks/hs/hs_ripopt_results.json      (HS suite, ripopt)
-  - benchmarks/hs/hs_ipopt_native_results.json (HS suite, ipopt)
   - benchmarks/cutest/results.json             (CUTEst 727 suite)
 
 Produces a single BENCHMARK_REPORT.md with per-suite and combined statistics.
@@ -75,55 +73,6 @@ def compute_stats(diffs):
 
 
 # ---- Load results ----
-
-def load_hs_results():
-    """Load HS suite results (separate files for each solver)."""
-    ripopt_path = os.path.join(SCRIPT_DIR, 'hs', 'hs_ripopt_results.json')
-    ipopt_path = os.path.join(SCRIPT_DIR, 'hs', 'hs_ipopt_native_results.json')
-
-    if not os.path.exists(ripopt_path) or not os.path.exists(ipopt_path):
-        return None
-
-    with open(ripopt_path) as f:
-        ripopt_data = json.load(f)
-    with open(ipopt_path) as f:
-        ipopt_data = json.load(f)
-
-    ripopt_by_num = {r['number']: r for r in ripopt_data}
-    ipopt_by_num = {r['number']: r for r in ipopt_data}
-
-    comparisons = []
-    for num in sorted(set(ripopt_by_num.keys()) | set(ipopt_by_num.keys())):
-        rr = ripopt_by_num.get(num, {})
-        cr = ipopt_by_num.get(num, {})
-
-        r_solved = is_solved(rr.get('status', ''))
-        c_solved = is_solved(cr.get('status', ''))
-        both = r_solved and c_solved
-        od = obj_diff(rr.get('objective'), cr.get('objective')) if both else float('nan')
-
-        comparisons.append({
-            'name': f"HS{num:03d}",
-            'suite': 'HS',
-            'n': rr.get('n', cr.get('n', 0)),
-            'm': rr.get('m', cr.get('m', 0)),
-            'ripopt_status': rr.get('status', 'N/A'),
-            'ipopt_status': cr.get('status', 'N/A'),
-            'ripopt_obj': rr.get('objective', float('nan')),
-            'ipopt_obj': cr.get('objective', float('nan')),
-            'obj_diff': od,
-            'ripopt_iters': rr.get('iterations', 0),
-            'ipopt_iters': cr.get('iterations', 0),
-            'ripopt_time': rr.get('solve_time', 0),
-            'ipopt_time': cr.get('solve_time', 0),
-            'ripopt_solved': r_solved,
-            'ipopt_solved': c_solved,
-            'both_solved': both,
-            'passed': both and not math.isnan(od) and od < 1e-4,
-        })
-
-    return comparisons
-
 
 def load_cutest_results(path=None):
     """Load CUTEst results (single file with solver field)."""
@@ -645,13 +594,6 @@ def main():
 
     # Load all suites
     suites = []
-
-    hs = load_hs_results()
-    if hs:
-        suites.append(("HS", hs))
-        print(f"HS suite: {len(hs)} problems loaded")
-    else:
-        print("HS suite: no results found (run `make hs-run` first)")
 
     cutest = load_cutest_results()
     if cutest:

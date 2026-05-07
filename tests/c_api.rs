@@ -640,14 +640,6 @@ fn c_api_max_iter_option() {
         let key = CString::new("max_iter").unwrap();
         ripopt_add_int_option(nlp, key.as_ptr(), 2);
 
-        let key = CString::new("enable_lbfgs_fallback").unwrap();
-        let val = CString::new("no").unwrap();
-        ripopt_add_str_option(nlp, key.as_ptr(), val.as_ptr());
-
-        let key = CString::new("enable_lbfgs_hessian_fallback").unwrap();
-        let val = CString::new("no").unwrap();
-        ripopt_add_str_option(nlp, key.as_ptr(), val.as_ptr());
-
         let mut x = [-1.0, 1.0];
         let status = ripopt_solve(nlp, x.as_mut_ptr(), ptr::null_mut(), ptr::null_mut(),
                                    ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
