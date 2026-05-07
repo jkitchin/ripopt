@@ -461,6 +461,7 @@ pub unsafe extern "C" fn ripopt_add_num_option(
         "constr_viol_tol" => p.options.constr_viol_tol = val,
         "dual_inf_tol" => p.options.dual_inf_tol = val,
         "compl_inf_tol" => p.options.compl_inf_tol = val,
+        "auxiliary_tol" => p.options.auxiliary_tol = val,
         "warm_start_bound_push" => p.options.warm_start_bound_push = val,
         "warm_start_bound_frac" => p.options.warm_start_bound_frac = val,
         "warm_start_mult_bound_push" => p.options.warm_start_mult_bound_push = val,

@@ -406,6 +406,247 @@ x2
     );
 }
 
+#[test]
+fn nl_auxiliary_preprocessing_gate_fixture_matches_fallback() {
+    let solve_fixture = |enable_preprocessing: bool| {
+        let nl = include_str!("fixtures/issue_10/auxiliary_gate.nl");
+        let data = parse_nl_file(nl).expect("parse issue-10 fixture");
+        let problem = NlProblem::from_nl_data(data).expect("build issue-10 fixture");
+        let options = SolverOptions {
+            print_level: 0,
+            enable_preprocessing,
+            tol: 1e-8,
+            ..SolverOptions::default()
+        };
+        let result = ripopt::solve(&problem, &options);
+        (problem, result)
+    };
+
+    let (pre_problem, preprocessed) = solve_fixture(true);
+    let (fallback_problem, fallback) = solve_fixture(false);
+
+    assert_eq!(
+        preprocessed.status,
+        SolveStatus::Optimal,
+        "preprocessed fixture solve should be Optimal, got {:?}",
+        preprocessed.status
+    );
+    assert_eq!(
+        fallback.status,
+        SolveStatus::Optimal,
+        "fallback fixture solve should be Optimal, got {:?}",
+        fallback.status
+    );
+
+    let pre_violation = max_constraint_violation(&pre_problem, &preprocessed.x);
+    let fallback_violation = max_constraint_violation(&fallback_problem, &fallback.x);
+    assert!(
+        pre_violation <= fallback_violation.max(1e-8) * 10.0 + 1e-8,
+        "preprocessed violation {pre_violation} should not be worse than fallback {fallback_violation}"
+    );
+
+    let scale = preprocessed
+        .objective
+        .abs()
+        .max(fallback.objective.abs())
+        .max(1.0);
+    assert!(
+        preprocessed.objective <= fallback.objective + 1e-6 * scale,
+        "preprocessed objective {} should not be worse than fallback {}",
+        preprocessed.objective,
+        fallback.objective
+    );
+    assert!(
+        preprocessed.iterations <= fallback.iterations + 5,
+        "preprocessed iterations {} should stay near fallback {}",
+        preprocessed.iterations,
+        fallback.iterations
+    );
+}
+
+struct Issue23Fixture {
+    name: &'static str,
+    nl: &'static str,
+}
+
+#[derive(Debug)]
+struct Issue23Metrics {
+    status: SolveStatus,
+    objective: f64,
+    constraint_violation: f64,
+    fallback: Option<String>,
+    iterations: usize,
+}
+
+fn solve_issue23_fixture(
+    fixture: &Issue23Fixture,
+    enable_preprocessing: bool,
+) -> (NlProblem, SolveResult) {
+    let data = parse_nl_file(fixture.nl).expect("parse issue-23 fixture");
+    let problem = NlProblem::from_nl_data(data).expect("build issue-23 fixture");
+    let options = SolverOptions {
+        print_level: 0,
+        enable_preprocessing,
+        max_iter: 500,
+        tol: 1e-8,
+        ..SolverOptions::default()
+    };
+    let result = ripopt::solve(&problem, &options);
+    (problem, result)
+}
+
+fn issue23_metrics(problem: &NlProblem, result: &SolveResult) -> Issue23Metrics {
+    Issue23Metrics {
+        status: result.status,
+        objective: result.objective,
+        constraint_violation: max_constraint_violation(problem, &result.x),
+        fallback: result.diagnostics.fallback_used.clone(),
+        iterations: result.iterations,
+    }
+}
+
+#[test]
+fn nl_issue_23_executable_incidence_fixtures_compare_preprocessing() {
+    let fixtures = [
+        Issue23Fixture {
+            name: "tutorial_flow_density",
+            nl: include_str!("fixtures/issue_23/tutorial_flow_density.nl"),
+        },
+        Issue23Fixture {
+            name: "tutorial_flow_density_perturbed",
+            nl: include_str!("fixtures/issue_23/tutorial_flow_density_perturbed.nl"),
+        },
+    ];
+
+    for fixture in fixtures {
+        let (pre_problem, pre_result) = solve_issue23_fixture(&fixture, true);
+        let (fallback_problem, fallback_result) = solve_issue23_fixture(&fixture, false);
+        let preprocessed = issue23_metrics(&pre_problem, &pre_result);
+        let fallback = issue23_metrics(&fallback_problem, &fallback_result);
+        let presolve = &pre_result.diagnostics.preprocessing.presolve;
+
+        eprintln!(
+            "issue 23 {name}: preprocessing={preprocessed:?}, no_preprocessing={fallback:?}",
+            name = fixture.name
+        );
+
+        assert_eq!(
+            preprocessed.status,
+            SolveStatus::Optimal,
+            "{} preprocessing should solve",
+            fixture.name
+        );
+        assert_eq!(
+            fallback.status,
+            SolveStatus::Optimal,
+            "{} no-preprocessing path should solve",
+            fixture.name
+        );
+        assert!(
+            preprocessed.constraint_violation <= 1e-8,
+            "{} preprocessing full-space violation too large: {}",
+            fixture.name,
+            preprocessed.constraint_violation
+        );
+        assert!(
+            fallback.constraint_violation <= 1e-8,
+            "{} no-preprocessing full-space violation too large: {}",
+            fixture.name,
+            fallback.constraint_violation
+        );
+        assert_eq!(
+            preprocessed.fallback.as_deref(),
+            None,
+            "{} auxiliary preprocessing should not fall back",
+            fixture.name
+        );
+        assert!(
+            preprocessed.iterations <= fallback.iterations,
+            "{} preprocessing iterations {} should not exceed no-preprocessing {}",
+            fixture.name,
+            preprocessed.iterations,
+            fallback.iterations
+        );
+        assert!(
+            (preprocessed.objective - fallback.objective).abs() <= 1e-8,
+            "{} objective mismatch: preprocessing {} vs no-preprocessing {}",
+            fixture.name,
+            preprocessed.objective,
+            fallback.objective
+        );
+        assert!(presolve.attempted, "{} should profile presolve", fixture.name);
+        assert!(presolve.solved, "{} should solve via presolve", fixture.name);
+        assert!(
+            presolve.candidates > 0,
+            "{} should report auxiliary candidates",
+            fixture.name
+        );
+        assert!(
+            presolve.auxiliary_blocks_solved > 0,
+            "{} should report auxiliary block solves",
+            fixture.name
+        );
+        assert_eq!(presolve.original_variables, pre_problem.num_variables());
+        assert_eq!(presolve.original_constraints, pre_problem.num_constraints());
+        assert!(
+            presolve.reduced_variables < presolve.original_variables,
+            "{} should report variable reduction",
+            fixture.name
+        );
+        assert!(
+            presolve.removed_constraints > 0,
+            "{} should report constraint reduction",
+            fixture.name
+        );
+        assert!(
+            !presolve.accepted_block_sizes.is_empty(),
+            "{} should report accepted block sizes",
+            fixture.name
+        );
+    }
+}
+
+fn max_constraint_violation<P: NlpProblem>(problem: &P, x: &[f64]) -> f64 {
+    let m = problem.num_constraints();
+    if m == 0 {
+        return 0.0;
+    }
+
+    let mut g = vec![0.0; m];
+    if !problem.constraints(x, true, &mut g) {
+        return f64::INFINITY;
+    }
+    let mut g_l = vec![0.0; m];
+    let mut g_u = vec![0.0; m];
+    problem.constraint_bounds(&mut g_l, &mut g_u);
+
+    let mut violation: f64 = 0.0;
+    for i in 0..m {
+        let row = if !g[i].is_finite() {
+            f64::INFINITY
+        } else if g_l[i].is_finite()
+            && g_u[i].is_finite()
+            && (g_u[i] - g_l[i]).abs() <= 1e-12
+        {
+            (g[i] - 0.5 * (g_l[i] + g_u[i])).abs()
+        } else {
+            let lower = if g_l[i].is_finite() {
+                (g_l[i] - g[i]).max(0.0)
+            } else {
+                0.0
+            };
+            let upper = if g_u[i].is_finite() {
+                (g[i] - g_u[i]).max(0.0)
+            } else {
+                0.0
+            };
+            lower.max(upper)
+        };
+        violation = violation.max(row);
+    }
+    violation
+}
+
 // ---------------------------------------------------------------------------
 // 8. SOL writer format check
 // ---------------------------------------------------------------------------
@@ -843,6 +1084,22 @@ fn cli_writes_validated_json_report() {
 
     // Options are echoed back so the run can be reproduced.
     assert_eq!(v["options"]["print_level"], 0);
+    assert!(
+        v["diagnostics"]["preprocessing"].is_object(),
+        "JSON report should include preprocessing diagnostics"
+    );
+    assert_eq!(
+        v["diagnostics"]["preprocessing"]["presolve"]["attempted"],
+        true
+    );
+    assert_eq!(
+        v["diagnostics"]["preprocessing"]["standard"]["attempted"],
+        true
+    );
+    assert_eq!(
+        v["diagnostics"]["preprocessing"]["standard"]["did_reduce"],
+        false
+    );
 
     let _ = std::fs::remove_file(&tmp);
     let _ = std::fs::remove_file(&json_path);

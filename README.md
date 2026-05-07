@@ -45,7 +45,7 @@ It implements a primal-dual interior point method with a barrier formulation, si
 - NLP scaling (gradient-based objective and constraint scaling)
 - Local infeasibility detection for inconsistent constraint systems
 - **Early stall detection**: bail out fast when stuck in early iterations to trigger fallbacks
-- **Preprocessing**: Automatic elimination of fixed variables, redundant constraints, and bound tightening from single-variable linear constraints
+- **Preprocessing**: Automatic auxiliary equality-block reduction/recovery, fixed-variable elimination, redundant-constraint removal, and bound tightening from single-variable linear constraints
 - **Near-linear constraint detection**: Automatically identifies linear constraints and skips their Hessian contribution
 - **Limited-memory Hessian approximation**: L-BFGS-in-IPM mode (`hessian_approximation_lbfgs`) replaces exact Hessian with L-BFGS curvature pairs, eliminating the need for second-derivative callbacks
 - **Multi-solver fallback architecture**: L-BFGS, Augmented Lagrangian, SQP, and explicit slack reformulation
@@ -458,7 +458,8 @@ Key options (all have Ipopt-matching defaults):
 | `warm_start`                    | false   | Enable warm-start initialization                           |
 | `constr_viol_tol`               | 1e-4    | Constraint violation tolerance                             |
 | `dual_inf_tol`                  | 1.0     | Dual infeasibility tolerance                               |
-| `enable_preprocessing`          | true    | Eliminate fixed variables and redundant constraints        |
+| `enable_preprocessing`          | true    | Internal auxiliary equality solves/recovery, fixed variables, redundancies |
+| `auxiliary_tol`                 | 1e-8    | Accepted residual for internal auxiliary equality solves/recovery |
 | `detect_linear_constraints`     | true    | Skip Hessian for linear constraints                        |
 | `enable_sqp_fallback`           | true    | SQP fallback for constrained problems                      |
 | `hessian_approximation_lbfgs`   | false   | Use L-BFGS Hessian approximation (no exact Hessian needed) |
@@ -479,6 +480,7 @@ Key options (all have Ipopt-matching defaults):
 - `constraint_values` -- constraint values g(x*)
 - `status` -- one of: `Optimal`, `Infeasible`, `LocalInfeasibility`, `MaxIterations`, `NumericalError`, `Unbounded`, `RestorationFailed`, `InternalError`
 - `iterations` -- number of IPM iterations
+- `diagnostics` -- `SolverDiagnostics`, including residuals, timing/evaluation counters, fallback information, and nested `diagnostics.preprocessing` phase data. The same diagnostics object is included in CLI JSON reports.
 
 ## C API
 
@@ -619,6 +621,7 @@ Option-setting functions return `1` on success, `0` if the keyword is unknown. A
 | `constr_viol_tol`            | 1e-4    | Constraint violation tolerance                  |
 | `dual_inf_tol`               | 1.0     | Dual infeasibility tolerance                    |
 | `compl_inf_tol`              | 1e-4    | Complementarity tolerance                       |
+| `auxiliary_tol`              | 1e-8    | Residual tolerance for internal auxiliary equality solves/recovery |
 | `max_wall_time`              | 0.0     | Wall-clock time limit in seconds (0 = no limit) |
 | `warm_start_bound_push`      | 1e-3    | Warm-start bound push                           |
 | `warm_start_bound_frac`      | 1e-3    | Warm-start bound fraction                       |
@@ -650,7 +653,7 @@ Option-setting functions return `1` on success, `0` if the keyword is unknown. A
 | `enable_slack_fallback`         | `"yes"`      | `"yes"`, `"no"`               | Slack reformulation fallback                      |
 | `enable_lbfgs_fallback`         | `"yes"`      | `"yes"`, `"no"`               | L-BFGS fallback for unconstrained                 |
 | `enable_al_fallback`            | `"yes"`      | `"yes"`, `"no"`               | Augmented Lagrangian fallback                     |
-| `enable_preprocessing`          | `"yes"`      | `"yes"`, `"no"`               | Preprocessing (fixed vars, redundant constraints) |
+| `enable_preprocessing`          | `"yes"`      | `"yes"`, `"no"`               | Internal auxiliary equality solves/recovery, fixed vars, redundancies |
 | `detect_linear_constraints`     | `"yes"`      | `"yes"`, `"no"`               | Skip Hessian for linear constraints               |
 | `enable_sqp_fallback`           | `"yes"`      | `"yes"`, `"no"`               | SQP fallback for constrained problems             |
 | `hessian_approximation`         | `"exact"`    | `"exact"`, `"limited-memory"` | Use L-BFGS Hessian approximation                  |
@@ -764,12 +767,12 @@ See [Compile and run the examples](#compile-and-run-the-examples) above for buil
 cargo test
 ```
 
-230 tests total:
-- **131 unit tests**: Dense LDL factorization, convergence checking, filter line search, fraction-to-boundary, KKT assembly, restoration, preprocessing, linearity detection, SQP, linear solver, autodiff, L-BFGS, sensitivity analysis
-- **12 C API tests**: FFI integration tests
-- **29 integration tests**: Rosenbrock, SimpleQP, HS071, HS035, PureBoundConstrained, MultipleEqualityConstraints, NE-to-LS reformulation, augmented Lagrangian, NL file parsing, IPM code paths, parametric sensitivity, and more
-- **15 HS regression tests**: Selected Hock-Schittkowski problems for regression checking
-- **14 coverage tests**: Augmented Lagrangian convergence paths, NL parser/solver pipeline, autodiff tape operations, IPM preprocessing/condensed KKT/unbounded detection
+The test suite covers:
+- **Unit tests**: Dense LDL factorization, convergence checking, filter line search, fraction-to-boundary, KKT assembly, restoration, preprocessing, linearity detection, SQP, linear solver, autodiff, L-BFGS, sensitivity analysis
+- **C API tests**: FFI integration tests
+- **Integration tests**: Rosenbrock, SimpleQP, HS071, HS035, PureBoundConstrained, MultipleEqualityConstraints, NE-to-LS reformulation, augmented Lagrangian, NL file parsing, IPM code paths, parametric sensitivity, and more
+- **HS regression tests**: Selected Hock-Schittkowski problems for regression checking
+- **Coverage tests**: Augmented Lagrangian convergence paths, NL parser/solver pipeline, autodiff tape operations, IPM preprocessing/condensed KKT/unbounded detection
 
 ## Code Coverage
 
@@ -819,7 +822,7 @@ Current coverage by module:
 | hybrid.rs                | 0%            |
 | iterative.rs             | 0%            |
 
-**Overall: 62% line coverage** (248 tests)
+**Overall: 62% line coverage** in the last recorded coverage run.
 
 The `hybrid.rs` and `iterative.rs` modules implement opt-in linear
 solvers (`LinearSolverChoice::Hybrid`, `::Iterative`) that no test
@@ -896,9 +899,10 @@ examples/
 
 Before solving, ripopt automatically analyzes the problem to reduce its size:
 
-1. **Fixed variable elimination**: Variables with `x_l == x_u` are removed and set to their fixed values in all evaluations
-2. **Redundant constraint removal**: Duplicate constraints (same Jacobian structure, values, and bounds) are eliminated
-3. **Bound tightening**: Single-variable linear constraints are used to tighten variable bounds
+1. **Auxiliary equality-system preprocessing/recovery**: Internal auxiliary equalities and variables may be solved before the main NLP or recovered after a reduced main solve when the removed variables are absent from the objective and inequalities
+2. **Fixed variable elimination**: Variables with `x_l == x_u` are removed and set to their fixed values in all evaluations
+3. **Redundant constraint removal**: Duplicate constraints (same Jacobian structure, values, and bounds) are eliminated
+4. **Bound tightening**: Single-variable linear constraints are used to tighten variable bounds
 
 The reduced problem is solved and the solution is mapped back to the original dimensions. Disable with `enable_preprocessing: false`.
 

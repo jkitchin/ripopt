@@ -1,5 +1,6 @@
 /target
 __pycache__/
+.venv/
 
 # Build/install logs
 *.log
@@ -33,6 +34,7 @@ benchmarks/electrolyte/electrolyte_results.jsonl
 benchmarks/grid/grid_results.jsonl
 benchmarks/run_stdout.txt
 benchmarks/run_stderr.txt
+benchmarks/preprocessing/results/
 
 # arki0003 / A8 forward-walk diagnostic probes (one-off, not part of crate)
 examples/arki_*.rs

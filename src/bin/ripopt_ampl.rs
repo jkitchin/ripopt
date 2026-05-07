@@ -232,6 +232,7 @@ fn print_help() {
     println!("    constr_viol_tol=<float>              Constraint violation tolerance [1e-4]");
     println!("    dual_inf_tol=<float>                 Dual infeasibility tolerance [1.0]");
     println!("    compl_inf_tol=<float>                Complementarity tolerance [1e-4]");
+    println!("    auxiliary_tol=<float>                Residual tolerance for internal auxiliary equality solves/recovery [1e-8]");
     println!();
     println!("  Barrier Parameter");
     println!("    mu_init=<float>                      Initial barrier parameter [0.1]");
@@ -283,7 +284,7 @@ fn print_help() {
     println!("    gondzio_mcc_max=<int>                Max Gondzio centrality corrections [3]");
     println!();
     println!("  Preprocessing & Diagnostics");
-    println!("    enable_preprocessing=<bool>          Eliminate fixed vars & redundant constraints [yes]");
+    println!("    enable_preprocessing=<bool>          Internal auxiliary equality solves/recovery, fixed vars, redundancies [yes]");
     println!("    print_level=<int>                    Verbosity: 0=silent, 5=verbose [5]");
     println!("    mu_oracle_quality_function=<bool>    Use quality function for mu selection [no]");
     println!();
@@ -351,6 +352,11 @@ fn apply_option(opts: &mut SolverOptions, key: &str, value: &str) {
         "compl_inf_tol" => {
             if let Ok(v) = value.parse() {
                 opts.compl_inf_tol = v;
+            }
+        }
+        "auxiliary_tol" => {
+            if let Ok(v) = value.parse() {
+                opts.auxiliary_tol = v;
             }
         }
         "kappa" => {

@@ -351,9 +351,13 @@ pub struct SolverOptions {
     /// restoration objective is min ρ·(p+n) + (η/2)·||D_R(x − x_R)||² with
     /// η = `resto_proximity_weight` · √μ. Default: 1.0 (Ipopt 3.14).
     pub resto_proximity_weight: f64,
-    /// Enable preprocessing to eliminate fixed variables and redundant constraints.
+    /// Enable preprocessing to internally solve and remove auxiliary equality
+    /// systems, eliminate fixed variables, and remove redundant constraints.
     /// Default: true.
     pub enable_preprocessing: bool,
+    /// Maximum accepted residual for internal auxiliary equality-system solves
+    /// during preprocessing. Default: 1e-8.
+    pub auxiliary_tol: f64,
     /// Detect linear constraints and skip their Hessian contribution.
     /// Default: true.
     pub detect_linear_constraints: bool,
@@ -713,6 +717,7 @@ impl Default for SolverOptions {
             kappa_resto: 0.9,
             resto_proximity_weight: 1.0,
             enable_preprocessing: true,
+            auxiliary_tol: 1e-8,
             detect_linear_constraints: true,
             hessian_approximation_lbfgs: false,
             mehrotra_pc: false,

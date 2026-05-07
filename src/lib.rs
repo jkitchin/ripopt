@@ -74,6 +74,7 @@
 //! - Sparse (multifrontal LDL^T) and dense (Bunch-Kaufman LDL^T) linear solvers
 //! - Parametric sensitivity analysis ([`solve_with_sensitivity`])
 
+pub(crate) mod auxiliary_preprocessing;
 pub mod intermediate;
 pub(crate) mod logging;
 pub mod c_api;
@@ -93,6 +94,7 @@ pub mod nl;
 pub mod options;
 pub mod preprocessing;
 pub mod problem;
+pub(crate) mod reduction_frame;
 pub mod restoration_nlp;
 pub mod result;
 pub mod sensitivity;

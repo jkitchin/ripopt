@@ -4,7 +4,10 @@
 
 `SolverDiagnostics` captures structured data about solver behavior during a
 solve. It is available both programmatically via `result.diagnostics` and as a
-stderr summary block (printed when `print_level >= 5`).
+stderr summary block (printed when `print_level >= 5`). JSON reports written
+with `ripopt problem.nl -o report.json` include the full diagnostics object,
+including preprocessing diagnostics that are not expanded in the compact stderr
+summary.
 
 The diagnostic block looks like:
 
@@ -42,6 +45,57 @@ soc_corrections: 0
 | `final_compl` | Complementarity error at termination |
 | `wall_time_secs` | Total wall-clock time |
 | `fallback_used` | Which fallback succeeded, if any (`lbfgs_hessian`, `augmented_lagrangian`, `sqp`, `slack`) |
+| `preprocessing` | Nested diagnostics for auxiliary presolve, auxiliary postsolve, and standard preprocessing |
+
+## Preprocessing diagnostics
+
+`diagnostics.preprocessing` is useful when `enable_preprocessing` changes
+iteration counts but not wall time. It is split into:
+
+| Object | Purpose |
+|---|---|
+| `preprocessing.presolve` | Auxiliary equality-block reduction before the main solve |
+| `preprocessing.postsolve` | Auxiliary reduction followed by recovery of eliminated variables |
+| `preprocessing.standard` | Fixed-variable and redundant-constraint preprocessing |
+
+For `preprocessing.presolve` and `preprocessing.postsolve`, the most useful
+fields are:
+
+| Field | Meaning |
+|---|---|
+| `attempted`, `solved`, `failed` | Whether the phase ran, solved through preprocessing, or rejected/fell back |
+| `skipped`, `skip_reason` | Whether the phase returned to the normal solve path before auxiliary solves, and why; examples include no accepted candidates, no-op gates, and cost gates |
+| `total_time_secs` | Total wall-clock time spent in the phase |
+| `candidate_detection_time_secs` | Candidate search time, including incidence, filtering, and structural analysis |
+| `incidence_time_secs` | Time spent constructing equality-incidence data |
+| `structural_analysis_time_secs` | Time spent on components, matching, Dulmage-Mendelsohn, and block-triangular analysis |
+| `candidate_filter_time_secs` | Time spent excluding objective- or inequality-coupled variables |
+| `auxiliary_solve_time_secs` | Presolve time spent solving accepted auxiliary blocks |
+| `recovery_solve_time_secs` | Postsolve time spent recovering eliminated variables |
+| `reduction_build_time_secs` | Time spent constructing the auxiliary-reduced problem |
+| `nested_preprocessing_time_secs` | Time spent applying standard preprocessing to the reduced problem |
+| `reduced_solve_time_secs` | Time spent solving the reduced problem |
+| `unmap_time_secs` | Time spent mapping the reduced solution back to the original variables and constraints |
+| `full_space_validation_time_secs` | Time spent recomputing objective, constraints, and residuals on the original problem |
+| `equality_rows`, `incident_variables`, `connected_components` | Equality-incidence structure size |
+| `candidates`, `btd_blocks`, `accepted_block_sizes` | Accepted auxiliary candidate and block structure |
+| `rejected_blocks`, `rejection_counts` | Rejection totals grouped by reason |
+| `auxiliary_blocks_solved`, `auxiliary_iterations`, `auxiliary_*_evals` | Internal auxiliary solve work |
+| `original_*`, `reduced_*`, `removed_*`, `nested_*` | Original, reduced, removed, and nested preprocessing dimensions |
+
+For `preprocessing.standard`, use `attempted`, `did_reduce`,
+`total_time_secs`, `construction_time_secs`, `reduced_solve_time_secs`,
+`unmap_time_secs`, `fixed_variables`, `redundant_constraints`, and the
+original/reduced dimensions.
+
+When preprocessing is slower than the no-preprocessing solve, compare
+`wall_time_secs` with the phase totals. High `candidate_detection_time_secs`
+points to structural overhead; high `auxiliary_solve_time_secs` or
+`recovery_solve_time_secs` points to internal block solves; high
+`reduced_solve_time_secs` means the reduced NLP itself still dominates. If
+`skipped` is true, `skip_reason` records the no-candidate result, no-op gate,
+or conservative cost gate that returned to the normal solve path before
+auxiliary block solves.
 
 ## Reading the diagnostics
 
@@ -660,5 +714,5 @@ The key knobs for steering, grouped by what they control:
 | `mehrotra_pc` | false | Mehrotra predictor-corrector (fewer iterations) |
 | `gondzio_mcc_max` | 0 | Gondzio centrality corrections (better centering) |
 | `warm_start` | false | Reuse previous solution as starting point |
-| `enable_preprocessing` | true | Eliminate fixed vars and redundant constraints |
+| `enable_preprocessing` | true | Auxiliary equality blocks, fixed vars, and redundant constraints |
 | `detect_linear_constraints` | true | Skip Hessian for linear constraints |

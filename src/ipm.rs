@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use crate::convergence::{self, ConvergenceInfo, ConvergenceStatus};
@@ -82,7 +83,10 @@ use crate::options::SolverOptions;
 use crate::problem::NlpProblem;
 use crate::trace;
 use crate::restoration_nlp::RestorationNlp;
-use crate::result::{SolveResult, SolverDiagnostics, SolveStatus};
+use crate::result::{
+    AuxiliaryPreprocessingDiagnostics, PreprocessingDiagnostics, PreprocessingRejectionCount,
+    SolveResult, SolverDiagnostics, SolveStatus, StandardPreprocessingDiagnostics,
+};
 use crate::warmstart::WarmStartInitializer;
 use crate::logging::rip_log;
 
@@ -2231,6 +2235,874 @@ impl SolverState {
     }
 }
 
+enum AuxiliaryPreprocessAttempt {
+    NoCandidates,
+    Solved(SolveResult),
+    Failed,
+}
+
+const AUXILIARY_COST_GATE_MIN_PROBLEM_SIZE: usize = 1_000;
+const AUXILIARY_COST_GATE_MIN_CANDIDATES: usize = 64;
+const AUXILIARY_COST_GATE_MIN_BLOCKS: usize = 128;
+const AUXILIARY_COST_GATE_MAX_REMOVAL_FRACTION: f64 = 0.25;
+
+fn copy_auxiliary_candidate_diagnostics(
+    target: &mut AuxiliaryPreprocessingDiagnostics,
+    candidate_count: usize,
+    diagnostics: &crate::auxiliary_preprocessing::AuxiliaryCandidateDiagnostics,
+) {
+    target.equality_rows = diagnostics.equality_rows;
+    target.incident_variables = diagnostics.incident_variables;
+    target.connected_components = diagnostics.connected_components;
+    target.square_components = diagnostics.square_components;
+    target.closed_components = diagnostics.closed_components;
+    target.candidates = candidate_count;
+    target.pure_equality_candidates = diagnostics.pure_equality_candidates;
+    target.objective_coupled_candidates = diagnostics.objective_coupled_candidates;
+    target.inequality_coupled_candidates = diagnostics.inequality_coupled_candidates;
+    target.objective_and_inequality_coupled_candidates =
+        diagnostics.objective_and_inequality_coupled_candidates;
+    target.btd_blocks = diagnostics.btd_blocks;
+    target.rank_accepted_blocks = diagnostics.rank_accepted_blocks;
+    target.rejected_blocks = diagnostics.rejected_blocks();
+    target.accepted_block_sizes = diagnostics.accepted_block_sizes();
+    target.incidence_time_secs = diagnostics.incidence_time_secs;
+    target.structural_analysis_time_secs = diagnostics.structural_analysis_time_secs;
+    target.candidate_filter_time_secs = diagnostics.candidate_filter_time_secs;
+
+    let mut rejection_counts = BTreeMap::<String, usize>::new();
+    for rejection in &diagnostics.rejections {
+        *rejection_counts
+            .entry(rejection.reason.label().to_string())
+            .or_insert(0) += 1;
+    }
+    target.rejection_counts = rejection_counts
+        .into_iter()
+        .map(|(reason, count)| PreprocessingRejectionCount { reason, count })
+        .collect();
+}
+
+fn copy_auxiliary_solve_outcome(
+    target: &mut AuxiliaryPreprocessingDiagnostics,
+    outcome: &crate::auxiliary_preprocessing::AuxiliarySolveOutcome,
+) {
+    target.auxiliary_blocks_solved = outcome.blocks_solved;
+    target.auxiliary_max_residual = outcome.max_residual;
+    target.auxiliary_iterations = outcome.total_iterations;
+    target.auxiliary_wall_time_secs = outcome.total_wall_time_secs;
+    target.auxiliary_obj_evals = outcome.total_obj_evals;
+    target.auxiliary_grad_evals = outcome.total_grad_evals;
+    target.auxiliary_constr_evals = outcome.total_constr_evals;
+    target.auxiliary_jac_evals = outcome.total_jac_evals;
+    target.auxiliary_hess_evals = outcome.total_hess_evals;
+}
+
+fn finish_auxiliary_diagnostics(
+    target: &mut AuxiliaryPreprocessingDiagnostics,
+    candidate_count: usize,
+    diagnostics: &crate::auxiliary_preprocessing::AuxiliaryCandidateDiagnostics,
+    started: Instant,
+) {
+    copy_auxiliary_candidate_diagnostics(target, candidate_count, diagnostics);
+    target.total_time_secs += started.elapsed().as_secs_f64();
+}
+
+fn predicted_auxiliary_reduction(
+    candidates: &[crate::auxiliary_preprocessing::PresolveCandidate],
+) -> (usize, usize, usize) {
+    let mut rows = BTreeSet::new();
+    let mut vars = BTreeSet::new();
+    let mut blocks = 0;
+    for candidate in candidates {
+        for block in &candidate.blocks {
+            blocks += 1;
+            rows.extend(block.rows.iter().copied());
+            vars.extend(block.vars.iter().copied());
+        }
+    }
+    (rows.len(), vars.len(), blocks)
+}
+
+fn predicted_auxiliary_removal_fraction(
+    problem_variables: usize,
+    problem_constraints: usize,
+    predicted_vars: usize,
+    predicted_rows: usize,
+) -> f64 {
+    let variable_fraction = if problem_variables > 0 {
+        predicted_vars as f64 / problem_variables as f64
+    } else {
+        0.0
+    };
+    let constraint_fraction = if problem_constraints > 0 {
+        predicted_rows as f64 / problem_constraints as f64
+    } else {
+        0.0
+    };
+    variable_fraction.min(constraint_fraction)
+}
+
+fn auxiliary_candidate_skip_reason(
+    problem_variables: usize,
+    problem_constraints: usize,
+    candidates: &[crate::auxiliary_preprocessing::PresolveCandidate],
+) -> Option<(crate::auxiliary_preprocessing::AuxiliaryRejectionReason, String)> {
+    let (predicted_rows, predicted_vars, predicted_blocks) =
+        predicted_auxiliary_reduction(candidates);
+    if predicted_rows == 0 || predicted_vars == 0 {
+        return Some((
+            crate::auxiliary_preprocessing::AuxiliaryRejectionReason::NoOpGate,
+            format!(
+                "predicted reduction removes {predicted_vars} variable(s) and {predicted_rows} constraint(s)"
+            ),
+        ));
+    }
+
+    let problem_size = problem_variables + problem_constraints;
+    let predicted_removal_fraction = predicted_auxiliary_removal_fraction(
+        problem_variables,
+        problem_constraints,
+        predicted_vars,
+        predicted_rows,
+    );
+    if problem_size >= AUXILIARY_COST_GATE_MIN_PROBLEM_SIZE
+        && candidates.len() >= AUXILIARY_COST_GATE_MIN_CANDIDATES
+        && predicted_blocks >= AUXILIARY_COST_GATE_MIN_BLOCKS
+        && predicted_removal_fraction < AUXILIARY_COST_GATE_MAX_REMOVAL_FRACTION
+    {
+        return Some((
+            crate::auxiliary_preprocessing::AuxiliaryRejectionReason::CostGate,
+            format!(
+                "{} candidate group(s), {predicted_blocks} auxiliary block(s), predicted removal {} variable(s)/{} constraint(s) ({:.1}% of dimensions), problem size {}x{}",
+                candidates.len(),
+                predicted_vars,
+                predicted_rows,
+                100.0 * predicted_removal_fraction,
+                problem_variables,
+                problem_constraints,
+            ),
+        ));
+    }
+
+    None
+}
+
+fn skip_auxiliary_phase(
+    label: &str,
+    target: &mut AuxiliaryPreprocessingDiagnostics,
+    candidate_count: usize,
+    diagnostics: &mut crate::auxiliary_preprocessing::AuxiliaryCandidateDiagnostics,
+    reason: crate::auxiliary_preprocessing::AuxiliaryRejectionReason,
+    detail: String,
+    started: Instant,
+    options: &SolverOptions,
+) -> AuxiliaryPreprocessAttempt {
+    let reason_label = reason.label();
+    diagnostics.reject_global(reason, Some(detail.clone()));
+    target.skipped = true;
+    target.skip_reason = Some(format!("{reason_label}: {detail}"));
+    if options.print_level >= 5 {
+        diagnostics.log_verbose(label);
+        rip_log!("ripopt: {label} skipped by {reason_label}: {detail}");
+    }
+    finish_auxiliary_diagnostics(target, candidate_count, diagnostics, started);
+    AuxiliaryPreprocessAttempt::NoCandidates
+}
+
+struct FullSpaceValidation {
+    objective: f64,
+    constraints: Vec<f64>,
+    primal_inf: f64,
+    dual_inf: f64,
+}
+
+fn validate_full_space_result(
+    problem: &dyn NlpProblem,
+    result: &SolveResult,
+    options: &SolverOptions,
+) -> Option<FullSpaceValidation> {
+    let n = problem.num_variables();
+    let m = problem.num_constraints();
+    if result.x.len() != n
+        || result.bound_multipliers_lower.len() != n
+        || result.bound_multipliers_upper.len() != n
+        || result.constraint_multipliers.len() != m
+        || result.constraint_values.len() != m
+    {
+        return None;
+    }
+
+    let mut objective = 0.0;
+    if !problem.objective(&result.x, true, &mut objective) || !objective.is_finite() {
+        return None;
+    }
+
+    let mut constraints = vec![0.0; m];
+    if m > 0 {
+        if !problem.constraints(&result.x, true, &mut constraints) {
+            return None;
+        }
+        if constraints.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+    }
+
+    let mut g_l = vec![0.0; m];
+    let mut g_u = vec![0.0; m];
+    problem.constraint_bounds(&mut g_l, &mut g_u);
+    sentinel_bounds_to_infinity(&mut g_l, &mut g_u, options);
+    let primal_inf = convergence::primal_infeasibility_max(&constraints, &g_l, &g_u);
+    if !primal_inf.is_finite() || primal_inf > options.constr_viol_tol {
+        return None;
+    }
+
+    let mut grad = vec![0.0; n];
+    if !problem.gradient(&result.x, true, &mut grad) || grad.iter().any(|value| !value.is_finite())
+    {
+        return None;
+    }
+
+    let (jac_rows, jac_cols) = problem.jacobian_structure();
+    if jac_rows.len() != jac_cols.len() {
+        return None;
+    }
+    let mut jac_vals = vec![0.0; jac_rows.len()];
+    if !problem.jacobian_values(&result.x, true, &mut jac_vals)
+        || jac_vals.iter().any(|value| !value.is_finite())
+    {
+        return None;
+    }
+    for (&row, &col) in jac_rows.iter().zip(jac_cols.iter()) {
+        if row >= m || col >= n {
+            return None;
+        }
+    }
+    if result
+        .constraint_multipliers
+        .iter()
+        .chain(result.bound_multipliers_lower.iter())
+        .chain(result.bound_multipliers_upper.iter())
+        .any(|value| !value.is_finite())
+    {
+        return None;
+    }
+
+    let dual_inf = convergence::dual_infeasibility(
+        &grad,
+        &jac_rows,
+        &jac_cols,
+        &jac_vals,
+        &result.constraint_multipliers,
+        &result.bound_multipliers_lower,
+        &result.bound_multipliers_upper,
+        n,
+    );
+    if !dual_inf.is_finite() || dual_inf > options.dual_inf_tol {
+        return None;
+    }
+
+    Some(FullSpaceValidation {
+        objective,
+        constraints,
+        primal_inf,
+        dual_inf,
+    })
+}
+
+fn auxiliary_preprocessing_options(
+    options: &SolverOptions,
+    solve_start: Instant,
+) -> Option<SolverOptions> {
+    let mut attempt_opts = options.clone();
+    if options.max_wall_time > 0.0 {
+        let elapsed = solve_start.elapsed().as_secs_f64();
+        let remaining = options.max_wall_time - elapsed;
+        if remaining <= 0.1 {
+            return None;
+        }
+        attempt_opts.max_wall_time = elapsed + 0.5 * remaining;
+    }
+    Some(attempt_opts)
+}
+
+fn auxiliary_reduced_solve_options(
+    options: &SolverOptions,
+    preprocess_opts: &SolverOptions,
+    reduced: &crate::auxiliary_preprocessing::AuxiliaryReducedProblem<'_>,
+    prep: &crate::preprocessing::PreprocessedProblem<'_>,
+    solve_start: Instant,
+) -> Option<SolverOptions> {
+    let mut reduced_opts = preprocess_opts.clone();
+    reduced_opts.enable_preprocessing = false;
+    reduced_opts.warm_start = false;
+    reduced_opts.warm_start_y = None;
+    reduced_opts.warm_start_z_l = None;
+    reduced_opts.warm_start_z_u = None;
+    reduced_opts.warm_start_s = None;
+    reduced_opts.warm_start_v_l = None;
+    reduced_opts.warm_start_v_u = None;
+    let aux_x_scaling = options
+        .user_x_scaling
+        .as_ref()
+        .and_then(|scaling| reduced.reduced_x_scaling(scaling));
+    reduced_opts.user_x_scaling = aux_x_scaling
+        .as_ref()
+        .and_then(|scaling| prep.reduced_x_scaling(scaling));
+    let aux_g_scaling = options
+        .user_g_scaling
+        .as_ref()
+        .and_then(|scaling| reduced.reduced_g_scaling(scaling));
+    reduced_opts.user_g_scaling = aux_g_scaling
+        .as_ref()
+        .and_then(|scaling| prep.reduced_g_scaling(scaling));
+    if preprocess_opts.max_wall_time > 0.0 {
+        let remaining = preprocess_opts.max_wall_time - solve_start.elapsed().as_secs_f64();
+        if remaining <= 0.1 {
+            return None;
+        }
+        reduced_opts.max_wall_time = remaining;
+    }
+    Some(reduced_opts)
+}
+
+/// Auxiliary preprocessing attempt: solve block-triangular equality
+/// subsystems first, remove the solved auxiliary variables and equality rows,
+/// then run the existing preprocessing wrapper on the auxiliary-reduced
+/// problem. The standard preprocessing result is unmapped before the auxiliary
+/// result is expanded back to the original full-space problem.
+fn try_auxiliary_preprocessed_solve<P: NlpProblem>(
+    problem: &P,
+    options: &SolverOptions,
+    solve_start: Instant,
+    phase: &mut AuxiliaryPreprocessingDiagnostics,
+) -> AuxiliaryPreprocessAttempt {
+    phase.attempted = true;
+    phase.original_variables = problem.num_variables();
+    phase.original_constraints = problem.num_constraints();
+    let phase_start = Instant::now();
+    let problem_dyn = problem as &dyn NlpProblem;
+    let candidate_start = Instant::now();
+    let (candidates, mut diagnostics) =
+        crate::auxiliary_preprocessing::find_presolve_candidates_with_diagnostics(
+            problem_dyn,
+            options.auxiliary_tol,
+        );
+    phase.candidate_detection_time_secs += candidate_start.elapsed().as_secs_f64();
+    if candidates.is_empty() {
+        phase.skipped = true;
+        phase.skip_reason = Some("no accepted auxiliary candidates".to_string());
+        if options.print_level >= 5 && diagnostics.equality_rows > 0 {
+            diagnostics.log_verbose("Auxiliary preprocessing");
+            rip_log!("ripopt: Auxiliary preprocessing skipped: no accepted auxiliary candidates");
+        }
+        finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
+        return AuxiliaryPreprocessAttempt::NoCandidates;
+    }
+
+    if let Some((reason, detail)) = auxiliary_candidate_skip_reason(
+        problem.num_variables(),
+        problem.num_constraints(),
+        &candidates,
+    ) {
+        return skip_auxiliary_phase(
+            "Auxiliary preprocessing",
+            phase,
+            candidates.len(),
+            &mut diagnostics,
+            reason,
+            detail,
+            phase_start,
+            options,
+        );
+    }
+
+    let Some(preprocess_opts) = auxiliary_preprocessing_options(options, solve_start) else {
+        diagnostics.reject_global(
+            crate::auxiliary_preprocessing::AuxiliaryRejectionReason::TimeBudgetExceeded,
+            Some("preprocessing slice could not leave fallback time".to_string()),
+        );
+        if options.print_level >= 5 {
+            diagnostics.log_verbose("Auxiliary preprocessing");
+        }
+        phase.failed = true;
+        finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
+        return AuxiliaryPreprocessAttempt::Failed;
+    };
+
+    let auxiliary_solve_start = Instant::now();
+    let outcome =
+        match crate::auxiliary_preprocessing::solve_auxiliary_blocks(
+            problem_dyn,
+            &candidates,
+            &preprocess_opts,
+            solve_start,
+        )
+        {
+            Ok(outcome) if outcome.blocks_solved > 0 => outcome,
+            Ok(_) => {
+                diagnostics.reject_global(
+                    crate::auxiliary_preprocessing::AuxiliaryRejectionReason::NoBlocksSolved,
+                    None,
+                );
+                if options.print_level >= 5 {
+                    diagnostics.log_verbose("Auxiliary preprocessing");
+                }
+                phase.auxiliary_solve_time_secs += auxiliary_solve_start.elapsed().as_secs_f64();
+                phase.failed = true;
+                finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
+                return AuxiliaryPreprocessAttempt::Failed;
+            }
+            Err(err) => {
+                diagnostics.record_auxiliary_error(&err, options.auxiliary_tol);
+                if options.print_level >= 5 {
+                    diagnostics.log_verbose("Auxiliary preprocessing");
+                    rip_log!("ripopt: Auxiliary preprocessing skipped after failure: {:?}", err);
+                }
+                phase.auxiliary_solve_time_secs += auxiliary_solve_start.elapsed().as_secs_f64();
+                phase.failed = true;
+                finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
+                return AuxiliaryPreprocessAttempt::Failed;
+            }
+        };
+    phase.auxiliary_solve_time_secs += auxiliary_solve_start.elapsed().as_secs_f64();
+    copy_auxiliary_solve_outcome(phase, &outcome);
+    let blocks_solved = outcome.blocks_solved;
+    let max_residual = outcome.max_residual;
+
+    if options.print_level >= 5 {
+        rip_log!(
+            "ripopt: Auxiliary preprocessing solved {} block(s), max residual {:.2e}",
+            blocks_solved,
+            max_residual,
+        );
+    }
+
+    let reduction_start = Instant::now();
+    let reduced =
+        match crate::auxiliary_preprocessing::AuxiliaryReducedProblem::new_with_exact_hessian(
+            problem_dyn,
+            &candidates,
+            outcome.x,
+            !options.hessian_approximation_lbfgs,
+        ) {
+            Ok(reduced) if reduced.did_reduce() => {
+                diagnostics.record_rank_accepted_candidates(&candidates);
+                phase.reduction_build_time_secs += reduction_start.elapsed().as_secs_f64();
+                phase.reduced_variables = reduced.num_variables();
+                phase.reduced_constraints = reduced.num_constraints();
+                phase.removed_variables = reduced.num_fixed();
+                phase.removed_constraints = reduced.num_removed_constraints();
+                reduced
+            }
+            Ok(_) => {
+                phase.reduction_build_time_secs += reduction_start.elapsed().as_secs_f64();
+                diagnostics.reject_global(
+                    crate::auxiliary_preprocessing::AuxiliaryRejectionReason::ReductionDidNotRemoveAnything,
+                    None,
+                );
+                if options.print_level >= 5 {
+                    diagnostics.log_verbose("Auxiliary preprocessing");
+                }
+                phase.failed = true;
+                finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
+                return AuxiliaryPreprocessAttempt::Failed;
+            }
+            Err(err) => {
+                phase.reduction_build_time_secs += reduction_start.elapsed().as_secs_f64();
+                diagnostics.record_auxiliary_error(&err, options.auxiliary_tol);
+                if options.print_level >= 5 {
+                    diagnostics.log_verbose("Auxiliary preprocessing");
+                    rip_log!("ripopt: Auxiliary preprocessing skipped after reduction failure: {:?}", err);
+                }
+                phase.failed = true;
+                finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
+                return AuxiliaryPreprocessAttempt::Failed;
+            }
+        };
+
+    if options.print_level >= 5 {
+        diagnostics.log_verbose("Auxiliary preprocessing");
+        rip_log!(
+            "ripopt: Auxiliary preprocessing reduced problem: {} fixed vars, {} removed constraints ({}x{} -> {}x{})",
+            reduced.num_fixed(),
+            reduced.num_removed_constraints(),
+            problem.num_variables(),
+            problem.num_constraints(),
+            reduced.num_variables(),
+            reduced.num_constraints(),
+        );
+    }
+
+    let nested_preprocessing_start = Instant::now();
+    let prep = crate::preprocessing::PreprocessedProblem::new(&reduced as &dyn NlpProblem, options.bound_push);
+    phase.nested_preprocessing_time_secs += nested_preprocessing_start.elapsed().as_secs_f64();
+    phase.nested_reduced_variables = prep.num_variables();
+    phase.nested_reduced_constraints = prep.num_constraints();
+    phase.nested_fixed_variables = prep.num_fixed();
+    phase.nested_redundant_constraints = prep.num_redundant();
+    if options.print_level >= 5 && prep.did_reduce() {
+        rip_log!(
+            "ripopt: Auxiliary nested preprocessing reduced problem: {} fixed vars, {} redundant constraints ({}x{} -> {}x{})",
+            prep.num_fixed(), prep.num_redundant(),
+            reduced.num_variables(), reduced.num_constraints(),
+            prep.num_variables(), prep.num_constraints(),
+        );
+    }
+
+    let Some(reduced_opts) =
+        auxiliary_reduced_solve_options(options, &preprocess_opts, &reduced, &prep, solve_start)
+    else {
+        diagnostics.reject_global(
+            crate::auxiliary_preprocessing::AuxiliaryRejectionReason::TimeBudgetExceeded,
+            Some("reduced solve slice could not leave fallback time".to_string()),
+        );
+        if options.print_level >= 5 {
+            diagnostics.log_verbose("Auxiliary preprocessing");
+        }
+        phase.failed = true;
+        finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
+        return AuxiliaryPreprocessAttempt::Failed;
+    };
+
+    let reduced_solve_start = Instant::now();
+    let nested_result = solve(&prep, &reduced_opts);
+    phase.reduced_solve_time_secs += reduced_solve_start.elapsed().as_secs_f64();
+    let unmap_start = Instant::now();
+    let stack = crate::reduction_frame::ReductionStack::new()
+        .push(prep.reduction_frame(), &reduced as &dyn NlpProblem)
+        .push(reduced.reduction_frame(), problem_dyn);
+    let mut result = stack.unmap_solution_with_options(&nested_result, Some(options));
+    phase.unmap_time_secs += unmap_start.elapsed().as_secs_f64();
+    if matches!(result.status, SolveStatus::Optimal) {
+        let validation_start = Instant::now();
+        let validation = validate_full_space_result(problem_dyn, &result, options);
+        phase.full_space_validation_time_secs += validation_start.elapsed().as_secs_f64();
+        if let Some(validation) = validation {
+            result.objective = validation.objective;
+            result.constraint_values = validation.constraints;
+            result.diagnostics.final_primal_inf = validation.primal_inf;
+            result.diagnostics.final_dual_inf = validation.dual_inf;
+            phase.solved = true;
+            finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
+            return AuxiliaryPreprocessAttempt::Solved(result);
+        }
+        diagnostics.reject_global(
+            crate::auxiliary_preprocessing::AuxiliaryRejectionReason::FullSpaceValidationFailure,
+            None,
+        );
+        if options.print_level >= 5 {
+            diagnostics.log_verbose("Auxiliary preprocessing");
+            rip_log!(
+                "ripopt: Auxiliary-reduced result validation failed, retrying without auxiliary preprocessing"
+            );
+        }
+    } else {
+        diagnostics.reject_global(
+            crate::auxiliary_preprocessing::AuxiliaryRejectionReason::AuxiliarySolveFailure {
+                status: result.status,
+            },
+            Some("auxiliary-reduced solve did not converge".to_string()),
+        );
+        if options.print_level >= 5 {
+            diagnostics.log_verbose("Auxiliary preprocessing");
+            rip_log!(
+                "ripopt: Auxiliary-reduced solve failed ({:?}), retrying without auxiliary preprocessing",
+                result.status,
+            );
+        }
+    }
+    phase.failed = true;
+    finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
+    AuxiliaryPreprocessAttempt::Failed
+}
+
+/// Auxiliary postsolve attempt: remove objective/inequality-independent
+/// equality recovery variables before the main solve, solve the reduced main
+/// NLP, then recover the removed variables from the equality subsystem in the
+/// context of the reduced solution.
+fn try_auxiliary_postsolve_solve<P: NlpProblem>(
+    problem: &P,
+    options: &SolverOptions,
+    solve_start: Instant,
+    phase: &mut AuxiliaryPreprocessingDiagnostics,
+) -> AuxiliaryPreprocessAttempt {
+    phase.attempted = true;
+    phase.original_variables = problem.num_variables();
+    phase.original_constraints = problem.num_constraints();
+    let phase_start = Instant::now();
+    let problem_dyn = problem as &dyn NlpProblem;
+    let candidate_start = Instant::now();
+    let (candidates, mut diagnostics) =
+        crate::auxiliary_preprocessing::find_postsolve_candidates_with_diagnostics(
+            problem_dyn,
+            options.auxiliary_tol,
+        );
+    phase.candidate_detection_time_secs += candidate_start.elapsed().as_secs_f64();
+    if candidates.is_empty() {
+        phase.skipped = true;
+        phase.skip_reason = Some("no accepted auxiliary postsolve candidates".to_string());
+        if options.print_level >= 5 && diagnostics.equality_rows > 0 {
+            diagnostics.log_verbose("Auxiliary postsolve");
+            rip_log!("ripopt: Auxiliary postsolve skipped: no accepted auxiliary candidates");
+        }
+        finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
+        return AuxiliaryPreprocessAttempt::NoCandidates;
+    }
+
+    if let Some((reason, detail)) = auxiliary_candidate_skip_reason(
+        problem.num_variables(),
+        problem.num_constraints(),
+        &candidates,
+    ) {
+        return skip_auxiliary_phase(
+            "Auxiliary postsolve",
+            phase,
+            candidates.len(),
+            &mut diagnostics,
+            reason,
+            detail,
+            phase_start,
+            options,
+        );
+    }
+
+    let Some(preprocess_opts) = auxiliary_preprocessing_options(options, solve_start) else {
+        diagnostics.reject_global(
+            crate::auxiliary_preprocessing::AuxiliaryRejectionReason::TimeBudgetExceeded,
+            Some("postsolve slice could not leave fallback time".to_string()),
+        );
+        if options.print_level >= 5 {
+            diagnostics.log_verbose("Auxiliary postsolve");
+        }
+        phase.failed = true;
+        finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
+        return AuxiliaryPreprocessAttempt::Failed;
+    };
+
+    let mut x_context = vec![0.0; problem.num_variables()];
+    problem.initial_point(&mut x_context);
+    let reduction_start = Instant::now();
+    let reduced =
+        match crate::auxiliary_preprocessing::AuxiliaryReducedProblem::new_with_exact_hessian(
+            problem_dyn,
+            &candidates,
+            x_context.clone(),
+            !options.hessian_approximation_lbfgs,
+        ) {
+            Ok(reduced) if reduced.did_reduce() => {
+                diagnostics.record_rank_accepted_candidates(&candidates);
+                phase.reduction_build_time_secs += reduction_start.elapsed().as_secs_f64();
+                phase.reduced_variables = reduced.num_variables();
+                phase.reduced_constraints = reduced.num_constraints();
+                phase.removed_variables = reduced.num_fixed();
+                phase.removed_constraints = reduced.num_removed_constraints();
+                reduced
+            }
+            Ok(_) => {
+                phase.reduction_build_time_secs += reduction_start.elapsed().as_secs_f64();
+                diagnostics.reject_global(
+                    crate::auxiliary_preprocessing::AuxiliaryRejectionReason::ReductionDidNotRemoveAnything,
+                    None,
+                );
+                if options.print_level >= 5 {
+                    diagnostics.log_verbose("Auxiliary postsolve");
+                }
+                phase.failed = true;
+                finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
+                return AuxiliaryPreprocessAttempt::Failed;
+            }
+            Err(err) => {
+                phase.reduction_build_time_secs += reduction_start.elapsed().as_secs_f64();
+                diagnostics.record_auxiliary_error(&err, options.auxiliary_tol);
+                if options.print_level >= 5 {
+                    diagnostics.log_verbose("Auxiliary postsolve");
+                    rip_log!("ripopt: Auxiliary postsolve skipped after reduction failure: {:?}", err);
+                }
+                phase.failed = true;
+                finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
+                return AuxiliaryPreprocessAttempt::Failed;
+            }
+        };
+
+    if options.print_level >= 5 {
+        diagnostics.log_verbose("Auxiliary postsolve");
+        rip_log!(
+            "ripopt: Auxiliary postsolve reduced problem: {} recovery vars, {} recovery constraints ({}x{} -> {}x{})",
+            reduced.num_fixed(),
+            reduced.num_removed_constraints(),
+            problem.num_variables(),
+            problem.num_constraints(),
+            reduced.num_variables(),
+            reduced.num_constraints(),
+        );
+    }
+
+    let nested_preprocessing_start = Instant::now();
+    let prep = crate::preprocessing::PreprocessedProblem::new(&reduced as &dyn NlpProblem, options.bound_push);
+    phase.nested_preprocessing_time_secs += nested_preprocessing_start.elapsed().as_secs_f64();
+    phase.nested_reduced_variables = prep.num_variables();
+    phase.nested_reduced_constraints = prep.num_constraints();
+    phase.nested_fixed_variables = prep.num_fixed();
+    phase.nested_redundant_constraints = prep.num_redundant();
+    if options.print_level >= 5 && prep.did_reduce() {
+        rip_log!(
+            "ripopt: Auxiliary postsolve nested preprocessing reduced problem: {} fixed vars, {} redundant constraints ({}x{} -> {}x{})",
+            prep.num_fixed(), prep.num_redundant(),
+            reduced.num_variables(), reduced.num_constraints(),
+            prep.num_variables(), prep.num_constraints(),
+        );
+    }
+
+    let Some(reduced_opts) =
+        auxiliary_reduced_solve_options(options, &preprocess_opts, &reduced, &prep, solve_start)
+    else {
+        diagnostics.reject_global(
+            crate::auxiliary_preprocessing::AuxiliaryRejectionReason::TimeBudgetExceeded,
+            Some("postsolve reduced solve slice could not leave fallback time".to_string()),
+        );
+        if options.print_level >= 5 {
+            diagnostics.log_verbose("Auxiliary postsolve");
+        }
+        phase.failed = true;
+        finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
+        return AuxiliaryPreprocessAttempt::Failed;
+    };
+
+    let reduced_solve_start = Instant::now();
+    let nested_result = solve(&prep, &reduced_opts);
+    phase.reduced_solve_time_secs += reduced_solve_start.elapsed().as_secs_f64();
+    let unmap_start = Instant::now();
+    let standard_stack = crate::reduction_frame::ReductionStack::new()
+        .push(prep.reduction_frame(), &reduced as &dyn NlpProblem);
+    let auxiliary_result = standard_stack.unmap_solution_with_options(&nested_result, Some(options));
+    phase.unmap_time_secs += unmap_start.elapsed().as_secs_f64();
+    if !matches!(auxiliary_result.status, SolveStatus::Optimal) {
+        diagnostics.reject_global(
+            crate::auxiliary_preprocessing::AuxiliaryRejectionReason::AuxiliarySolveFailure {
+                status: auxiliary_result.status,
+            },
+            Some("auxiliary-postsolve reduced solve did not converge".to_string()),
+        );
+        if options.print_level >= 5 {
+            diagnostics.log_verbose("Auxiliary postsolve");
+            rip_log!(
+                "ripopt: Auxiliary-postsolve reduced solve failed ({:?}), retrying without auxiliary postsolve",
+                auxiliary_result.status,
+            );
+        }
+        phase.failed = true;
+        finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
+        return AuxiliaryPreprocessAttempt::Failed;
+    }
+
+    let unmap_start = Instant::now();
+    let partial_stack = crate::reduction_frame::ReductionStack::new()
+        .push(prep.reduction_frame(), &reduced as &dyn NlpProblem)
+        .push(reduced.reduction_frame(), problem_dyn);
+    let partial = partial_stack.unmap_solution_with_options(&nested_result, Some(options));
+    phase.unmap_time_secs += unmap_start.elapsed().as_secs_f64();
+    x_context = partial.x;
+    let recovery_solve_start = Instant::now();
+    let outcome = match crate::auxiliary_preprocessing::solve_auxiliary_blocks_from(
+        problem_dyn,
+        &candidates,
+        &preprocess_opts,
+        solve_start,
+        &mut x_context,
+    ) {
+        Ok(outcome) if outcome.blocks_solved > 0 => outcome,
+        Ok(_) => {
+            diagnostics.reject_global(
+                crate::auxiliary_preprocessing::AuxiliaryRejectionReason::NoBlocksSolved,
+                None,
+            );
+            if options.print_level >= 5 {
+                diagnostics.log_verbose("Auxiliary postsolve");
+            }
+            phase.recovery_solve_time_secs += recovery_solve_start.elapsed().as_secs_f64();
+            phase.failed = true;
+            finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
+            return AuxiliaryPreprocessAttempt::Failed;
+        }
+        Err(err) => {
+            diagnostics.record_auxiliary_error(&err, options.auxiliary_tol);
+            if options.print_level >= 5 {
+                diagnostics.log_verbose("Auxiliary postsolve");
+                rip_log!("ripopt: Auxiliary postsolve recovery failed: {:?}", err);
+            }
+            phase.recovery_solve_time_secs += recovery_solve_start.elapsed().as_secs_f64();
+            phase.failed = true;
+            finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
+            return AuxiliaryPreprocessAttempt::Failed;
+        }
+    };
+    phase.recovery_solve_time_secs += recovery_solve_start.elapsed().as_secs_f64();
+    copy_auxiliary_solve_outcome(phase, &outcome);
+
+    if options.print_level >= 5 {
+        rip_log!(
+            "ripopt: Auxiliary postsolve recovered {} block(s), max residual {:.2e}",
+            outcome.blocks_solved,
+            outcome.max_residual,
+        );
+    }
+
+    let reduction_start = Instant::now();
+    let recovered_reduced =
+        match crate::auxiliary_preprocessing::AuxiliaryReducedProblem::new_with_exact_hessian(
+            problem_dyn,
+            &candidates,
+            outcome.x,
+            !options.hessian_approximation_lbfgs,
+        ) {
+            Ok(reduced) => {
+                phase.reduction_build_time_secs += reduction_start.elapsed().as_secs_f64();
+                reduced
+            }
+            Err(err) => {
+                phase.reduction_build_time_secs += reduction_start.elapsed().as_secs_f64();
+                diagnostics.record_auxiliary_error(&err, options.auxiliary_tol);
+                if options.print_level >= 5 {
+                    diagnostics.log_verbose("Auxiliary postsolve");
+                    rip_log!("ripopt: Auxiliary postsolve skipped after recovery validation failure: {:?}", err);
+                }
+                phase.failed = true;
+                finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
+                return AuxiliaryPreprocessAttempt::Failed;
+            }
+        };
+    let unmap_start = Instant::now();
+    let recovered_stack = crate::reduction_frame::ReductionStack::new()
+        .push(prep.reduction_frame(), &reduced as &dyn NlpProblem)
+        .push(recovered_reduced.reduction_frame(), problem_dyn);
+    let mut result = recovered_stack.unmap_solution_with_options(&nested_result, Some(options));
+    phase.unmap_time_secs += unmap_start.elapsed().as_secs_f64();
+    let validation_start = Instant::now();
+    let validation = validate_full_space_result(problem_dyn, &result, options);
+    phase.full_space_validation_time_secs += validation_start.elapsed().as_secs_f64();
+    if let Some(validation) = validation {
+        result.objective = validation.objective;
+        result.constraint_values = validation.constraints;
+        result.diagnostics.final_primal_inf = validation.primal_inf;
+        result.diagnostics.final_dual_inf = validation.dual_inf;
+        phase.solved = true;
+        finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
+        return AuxiliaryPreprocessAttempt::Solved(result);
+    }
+    diagnostics.reject_global(
+        crate::auxiliary_preprocessing::AuxiliaryRejectionReason::FullSpaceValidationFailure,
+        None,
+    );
+    if options.print_level >= 5 {
+        diagnostics.log_verbose("Auxiliary postsolve");
+        rip_log!(
+            "ripopt: Auxiliary-postsolve result validation failed, retrying without auxiliary postsolve"
+        );
+    }
+    phase.failed = true;
+    finish_auxiliary_diagnostics(phase, candidates.len(), &diagnostics, phase_start);
+    AuxiliaryPreprocessAttempt::Failed
+}
 
 /// Run preprocessing (fixed-variable and redundant-constraint elimination)
 /// and, if it reduces the problem, recursively solve the smaller problem
@@ -2242,14 +3114,23 @@ impl SolverState {
 /// This mirrors Ipopt 3.14's `TNLPAdapter` forward-pass behavior: when
 /// the adapter eliminates fixed variables, it commits to the reduced
 /// problem — there is no retry-on-failure with the unreduced problem.
-fn try_preprocessed_solve<P: NlpProblem>(
+fn try_standard_preprocessed_solve<P: NlpProblem>(
     problem: &P,
     options: &SolverOptions,
+    diagnostics: &mut StandardPreprocessingDiagnostics,
 ) -> Option<SolveResult> {
     let make_parameter = matches!(
         options.fixed_variable_treatment,
         FixedVariableTreatment::MakeParameter
     );
+    if !options.enable_preprocessing && !make_parameter {
+        return None;
+    }
+    diagnostics.attempted = true;
+    diagnostics.original_variables = problem.num_variables();
+    diagnostics.original_constraints = problem.num_constraints();
+    let total_start = Instant::now();
+    let construction_start = Instant::now();
     let prep = if options.enable_preprocessing {
         crate::preprocessing::PreprocessedProblem::new(
             problem as &dyn NlpProblem,
@@ -2261,11 +3142,18 @@ fn try_preprocessed_solve<P: NlpProblem>(
         // Ipopt 3.14's `TNLPAdapter` behavior.
         crate::preprocessing::PreprocessedProblem::new_fixed_only(problem as &dyn NlpProblem)
     } else {
-        return None;
+        unreachable!("standard preprocessing precondition checked above");
     };
+    diagnostics.construction_time_secs += construction_start.elapsed().as_secs_f64();
+    diagnostics.reduced_variables = prep.num_variables();
+    diagnostics.reduced_constraints = prep.num_constraints();
+    diagnostics.fixed_variables = prep.num_fixed();
+    diagnostics.redundant_constraints = prep.num_redundant();
     if !prep.did_reduce() {
+        diagnostics.total_time_secs += total_start.elapsed().as_secs_f64();
         return None;
     }
+    diagnostics.did_reduce = true;
     if options.print_level >= 5 {
         rip_log!(
             "ripopt: Preprocessing reduced problem: {} fixed vars, {} redundant constraints ({}x{} -> {}x{})",
@@ -2276,8 +3164,54 @@ fn try_preprocessed_solve<P: NlpProblem>(
     }
     let mut prep_opts = options.clone();
     prep_opts.enable_preprocessing = false;
+    let reduced_solve_start = Instant::now();
     let reduced_result = solve(&prep, &prep_opts);
-    Some(prep.unmap_solution(&reduced_result))
+    diagnostics.reduced_solve_time_secs += reduced_solve_start.elapsed().as_secs_f64();
+    let unmap_start = Instant::now();
+    let result = prep.unmap_solution(&reduced_result);
+    diagnostics.unmap_time_secs += unmap_start.elapsed().as_secs_f64();
+    diagnostics.total_time_secs += total_start.elapsed().as_secs_f64();
+    Some(result)
+}
+
+/// Run preprocessing (presolve auxiliary equality-block reduction, postsolve
+/// auxiliary equality recovery, then fixed-variable and redundant-constraint
+/// elimination)
+/// and, if it reduces the problem, recursively `solve` the smaller problem.
+/// Auxiliary reductions must validate in the full space before being returned;
+/// the standard fixed/redundant preprocessor keeps upstream's commit-to-reduced
+/// behavior.
+fn try_preprocessed_solve<P: NlpProblem>(
+    problem: &P,
+    options: &SolverOptions,
+    solve_start: Instant,
+    diagnostics: &mut PreprocessingDiagnostics,
+) -> Option<SolveResult> {
+    if options.enable_preprocessing {
+        if let AuxiliaryPreprocessAttempt::Solved(result) =
+            try_auxiliary_preprocessed_solve(
+                problem,
+                options,
+                solve_start,
+                &mut diagnostics.presolve,
+            )
+        {
+            return Some(result);
+        }
+
+        if let AuxiliaryPreprocessAttempt::Solved(result) =
+            try_auxiliary_postsolve_solve(
+                problem,
+                options,
+                solve_start,
+                &mut diagnostics.postsolve,
+            )
+        {
+            return Some(result);
+        }
+    }
+
+    try_standard_preprocessed_solve(problem, options, &mut diagnostics.standard)
 }
 
 /// Compute the accepted step length and resulting θ for one Gauss–Newton
@@ -2349,10 +3283,19 @@ fn solve_inner<P: NlpProblem>(
     options: &SolverOptions,
     solve_start: Instant,
 ) -> SolveResult {
-    if let Some(result) = try_preprocessed_solve(problem, options) {
+    let mut preprocessing_diagnostics = PreprocessingDiagnostics::default();
+    if let Some(mut result) =
+        try_preprocessed_solve(problem, options, solve_start, &mut preprocessing_diagnostics)
+    {
+        result.diagnostics.preprocessing = preprocessing_diagnostics;
+        result.diagnostics.wall_time_secs = solve_start.elapsed().as_secs_f64();
+        if options.print_level >= 4 {
+            print_final_summary(&result);
+        }
         return result;
     }
     let mut result = solve_ipm(problem, options);
+    result.diagnostics.preprocessing = preprocessing_diagnostics;
     result.diagnostics.wall_time_secs = solve_start.elapsed().as_secs_f64();
     if options.print_level >= 4 {
         print_final_summary(&result);
@@ -6624,28 +7567,39 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 let i = state.bound_layout.x_u_to_full[k];
                 grad_lag[i] += state.z_u_compressed[k];
             }
-            let (gl_idx, gl_inf) = grad_lag.iter().enumerate().fold(
-                (0usize, 0.0f64),
-                |(ai, av), (i, &v)| if v.abs() > av { (i, v.abs()) } else { (ai, av) },
-            );
-            let x_l_fin = state.x_l_at(gl_idx).is_finite();
-            let x_u_fin = state.x_u_at(gl_idx).is_finite();
             let x_inf = state.x.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
-            rip_log!(
-                "ripopt: iter0-probe: |grad_f|_inf={:.3e}@var{}, |J^T y|_inf={:.3e}, |y|_inf={:.3e}, |z_L|_inf={:.3e}, |z_U|_inf={:.3e}, sum|y|={:.3e}, sum|z_L|={:.3e}, sum|z_U|={:.3e}, |x|_inf={:.3e}, n={} m={}",
-                gf_inf, gf_inf_idx, jty_inf, y_inf, zl_inf, zu_inf, y_sum, zl_sum, zu_sum, x_inf, state.n, state.m
-            );
-            // Phase 6d.3: gl_idx may or may not have a compressed slot.
-            let zl_at_gl = state.bound_layout.full_to_x_l[gl_idx]
-                .map(|k| state.z_l_compressed[k])
-                .unwrap_or(0.0);
-            let zu_at_gl = state.bound_layout.full_to_x_u[gl_idx]
-                .map(|k| state.z_u_compressed[k])
-                .unwrap_or(0.0);
-            rip_log!(
-                "ripopt: iter0-probe: |grad_lag|_inf={:.3e}@var{} (grad_f={:.3e}, J^T y={:.3e}, z_L={:.3e}, z_U={:.3e}, x_l_fin={}, x_u_fin={}, obj_scaling={:.3e})",
-                gl_inf, gl_idx, state.grad_f[gl_idx], jty[gl_idx], zl_at_gl, zu_at_gl, x_l_fin, x_u_fin, state.obj_scaling
-            );
+            if state.n == 0 {
+                rip_log!(
+                    "ripopt: iter0-probe: |grad_f|_inf={:.3e}@var-, |J^T y|_inf={:.3e}, |y|_inf={:.3e}, |z_L|_inf={:.3e}, |z_U|_inf={:.3e}, sum|y|={:.3e}, sum|z_L|={:.3e}, sum|z_U|={:.3e}, |x|_inf={:.3e}, n={} m={}",
+                    gf_inf, jty_inf, y_inf, zl_inf, zu_inf, y_sum, zl_sum, zu_sum, x_inf, state.n, state.m
+                );
+                rip_log!(
+                    "ripopt: iter0-probe: |grad_lag|_inf=0.000e0@var- (empty variable space, obj_scaling={:.3e})",
+                    state.obj_scaling
+                );
+            } else {
+                let (gl_idx, gl_inf) = grad_lag.iter().enumerate().fold(
+                    (0usize, 0.0f64),
+                    |(ai, av), (i, &v)| if v.abs() > av { (i, v.abs()) } else { (ai, av) },
+                );
+                let x_l_fin = state.x_l_at(gl_idx).is_finite();
+                let x_u_fin = state.x_u_at(gl_idx).is_finite();
+                rip_log!(
+                    "ripopt: iter0-probe: |grad_f|_inf={:.3e}@var{}, |J^T y|_inf={:.3e}, |y|_inf={:.3e}, |z_L|_inf={:.3e}, |z_U|_inf={:.3e}, sum|y|={:.3e}, sum|z_L|={:.3e}, sum|z_U|={:.3e}, |x|_inf={:.3e}, n={} m={}",
+                    gf_inf, gf_inf_idx, jty_inf, y_inf, zl_inf, zu_inf, y_sum, zl_sum, zu_sum, x_inf, state.n, state.m
+                );
+                // Phase 6d.3: gl_idx may or may not have a compressed slot.
+                let zl_at_gl = state.bound_layout.full_to_x_l[gl_idx]
+                    .map(|k| state.z_l_compressed[k])
+                    .unwrap_or(0.0);
+                let zu_at_gl = state.bound_layout.full_to_x_u[gl_idx]
+                    .map(|k| state.z_u_compressed[k])
+                    .unwrap_or(0.0);
+                rip_log!(
+                    "ripopt: iter0-probe: |grad_lag|_inf={:.3e}@var{} (grad_f={:.3e}, J^T y={:.3e}, z_L={:.3e}, z_U={:.3e}, x_l_fin={}, x_u_fin={}, obj_scaling={:.3e})",
+                    gl_inf, gl_idx, state.grad_f[gl_idx], jty[gl_idx], zl_at_gl, zu_at_gl, x_l_fin, x_u_fin, state.obj_scaling
+                );
+            }
 
             // Per-component multiplier dump for diffing against Ipopt's
             // file_print_level=8 output (curr_y_c / curr_y_d / curr_z_L /
@@ -10844,6 +11798,8 @@ fn make_result(state: &SolverState, status: SolveStatus) -> SolveResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CStr;
+    use std::os::raw::{c_char, c_void};
 
     // Build a minimal SolverState for testing private mu/complementarity helpers.
     // The caller supplies only fields the test exercises; everything else is zeroed.
@@ -10944,6 +11900,714 @@ mod tests {
             n_jac_evals: 0,
             n_hess_evals: 0,
         }
+    }
+
+    struct UnusedProblem;
+
+    impl NlpProblem for UnusedProblem {
+        fn num_variables(&self) -> usize { panic!("preprocessing-disabled path should not inspect the problem") }
+        fn num_constraints(&self) -> usize { panic!("preprocessing-disabled path should not inspect the problem") }
+        fn bounds(&self, _x_l: &mut [f64], _x_u: &mut [f64]) {
+            panic!("preprocessing-disabled path should not inspect the problem")
+        }
+        fn constraint_bounds(&self, _g_l: &mut [f64], _g_u: &mut [f64]) {
+            panic!("preprocessing-disabled path should not inspect the problem")
+        }
+        fn initial_point(&self, _x0: &mut [f64]) {
+            panic!("preprocessing-disabled path should not inspect the problem")
+        }
+        fn objective(&self, _x: &[f64], _new_x: bool, _obj: &mut f64) -> bool {
+            panic!("preprocessing-disabled path should not inspect the problem")
+        }
+        fn gradient(&self, _x: &[f64], _new_x: bool, _grad: &mut [f64]) -> bool {
+            panic!("preprocessing-disabled path should not inspect the problem")
+        }
+        fn constraints(&self, _x: &[f64], _new_x: bool, _g: &mut [f64]) -> bool {
+            panic!("preprocessing-disabled path should not inspect the problem")
+        }
+        fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            panic!("preprocessing-disabled path should not inspect the problem")
+        }
+        fn jacobian_values(&self, _x: &[f64], _new_x: bool, _vals: &mut [f64]) -> bool {
+            panic!("preprocessing-disabled path should not inspect the problem")
+        }
+        fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            panic!("preprocessing-disabled path should not inspect the problem")
+        }
+        fn hessian_values(
+            &self,
+            _x: &[f64],
+            _new_x: bool,
+            _obj_factor: f64,
+            _lambda: &[f64],
+            _vals: &mut [f64],
+        ) -> bool {
+            panic!("preprocessing-disabled path should not inspect the problem")
+        }
+    }
+
+    struct ValidationProblem;
+
+    impl NlpProblem for ValidationProblem {
+        fn num_variables(&self) -> usize { 1 }
+        fn num_constraints(&self) -> usize { 1 }
+
+        fn bounds(&self, x_l: &mut [f64], x_u: &mut [f64]) {
+            x_l[0] = f64::NEG_INFINITY;
+            x_u[0] = f64::INFINITY;
+        }
+
+        fn constraint_bounds(&self, g_l: &mut [f64], g_u: &mut [f64]) {
+            g_l[0] = 1.0;
+            g_u[0] = 1.0;
+        }
+
+        fn initial_point(&self, x0: &mut [f64]) {
+            x0[0] = 0.0;
+        }
+
+        fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+            *obj = x[0] * x[0];
+            true
+        }
+
+        fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
+            grad[0] = 2.0 * x[0];
+            true
+        }
+
+        fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
+            g[0] = x[0];
+            true
+        }
+
+        fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            (vec![0], vec![0])
+        }
+
+        fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
+            vals[0] = 1.0;
+            true
+        }
+
+        fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            (vec![0], vec![0])
+        }
+
+        fn hessian_values(
+            &self,
+            _x: &[f64],
+            _new_x: bool,
+            obj_factor: f64,
+            _lambda: &[f64],
+            vals: &mut [f64],
+        ) -> bool {
+            vals[0] = 2.0 * obj_factor;
+            true
+        }
+    }
+
+    fn validation_result(x: f64) -> SolveResult {
+        SolveResult {
+            x: vec![x],
+            objective: f64::NAN,
+            constraint_multipliers: vec![-2.0 * x],
+            bound_multipliers_lower: vec![0.0],
+            bound_multipliers_upper: vec![0.0],
+            constraint_values: vec![f64::NAN],
+            status: SolveStatus::Optimal,
+            iterations: 0,
+            diagnostics: SolverDiagnostics::default(),
+        }
+    }
+
+    struct FalsePositivePostsolveProblem;
+
+    impl NlpProblem for FalsePositivePostsolveProblem {
+        fn num_variables(&self) -> usize { 2 }
+        fn num_constraints(&self) -> usize { 1 }
+
+        fn bounds(&self, x_l: &mut [f64], x_u: &mut [f64]) {
+            x_l.fill(f64::NEG_INFINITY);
+            x_u.fill(f64::INFINITY);
+        }
+
+        fn constraint_bounds(&self, g_l: &mut [f64], g_u: &mut [f64]) {
+            g_l[0] = 0.0;
+            g_u[0] = 0.0;
+        }
+
+        fn initial_point(&self, x0: &mut [f64]) {
+            x0[0] = 0.5;
+            x0[1] = 0.0;
+        }
+
+        fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+            *obj = (x[0] - 2.0) * (x[0] - 2.0)
+                + 100.0 * x[1] * x[1] * (x[1] - 1.0) * (x[1] - 1.0);
+            true
+        }
+
+        fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
+            grad[0] = 2.0 * (x[0] - 2.0);
+            grad[1] = 200.0 * x[1] * (x[1] - 1.0) * (2.0 * x[1] - 1.0);
+            true
+        }
+
+        fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
+            g[0] = x[1] - x[0];
+            true
+        }
+
+        fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            (vec![0, 0], vec![0, 1])
+        }
+
+        fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
+            vals[0] = -1.0;
+            vals[1] = 1.0;
+            true
+        }
+
+        fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            (vec![0, 1], vec![0, 1])
+        }
+
+        fn hessian_values(
+            &self,
+            x: &[f64],
+            _new_x: bool,
+            obj_factor: f64,
+            _lambda: &[f64],
+            vals: &mut [f64],
+        ) -> bool {
+            vals[0] = 2.0 * obj_factor;
+            vals[1] = obj_factor * (1200.0 * x[1] * x[1] - 1200.0 * x[1] + 200.0);
+            true
+        }
+    }
+
+    fn false_positive_postsolve_result() -> SolveResult {
+        SolveResult {
+            x: vec![2.0, 2.0],
+            objective: 400.0,
+            constraint_multipliers: vec![-1200.0],
+            bound_multipliers_lower: vec![0.0, 0.0],
+            bound_multipliers_upper: vec![0.0, 0.0],
+            constraint_values: vec![0.0],
+            status: SolveStatus::Optimal,
+            iterations: 0,
+            diagnostics: SolverDiagnostics::default(),
+        }
+    }
+
+    struct AuxNestedPreprocessProblem;
+
+    impl NlpProblem for AuxNestedPreprocessProblem {
+        fn num_variables(&self) -> usize { 3 }
+        fn num_constraints(&self) -> usize { 1 }
+
+        fn bounds(&self, x_l: &mut [f64], x_u: &mut [f64]) {
+            x_l[0] = f64::NEG_INFINITY;
+            x_u[0] = f64::INFINITY;
+            x_l[1] = f64::NEG_INFINITY;
+            x_u[1] = f64::INFINITY;
+            x_l[2] = 4.0;
+            x_u[2] = 4.0;
+        }
+
+        fn constraint_bounds(&self, g_l: &mut [f64], g_u: &mut [f64]) {
+            g_l[0] = 0.0;
+            g_u[0] = 0.0;
+        }
+
+        fn initial_point(&self, x0: &mut [f64]) {
+            x0[0] = 0.0;
+            x0[1] = 0.0;
+            x0[2] = 4.0;
+        }
+
+        fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+            *obj = (x[1] - 3.0) * (x[1] - 3.0) + (x[2] - 4.0) * (x[2] - 4.0);
+            true
+        }
+
+        fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
+            grad[0] = 0.0;
+            grad[1] = 2.0 * (x[1] - 3.0);
+            grad[2] = 2.0 * (x[2] - 4.0);
+            true
+        }
+
+        fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
+            g[0] = x[0] - 2.0;
+            true
+        }
+
+        fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            (vec![0], vec![0])
+        }
+
+        fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
+            vals[0] = 1.0;
+            true
+        }
+
+        fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            (vec![1, 2], vec![1, 2])
+        }
+
+        fn hessian_values(
+            &self,
+            _x: &[f64],
+            _new_x: bool,
+            obj_factor: f64,
+            _lambda: &[f64],
+            vals: &mut [f64],
+        ) -> bool {
+            vals[0] = 2.0 * obj_factor;
+            vals[1] = 2.0 * obj_factor;
+            true
+        }
+    }
+
+    struct AuxEliminatesAllProblem;
+
+    impl NlpProblem for AuxEliminatesAllProblem {
+        fn num_variables(&self) -> usize { 1 }
+        fn num_constraints(&self) -> usize { 1 }
+
+        fn bounds(&self, x_l: &mut [f64], x_u: &mut [f64]) {
+            x_l[0] = f64::NEG_INFINITY;
+            x_u[0] = f64::INFINITY;
+        }
+
+        fn constraint_bounds(&self, g_l: &mut [f64], g_u: &mut [f64]) {
+            g_l[0] = 0.0;
+            g_u[0] = 0.0;
+        }
+
+        fn initial_point(&self, x0: &mut [f64]) {
+            x0[0] = 0.0;
+        }
+
+        fn objective(&self, _x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+            *obj = 0.0;
+            true
+        }
+
+        fn gradient(&self, _x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
+            grad[0] = 0.0;
+            true
+        }
+
+        fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
+            g[0] = x[0] - 2.0;
+            true
+        }
+
+        fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            (vec![0], vec![0])
+        }
+
+        fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
+            vals[0] = 1.0;
+            true
+        }
+
+        fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            (Vec::new(), Vec::new())
+        }
+
+        fn hessian_values(
+            &self,
+            _x: &[f64],
+            _new_x: bool,
+            _obj_factor: f64,
+            _lambda: &[f64],
+            _vals: &mut [f64],
+        ) -> bool {
+            true
+        }
+    }
+
+    struct ManyIndependentAuxiliaryBlocksProblem {
+        total_variables: usize,
+        equality_blocks: usize,
+    }
+
+    impl NlpProblem for ManyIndependentAuxiliaryBlocksProblem {
+        fn num_variables(&self) -> usize { self.total_variables }
+        fn num_constraints(&self) -> usize { self.equality_blocks }
+
+        fn bounds(&self, x_l: &mut [f64], x_u: &mut [f64]) {
+            x_l.fill(f64::NEG_INFINITY);
+            x_u.fill(f64::INFINITY);
+        }
+
+        fn constraint_bounds(&self, g_l: &mut [f64], g_u: &mut [f64]) {
+            for row in 0..self.equality_blocks {
+                g_l[row] = 0.0;
+                g_u[row] = 0.0;
+            }
+        }
+
+        fn initial_point(&self, x0: &mut [f64]) {
+            x0.fill(0.0);
+        }
+
+        fn objective(&self, _x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+            *obj = 0.0;
+            true
+        }
+
+        fn gradient(&self, _x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
+            grad.fill(0.0);
+            true
+        }
+
+        fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
+            for row in 0..self.equality_blocks {
+                g[row] = x[row] - 1.0;
+            }
+            true
+        }
+
+        fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            (
+                (0..self.equality_blocks).collect(),
+                (0..self.equality_blocks).collect(),
+            )
+        }
+
+        fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
+            vals.fill(1.0);
+            true
+        }
+
+        fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            (Vec::new(), Vec::new())
+        }
+
+        fn hessian_values(
+            &self,
+            _x: &[f64],
+            _new_x: bool,
+            _obj_factor: f64,
+            _lambda: &[f64],
+            _vals: &mut [f64],
+        ) -> bool {
+            true
+        }
+    }
+
+    fn candidate_shape(
+        candidate_count: usize,
+        block_count: usize,
+    ) -> Vec<crate::auxiliary_preprocessing::PresolveCandidate> {
+        let mut candidates = Vec::new();
+        let mut next = 0;
+        for candidate_index in 0..candidate_count {
+            let remaining_candidates = candidate_count - candidate_index;
+            let remaining_blocks = block_count - next;
+            let blocks_this_candidate = remaining_blocks.div_ceil(remaining_candidates);
+            let mut blocks = Vec::new();
+            for _ in 0..blocks_this_candidate {
+                blocks.push(crate::auxiliary_preprocessing::EqualityBlock {
+                    rows: vec![next],
+                    vars: vec![next],
+                });
+                next += 1;
+            }
+            candidates.push(crate::auxiliary_preprocessing::PresolveCandidate { blocks });
+        }
+        candidates
+    }
+
+    unsafe extern "C" fn capture_log(msg: *const c_char, user_data: *mut c_void) {
+        let logs = &mut *(user_data as *mut Vec<String>);
+        logs.push(CStr::from_ptr(msg).to_string_lossy().into_owned());
+    }
+
+    fn collect_auxiliary_preprocessing_logs(print_level: u8) -> Vec<String> {
+        let problem = AuxNestedPreprocessProblem;
+        let options = SolverOptions {
+            print_level,
+            enable_preprocessing: true,
+            max_iter: 100,
+            ..SolverOptions::default()
+        };
+        let mut logs: Vec<String> = Vec::new();
+        crate::logging::set_log_callback(Some((
+            capture_log,
+            &mut logs as *mut Vec<String> as *mut c_void,
+        )));
+        let mut diagnostics = PreprocessingDiagnostics::default();
+        let _ = try_preprocessed_solve(&problem, &options, Instant::now(), &mut diagnostics);
+        crate::logging::set_log_callback(None);
+        logs
+    }
+
+    #[test]
+    fn preprocessing_disabled_bypasses_auxiliary_path() {
+        let problem = UnusedProblem;
+        let options = SolverOptions {
+            enable_preprocessing: false,
+            ..SolverOptions::default()
+        };
+
+        let mut diagnostics = PreprocessingDiagnostics::default();
+        let result = try_preprocessed_solve(&problem, &options, Instant::now(), &mut diagnostics);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn full_space_validation_rejects_recomputed_constraint_violation() {
+        let problem = ValidationProblem;
+        let options = SolverOptions {
+            constr_viol_tol: 1e-4,
+            ..SolverOptions::default()
+        };
+        let result = validation_result(1.01);
+
+        let validation = validate_full_space_result(&problem, &result, &options);
+
+        assert!(validation.is_none());
+    }
+
+    #[test]
+    fn full_space_validation_reports_recomputed_values() {
+        let problem = ValidationProblem;
+        let options = SolverOptions {
+            constr_viol_tol: 1e-4,
+            ..SolverOptions::default()
+        };
+        let result = validation_result(1.00005);
+
+        let validation = validate_full_space_result(&problem, &result, &options)
+            .expect("recomputed full-space point should satisfy constraint tolerance");
+
+        assert!((validation.objective - 1.0001000025).abs() < 1e-12);
+        assert_eq!(validation.constraints.len(), 1);
+        assert!((validation.constraints[0] - 1.00005).abs() < 1e-12);
+        assert!((validation.primal_inf - 5e-5).abs() < 1e-12);
+        assert!(validation.dual_inf < 1e-12);
+    }
+
+    #[test]
+    fn full_space_validation_rejects_postsolve_objective_probe_false_positive() {
+        let problem = FalsePositivePostsolveProblem;
+        let options = SolverOptions {
+            dual_inf_tol: 1.0,
+            ..SolverOptions::default()
+        };
+        let result = false_positive_postsolve_result();
+
+        let validation = validate_full_space_result(&problem, &result, &options);
+
+        assert!(
+            validation.is_none(),
+            "postsolve candidates with large full-space stationarity residual must fall back"
+        );
+    }
+
+    #[test]
+    fn auxiliary_preprocessing_attempt_uses_half_remaining_wall_time() {
+        let options = SolverOptions {
+            max_wall_time: 2.0,
+            ..SolverOptions::default()
+        };
+        let solve_start = Instant::now() - Duration::from_millis(400);
+
+        let attempt_opts = auxiliary_preprocessing_options(&options, solve_start)
+            .expect("remaining time should allow preprocessing attempt");
+        let elapsed = solve_start.elapsed().as_secs_f64();
+        let original_remaining = options.max_wall_time - elapsed;
+        let attempt_remaining = attempt_opts.max_wall_time - elapsed;
+
+        assert!((attempt_remaining - 0.5 * original_remaining).abs() < 0.02);
+    }
+
+    #[test]
+    fn auxiliary_preprocessing_attempt_stops_when_slice_cannot_leave_fallback_time() {
+        let options = SolverOptions {
+            max_wall_time: 0.05,
+            ..SolverOptions::default()
+        };
+
+        let attempt_opts = auxiliary_preprocessing_options(&options, Instant::now());
+
+        assert!(attempt_opts.is_none());
+    }
+
+    #[test]
+    fn auxiliary_cost_gate_matches_known_preprocessing_shapes() {
+        let issue_23 = candidate_shape(1, 13);
+        assert!(auxiliary_candidate_skip_reason(19, 19, &issue_23).is_none());
+
+        let gaslib11_steady = candidate_shape(2, 52);
+        assert!(auxiliary_candidate_skip_reason(204, 200, &gaslib11_steady).is_none());
+
+        let gaslib40_steady = candidate_shape(16, 86);
+        assert!(auxiliary_candidate_skip_reason(1694, 1682, &gaslib40_steady).is_none());
+
+        let gaslib11_dynamic_shape = candidate_shape(106, 278);
+        let skip = auxiliary_candidate_skip_reason(2542, 2492, &gaslib11_dynamic_shape)
+            .expect("large many-block dynamic gas shape should trip the cost gate");
+        assert_eq!(
+            skip.0.label(),
+            crate::auxiliary_preprocessing::AuxiliaryRejectionReason::CostGate.label()
+        );
+        assert!(skip.1.contains("106 candidate group"));
+        assert!(skip.1.contains("278 auxiliary block"));
+    }
+
+    #[test]
+    fn auxiliary_cost_gate_allows_large_useful_many_block_reduction() {
+        let useful_many_block_shape = candidate_shape(900, 900);
+
+        assert!(
+            auxiliary_candidate_skip_reason(1_000, 1_000, &useful_many_block_shape).is_none(),
+            "large many-block reductions that remove most dimensions should be attempted"
+        );
+    }
+
+    #[test]
+    fn auxiliary_cost_gate_skips_many_blocks_before_auxiliary_solves() {
+        let problem = ManyIndependentAuxiliaryBlocksProblem {
+            total_variables: 1_000,
+            equality_blocks: 130,
+        };
+        let options = SolverOptions {
+            print_level: 0,
+            enable_preprocessing: true,
+            max_iter: 100,
+            ..SolverOptions::default()
+        };
+
+        let mut phase = AuxiliaryPreprocessingDiagnostics::default();
+        let attempt =
+            try_auxiliary_preprocessed_solve(&problem, &options, Instant::now(), &mut phase);
+
+        assert!(matches!(attempt, AuxiliaryPreprocessAttempt::NoCandidates));
+        assert!(phase.skipped);
+        assert!(
+            phase
+                .skip_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("cost gate")),
+            "skip_reason={:?}",
+            phase.skip_reason
+        );
+        assert_eq!(phase.candidates, 130);
+        assert_eq!(phase.btd_blocks, 130);
+        assert_eq!(phase.auxiliary_blocks_solved, 0);
+        assert_eq!(phase.auxiliary_iterations, 0);
+        assert_eq!(phase.auxiliary_solve_time_secs, 0.0);
+        assert!(
+            phase
+                .rejection_counts
+                .iter()
+                .any(|entry| entry.reason == "cost gate" && entry.count == 1),
+            "rejection_counts={:?}",
+            phase.rejection_counts
+        );
+    }
+
+    #[test]
+    fn auxiliary_cost_gate_logs_verbose_skip_reason() {
+        let problem = ManyIndependentAuxiliaryBlocksProblem {
+            total_variables: 1_000,
+            equality_blocks: 130,
+        };
+        let options = SolverOptions {
+            print_level: 5,
+            enable_preprocessing: true,
+            max_iter: 100,
+            ..SolverOptions::default()
+        };
+
+        let mut logs: Vec<String> = Vec::new();
+        crate::logging::set_log_callback(Some((
+            capture_log,
+            &mut logs as *mut Vec<String> as *mut c_void,
+        )));
+        let mut phase = AuxiliaryPreprocessingDiagnostics::default();
+        let _ = try_auxiliary_preprocessed_solve(&problem, &options, Instant::now(), &mut phase);
+        crate::logging::set_log_callback(None);
+
+        assert!(
+            logs.iter()
+                .any(|line| line.contains("Auxiliary preprocessing skipped by cost gate")),
+            "logs={logs:?}"
+        );
+    }
+
+    #[test]
+    fn auxiliary_preprocessing_wraps_standard_preprocessor_and_unmaps() {
+        let problem = AuxNestedPreprocessProblem;
+        let options = SolverOptions {
+            print_level: 0,
+            enable_preprocessing: true,
+            max_iter: 100,
+            ..SolverOptions::default()
+        };
+
+        let mut diagnostics = PreprocessingDiagnostics::default();
+        let result = try_preprocessed_solve(&problem, &options, Instant::now(), &mut diagnostics)
+            .expect("auxiliary preprocessing should solve");
+
+        assert_eq!(result.status, SolveStatus::Optimal);
+        assert!((result.x[0] - 2.0).abs() < 1e-8, "x0={}", result.x[0]);
+        assert!((result.x[1] - 3.0).abs() < 1e-6, "x1={}", result.x[1]);
+        assert!((result.x[2] - 4.0).abs() < 1e-12, "x2={}", result.x[2]);
+        assert_eq!(result.constraint_values.len(), 1);
+        assert!(result.constraint_values[0].abs() < 1e-8);
+        assert!(result.diagnostics.final_primal_inf < 1e-8);
+        assert!(diagnostics.presolve.solved);
+        assert!(diagnostics.presolve.total_time_secs > 0.0);
+        assert_eq!(diagnostics.presolve.auxiliary_blocks_solved, 1);
+        assert_eq!(diagnostics.presolve.removed_variables, 1);
+    }
+
+    #[test]
+    fn auxiliary_preprocessing_logs_are_verbose_only() {
+        let quiet = collect_auxiliary_preprocessing_logs(4);
+        assert!(
+            !quiet.iter().any(|line| line.contains("Auxiliary preprocessing")),
+            "auxiliary preprocessing logs should be gated at print_level >= 5: {:?}",
+            quiet
+        );
+
+        let verbose = collect_auxiliary_preprocessing_logs(5);
+        assert!(
+            verbose.iter().any(|line| line.contains("Auxiliary preprocessing")),
+            "expected auxiliary preprocessing logs at print_level 5: {:?}",
+            verbose
+        );
+    }
+
+    #[test]
+    fn verbose_auxiliary_preprocessing_handles_empty_reduced_problem() {
+        let problem = AuxEliminatesAllProblem;
+        let options = SolverOptions {
+            print_level: 5,
+            enable_preprocessing: true,
+            max_iter: 100,
+            ..SolverOptions::default()
+        };
+
+        let mut diagnostics = PreprocessingDiagnostics::default();
+        let result = try_preprocessed_solve(&problem, &options, Instant::now(), &mut diagnostics)
+            .expect("auxiliary preprocessing should solve the reduced empty problem");
+
+        assert_eq!(result.status, SolveStatus::Optimal);
+        assert!((result.x[0] - 2.0).abs() < 1e-10);
+        assert!(result.diagnostics.final_primal_inf < 1e-10);
+        assert!(diagnostics.presolve.solved);
+        assert_eq!(diagnostics.presolve.reduced_variables, 0);
+        assert_eq!(diagnostics.presolve.reduced_constraints, 0);
     }
 
     /// Phase 3f test helper: replace the constraint bounds on a
