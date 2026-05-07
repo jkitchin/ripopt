@@ -1,5 +1,93 @@
 use crate::logging::rip_log;
 
+/// Count of preprocessing rejections grouped by reason label.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct PreprocessingRejectionCount {
+    pub reason: String,
+    pub count: usize,
+}
+
+/// Diagnostics for one auxiliary preprocessing attempt, either presolve or
+/// postsolve recovery.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct AuxiliaryPreprocessingDiagnostics {
+    pub attempted: bool,
+    pub solved: bool,
+    pub failed: bool,
+    pub total_time_secs: f64,
+    pub candidate_detection_time_secs: f64,
+    pub incidence_time_secs: f64,
+    pub structural_analysis_time_secs: f64,
+    pub candidate_filter_time_secs: f64,
+    pub auxiliary_solve_time_secs: f64,
+    pub reduction_build_time_secs: f64,
+    pub nested_preprocessing_time_secs: f64,
+    pub reduced_solve_time_secs: f64,
+    pub recovery_solve_time_secs: f64,
+    pub unmap_time_secs: f64,
+    pub full_space_validation_time_secs: f64,
+    pub equality_rows: usize,
+    pub incident_variables: usize,
+    pub connected_components: usize,
+    pub square_components: usize,
+    pub closed_components: usize,
+    pub candidates: usize,
+    pub pure_equality_candidates: usize,
+    pub objective_coupled_candidates: usize,
+    pub inequality_coupled_candidates: usize,
+    pub objective_and_inequality_coupled_candidates: usize,
+    pub btd_blocks: usize,
+    pub rank_accepted_blocks: usize,
+    pub rejected_blocks: usize,
+    pub rejection_counts: Vec<PreprocessingRejectionCount>,
+    pub accepted_block_sizes: Vec<(usize, usize)>,
+    pub auxiliary_blocks_solved: usize,
+    pub auxiliary_max_residual: f64,
+    pub auxiliary_iterations: usize,
+    pub auxiliary_wall_time_secs: f64,
+    pub auxiliary_obj_evals: usize,
+    pub auxiliary_grad_evals: usize,
+    pub auxiliary_constr_evals: usize,
+    pub auxiliary_jac_evals: usize,
+    pub auxiliary_hess_evals: usize,
+    pub original_variables: usize,
+    pub original_constraints: usize,
+    pub reduced_variables: usize,
+    pub reduced_constraints: usize,
+    pub removed_variables: usize,
+    pub removed_constraints: usize,
+    pub nested_reduced_variables: usize,
+    pub nested_reduced_constraints: usize,
+    pub nested_fixed_variables: usize,
+    pub nested_redundant_constraints: usize,
+}
+
+/// Diagnostics for the standard fixed-variable / redundant-constraint
+/// preprocessing wrapper.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct StandardPreprocessingDiagnostics {
+    pub attempted: bool,
+    pub did_reduce: bool,
+    pub total_time_secs: f64,
+    pub construction_time_secs: f64,
+    pub reduced_solve_time_secs: f64,
+    pub unmap_time_secs: f64,
+    pub original_variables: usize,
+    pub original_constraints: usize,
+    pub reduced_variables: usize,
+    pub reduced_constraints: usize,
+    pub fixed_variables: usize,
+    pub redundant_constraints: usize,
+}
+
+/// Preprocessing diagnostics grouped by preprocessing path.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct PreprocessingDiagnostics {
+    pub presolve: AuxiliaryPreprocessingDiagnostics,
+    pub postsolve: AuxiliaryPreprocessingDiagnostics,
+    pub standard: StandardPreprocessingDiagnostics,
+}
+
 /// Status of the solve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum SolveStatus {
@@ -104,6 +192,8 @@ pub struct SolverDiagnostics {
     pub n_constr_evals: usize,
     pub n_jac_evals: usize,
     pub n_hess_evals: usize,
+    /// Timing and structural diagnostics for preprocessing paths.
+    pub preprocessing: PreprocessingDiagnostics,
 }
 
 impl SolverDiagnostics {

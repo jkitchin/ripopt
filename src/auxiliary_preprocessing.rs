@@ -56,6 +56,13 @@ pub(crate) struct AuxiliarySolveOutcome {
     pub(crate) x: Vec<f64>,
     pub(crate) blocks_solved: usize,
     pub(crate) max_residual: f64,
+    pub(crate) total_iterations: usize,
+    pub(crate) total_wall_time_secs: f64,
+    pub(crate) total_obj_evals: usize,
+    pub(crate) total_grad_evals: usize,
+    pub(crate) total_constr_evals: usize,
+    pub(crate) total_jac_evals: usize,
+    pub(crate) total_hess_evals: usize,
 }
 
 #[allow(dead_code)]
@@ -117,7 +124,7 @@ pub(crate) enum AuxiliaryRejectionReason {
 }
 
 impl AuxiliaryRejectionReason {
-    fn label(&self) -> &'static str {
+    pub(crate) fn label(&self) -> &'static str {
         match self {
             Self::EmptyComponent => "empty component",
             Self::NonSquareComponent { .. } => "non-square component",
@@ -149,7 +156,7 @@ pub(crate) struct AuxiliaryRejection {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct AuxiliaryCandidateDiagnostics {
     pub(crate) equality_rows: usize,
     pub(crate) incident_variables: usize,
@@ -164,6 +171,9 @@ pub(crate) struct AuxiliaryCandidateDiagnostics {
     pub(crate) objective_and_inequality_coupled_candidates: usize,
     pub(crate) accepted_blocks: Vec<EqualityBlock>,
     pub(crate) rejections: Vec<AuxiliaryRejection>,
+    pub(crate) incidence_time_secs: f64,
+    pub(crate) structural_analysis_time_secs: f64,
+    pub(crate) candidate_filter_time_secs: f64,
 }
 
 impl AuxiliaryCandidateDiagnostics {
@@ -1017,6 +1027,13 @@ pub(crate) fn solve_auxiliary_blocks_from(
 ) -> Result<AuxiliarySolveOutcome, AuxiliarySolveError> {
     let mut blocks_solved = 0;
     let mut max_residual: f64 = 0.0;
+    let mut total_iterations = 0;
+    let mut total_wall_time_secs = 0.0;
+    let mut total_obj_evals = 0;
+    let mut total_grad_evals = 0;
+    let mut total_constr_evals = 0;
+    let mut total_jac_evals = 0;
+    let mut total_hess_evals = 0;
 
     for candidate in candidates {
         for block in &candidate.blocks {
@@ -1044,6 +1061,13 @@ pub(crate) fn solve_auxiliary_blocks_from(
             }
             blocks_solved += 1;
             max_residual = max_residual.max(residual);
+            total_iterations += result.iterations;
+            total_wall_time_secs += result.diagnostics.wall_time_secs;
+            total_obj_evals += result.diagnostics.n_obj_evals;
+            total_grad_evals += result.diagnostics.n_grad_evals;
+            total_constr_evals += result.diagnostics.n_constr_evals;
+            total_jac_evals += result.diagnostics.n_jac_evals;
+            total_hess_evals += result.diagnostics.n_hess_evals;
         }
     }
 
@@ -1051,6 +1075,13 @@ pub(crate) fn solve_auxiliary_blocks_from(
         x: x_full.to_vec(),
         blocks_solved,
         max_residual,
+        total_iterations,
+        total_wall_time_secs,
+        total_obj_evals,
+        total_grad_evals,
+        total_constr_evals,
+        total_jac_evals,
+        total_hess_evals,
     })
 }
 
@@ -1224,12 +1255,15 @@ pub(crate) fn find_presolve_candidates_with_diagnostics(
     problem: &dyn NlpProblem,
     tol: f64,
 ) -> (Vec<PresolveCandidate>, AuxiliaryCandidateDiagnostics) {
+    let incidence_start = Instant::now();
     let incidence = EqualityIncidence::from_problem(problem, tol);
     let mut diagnostics = AuxiliaryCandidateDiagnostics::from_incidence(&incidence);
+    diagnostics.incidence_time_secs = incidence_start.elapsed().as_secs_f64();
     if incidence.row_global.is_empty() {
         return (Vec::new(), diagnostics);
     }
 
+    let structural_start = Instant::now();
     let selected_rows: Vec<_> = (0..incidence.row_adj_vars.len()).collect();
     let selected_vars: Vec<_> = incidence
         .var_adj_rows
@@ -1237,9 +1271,14 @@ pub(crate) fn find_presolve_candidates_with_diagnostics(
         .enumerate()
         .filter_map(|(var, rows)| (!rows.is_empty()).then_some(var))
         .collect();
+    diagnostics.structural_analysis_time_secs += structural_start.elapsed().as_secs_f64();
+
+    let filter_start = Instant::now();
     let objective_independent = objective_independent_variables(problem, tol);
     let inequality_coupled = variables_in_inequality_rows(problem, tol);
+    diagnostics.candidate_filter_time_secs += filter_start.elapsed().as_secs_f64();
 
+    let structural_start = Instant::now();
     let components = incidence
         .connected_components(&selected_rows, &selected_vars)
         .into_iter()
@@ -1280,6 +1319,7 @@ pub(crate) fn find_presolve_candidates_with_diagnostics(
             }
         }
     }
+    diagnostics.structural_analysis_time_secs += structural_start.elapsed().as_secs_f64();
     (candidates, diagnostics)
 }
 
@@ -1296,14 +1336,20 @@ pub(crate) fn find_postsolve_candidates_with_diagnostics(
     problem: &dyn NlpProblem,
     tol: f64,
 ) -> (Vec<PresolveCandidate>, AuxiliaryCandidateDiagnostics) {
+    let incidence_start = Instant::now();
     let incidence = EqualityIncidence::from_problem(problem, tol);
     let mut diagnostics = AuxiliaryCandidateDiagnostics::from_incidence(&incidence);
+    diagnostics.incidence_time_secs = incidence_start.elapsed().as_secs_f64();
     if incidence.row_global.is_empty() {
         return (Vec::new(), diagnostics);
     }
 
+    let filter_start = Instant::now();
     let objective_independent = objective_independent_variables(problem, tol);
     let inequality_coupled = variables_in_inequality_rows(problem, tol);
+    diagnostics.candidate_filter_time_secs += filter_start.elapsed().as_secs_f64();
+
+    let structural_start = Instant::now();
     let selected_vars: Vec<_> = incidence
         .var_adj_rows
         .iter()
@@ -1316,6 +1362,7 @@ pub(crate) fn find_postsolve_candidates_with_diagnostics(
         })
         .collect();
     if selected_vars.is_empty() {
+        diagnostics.structural_analysis_time_secs += structural_start.elapsed().as_secs_f64();
         return (Vec::new(), diagnostics);
     }
 
@@ -1349,6 +1396,7 @@ pub(crate) fn find_postsolve_candidates_with_diagnostics(
             candidates.push(candidate);
         }
     }
+    diagnostics.structural_analysis_time_secs += structural_start.elapsed().as_secs_f64();
     (candidates, diagnostics)
 }
 

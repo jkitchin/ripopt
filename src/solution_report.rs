@@ -384,5 +384,6 @@ mod tests {
         assert!(json.contains("\"solver\""));
         assert!(json.contains("\"validation\""));
         assert!(json.contains("\"kkt_satisfied\""));
+        assert!(json.contains("\"preprocessing\""));
     }
 }
