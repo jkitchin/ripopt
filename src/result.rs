@@ -14,6 +14,8 @@ pub struct AuxiliaryPreprocessingDiagnostics {
     pub attempted: bool,
     pub solved: bool,
     pub failed: bool,
+    pub skipped: bool,
+    pub skip_reason: Option<String>,
     pub total_time_secs: f64,
     pub candidate_detection_time_secs: f64,
     pub incidence_time_secs: f64,
