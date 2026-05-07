@@ -1,84 +1,84 @@
-   Compiling ripopt v0.8.0-dev (/Users/jkitchin/Dropbox/projects/ripopt)
-    Finished `release` profile [optimized + debuginfo] target(s) in 3m 11s
-     Running unittests src/lib.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/ripopt-f79492db42b63ff7)
+   Compiling ripopt v0.8.0 (/Users/jkitchin/projects/ripopt)
+    Finished `release` profile [optimized + debuginfo] target(s) in 4m 11s
+     Running unittests src/lib.rs (/Users/jkitchin/projects/ripopt/target/release/deps/ripopt-3afed2f3740c7a27)
 
 running 0 tests
 
-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 323 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 315 filtered out; finished in 0.00s
 
-     Running unittests src/bin/ripopt_ampl.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/ripopt-bcf474fa444293f7)
+     Running unittests src/bin/ripopt_ampl.rs (/Users/jkitchin/projects/ripopt/target/release/deps/ripopt-f7c4ea9cc05101c4)
 
 running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-     Running tests/aug_kkt_path.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/aug_kkt_path-8fc4ddc7a6a529ce)
+     Running tests/aug_kkt_path.rs (/Users/jkitchin/projects/ripopt/target/release/deps/aug_kkt_path-21e03e7c614340e8)
 
 running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
 
-     Running tests/c_api.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/c_api-49a319a9bda9896f)
+     Running tests/c_api.rs (/Users/jkitchin/projects/ripopt/target/release/deps/c_api-f338484f5a8a451e)
 
 running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
 
-     Running tests/correctness.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/correctness-e7195c634d42fe33)
+     Running tests/correctness.rs (/Users/jkitchin/projects/ripopt/target/release/deps/correctness-636d25f757535cde)
 
 running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 33 filtered out; finished in 0.00s
 
-     Running tests/electrolyte_thermo.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/electrolyte_thermo-1ac0197a265c8dce)
+     Running tests/electrolyte_thermo.rs (/Users/jkitchin/projects/ripopt/target/release/deps/electrolyte_thermo-1c20ddcd47ae7593)
 
 running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.00s
 
-     Running tests/feral_solvers.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/feral_solvers-20983a1115a38152)
+     Running tests/feral_solvers.rs (/Users/jkitchin/projects/ripopt/target/release/deps/feral_solvers-bb55d2f981d5edfc)
 
 running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
 
-     Running tests/grid.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/grid-e5d9dbd3481df612)
+     Running tests/grid.rs (/Users/jkitchin/projects/ripopt/target/release/deps/grid-52c84171180fca4c)
 
 running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
 
-     Running tests/hs_problems_subset.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/hs_problems_subset-351a8aeebf7033f2)
+     Running tests/hs_problems_subset.rs (/Users/jkitchin/projects/ripopt/target/release/deps/hs_problems_subset-a168d6ec2fa821d5)
 
 running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-     Running tests/hs_regression.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/hs_regression-b6f1dcc861707675)
+     Running tests/hs_regression.rs (/Users/jkitchin/projects/ripopt/target/release/deps/hs_regression-d457e87b4fcab6d7)
 
 running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s
 
-     Running tests/ipm_paths.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/ipm_paths-424c1b86041d1c95)
+     Running tests/ipm_paths.rs (/Users/jkitchin/projects/ripopt/target/release/deps/ipm_paths-f0a665ce21ed26ac)
 
 running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
 
-     Running tests/iterative_solvers.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/iterative_solvers-daf6664dbda396fe)
+     Running tests/iterative_solvers.rs (/Users/jkitchin/projects/ripopt/target/release/deps/iterative_solvers-5c2ed1a306f22d2e)
 
 running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
 
-     Running tests/large_scale.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/large_scale-f0d00ef404678006)
+     Running tests/large_scale.rs (/Users/jkitchin/projects/ripopt/target/release/deps/large_scale-8a65b02ef61b09ad)
 
 running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
 
-     Running tests/large_scale_benchmark.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/large_scale_benchmark-371ea409a3b897c1)
+     Running tests/large_scale_benchmark.rs (/Users/jkitchin/projects/ripopt/target/release/deps/large_scale_benchmark-1927adbdb13020ba)
 
 running 1 test
 
@@ -91,34 +91,33 @@ This program contains Ipopt, a library for large-scale nonlinear optimization.
          For more information visit https://github.com/coin-or/Ipopt
 ******************************************************************************
 
-BENCH: name=Rosenbrock 500, n=500, m=0, ripopt_status=Optimal, ripopt_obj=1.561961e-26, ripopt_iters=751, ripopt_time=0.0925, ipopt_status=Optimal, ipopt_obj=3.520843e-18, ipopt_iters=749, ipopt_time=0.1834, speedup=1.98x
-BENCH: name=Bratu 1K, n=1000, m=998, ripopt_status=Optimal, ripopt_obj=0.000000e0, ripopt_iters=2, ripopt_time=0.0076, ipopt_status=Optimal, ipopt_obj=0.000000e0, ipopt_iters=2, ipopt_time=0.0020, speedup=0.27x
-BENCH: name=SparseQP 1K, n=500, m=500, ripopt_status=Optimal, ripopt_obj=-1.248170e2, ripopt_iters=6, ripopt_time=0.0128, ipopt_status=Optimal, ipopt_obj=-1.248170e2, ipopt_iters=6, ipopt_time=0.0039, speedup=0.30x
-BENCH: name=OptControl 2.5K, n=2499, m=1250, ripopt_status=Optimal, ripopt_obj=1.176959e-1, ripopt_iters=1, ripopt_time=0.0269, ipopt_status=Optimal, ipopt_obj=1.176959e-1, ipopt_iters=1, ipopt_time=0.0026, speedup=0.10x
-BENCH: name=Poisson 2.5K, n=5000, m=2500, ripopt_status=Optimal, ripopt_obj=9.945800e-2, ripopt_iters=1, ripopt_time=5.7768, ipopt_status=Optimal, ipopt_obj=9.945800e-2, ipopt_iters=1, ipopt_time=0.0099, speedup=0.00x
-BENCH: name=Rosenbrock 5K, n=5000, m=0, ripopt_status=MaxIterations, ripopt_obj=2.927492e3, ripopt_iters=2999, ripopt_time=3.6963, ipopt_status=Failed, ipopt_obj=2.926793e3, ipopt_iters=3000, ipopt_time=3.6610, speedup=0.99x
-BENCH: name=Bratu 10K, n=10000, m=9998, ripopt_status=Optimal, ripopt_obj=0.000000e0, ripopt_iters=1, ripopt_time=0.1543, ipopt_status=Optimal, ipopt_obj=0.000000e0, ipopt_iters=2, ipopt_time=0.0117, speedup=0.08x
-BENCH: name=OptControl 20K, n=19999, m=10000, ripopt_status=Optimal, ripopt_obj=1.173789e-1, ripopt_iters=1, ripopt_time=1.2044, ipopt_status=Optimal, ipopt_obj=1.173789e-1, ipopt_iters=1, ipopt_time=0.0197, speedup=0.02x
-test large_scale_vs_ipopt has been running for over 60 seconds
-BENCH: name=Poisson 50K, n=49928, m=24964, ripopt_status=Optimal, ripopt_obj=9.946953e-2, ripopt_iters=1, ripopt_time=4463.8009, ipopt_status=Optimal, ipopt_obj=9.946953e-2, ipopt_iters=1, ipopt_time=0.1208, speedup=0.00x
-BENCH: name=SparseQP 100K, n=50000, m=50000, ripopt_status=Optimal, ripopt_obj=-1.249982e4, ripopt_iters=6, ripopt_time=17.3477, ipopt_status=Optimal, ipopt_obj=-1.249982e4, ipopt_iters=6, ipopt_time=0.2970, speedup=0.02x
+BENCH: name=Rosenbrock 500, n=500, m=0, ripopt_status=Optimal, ripopt_obj=1.561961e-26, ripopt_iters=751, ripopt_time=0.0707, ipopt_status=Optimal, ipopt_obj=3.520843e-18, ipopt_iters=749, ipopt_time=0.1912, speedup=2.71x
+BENCH: name=Bratu 1K, n=1000, m=998, ripopt_status=Optimal, ripopt_obj=0.000000e0, ripopt_iters=2, ripopt_time=0.0033, ipopt_status=Optimal, ipopt_obj=0.000000e0, ipopt_iters=2, ipopt_time=0.0027, speedup=0.80x
+BENCH: name=SparseQP 1K, n=500, m=500, ripopt_status=Optimal, ripopt_obj=-1.248170e2, ripopt_iters=6, ripopt_time=0.0046, ipopt_status=Optimal, ipopt_obj=-1.248170e2, ipopt_iters=6, ipopt_time=0.0039, speedup=0.84x
+BENCH: name=OptControl 2.5K, n=2499, m=1250, ripopt_status=Optimal, ripopt_obj=1.176959e-1, ripopt_iters=1, ripopt_time=0.0136, ipopt_status=Optimal, ipopt_obj=1.176959e-1, ipopt_iters=1, ipopt_time=0.0027, speedup=0.20x
+BENCH: name=Poisson 2.5K, n=5000, m=2500, ripopt_status=Optimal, ripopt_obj=9.945800e-2, ripopt_iters=1, ripopt_time=0.0550, ipopt_status=Optimal, ipopt_obj=9.945800e-2, ipopt_iters=1, ipopt_time=0.0098, speedup=0.18x
+BENCH: name=Rosenbrock 5K, n=5000, m=0, ripopt_status=MaxIterations, ripopt_obj=2.927492e3, ripopt_iters=2999, ripopt_time=2.8965, ipopt_status=Failed, ipopt_obj=2.926793e3, ipopt_iters=3000, ipopt_time=3.6934, speedup=1.28x
+BENCH: name=Bratu 10K, n=10000, m=9998, ripopt_status=Optimal, ripopt_obj=0.000000e0, ripopt_iters=1, ripopt_time=0.1425, ipopt_status=Optimal, ipopt_obj=0.000000e0, ipopt_iters=2, ipopt_time=0.0122, speedup=0.09x
+BENCH: name=OptControl 20K, n=19999, m=10000, ripopt_status=Optimal, ripopt_obj=1.173789e-1, ripopt_iters=1, ripopt_time=0.2959, ipopt_status=Optimal, ipopt_obj=1.173789e-1, ipopt_iters=1, ipopt_time=0.0197, speedup=0.07x
+BENCH: name=Poisson 50K, n=49928, m=24964, ripopt_status=Optimal, ripopt_obj=9.946953e-2, ripopt_iters=1, ripopt_time=2.3213, ipopt_status=Optimal, ipopt_obj=9.946953e-2, ipopt_iters=1, ipopt_time=0.1486, speedup=0.06x
+BENCH: name=SparseQP 100K, n=50000, m=50000, ripopt_status=Optimal, ripopt_obj=-1.249982e4, ripopt_iters=6, ripopt_time=5.5686, ipopt_status=Optimal, ipopt_obj=-1.249982e4, ipopt_iters=6, ipopt_time=0.2945, speedup=0.05x
 test large_scale_vs_ipopt ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4496.43s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.75s
 
-     Running tests/lbfgs_ipm.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/lbfgs_ipm-8c3de5b9f63bb4f0)
+     Running tests/lbfgs_ipm.rs (/Users/jkitchin/projects/ripopt/target/release/deps/lbfgs_ipm-9c0a40a4a7333623)
 
 running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
 
-     Running tests/nl_integration.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/nl_integration-05f4cf47f78e2ada)
+     Running tests/nl_integration.rs (/Users/jkitchin/projects/ripopt/target/release/deps/nl_integration-c71e26d09446fa7a)
 
 running 0 tests
 
-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.00s
 
-     Running tests/sensitivity.rs (/Users/jkitchin/Dropbox/projects/ripopt/target/release/deps/sensitivity-5c5a3dd0794cbf67)
+     Running tests/sensitivity.rs (/Users/jkitchin/projects/ripopt/target/release/deps/sensitivity-82a837a298d276d1)
 
 running 0 tests
 

@@ -14,7 +14,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 8081.526314065173,
+    "ripopt_obj": 8081.526314065147,
     "ipopt_obj": 8081.526314065163,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -24,7 +24,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 576.8924218983483,
+    "ripopt_obj": 576.8924218983685,
     "ipopt_obj": 576.892421898335,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -34,7 +34,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 8081.5262352230975,
+    "ripopt_obj": 8081.52623521994,
     "ipopt_obj": 8081.526236731194,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -44,7 +44,7 @@
     "suite": "CUTEst",
     "ripopt_status": "MaxIterations",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 516.8643201139453,
+    "ripopt_obj": 624.1276214311976,
     "ipopt_obj": 576.892402381318,
     "ripopt_solved": false,
     "ipopt_solved": true
@@ -104,7 +104,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Acceptable",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 33.29877588175277,
+    "ripopt_obj": 33.29877578993084,
     "ipopt_obj": 33.29610895278262,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -114,7 +114,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Acceptable",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 30.491991801031265,
+    "ripopt_obj": 30.491933539189237,
     "ipopt_obj": 30.492605562691978,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -144,7 +144,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 3386.527772571474,
+    "ripopt_obj": 3386.134647248284,
     "ipopt_obj": 3245.240887989833,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -152,7 +152,7 @@
   {
     "name": "ARGAUSS",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -184,7 +184,7 @@
     "suite": "CUTEst",
     "ripopt_status": "MaxIterations",
     "ipopt_status": "MaxIterations",
-    "ripopt_obj": 94680150.139499,
+    "ripopt_obj": 94680150.1394829,
     "ipopt_obj": 94680129.03179865,
     "ripopt_solved": false,
     "ipopt_solved": false
@@ -242,7 +242,7 @@
   {
     "name": "BARDNE",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -254,7 +254,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 259180.33716541796,
+    "ripopt_obj": 259180.3371654243,
     "ipopt_obj": 259180.3371654187,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -332,7 +332,7 @@
   {
     "name": "BIGGS6NE",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "NumericalError",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -354,7 +354,7 @@
     "suite": "CUTEst",
     "ripopt_status": "MaxIterations",
     "ipopt_status": "Timeout",
-    "ripopt_obj": 18238.51686168508,
+    "ripopt_obj": 18238.51686168447,
     "ipopt_obj": null,
     "ripopt_solved": false,
     "ipopt_solved": false
@@ -402,7 +402,7 @@
   {
     "name": "BOXBOD",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -514,7 +514,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -0.9999999999946994,
+    "ripopt_obj": -0.9999999987917948,
     "ipopt_obj": -0.9999999999974828,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -534,7 +534,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.8248917782992529,
+    "ripopt_obj": 0.8248917782992535,
     "ipopt_obj": 0.8248917782992533,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -544,7 +544,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 6.188118811881187,
+    "ripopt_obj": 6.188118811881188,
     "ipopt_obj": 6.188118811881188,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -564,7 +564,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.03256820039325361,
+    "ripopt_obj": 0.03256820039326121,
     "ipopt_obj": 0.03256820039326121,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -574,7 +574,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 4.093023255813991,
+    "ripopt_obj": 4.093023255813922,
     "ipopt_obj": 4.093023255813953,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -584,7 +584,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -45.510550739890625,
+    "ripopt_obj": -3.7047681836394495,
     "ipopt_obj": -3.70476818363945,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -594,7 +594,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 961.7151721300348,
+    "ripopt_obj": 961.715172130052,
     "ipopt_obj": 961.715172130052,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -604,7 +604,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.27704478876226357,
+    "ripopt_obj": 0.2770447887629161,
     "ipopt_obj": 0.27704478876290517,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -614,7 +614,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 306.4999999994131,
+    "ripopt_obj": 306.5,
     "ipopt_obj": 306.5,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -622,11 +622,11 @@
   {
     "name": "BT8",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "Acceptable",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 1.933391301134735,
+    "ripopt_obj": 1.0,
     "ipopt_obj": 1.0000000037252903,
-    "ripopt_solved": false,
+    "ripopt_solved": true,
     "ipopt_solved": true
   },
   {
@@ -634,7 +634,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -1.000000000002107,
+    "ripopt_obj": -1.0000000000031393,
     "ipopt_obj": -1.0000000000031393,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -642,9 +642,9 @@
   {
     "name": "BURKEHAN",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "MaxIterations",
     "ipopt_status": "Infeasible",
-    "ripopt_obj": -2.014565632806675e-10,
+    "ripopt_obj": -0.0002342236082585263,
     "ipopt_obj": -4.078734625091242e-06,
     "ripopt_solved": false,
     "ipopt_solved": false
@@ -654,7 +654,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -4.68330013267038,
+    "ripopt_obj": -4.683300132670379,
     "ipopt_obj": -4.6833001326725,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -674,7 +674,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 1.3399563564501058,
+    "ripopt_obj": 1.3399563561423735,
     "ipopt_obj": 1.339956356142499,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -702,7 +702,7 @@
   {
     "name": "CERI651A",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -762,7 +762,7 @@
   {
     "name": "CERI651D",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -822,7 +822,7 @@
   {
     "name": "CHWIRUT1",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -834,7 +834,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 2384.477139309348,
+    "ripopt_obj": 2384.4771393093497,
     "ipopt_obj": 2384.4771393093497,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -842,7 +842,7 @@
   {
     "name": "CHWIRUT2",
     "suite": "CUTEst",
-    "ripopt_status": "NumericalError",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -894,7 +894,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -6230.795614711617,
+    "ripopt_obj": -6230.795614718794,
     "ipopt_obj": -6230.795614719196,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -904,7 +904,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 27.999999910024925,
+    "ripopt_obj": 27.99999991002493,
     "ipopt_obj": 27.999999910024908,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -934,7 +934,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 91.0562395342668,
+    "ripopt_obj": 91.05623953426644,
     "ipopt_obj": 91.05623953090804,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -942,9 +942,9 @@
   {
     "name": "CRESC100",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "NumericalError",
     "ipopt_status": "Infeasible",
-    "ripopt_obj": 0.2781186902918235,
+    "ripopt_obj": 71772912.62637006,
     "ipopt_obj": -3.4120043127474586e-14,
     "ripopt_solved": false,
     "ipopt_solved": false
@@ -954,7 +954,7 @@
     "suite": "CUTEst",
     "ripopt_status": "MaxIterations",
     "ipopt_status": "Timeout",
-    "ripopt_obj": 10.169095361053616,
+    "ripopt_obj": 3629.534362891328,
     "ipopt_obj": null,
     "ripopt_solved": false,
     "ipopt_solved": false
@@ -962,11 +962,11 @@
   {
     "name": "CRESC4",
     "suite": "CUTEst",
-    "ripopt_status": "RestorationFailed",
+    "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 4.258975600136955,
+    "ripopt_obj": 0.8718975618873632,
     "ipopt_obj": 0.8718975346465687,
-    "ripopt_solved": false,
+    "ripopt_solved": true,
     "ipopt_solved": true
   },
   {
@@ -974,7 +974,7 @@
     "suite": "CUTEst",
     "ripopt_status": "NumericalError",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.613870935657523,
+    "ripopt_obj": 67.57245360861309,
     "ipopt_obj": 0.7862466868539991,
     "ripopt_solved": false,
     "ipopt_solved": true
@@ -984,7 +984,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -49.07520073610804,
+    "ripopt_obj": -49.075200736016505,
     "ipopt_obj": -49.07520073430104,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -994,7 +994,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 55.01760482562212,
+    "ripopt_obj": 55.017604808558744,
     "ipopt_obj": 55.0176048099858,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -1032,7 +1032,7 @@
   {
     "name": "DANIWOOD",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -1052,7 +1052,7 @@
   {
     "name": "DANWOOD",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -1094,7 +1094,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.002713486437319997,
+    "ripopt_obj": 0.0027135020841417053,
     "ipopt_obj": 0.0025694748774262215,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -1124,7 +1124,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 3.0548808971951935,
+    "ripopt_obj": 3.0548808964857748,
     "ipopt_obj": 3.0548808952563182,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -1134,7 +1134,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -30.763999411145996,
+    "ripopt_obj": -30.763999411129664,
     "ipopt_obj": -30.764007520210157,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -1144,7 +1144,7 @@
     "suite": "CUTEst",
     "ripopt_status": "NumericalError",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 174.78697566173147,
+    "ripopt_obj": 174.7869756614382,
     "ipopt_obj": 174.78697568942871,
     "ripopt_solved": false,
     "ipopt_solved": true
@@ -1342,9 +1342,9 @@
   {
     "name": "DIAMON2D",
     "suite": "CUTEst",
-    "ripopt_status": "Timeout",
+    "ripopt_status": "MaxIterations",
     "ipopt_status": "IpoptStatus(-10)",
-    "ripopt_obj": null,
+    "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
     "ripopt_solved": false,
     "ipopt_solved": false
@@ -1354,7 +1354,7 @@
     "suite": "CUTEst",
     "ripopt_status": "MaxIterations",
     "ipopt_status": "Timeout",
-    "ripopt_obj": 675.9493657978975,
+    "ripopt_obj": 676.74454340359,
     "ipopt_obj": null,
     "ripopt_solved": false,
     "ipopt_solved": false
@@ -1374,7 +1374,7 @@
     "suite": "CUTEst",
     "ripopt_status": "MaxIterations",
     "ipopt_status": "Timeout",
-    "ripopt_obj": 257.3601525621039,
+    "ripopt_obj": 255.51673267201795,
     "ipopt_obj": null,
     "ripopt_solved": false,
     "ipopt_solved": false
@@ -1384,7 +1384,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 680.6300573593387,
+    "ripopt_obj": 680.6300573595671,
     "ipopt_obj": 680.6300573593387,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -1394,7 +1394,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 1.5625000025415263,
+    "ripopt_obj": 1.56249999752,
     "ipopt_obj": 1.5624999975199962,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -1404,7 +1404,7 @@
     "suite": "CUTEst",
     "ripopt_status": "MaxIterations",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 246.84324380694676,
+    "ripopt_obj": 25.152001675883568,
     "ipopt_obj": 12.000074872030725,
     "ripopt_solved": false,
     "ipopt_solved": true
@@ -1414,7 +1414,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 2471.897810918057,
+    "ripopt_obj": 2471.897810918843,
     "ipopt_obj": 2471.897810918843,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -1422,19 +1422,19 @@
   {
     "name": "DJTL",
     "suite": "CUTEst",
-    "ripopt_status": "Acceptable",
+    "ripopt_status": "StopAtTinyStep",
     "ipopt_status": "Acceptable",
-    "ripopt_obj": -8951.544723747427,
+    "ripopt_obj": -8951.544723747416,
     "ipopt_obj": -8951.544723747416,
-    "ripopt_solved": true,
+    "ripopt_solved": false,
     "ipopt_solved": true
   },
   {
     "name": "DMN15102",
     "suite": "CUTEst",
-    "ripopt_status": "Timeout",
+    "ripopt_status": "MaxIterations",
     "ipopt_status": "IpoptStatus(-10)",
-    "ripopt_obj": null,
+    "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
     "ripopt_solved": false,
     "ipopt_solved": false
@@ -1444,7 +1444,7 @@
     "suite": "CUTEst",
     "ripopt_status": "MaxIterations",
     "ipopt_status": "Timeout",
-    "ripopt_obj": 674.8476415451497,
+    "ripopt_obj": 673.8781473595412,
     "ipopt_obj": null,
     "ripopt_solved": false,
     "ipopt_solved": false
@@ -1464,7 +1464,7 @@
     "suite": "CUTEst",
     "ripopt_status": "MaxIterations",
     "ipopt_status": "Timeout",
-    "ripopt_obj": 255.5145664484612,
+    "ripopt_obj": 255.2276590380943,
     "ipopt_obj": null,
     "ripopt_solved": false,
     "ipopt_solved": false
@@ -1484,7 +1484,7 @@
     "suite": "CUTEst",
     "ripopt_status": "MaxIterations",
     "ipopt_status": "Timeout",
-    "ripopt_obj": 166.52313143613625,
+    "ripopt_obj": 166.24488548159985,
     "ipopt_obj": null,
     "ripopt_solved": false,
     "ipopt_solved": false
@@ -1504,7 +1504,7 @@
     "suite": "CUTEst",
     "ripopt_status": "MaxIterations",
     "ipopt_status": "Timeout",
-    "ripopt_obj": 104.31922062935004,
+    "ripopt_obj": 103.64368290073122,
     "ipopt_obj": null,
     "ripopt_solved": false,
     "ipopt_solved": false
@@ -1512,9 +1512,9 @@
   {
     "name": "DMN37142",
     "suite": "CUTEst",
-    "ripopt_status": "Timeout",
+    "ripopt_status": "MaxIterations",
     "ipopt_status": "IpoptStatus(-10)",
-    "ripopt_obj": null,
+    "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
     "ripopt_solved": false,
     "ipopt_solved": false
@@ -1524,7 +1524,7 @@
     "suite": "CUTEst",
     "ripopt_status": "MaxIterations",
     "ipopt_status": "Timeout",
-    "ripopt_obj": 188.29097868663496,
+    "ripopt_obj": 188.252330028178,
     "ipopt_obj": null,
     "ripopt_solved": false,
     "ipopt_solved": false
@@ -1532,9 +1532,9 @@
   {
     "name": "DMN37143",
     "suite": "CUTEst",
-    "ripopt_status": "Timeout",
+    "ripopt_status": "MaxIterations",
     "ipopt_status": "IpoptStatus(-10)",
-    "ripopt_obj": null,
+    "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
     "ripopt_solved": false,
     "ipopt_solved": false
@@ -1544,7 +1544,7 @@
     "suite": "CUTEst",
     "ripopt_status": "MaxIterations",
     "ipopt_status": "Timeout",
-    "ripopt_obj": 154.0221240592825,
+    "ripopt_obj": 117.19446367156876,
     "ipopt_obj": null,
     "ripopt_solved": false,
     "ipopt_solved": false
@@ -1554,7 +1554,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 18744.00976730374,
+    "ripopt_obj": 18744.00976730525,
     "ipopt_obj": 18744.009767302457,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -1564,7 +1564,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.03501296923382227,
+    "ripopt_obj": 0.03501296923382183,
     "ipopt_obj": 0.03501296457697563,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -1574,7 +1574,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.03373367050018672,
+    "ripopt_obj": 0.03373367050018701,
     "ipopt_obj": 0.03373367050017801,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -1584,7 +1584,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.7460906189797551,
+    "ripopt_obj": 0.7460906189797559,
     "ipopt_obj": 0.7460906189405001,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -1624,7 +1624,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 18309.360058528655,
+    "ripopt_obj": 18309.360058528648,
     "ipopt_obj": 18309.36005801744,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -1632,7 +1632,7 @@
   {
     "name": "ECKERLE4",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -1682,19 +1682,19 @@
   {
     "name": "EGGCRATENE",
     "suite": "CUTEst",
-    "ripopt_status": "Optimal",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
-    "ripopt_solved": true,
+    "ripopt_solved": false,
     "ipopt_solved": false
   },
   {
     "name": "ELATTAR",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "NumericalError",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 39.34783979310385,
+    "ripopt_obj": 19.82240998773098,
     "ipopt_obj": 74.20617856924706,
     "ripopt_solved": false,
     "ipopt_solved": true
@@ -1722,7 +1722,7 @@
   {
     "name": "ELATVIDUNE",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -1752,7 +1752,7 @@
   {
     "name": "ENSO",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -1772,11 +1772,11 @@
   {
     "name": "EQC",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "Acceptable",
     "ipopt_status": "ErrorInStepComputation",
-    "ripopt_obj": -1055.646341062121,
+    "ripopt_obj": -826.3086168540965,
     "ipopt_obj": -865.1227138604481,
-    "ripopt_solved": false,
+    "ripopt_solved": true,
     "ipopt_solved": false
   },
   {
@@ -1784,7 +1784,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 28.04525502885805,
+    "ripopt_obj": 28.045255030310535,
     "ipopt_obj": 28.0452550288578,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -1834,7 +1834,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.0011366153024769611,
+    "ripopt_obj": 0.001136615309272132,
     "ipopt_obj": 0.0011366460636607078,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -1844,7 +1844,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 10.824288745288214,
+    "ripopt_obj": 10.824288745146069,
     "ipopt_obj": 0.005019367048024607,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -1854,7 +1854,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 58.06855300312603,
+    "ripopt_obj": 57.64316091417665,
     "ipopt_obj": 0.02330262008361151,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -1862,7 +1862,7 @@
   {
     "name": "EXPFITNE",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "MaxIterations",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -1882,7 +1882,7 @@
   {
     "name": "FBRAIN",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -1964,7 +1964,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 11.1491091414845,
+    "ripopt_obj": 11.149109141484493,
     "ipopt_obj": 11.149109141484509,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -1974,7 +1974,7 @@
     "suite": "CUTEst",
     "ripopt_status": "NumericalError",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 8.576379128390348e-10,
+    "ripopt_obj": 8.366053936901476e-10,
     "ipopt_obj": -9.539853769965943e-10,
     "ripopt_solved": false,
     "ipopt_solved": true
@@ -1982,11 +1982,11 @@
   {
     "name": "FLETCHER",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 11.542829731009084,
+    "ripopt_obj": 11.656854112943837,
     "ipopt_obj": 11.656854112253866,
-    "ripopt_solved": false,
+    "ripopt_solved": true,
     "ipopt_solved": true
   },
   {
@@ -2002,7 +2002,7 @@
   {
     "name": "GAUSS1",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -2022,7 +2022,7 @@
   {
     "name": "GAUSS2",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -2042,7 +2042,7 @@
   {
     "name": "GAUSS3",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -2054,7 +2054,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 1244.4846360131571,
+    "ripopt_obj": 1244.484636013158,
     "ipopt_obj": 1244.484636013158,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -2094,7 +2094,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.9271736937663922,
+    "ripopt_obj": 0.9271736937663906,
     "ipopt_obj": 0.9271736937663908,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -2134,7 +2134,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -5.387944697354897e-09,
+    "ripopt_obj": -5.387944697273582e-09,
     "ipopt_obj": -9.500001900483032e-09,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -2164,7 +2164,7 @@
     "suite": "CUTEst",
     "ripopt_status": "StopAtTinyStep",
     "ipopt_status": "IpoptStatus(-10)",
-    "ripopt_obj": 13.850380026654456,
+    "ripopt_obj": 13.850400925122797,
     "ipopt_obj": 0.0,
     "ripopt_solved": false,
     "ipopt_solved": false
@@ -2172,7 +2172,7 @@
   {
     "name": "GROWTH",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -2202,7 +2202,7 @@
   {
     "name": "GULFNE",
     "suite": "CUTEst",
-    "ripopt_status": "NumericalError",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -2212,7 +2212,7 @@
   {
     "name": "HAHN1",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -2232,19 +2232,19 @@
   {
     "name": "HAIFAM",
     "suite": "CUTEst",
-    "ripopt_status": "NumericalError",
+    "ripopt_status": "Acceptable",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -45.00029616446986,
+    "ripopt_obj": -45.00036048412557,
     "ipopt_obj": -45.00036022673628,
-    "ripopt_solved": false,
+    "ripopt_solved": true,
     "ipopt_solved": true
   },
   {
     "name": "HAIFAS",
     "suite": "CUTEst",
-    "ripopt_status": "Acceptable",
+    "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -0.4500000099699994,
+    "ripopt_obj": -0.4500000099700004,
     "ipopt_obj": -0.4500000099715406,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -2264,7 +2264,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.032940564071674394,
+    "ripopt_obj": 1.6313457763666368,
     "ipopt_obj": 2.218281818509998,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -2352,7 +2352,7 @@
   {
     "name": "HATFLDDNE",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -2402,11 +2402,11 @@
   {
     "name": "HATFLDFLNE",
     "suite": "CUTEst",
-    "ripopt_status": "Optimal",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "Optimal",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
-    "ripopt_solved": true,
+    "ripopt_solved": false,
     "ipopt_solved": true
   },
   {
@@ -2442,11 +2442,11 @@
   {
     "name": "HATFLDH",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -24.511468195222207,
+    "ripopt_obj": -24.50000034825034,
     "ipopt_obj": -24.50000034811448,
-    "ripopt_solved": false,
+    "ripopt_solved": true,
     "ipopt_solved": true
   },
   {
@@ -2522,9 +2522,9 @@
   {
     "name": "HIELOW",
     "suite": "CUTEst",
-    "ripopt_status": "Acceptable",
+    "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 874.1654321149647,
+    "ripopt_obj": 874.1654321149712,
     "ipopt_obj": 874.1654321149712,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -2572,7 +2572,7 @@
   {
     "name": "HIMMELBD",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "Infeasible",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -2602,7 +2602,7 @@
   {
     "name": "HIMMELBFNE",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -2644,7 +2644,7 @@
     "suite": "CUTEst",
     "ripopt_status": "NumericalError",
     "ipopt_status": "ErrorInStepComputation",
-    "ripopt_obj": -1910.342736662497,
+    "ripopt_obj": -1910.3412255051464,
     "ipopt_obj": -1910.3447232659728,
     "ripopt_solved": false,
     "ipopt_solved": false
@@ -2654,7 +2654,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.05181432103056573,
+    "ripopt_obj": 0.05181432101739981,
     "ipopt_obj": 0.05181432108215193,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -2692,31 +2692,31 @@
   {
     "name": "HIMMELP4",
     "suite": "CUTEst",
-    "ripopt_status": "Optimal",
+    "ripopt_status": "NumericalError",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -59.013178048361624,
+    "ripopt_obj": -27.160194764937955,
     "ipopt_obj": -59.01317804826283,
-    "ripopt_solved": true,
+    "ripopt_solved": false,
     "ipopt_solved": true
   },
   {
     "name": "HIMMELP5",
     "suite": "CUTEst",
-    "ripopt_status": "NumericalError",
+    "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -28.13713976499031,
+    "ripopt_obj": -59.01317804583459,
     "ipopt_obj": -59.01317804836788,
-    "ripopt_solved": false,
+    "ripopt_solved": true,
     "ipopt_solved": true
   },
   {
     "name": "HIMMELP6",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 62.54117292527371,
+    "ripopt_obj": -8.198044055902699,
     "ipopt_obj": -59.01317804833877,
-    "ripopt_solved": false,
+    "ripopt_solved": true,
     "ipopt_solved": true
   },
   {
@@ -2724,7 +2724,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 22.571087363489045,
+    "ripopt_obj": 22.57108736348904,
     "ipopt_obj": 22.571087363489053,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -2744,7 +2744,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -1.000000004991996,
+    "ripopt_obj": -1.000000005034309,
     "ipopt_obj": -1.00000000499,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -2754,7 +2754,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 680.6300573725428,
+    "ripopt_obj": 680.6300573727714,
     "ipopt_obj": 680.6300573725428,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -2764,7 +2764,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 680.6300573876063,
+    "ripopt_obj": 680.6300573876064,
     "ipopt_obj": 680.6300573876064,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -2774,7 +2774,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 678.679637897787,
+    "ripopt_obj": 678.6796378908642,
     "ipopt_obj": 678.6796378908399,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -2782,11 +2782,11 @@
   {
     "name": "HS101",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 1955.6719280982493,
+    "ripopt_obj": 1809.764682486739,
     "ipopt_obj": 1809.764682474692,
-    "ripopt_solved": false,
+    "ripopt_solved": true,
     "ipopt_solved": true
   },
   {
@@ -2794,7 +2794,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 911.8805326313465,
+    "ripopt_obj": 911.8805326173608,
     "ipopt_obj": 911.8805326354676,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -2804,7 +2804,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 543.6679361129266,
+    "ripopt_obj": 543.6679360514368,
     "ipopt_obj": 543.6679360513294,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -2814,7 +2814,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 3.95116333676352,
+    "ripopt_obj": 3.951163336743245,
     "ipopt_obj": 3.9511633367433294,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -2824,7 +2824,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 1136.3073035633015,
+    "ripopt_obj": 1136.3073035633026,
     "ipopt_obj": 1136.3073035633026,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -2834,7 +2834,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 7049.2478976816265,
+    "ripopt_obj": 7049.24789772662,
     "ipopt_obj": 7049.2478976815355,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -2844,7 +2844,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 5055.011794125041,
+    "ripopt_obj": 5055.011794429904,
     "ipopt_obj": 5055.01179412504,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -2854,7 +2854,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Acceptable",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -0.674981449621253,
+    "ripopt_obj": -0.674981449619598,
     "ipopt_obj": -0.5000000089363473,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -2864,7 +2864,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 5362.069156530554,
+    "ripopt_obj": 5362.069156530555,
     "ipopt_obj": 5362.069156537171,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -2874,7 +2874,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -8.498464253205395,
+    "ripopt_obj": -8.498464253487832,
     "ipopt_obj": -8.498464253637962,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -2884,7 +2884,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -47.76109086574729,
+    "ripopt_obj": -47.76109086009003,
     "ipopt_obj": -47.76109085987934,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -2894,7 +2894,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -47.76109086406526,
+    "ripopt_obj": -47.76109086431433,
     "ipopt_obj": -47.76109086431432,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -2904,7 +2904,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -47.76109085936586,
+    "ripopt_obj": -47.76109085936585,
     "ipopt_obj": -47.76109085936588,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -2914,7 +2914,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 24.30620902645232,
+    "ripopt_obj": 24.306209026380795,
     "ipopt_obj": 24.30620902638915,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -2924,7 +2924,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -1768.807152264073,
+    "ripopt_obj": -1768.8071522618684,
     "ipopt_obj": -1768.807152264235,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -2944,7 +2944,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 32.3486776176718,
+    "ripopt_obj": 32.34867757959709,
     "ipopt_obj": 32.3486775795973,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -2984,7 +2984,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Acceptable",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.9936038509644076,
+    "ripopt_obj": 0.9941172877977832,
     "ipopt_obj": 0.994578532848864,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3034,7 +3034,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 4.999999999283798,
+    "ripopt_obj": 4.9999999980229015,
     "ipopt_obj": 4.999999998010001,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3074,7 +3074,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 40.19872730653508,
+    "ripopt_obj": 40.198727306535005,
     "ipopt_obj": 40.19872718655873,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3114,7 +3114,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 1.9999999600200895,
+    "ripopt_obj": 1.9999999600972191,
     "ipopt_obj": 1.9999999600664324,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3154,7 +3154,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 3.085491866542437e-16,
+    "ripopt_obj": 1.2913838048281224e-16,
     "ipopt_obj": 1.2913838048281224e-16,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3174,7 +3174,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.039999999999999994,
+    "ripopt_obj": 0.03999999999998554,
     "ipopt_obj": 0.03999999999998266,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3184,7 +3184,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 9.860761315262648e-32,
+    "ripopt_obj": 3.0814879110195774e-31,
     "ipopt_obj": 1.2325951644078311e-30,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3194,7 +3194,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -22.62741700453976,
+    "ripopt_obj": -22.62741700503059,
     "ipopt_obj": -22.62741700503059,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3202,7 +3202,7 @@
   {
     "name": "HS2NE",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "Infeasible",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -3224,7 +3224,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.9999999900165926,
+    "ripopt_obj": 0.9999999900122016,
     "ipopt_obj": 1.0000000088789534,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3234,7 +3234,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 5.9999999408837645,
+    "ripopt_obj": 5.999999940045684,
     "ipopt_obj": 5.9999999400089035,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3244,7 +3244,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.9999999613397932,
+    "ripopt_obj": 0.9999999613290592,
     "ipopt_obj": 0.9999999616268184,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3254,7 +3254,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -4.58578654795942,
+    "ripopt_obj": -4.585786551132442,
     "ipopt_obj": -4.58578655113244,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3264,7 +3264,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -0.8340324446554076,
+    "ripopt_obj": -0.8340324542837662,
     "ipopt_obj": -0.8340324484206567,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3284,7 +3284,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.11111111388399064,
+    "ripopt_obj": 0.11111111388399109,
     "ipopt_obj": 0.11111110889890008,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3334,7 +3334,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -1.000000000002107,
+    "ripopt_obj": -1.0000000000031393,
     "ipopt_obj": -1.0000000000031393,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3364,7 +3364,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -0.2500000000000017,
+    "ripopt_obj": -0.2500000000822895,
     "ipopt_obj": -0.25000000008228956,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3394,7 +3394,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -44.00000002994598,
+    "ripopt_obj": -44.00000002998001,
     "ipopt_obj": -44.00000002998,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3404,7 +3404,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -13.000000110608458,
+    "ripopt_obj": -13.00000011444091,
     "ipopt_obj": -15.000000149960002,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3434,7 +3434,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 3.198379755103131e-16,
+    "ripopt_obj": 8.553352420745915e-16,
     "ipopt_obj": 8.553352464057864e-16,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3444,7 +3444,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 9.527368319727103e-14,
+    "ripopt_obj": 2.973906151295847e-14,
     "ipopt_obj": 6.575160357819919e-14,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3454,7 +3454,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.0,
+    "ripopt_obj": 1.035379938102578e-30,
     "ipopt_obj": 4.437342591868191e-31,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3484,7 +3484,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.0,
+    "ripopt_obj": 1.232595164407831e-31,
     "ipopt_obj": 0.0,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3504,7 +3504,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 5.3266475644699085,
+    "ripopt_obj": 5.326647564469931,
     "ipopt_obj": 5.326647564469915,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3544,7 +3544,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -3.456000000000082,
+    "ripopt_obj": -3.456000000000087,
     "ipopt_obj": -3.456000000000087,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3554,7 +3554,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.030647619047629467,
+    "ripopt_obj": 0.030647619047629433,
     "ipopt_obj": 0.0306476190476192,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3564,7 +3564,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -6.74950471965922,
+    "ripopt_obj": -7.80278940400096,
     "ipopt_obj": -6.749504719659096,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3574,7 +3574,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.0,
+    "ripopt_obj": 4.930380657631324e-32,
     "ipopt_obj": 0.0,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3584,7 +3584,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.03256820025379033,
+    "ripopt_obj": 0.032568200253790286,
     "ipopt_obj": 0.032568200253909704,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3594,7 +3594,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -143.6461421977803,
+    "ripopt_obj": -143.6461421977805,
     "ipopt_obj": -143.64614219778028,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3604,7 +3604,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -26272.514647971595,
+    "ripopt_obj": -26272.514647971588,
     "ipopt_obj": -26272.514647971595,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3614,7 +3614,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 961.715172130052,
+    "ripopt_obj": 961.7151721300522,
     "ipopt_obj": 961.715172130052,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3624,7 +3624,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 6299.842398427627,
+    "ripopt_obj": 6299.842405074129,
     "ipopt_obj": 6299.842405144493,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3634,7 +3634,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.9535288560202564,
+    "ripopt_obj": 0.9535288559851554,
     "ipopt_obj": 0.9535288559851424,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3644,7 +3644,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.5181632657708791,
+    "ripopt_obj": 0.518163266663973,
     "ipopt_obj": 0.5181632655346204,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3654,7 +3654,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -1162.1186961620735,
+    "ripopt_obj": -1162.11869614673,
     "ipopt_obj": -1162.118696162078,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3664,7 +3664,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -0.920425003640226,
+    "ripopt_obj": -0.9204250036409304,
     "ipopt_obj": -0.920425003640406,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3674,7 +3674,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -956.7128866500312,
+    "ripopt_obj": -956.7128866500288,
     "ipopt_obj": -956.712886650028,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3684,7 +3684,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -1.7320508076667485,
+    "ripopt_obj": -1.7320508075689498,
     "ipopt_obj": -1.7320508075689496,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3694,7 +3694,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.18634912210126384,
+    "ripopt_obj": 0.1870436538395449,
     "ipopt_obj": 0.007498463574427714,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3704,7 +3704,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 17.014017276427957,
+    "ripopt_obj": 17.014017273891746,
     "ipopt_obj": 17.01401727277449,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3714,7 +3714,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 727.6788661940924,
+    "ripopt_obj": 727.6788662309186,
     "ipopt_obj": 727.6788651162777,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3774,7 +3774,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.24150512878708535,
+    "ripopt_obj": 0.2415051287672836,
     "ipopt_obj": 0.24150512876713315,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3784,7 +3784,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -2.919700409923092,
+    "ripopt_obj": -2.9197004089696605,
     "ipopt_obj": -2.9197004089696605,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3794,7 +3794,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.07877682087037277,
+    "ripopt_obj": 0.07877682096273649,
     "ipopt_obj": 0.07877682096273643,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3814,7 +3814,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.053949847770271786,
+    "ripopt_obj": 0.053949847770271765,
     "ipopt_obj": 0.0539498477702668,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3824,7 +3824,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.053949847745318635,
+    "ripopt_obj": 0.05394984777027112,
     "ipopt_obj": 0.053949847770272896,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3834,7 +3834,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -30665.539128862412,
+    "ripopt_obj": -30665.539128862005,
     "ipopt_obj": -30665.539128862412,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3844,7 +3844,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -5280335.24710128,
+    "ripopt_obj": -5280335.247153003,
     "ipopt_obj": -5280335.247153389,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3854,7 +3854,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -2.2156047075322545,
+    "ripopt_obj": -2.215604707532256,
     "ipopt_obj": -2.215604693465009,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3874,7 +3874,7 @@
     "suite": "CUTEst",
     "ripopt_status": "MaxIterations",
     "ipopt_status": "MaxIterations",
-    "ripopt_obj": 8922.74702382056,
+    "ripopt_obj": 8956.4184738021,
     "ipopt_obj": 8913.97004565477,
     "ripopt_solved": false,
     "ipopt_solved": false
@@ -3884,7 +3884,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 1.3626462176623757,
+    "ripopt_obj": 1.3626462171527718,
     "ipopt_obj": 1.362646217661002,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3894,7 +3894,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 1.3626462242255934,
+    "ripopt_obj": 1.3626462176623884,
     "ipopt_obj": 1.3626462176452456,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3914,7 +3914,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 1.362646217662013,
+    "ripopt_obj": 1.362646217662363,
     "ipopt_obj": 1.3626462176623653,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3924,7 +3924,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 1.3626462176647185,
+    "ripopt_obj": 1.3626462176422922,
     "ipopt_obj": 1.3626462176623635,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3934,7 +3934,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 1.3626462176623595,
+    "ripopt_obj": 1.3626462176624117,
     "ipopt_obj": 1.3626462176625156,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3944,7 +3944,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 135.07596244630176,
+    "ripopt_obj": 135.0759624569229,
     "ipopt_obj": 135.07596244558786,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3954,7 +3954,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.015617761158279954,
+    "ripopt_obj": 0.015617718220134356,
     "ipopt_obj": 0.01561771822030354,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3964,7 +3964,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.015617724577841734,
+    "ripopt_obj": 0.01561771822023496,
     "ipopt_obj": 0.015617749733961996,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3974,7 +3974,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 4.0712408095208215,
+    "ripopt_obj": 3.135805830488993,
     "ipopt_obj": 3.1358058304484815,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -3984,7 +3984,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 3.1358058314623896,
+    "ripopt_obj": 3.135805830448481,
     "ipopt_obj": 3.135805830448478,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -4122,7 +4122,7 @@
   {
     "name": "JUDGENE",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -4132,7 +4132,7 @@
   {
     "name": "KIRBY2",
     "suite": "CUTEst",
-    "ripopt_status": "NumericalError",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -4154,7 +4154,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -9.980001594384523e-09,
+    "ripopt_obj": -9.852050197440069e-09,
     "ipopt_obj": -1.0017608815200428e-08,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -4172,7 +4172,7 @@
   {
     "name": "KOEBHELBNE",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -4204,7 +4204,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.5757979150468467,
+    "ripopt_obj": 0.5757979150468373,
     "ipopt_obj": 0.5757979155299927,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -4214,7 +4214,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 350525.11685842794,
+    "ripopt_obj": 350525.11685843,
     "ipopt_obj": 350525.1168584257,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -4242,7 +4242,7 @@
   {
     "name": "LANCZOS2",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -4284,7 +4284,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 9.004901820685788,
+    "ripopt_obj": 9.0049018207176,
     "ipopt_obj": 9.004901790139508,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -4302,11 +4302,11 @@
   {
     "name": "LEVYMONE5",
     "suite": "CUTEst",
-    "ripopt_status": "Optimal",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
-    "ripopt_solved": true,
+    "ripopt_solved": false,
     "ipopt_solved": false
   },
   {
@@ -4332,7 +4332,7 @@
   {
     "name": "LEVYMONE8",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "LocalInfeasibility",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -4342,7 +4342,7 @@
   {
     "name": "LEVYMONE9",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "LocalInfeasibility",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -4352,9 +4352,9 @@
   {
     "name": "LEVYMONT10",
     "suite": "CUTEst",
-    "ripopt_status": "Acceptable",
+    "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 163.7009220022495,
+    "ripopt_obj": 163.70092200224954,
     "ipopt_obj": 163.70092200224954,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -4364,7 +4364,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 7.773811079395944,
+    "ripopt_obj": 7.773811079395945,
     "ipopt_obj": 1.2395024696476208e-25,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -4412,11 +4412,11 @@
   {
     "name": "LEWISPOL",
     "suite": "CUTEst",
-    "ripopt_status": "Acceptable",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
-    "ripopt_obj": 2.999705475030891,
+    "ripopt_obj": 1.1640629096061097,
     "ipopt_obj": 0.0,
-    "ripopt_solved": true,
+    "ripopt_solved": false,
     "ipopt_solved": false
   },
   {
@@ -4434,7 +4434,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -0.020198311700193483,
+    "ripopt_obj": -0.020198311700193435,
     "ipopt_obj": -0.017577539398253905,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -4444,7 +4444,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -77.00004549331975,
+    "ripopt_obj": -77.00004549332009,
     "ipopt_obj": -77.00004548557075,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -4484,7 +4484,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 1.41421345019137,
+    "ripopt_obj": 1.4142134502233823,
     "ipopt_obj": 1.4142134488730451,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -4522,7 +4522,7 @@
   {
     "name": "LSC1",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -4542,7 +4542,7 @@
   {
     "name": "LSC2",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -4564,7 +4564,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 123.11244780675771,
+    "ripopt_obj": 123.11244780675784,
     "ipopt_obj": 123.11244812008847,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -4584,7 +4584,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.6164324262049347,
+    "ripopt_obj": 0.6164324255913347,
     "ipopt_obj": 0.6164324255695417,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -4594,7 +4594,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -1.4142135722580071,
+    "ripopt_obj": -1.414213571837009,
     "ipopt_obj": -1.4142135723530944,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -4614,7 +4614,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -9.800022292724413e-09,
+    "ripopt_obj": -9.800004267037598e-09,
     "ipopt_obj": -9.810659066811851e-09,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -4634,7 +4634,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -1.0000000000001577,
+    "ripopt_obj": -1.0000000000000009,
     "ipopt_obj": -1.0000000000000009,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -4654,7 +4654,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 3.4786818153074556e-11,
+    "ripopt_obj": 7.701333347038121e-10,
     "ipopt_obj": 6.962253387497709e-12,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -4674,7 +4674,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -6230.795614711617,
+    "ripopt_obj": -6230.795614718794,
     "ipopt_obj": -6230.795614719196,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -4692,9 +4692,9 @@
   {
     "name": "MESH",
     "suite": "CUTEst",
-    "ripopt_status": "RestorationFailed",
+    "ripopt_status": "MaxIterations",
     "ipopt_status": "IpoptStatus(4)",
-    "ripopt_obj": -6.232766087392129e+33,
+    "ripopt_obj": -1.5894042267685405e+32,
     "ipopt_obj": -2.201154999104979e+37,
     "ripopt_solved": false,
     "ipopt_solved": false
@@ -4772,7 +4772,7 @@
   {
     "name": "MGH09",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -4832,7 +4832,7 @@
   {
     "name": "MGH17",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -4852,7 +4852,7 @@
   {
     "name": "MGH17S",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -4874,7 +4874,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -1.0000000099960558,
+    "ripopt_obj": -1.0000000095440589,
     "ipopt_obj": -1.0000000093590975,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -4884,7 +4884,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -1.000000009980366,
+    "ripopt_obj": -1.000000009980001,
     "ipopt_obj": -1.000000009976429,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -4894,7 +4894,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 115.70643951027314,
+    "ripopt_obj": 115.70643951023392,
     "ipopt_obj": 115.70643951023332,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -4904,7 +4904,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -9.562191838955263e-09,
+    "ripopt_obj": -9.562191841069673e-09,
     "ipopt_obj": -9.95660421547646e-09,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -4922,7 +4922,7 @@
   {
     "name": "MISRA1A",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -4942,7 +4942,7 @@
   {
     "name": "MISRA1B",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -5004,7 +5004,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -1.0000000099600004,
+    "ripopt_obj": -1.00000000996,
     "ipopt_obj": -1.000000010033345,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -5022,9 +5022,9 @@
   {
     "name": "MSS1",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "StopAtTinyStep",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -6.763024249072591e-285,
+    "ripopt_obj": -9.88176007494415,
     "ipopt_obj": -14.000000000012086,
     "ripopt_solved": false,
     "ipopt_solved": true
@@ -5032,7 +5032,7 @@
   {
     "name": "MUONSINE",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -5054,7 +5054,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 24.978809531690217,
+    "ripopt_obj": 24.97880953170588,
     "ipopt_obj": 24.97880953170588,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -5062,7 +5062,7 @@
   {
     "name": "NASH",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "Infeasible",
     "ripopt_obj": 0.0,
     "ipopt_obj": 4.9890865241107344e-05,
@@ -5072,7 +5072,7 @@
   {
     "name": "NELSON",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -5082,9 +5082,9 @@
   {
     "name": "NET1",
     "suite": "CUTEst",
-    "ripopt_status": "Infeasible",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 1395608.874153137,
+    "ripopt_obj": 1748712.9865121315,
     "ipopt_obj": 941194.2587740216,
     "ripopt_solved": false,
     "ipopt_solved": true
@@ -5092,21 +5092,21 @@
   {
     "name": "NYSTROM5",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "Optimal",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
-    "ripopt_solved": false,
+    "ripopt_solved": true,
     "ipopt_solved": false
   },
   {
     "name": "NYSTROM5C",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "Optimal",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
-    "ripopt_solved": false,
+    "ripopt_solved": true,
     "ipopt_solved": false
   },
   {
@@ -5124,7 +5124,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.5382431199801532,
+    "ripopt_obj": 0.5382431119422287,
     "ipopt_obj": 0.5382431096584037,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -5134,7 +5134,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.0871596243966863,
+    "ripopt_obj": 0.08715962439668631,
     "ipopt_obj": 0.08715962390059094,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -5144,7 +5144,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.004505046743259416,
+    "ripopt_obj": 0.004505046743259404,
     "ipopt_obj": 0.004505042931227994,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -5154,7 +5154,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.8570321154072562,
+    "ripopt_obj": 0.8570188958185819,
     "ipopt_obj": 0.004295420787716771,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -5164,7 +5164,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.0026500838189883894,
+    "ripopt_obj": 0.0026500864678840525,
     "ipopt_obj": 0.0026500766742341727,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -5174,7 +5174,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.0020697316614888277,
+    "ripopt_obj": 0.0020697316978452035,
     "ipopt_obj": 0.0020697270255729643,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -5184,7 +5184,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 4.4507448177228395e-05,
+    "ripopt_obj": 4.4466841754981606e-05,
     "ipopt_obj": 4.465915088363962e-05,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -5194,7 +5194,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 549.9999988477873,
+    "ripopt_obj": 549.9999988458472,
     "ipopt_obj": 549.999998881209,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -5232,7 +5232,7 @@
   {
     "name": "OSBORNE2",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -5274,7 +5274,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 11754.60254536196,
+    "ripopt_obj": 11754.602545361962,
     "ipopt_obj": 11754.602545361962,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -5292,7 +5292,7 @@
   {
     "name": "PALMER1ANE",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -5352,7 +5352,7 @@
   {
     "name": "PALMER1ENE",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -5392,7 +5392,7 @@
   {
     "name": "PALMER2ANE",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -5442,7 +5442,7 @@
   {
     "name": "PALMER2ENE",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -5452,7 +5452,7 @@
   {
     "name": "PALMER2NE",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -5482,7 +5482,7 @@
   {
     "name": "PALMER3ANE",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -5532,7 +5532,7 @@
   {
     "name": "PALMER3ENE",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -5554,7 +5554,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 2285.383225429006,
+    "ripopt_obj": 2285.3832254290064,
     "ipopt_obj": 2285.383225429007,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -5572,7 +5572,7 @@
   {
     "name": "PALMER4ANE",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -5622,7 +5622,7 @@
   {
     "name": "PALMER4ENE",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -5652,7 +5652,7 @@
   {
     "name": "PALMER5ANE",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -5672,7 +5672,7 @@
   {
     "name": "PALMER5BNE",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -5712,7 +5712,7 @@
   {
     "name": "PALMER5ENE",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -5732,7 +5732,7 @@
   {
     "name": "PALMER6ANE",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -5762,7 +5762,7 @@
   {
     "name": "PALMER6ENE",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -5782,7 +5782,7 @@
   {
     "name": "PALMER7ANE",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -5812,7 +5812,7 @@
   {
     "name": "PALMER7ENE",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -5832,7 +5832,7 @@
   {
     "name": "PALMER8ANE",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -5862,7 +5862,7 @@
   {
     "name": "PALMER8ENE",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -5884,7 +5884,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.00013652169311687722,
+    "ripopt_obj": 0.0001365216931168773,
     "ipopt_obj": 0.00013652167141323544,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -5892,7 +5892,7 @@
   {
     "name": "PFIT1",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "Infeasible",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -5952,7 +5952,7 @@
   {
     "name": "PFIT4",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "Optimal",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -5974,7 +5974,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 2.7182818184790447,
+    "ripopt_obj": 2.718281820277235,
     "ipopt_obj": 2.7182818184790474,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -5984,7 +5984,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 54.598150023129016,
+    "ripopt_obj": 54.598150023164216,
     "ipopt_obj": 54.5981500311825,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -5992,21 +5992,21 @@
   {
     "name": "POLAK3",
     "suite": "CUTEst",
-    "ripopt_status": "NumericalError",
+    "ripopt_status": "Optimal",
     "ipopt_status": "MaxIterations",
-    "ripopt_obj": 188.8560222502256,
+    "ripopt_obj": 5.9330033387532,
     "ipopt_obj": 1040537.5258638138,
-    "ripopt_solved": false,
+    "ripopt_solved": true,
     "ipopt_solved": false
   },
   {
     "name": "POLAK4",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -2.497099921711924e-07,
+    "ripopt_obj": -9.492096369974456e-09,
     "ipopt_obj": -9.96595065567783e-09,
-    "ripopt_solved": false,
+    "ripopt_solved": true,
     "ipopt_solved": true
   },
   {
@@ -6014,7 +6014,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Acceptable",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 49.99999999002,
+    "ripopt_obj": 49.999999990019994,
     "ipopt_obj": 49.99999999002,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -6024,7 +6024,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "MaxIterations",
-    "ripopt_obj": -44.00000000912339,
+    "ripopt_obj": -44.00000001124128,
     "ipopt_obj": -29.681941666423754,
     "ripopt_solved": true,
     "ipopt_solved": false
@@ -6054,7 +6054,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.032749709005683914,
+    "ripopt_obj": 0.03274970900568392,
     "ipopt_obj": 0.03274970896380768,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -6064,7 +6064,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.026306952079713383,
+    "ripopt_obj": 0.026306952079713387,
     "ipopt_obj": 0.026306952907508344,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -6074,7 +6074,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.02579179793573666,
+    "ripopt_obj": 0.025791797935736653,
     "ipopt_obj": 0.025791797994991452,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -6102,11 +6102,11 @@
   {
     "name": "POWELLSQ",
     "suite": "CUTEst",
-    "ripopt_status": "Optimal",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "Infeasible",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
-    "ripopt_solved": true,
+    "ripopt_solved": false,
     "ipopt_solved": false
   },
   {
@@ -6164,7 +6164,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 58.79009836532272,
+    "ripopt_obj": 58.790098273118005,
     "ipopt_obj": 58.79009827957107,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -6174,7 +6174,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 35.73896608984469,
+    "ripopt_obj": 35.73896607975777,
     "ipopt_obj": 35.73896607952278,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -6194,7 +6194,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.17839421725125948,
+    "ripopt_obj": 0.17839421723820903,
     "ipopt_obj": 0.17839421576558134,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -6214,7 +6214,7 @@
     "suite": "CUTEst",
     "ripopt_status": "NumericalError",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -994.2651395746764,
+    "ripopt_obj": -994.2651395746756,
     "ipopt_obj": -806.5219397501434,
     "ripopt_solved": false,
     "ipopt_solved": true
@@ -6224,7 +6224,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -0.007842848530277323,
+    "ripopt_obj": -0.007842848530277327,
     "ipopt_obj": -0.007842801091383,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -6234,7 +6234,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -0.009136323473755564,
+    "ripopt_obj": -0.00913632347375554,
     "ipopt_obj": -0.00913640408129143,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -6242,7 +6242,7 @@
   {
     "name": "RAT42",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -6262,7 +6262,7 @@
   {
     "name": "RAT43",
     "suite": "CUTEst",
-    "ripopt_status": "NumericalError",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -6322,11 +6322,11 @@
   {
     "name": "ROBOT",
     "suite": "CUTEst",
-    "ripopt_status": "StopAtTinyStep",
+    "ripopt_status": "Optimal",
     "ipopt_status": "IpoptStatus(3)",
-    "ripopt_obj": 6.593298887857102,
+    "ripopt_obj": 6.593298887857099,
     "ipopt_obj": 6.593298887857108,
-    "ripopt_solved": false,
+    "ripopt_solved": true,
     "ipopt_solved": false
   },
   {
@@ -6354,7 +6354,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -44.00000000997,
+    "ripopt_obj": -44.00000000976253,
     "ipopt_obj": -44.00000000999292,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -6452,7 +6452,7 @@
   {
     "name": "SANTA",
     "suite": "CUTEst",
-    "ripopt_status": "LocalInfeasibility",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -6534,7 +6534,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -1.0000000090901582,
+    "ripopt_obj": -1.0000000088784116,
     "ipopt_obj": -1.0000000006341958,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -6552,11 +6552,11 @@
   {
     "name": "SIPOW2",
     "suite": "CUTEst",
-    "ripopt_status": "Optimal",
+    "ripopt_status": "NumericalError",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -1.000000009697062,
+    "ripopt_obj": -1.000000007772008,
     "ipopt_obj": -1.0000000092920736,
-    "ripopt_solved": true,
+    "ripopt_solved": false,
     "ipopt_solved": true
   },
   {
@@ -6564,7 +6564,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -1.0000049421127004,
+    "ripopt_obj": -1.000004942112752,
     "ipopt_obj": -1.000004944804342,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -6632,19 +6632,19 @@
   {
     "name": "SPANHYD",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
     "ripopt_obj": 239.73800065831855,
     "ipopt_obj": 239.73800065831855,
-    "ripopt_solved": false,
+    "ripopt_solved": true,
     "ipopt_solved": true
   },
   {
     "name": "SPIRAL",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "NumericalError",
     "ipopt_status": "Infeasible",
-    "ripopt_obj": 1033.2358159000894,
+    "ripopt_obj": 6540.713975830965,
     "ipopt_obj": 16850.970451288653,
     "ripopt_solved": false,
     "ipopt_solved": false
@@ -6724,7 +6724,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.06786018306224983,
+    "ripopt_obj": 0.06786018306224939,
     "ipopt_obj": 0.06786018306248787,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -6744,7 +6744,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -0.55440628554779,
+    "ripopt_obj": -0.5544062805388412,
     "ipopt_obj": -0.554406285533589,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -6754,7 +6754,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 15.08218992970247,
+    "ripopt_obj": 15.0821899287594,
     "ipopt_obj": 15.082189912753243,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -6772,9 +6772,9 @@
   {
     "name": "TAX13322",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "NumericalError",
     "ipopt_status": "MaxIterations",
-    "ripopt_obj": -385.04734048634214,
+    "ripopt_obj": -220.309376420219,
     "ipopt_obj": -1045018477671.6458,
     "ripopt_solved": false,
     "ipopt_solved": false
@@ -6784,7 +6784,7 @@
     "suite": "CUTEst",
     "ripopt_status": "NumericalError",
     "ipopt_status": "Acceptable",
-    "ripopt_obj": -344.5547527942364,
+    "ripopt_obj": -234.69444173002455,
     "ipopt_obj": -342.9088661121257,
     "ripopt_solved": false,
     "ipopt_solved": true
@@ -6794,7 +6794,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 2302.54848943058,
+    "ripopt_obj": 2295.373434522886,
     "ipopt_obj": 2295.3734345145012,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -6804,7 +6804,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 2302.548489430589,
+    "ripopt_obj": 2277.945784652826,
     "ipopt_obj": 2302.5484894305705,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -6814,7 +6814,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 2247.129045060469,
+    "ripopt_obj": 2247.129045060075,
     "ipopt_obj": 2247.1290450599327,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -6834,7 +6834,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 5.334687275427278,
+    "ripopt_obj": 5.334687276707446,
     "ipopt_obj": 5.334687275776397,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -6844,7 +6844,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.6490311009882372,
+    "ripopt_obj": 0.6490311009882374,
     "ipopt_obj": 0.6490310990066457,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -6854,7 +6854,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 4.3011578503415056,
+    "ripopt_obj": 4.301157850396264,
     "ipopt_obj": 4.301157850912337,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -6862,7 +6862,7 @@
   {
     "name": "THURBER",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "LocalInfeasibility",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -6922,21 +6922,21 @@
   {
     "name": "TRO3X3",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "Acceptable",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -974682327168554.4,
+    "ripopt_obj": 8.999226286853759,
     "ipopt_obj": 8.967478352707397,
-    "ripopt_solved": false,
+    "ripopt_solved": true,
     "ipopt_solved": true
   },
   {
     "name": "TRO4X4",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "Acceptable",
     "ipopt_status": "IpoptStatus(4)",
-    "ripopt_obj": 8.92188398369954,
+    "ripopt_obj": 8.999995846865628,
     "ipopt_obj": -1.957476279591892e+20,
-    "ripopt_solved": false,
+    "ripopt_solved": true,
     "ipopt_solved": false
   },
   {
@@ -6944,7 +6944,7 @@
     "suite": "CUTEst",
     "ripopt_status": "MaxIterations",
     "ipopt_status": "RestorationFailed",
-    "ripopt_obj": -12936182.001327746,
+    "ripopt_obj": -14126961229.67338,
     "ipopt_obj": -317796557934275.44,
     "ripopt_solved": false,
     "ipopt_solved": false
@@ -6974,7 +6974,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 2.690687801225279e-23,
+    "ripopt_obj": 2.2456945348248693e-23,
     "ipopt_obj": 8.203374463458425e-24,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -6992,7 +6992,7 @@
   {
     "name": "VESUVIA",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -7012,7 +7012,7 @@
   {
     "name": "VESUVIO",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "NumericalError",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -7022,9 +7022,9 @@
   {
     "name": "VESUVIOLS",
     "suite": "CUTEst",
-    "ripopt_status": "Acceptable",
+    "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 991.4100028650424,
+    "ripopt_obj": 991.4100028650448,
     "ipopt_obj": 991.4100028650444,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -7032,7 +7032,7 @@
   {
     "name": "VESUVIOU",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -7062,7 +7062,7 @@
   {
     "name": "VIBRBEAMNE",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "RestorationFailed",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -7074,7 +7074,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Infeasible",
-    "ripopt_obj": 0.9999999951342252,
+    "ripopt_obj": 0.9999999950099984,
     "ipopt_obj": -0.9999999950003332,
     "ripopt_solved": true,
     "ipopt_solved": false
@@ -7162,7 +7162,7 @@
   {
     "name": "WEEDSNE",
     "suite": "CUTEst",
-    "ripopt_status": "MaxIterations",
+    "ripopt_status": "LocalInfeasibility",
     "ipopt_status": "IpoptStatus(-10)",
     "ripopt_obj": 0.0,
     "ipopt_obj": 0.0,
@@ -7172,11 +7172,11 @@
   {
     "name": "WOMFLET",
     "suite": "CUTEst",
-    "ripopt_status": "Optimal",
+    "ripopt_status": "MaxIterations",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -9.978567801772745e-09,
+    "ripopt_obj": 4.0562514660173195,
     "ipopt_obj": 6.049999999078937,
-    "ripopt_solved": true,
+    "ripopt_solved": false,
     "ipopt_solved": true
   },
   {
@@ -7264,7 +7264,7 @@
     "suite": "CUTEst",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 1.9999998775687364,
+    "ripopt_obj": 1.999999877883986,
     "ipopt_obj": 1.999999877529895,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -7284,7 +7284,7 @@
     "suite": "Electrolyte",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 0.0007755935282401775,
+    "ripopt_obj": 0.000775592134778035,
     "ipopt_obj": -0.006933670187752001,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -7294,7 +7294,7 @@
     "suite": "Electrolyte",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -0.7723719468368418,
+    "ripopt_obj": -0.7723717286693826,
     "ipopt_obj": -0.7723713625975525,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -7334,7 +7334,7 @@
     "suite": "Electrolyte",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -0.48326822740568903,
+    "ripopt_obj": -0.4832682274056858,
     "ipopt_obj": -0.4832680501409171,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -7344,7 +7344,7 @@
     "suite": "Electrolyte",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": -0.05531210685978848,
+    "ripopt_obj": -0.05531209113684935,
     "ipopt_obj": -0.05531205597235094,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -7374,7 +7374,7 @@
     "suite": "Electrolyte",
     "ripopt_status": "Optimal",
     "ipopt_status": "Infeasible",
-    "ripopt_obj": -1.3474845497608574,
+    "ripopt_obj": -1.3482721229153687,
     "ipopt_obj": -1.36283675686854,
     "ripopt_solved": true,
     "ipopt_solved": false
@@ -7404,7 +7404,7 @@
     "suite": "Grid",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 2178.080420773509,
+    "ripopt_obj": 2178.0804208038203,
     "ipopt_obj": 2178.080406411837,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -7414,7 +7414,7 @@
     "suite": "Grid",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 8208.515458604497,
+    "ripopt_obj": 8208.5154586033,
     "ipopt_obj": 8208.515425007794,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -7424,7 +7424,7 @@
     "suite": "Grid",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 5812.643017424871,
+    "ripopt_obj": 5812.643016981305,
     "ipopt_obj": 5812.642934996067,
     "ripopt_solved": true,
     "ipopt_solved": true
@@ -7434,7 +7434,7 @@
     "suite": "Grid",
     "ripopt_status": "Optimal",
     "ipopt_status": "Optimal",
-    "ripopt_obj": 17551.890927682136,
+    "ripopt_obj": 17551.890927682114,
     "ipopt_obj": 17551.8908990633,
     "ripopt_solved": true,
     "ipopt_solved": true
