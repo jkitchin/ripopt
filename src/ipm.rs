@@ -2679,8 +2679,12 @@ fn try_auxiliary_preprocessed_solve<P: NlpProblem>(
 
     let reduction_start = Instant::now();
     let reduced =
-        match crate::auxiliary_preprocessing::AuxiliaryReducedProblem::new(problem_dyn, &candidates, outcome.x)
-        {
+        match crate::auxiliary_preprocessing::AuxiliaryReducedProblem::new_with_exact_hessian(
+            problem_dyn,
+            &candidates,
+            outcome.x,
+            !options.hessian_approximation_lbfgs,
+        ) {
             Ok(reduced) if reduced.did_reduce() => {
                 diagnostics.record_rank_accepted_candidates(&candidates);
                 phase.reduction_build_time_secs += reduction_start.elapsed().as_secs_f64();
@@ -2879,8 +2883,12 @@ fn try_auxiliary_postsolve_solve<P: NlpProblem>(
     problem.initial_point(&mut x_context);
     let reduction_start = Instant::now();
     let reduced =
-        match crate::auxiliary_preprocessing::AuxiliaryReducedProblem::new(problem_dyn, &candidates, x_context.clone())
-        {
+        match crate::auxiliary_preprocessing::AuxiliaryReducedProblem::new_with_exact_hessian(
+            problem_dyn,
+            &candidates,
+            x_context.clone(),
+            !options.hessian_approximation_lbfgs,
+        ) {
             Ok(reduced) if reduced.did_reduce() => {
                 diagnostics.record_rank_accepted_candidates(&candidates);
                 phase.reduction_build_time_secs += reduction_start.elapsed().as_secs_f64();
@@ -3041,8 +3049,12 @@ fn try_auxiliary_postsolve_solve<P: NlpProblem>(
 
     let reduction_start = Instant::now();
     let recovered_reduced =
-        match crate::auxiliary_preprocessing::AuxiliaryReducedProblem::new(problem_dyn, &candidates, outcome.x)
-        {
+        match crate::auxiliary_preprocessing::AuxiliaryReducedProblem::new_with_exact_hessian(
+            problem_dyn,
+            &candidates,
+            outcome.x,
+            !options.hessian_approximation_lbfgs,
+        ) {
             Ok(reduced) => {
                 phase.reduction_build_time_secs += reduction_start.elapsed().as_secs_f64();
                 reduced
