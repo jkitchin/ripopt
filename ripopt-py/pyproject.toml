@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "ripopt"
-version = "0.7.1"
+version = "0.8.0"
 description = "Direct Python bindings for ripopt (interior-point NLP solver) with JAX autodiff"
 readme = "README.md"
 license = { text = "EPL-2.0" }
