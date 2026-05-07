@@ -417,10 +417,20 @@ pub(crate) struct AuxiliaryBlockProblem<'a> {
 }
 
 impl<'a> AuxiliaryBlockProblem<'a> {
+    #[cfg(test)]
     pub(crate) fn new(
         inner: &'a dyn NlpProblem,
         block: &EqualityBlock,
         fixed_x: &[f64],
+    ) -> Result<Self, AuxiliarySolveError> {
+        Self::new_with_exact_hessian(inner, block, fixed_x, true)
+    }
+
+    fn new_with_exact_hessian(
+        inner: &'a dyn NlpProblem,
+        block: &EqualityBlock,
+        fixed_x: &[f64],
+        include_exact_hessian: bool,
     ) -> Result<Self, AuxiliarySolveError> {
         let n_orig = inner.num_variables();
         let m_orig = inner.num_constraints();
@@ -452,7 +462,11 @@ impl<'a> AuxiliaryBlockProblem<'a> {
             }
         }
 
-        let (inner_hess_rows, inner_hess_cols) = inner.hessian_structure();
+        let (inner_hess_rows, inner_hess_cols) = if include_exact_hessian {
+            inner.hessian_structure()
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let mut hess_rows = Vec::new();
         let mut hess_cols = Vec::new();
         let mut hess_entry_map = Vec::new();
@@ -643,10 +657,20 @@ pub(crate) struct AuxiliaryReducedProblem<'a> {
 }
 
 impl<'a> AuxiliaryReducedProblem<'a> {
+    #[cfg(test)]
     pub(crate) fn new(
         inner: &'a dyn NlpProblem,
         candidates: &[PresolveCandidate],
         fixed_x: Vec<f64>,
+    ) -> Result<Self, AuxiliarySolveError> {
+        Self::new_with_exact_hessian(inner, candidates, fixed_x, true)
+    }
+
+    pub(crate) fn new_with_exact_hessian(
+        inner: &'a dyn NlpProblem,
+        candidates: &[PresolveCandidate],
+        fixed_x: Vec<f64>,
+        include_exact_hessian: bool,
     ) -> Result<Self, AuxiliarySolveError> {
         let n_orig = inner.num_variables();
         let m_orig = inner.num_constraints();
@@ -714,7 +738,11 @@ impl<'a> AuxiliaryReducedProblem<'a> {
             }
         }
 
-        let (inner_hess_rows, inner_hess_cols) = inner.hessian_structure();
+        let (inner_hess_rows, inner_hess_cols) = if include_exact_hessian {
+            inner.hessian_structure()
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let mut hess_rows = Vec::new();
         let mut hess_cols = Vec::new();
         let mut hess_entry_map = Vec::new();
@@ -946,7 +974,12 @@ fn auxiliary_block_jacobian_rank(
     block: &EqualityBlock,
     fixed_x: &[f64],
 ) -> Result<usize, AuxiliarySolveError> {
-    let block_problem = AuxiliaryBlockProblem::new(inner, block, fixed_x)?;
+    let block_problem = AuxiliaryBlockProblem::new_with_exact_hessian(
+        inner,
+        block,
+        fixed_x,
+        false,
+    )?;
     let rows = block_problem.rows.len();
     let cols = block_problem.vars.len();
     if rows == 0 || cols == 0 {
@@ -1072,12 +1105,22 @@ pub(crate) fn solve_auxiliary_blocks_from(
 
     for candidate in candidates {
         for block in &candidate.blocks {
-            let block_problem = AuxiliaryBlockProblem::new(problem, block, x_full)?;
+            let include_exact_hessian = !options.hessian_approximation_lbfgs;
+            let block_problem = AuxiliaryBlockProblem::new_with_exact_hessian(
+                problem,
+                block,
+                x_full,
+                include_exact_hessian,
+            )?;
             let Some(aux_options) = auxiliary_solver_options(options, solve_start) else {
                 return Err(AuxiliarySolveError::TimeBudgetExceeded { blocks_solved });
             };
             let lightweight_start = Instant::now();
-            match try_lightweight_auxiliary_block_solve(&block_problem, options.auxiliary_tol) {
+            match try_lightweight_auxiliary_block_solve(
+                &block_problem,
+                options.auxiliary_tol,
+                include_exact_hessian,
+            ) {
                 LightweightAuxiliaryBlockAttempt::Solved { solution, counters } => {
                     for (local, &var) in block.vars.iter().enumerate() {
                         x_full[var] = solution.x[local];
@@ -1223,12 +1266,17 @@ fn auxiliary_solver_options(
 fn try_lightweight_auxiliary_block_solve(
     problem: &AuxiliaryBlockProblem<'_>,
     auxiliary_tol: f64,
+    allow_exact_hessian_probe: bool,
 ) -> LightweightAuxiliaryBlockAttempt {
     let mut counters = LightweightAuxiliaryProbeCounters::default();
-    if let Some(solution) =
-        try_lightweight_affine_square_auxiliary_block_solve(problem, auxiliary_tol, &mut counters)
-    {
-        return LightweightAuxiliaryBlockAttempt::Solved { solution, counters };
+    if allow_exact_hessian_probe {
+        if let Some(solution) = try_lightweight_affine_square_auxiliary_block_solve(
+            problem,
+            auxiliary_tol,
+            &mut counters,
+        ) {
+            return LightweightAuxiliaryBlockAttempt::Solved { solution, counters };
+        }
     }
     if let Some(solution) =
         try_lightweight_scalar_newton_auxiliary_block_solve(problem, auxiliary_tol, &mut counters)
@@ -2893,6 +2941,7 @@ fn topologically_order_blocks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use crate::preprocessing::PreprocessedProblem;
     use crate::reduction_frame::{solve_dense_square_system, ReductionStack};
 
@@ -3357,6 +3406,77 @@ mod tests {
             lambda: &[f64],
             vals: &mut [f64],
         ) -> bool {
+            vals[0] = 2.0 * lambda[0];
+            true
+        }
+    }
+
+    static LBFGS_AUX_HESS_STRUCTURE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static LBFGS_AUX_HESS_VALUE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    struct HessianCountingScalarAuxProblem;
+
+    impl NlpProblem for HessianCountingScalarAuxProblem {
+        fn num_variables(&self) -> usize {
+            1
+        }
+
+        fn num_constraints(&self) -> usize {
+            1
+        }
+
+        fn bounds(&self, x_l: &mut [f64], x_u: &mut [f64]) {
+            x_l[0] = 0.1;
+            x_u[0] = 10.0;
+        }
+
+        fn constraint_bounds(&self, g_l: &mut [f64], g_u: &mut [f64]) {
+            g_l[0] = 4.0;
+            g_u[0] = 4.0;
+        }
+
+        fn initial_point(&self, x0: &mut [f64]) {
+            x0[0] = 1.0;
+        }
+
+        fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+            *obj = x[0];
+            true
+        }
+
+        fn gradient(&self, _x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
+            grad[0] = 1.0;
+            true
+        }
+
+        fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
+            g[0] = x[0] * x[0];
+            true
+        }
+
+        fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            (vec![0], vec![0])
+        }
+
+        fn jacobian_values(&self, x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
+            vals[0] = 2.0 * x[0];
+            true
+        }
+
+        fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            LBFGS_AUX_HESS_STRUCTURE_CALLS.fetch_add(1, Ordering::SeqCst);
+            (vec![0], vec![0])
+        }
+
+        fn hessian_values(
+            &self,
+            _x: &[f64],
+            _new_x: bool,
+            _obj_factor: f64,
+            lambda: &[f64],
+            vals: &mut [f64],
+        ) -> bool {
+            LBFGS_AUX_HESS_VALUE_CALLS.fetch_add(1, Ordering::SeqCst);
             vals[0] = 2.0 * lambda[0];
             true
         }
@@ -4160,6 +4280,41 @@ mod tests {
     }
 
     #[test]
+    fn auxiliary_solve_lbfgs_skips_hessian_callbacks_during_lightweight_probe() {
+        LBFGS_AUX_HESS_STRUCTURE_CALLS.store(0, Ordering::SeqCst);
+        LBFGS_AUX_HESS_VALUE_CALLS.store(0, Ordering::SeqCst);
+
+        let problem = HessianCountingScalarAuxProblem;
+        let candidates = vec![PresolveCandidate {
+            blocks: vec![EqualityBlock {
+                rows: vec![0],
+                vars: vec![0],
+            }],
+        }];
+        let mut options = quiet_aux_options();
+        options.hessian_approximation_lbfgs = true;
+
+        let outcome =
+            solve_auxiliary_blocks(&problem, &candidates, &options, std::time::Instant::now())
+                .expect("auxiliary solve");
+
+        assert_eq!(outcome.blocks_solved, 1);
+        assert!(outcome.max_residual <= options.auxiliary_tol);
+        assert!((outcome.x[0] - 2.0).abs() < 1e-5, "x = {:?}", outcome.x);
+        assert_eq!(outcome.total_hess_evals, 0);
+        assert_eq!(
+            LBFGS_AUX_HESS_STRUCTURE_CALLS.load(Ordering::SeqCst),
+            0,
+            "L-BFGS auxiliary preprocessing should not call hessian_structure"
+        );
+        assert_eq!(
+            LBFGS_AUX_HESS_VALUE_CALLS.load(Ordering::SeqCst),
+            0,
+            "L-BFGS auxiliary preprocessing should not call hessian_values"
+        );
+    }
+
+    #[test]
     fn auxiliary_solve_falls_back_for_unsupported_nonlinear_square_block() {
         let problem = TriangularAuxProblem;
         let block = EqualityBlock {
@@ -4174,6 +4329,7 @@ mod tests {
         let probe_counters = match try_lightweight_auxiliary_block_solve(
             &block_problem,
             probe_options.auxiliary_tol,
+            true,
         ) {
             LightweightAuxiliaryBlockAttempt::Unsupported { counters } => counters,
             LightweightAuxiliaryBlockAttempt::Solved { .. } => {
