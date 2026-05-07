@@ -1242,9 +1242,9 @@ pub(crate) fn find_presolve_candidates_with_diagnostics(
         .into_iter()
         .collect::<Vec<_>>();
     diagnostics.connected_components = components.len();
-    let dm = incidence.dulmage_mendelsohn_partition();
 
     let mut candidates = Vec::new();
+    let mut dm = None;
     for component in components {
         let whole_component_square = component.rows.len() == component.vars.len();
         if let Some(candidate) = presolve_candidate_from_component(
@@ -1262,7 +1262,10 @@ pub(crate) fn find_presolve_candidates_with_diagnostics(
             continue;
         }
 
-        for dm_component in dm_square_components_for_component(&incidence, &dm, &component) {
+        let dm_partition = dm.get_or_insert_with(|| incidence.dulmage_mendelsohn_partition());
+        let dm_components =
+            dm_square_components_for_component(&incidence, dm_partition, &component);
+        for dm_component in dm_components {
             if let Some(candidate) = presolve_candidate_from_dm_square_component(
                 &incidence,
                 dm_component,
