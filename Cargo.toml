@@ -77,6 +77,10 @@ name = "issue28_probe"
 required-features = ["cutest"]
 
 [[example]]
+name = "qcnew_probe"
+required-features = ["cutest", "ipopt-native"]
+
+[[example]]
 name = "compare_large_scale"
 required-features = ["ipopt-native"]
 

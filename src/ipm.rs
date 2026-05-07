@@ -6809,6 +6809,35 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             return result;
         }
 
+        // --- Barrier parameter update (free/fixed mode) ---
+        // Ipopt order (`IpIpoptAlg.cpp:347-417`): UpdateBarrierParameter()
+        // runs at the *top* of each iter, BEFORE ComputeSearchDirection().
+        // The Newton step is therefore taken at the post-update μ. ripopt
+        // historically updated μ at the end of each iter, which is
+        // equivalent for iter ≥ 1 (the prior iter's end-update sees the
+        // same state as the current iter's start-update) but skips the
+        // crucial iter-0 adaptation: with mu_strategy=adaptive, Ipopt's
+        // QF oracle picks a smaller μ at iter 0 (e.g. 0.0158 vs the
+        // mu_init=0.1 default). On tight-bound problems like QCNEW
+        // (x − x_l ≈ 2e-6), Σ_x ≈ z_L/(x − x_L) ≈ 5e5 and the iter-0
+        // Newton dx is ≈ μ. Skipping the iter-0 oracle therefore takes
+        // a ~6× too-large step that lands in a region the line search
+        // can't recover from. Saving mu_before_update lets the
+        // tiny-step latch detect "mu update found nothing to change"
+        // (Ipopt `!mu_changed`, IpMonotoneMuUpdate.cpp:158-160).
+        let mu_before_update = state.mu;
+        update_barrier_parameter(
+            &mut state,
+            &mut mu_state,
+            &mut filter,
+            &mut last_mehrotra_sigma,
+            options,
+            use_sparse,
+        );
+        if mu_state.tiny_step && state.mu == mu_before_update {
+            pending_tiny_step_exit = true;
+        }
+
         // A7: primary Newton step via the 4-block augmented system
         // [x; s; y_c; y_d]. A7.5 ports the Ipopt Probing μ oracle
         // (`IpProbingMuOracle::CalculateMu`) and gates it on
@@ -7549,29 +7578,9 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         let _ = apply_magic_step(&mut state, options);
         maybe_recalc_y_post_step(&mut state, options, n, m, lbfgs_mode);
 
-        // --- Barrier parameter update (free/fixed mode) ---
-        // Save mu before so we can detect "mu update found nothing to
-        // change" (Ipopt `!mu_changed`, IpMonotoneMuUpdate.cpp:158-160).
-        let mu_before_update = state.mu;
-        update_barrier_parameter(
-            &mut state,
-            &mut mu_state,
-            &mut filter,
-            &mut last_mehrotra_sigma,
-            options,
-            use_sparse,
-        );
-        // Set the STOP_AT_TINY_STEP latch when the tiny-step flag is
-        // active and the mu update could not advance — exactly the
-        // Ipopt throw condition (`!mu_changed && tiny_step_flag`,
-        // IpMonotoneMuUpdate.cpp:158-160; IpAdaptiveMuUpdate.cpp:330,377).
-        // `mu_state.tiny_step` already encodes "current iter detection
-        // AND previous iter latched", so no extra counter gate is needed.
-        // Consumed at the top of the next iteration AFTER check_convergence,
-        // so a KKT-clean iterate still exits Optimal.
-        if mu_state.tiny_step && state.mu == mu_before_update {
-            pending_tiny_step_exit = true;
-        }
+        // Barrier-parameter update was moved to the top of the loop
+        // (above ComputeSearchDirection) to match Ipopt's
+        // IpIpoptAlg.cpp:347-417 ordering. See the prepended call site.
 
         track_post_step_acceptable(&mut state, options);
 
