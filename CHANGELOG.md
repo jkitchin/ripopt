@@ -1,5 +1,27 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **Auxiliary equality preprocessing** (PR #32): when `enable_preprocessing` is
+  enabled (default), ripopt now detects square auxiliary equality subsystems via
+  Dulmage-Mendelsohn partitioning and block-triangular decomposition, solves
+  them outside the main IPM, and removes the solved auxiliary variables and
+  rows before the main solve. Inequality- and objective-coupled candidates are
+  kept on the full-space path. Reduced solutions are rejected and the standard
+  preprocessing path is used as fallback unless they validate in the original
+  full space at the user's `constr_viol_tol` and `dual_inf_tol`. New option
+  `auxiliary_tol` (default 1e-8) controls the accepted residual for internal
+  auxiliary solves.
+  - Behavior change: with the default `enable_preprocessing = true`, the new
+    auxiliary path runs on every solve. Set `enable_preprocessing = false` to
+    bypass both the auxiliary and the standard fixed-variable / redundant-
+    constraint preprocessing paths.
+  - CUTEst impact (vs v0.8.0): +1 Optimal (DENSCHNENE moves
+    `LocalInfeasibility` → `Optimal`), 37 problems faster (e.g. HATFLDF
+    105 → 0 iters, HEART6 45 → 0), 2 problems slower (RES +16, ACOPP30 +4),
+    no lost solves, no objective-match regressions.
+
 ## [0.8.0] - 2026-05-06
 
 **BREAKING:** the default sparse linear solver has changed from `rmumps` to
