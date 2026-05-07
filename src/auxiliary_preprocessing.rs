@@ -1023,9 +1023,23 @@ struct LightweightAuxiliaryBlockSolution {
     x: Vec<f64>,
     residual: f64,
     iterations: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LightweightAuxiliaryProbeCounters {
     constr_evals: usize,
     jac_evals: usize,
     hess_evals: usize,
+}
+
+enum LightweightAuxiliaryBlockAttempt {
+    Solved {
+        solution: LightweightAuxiliaryBlockSolution,
+        counters: LightweightAuxiliaryProbeCounters,
+    },
+    Unsupported {
+        counters: LightweightAuxiliaryProbeCounters,
+    },
 }
 
 pub(crate) fn solve_auxiliary_blocks(
@@ -1063,21 +1077,26 @@ pub(crate) fn solve_auxiliary_blocks_from(
                 return Err(AuxiliarySolveError::TimeBudgetExceeded { blocks_solved });
             };
             let lightweight_start = Instant::now();
-            if let Some(solution) = try_lightweight_auxiliary_block_solve(
-                &block_problem,
-                options.auxiliary_tol,
-            ) {
-                for (local, &var) in block.vars.iter().enumerate() {
-                    x_full[var] = solution.x[local];
+            match try_lightweight_auxiliary_block_solve(&block_problem, options.auxiliary_tol) {
+                LightweightAuxiliaryBlockAttempt::Solved { solution, counters } => {
+                    for (local, &var) in block.vars.iter().enumerate() {
+                        x_full[var] = solution.x[local];
+                    }
+                    blocks_solved += 1;
+                    max_residual = max_residual.max(solution.residual);
+                    total_iterations += solution.iterations;
+                    total_wall_time_secs += lightweight_start.elapsed().as_secs_f64();
+                    total_constr_evals += counters.constr_evals;
+                    total_jac_evals += counters.jac_evals;
+                    total_hess_evals += counters.hess_evals;
+                    continue;
                 }
-                blocks_solved += 1;
-                max_residual = max_residual.max(solution.residual);
-                total_iterations += solution.iterations;
-                total_wall_time_secs += lightweight_start.elapsed().as_secs_f64();
-                total_constr_evals += solution.constr_evals;
-                total_jac_evals += solution.jac_evals;
-                total_hess_evals += solution.hess_evals;
-                continue;
+                LightweightAuxiliaryBlockAttempt::Unsupported { counters } => {
+                    total_wall_time_secs += lightweight_start.elapsed().as_secs_f64();
+                    total_constr_evals += counters.constr_evals;
+                    total_jac_evals += counters.jac_evals;
+                    total_hess_evals += counters.hess_evals;
+                }
             }
 
             let result = crate::solve(&block_problem, &aux_options);
@@ -1204,14 +1223,25 @@ fn auxiliary_solver_options(
 fn try_lightweight_auxiliary_block_solve(
     problem: &AuxiliaryBlockProblem<'_>,
     auxiliary_tol: f64,
-) -> Option<LightweightAuxiliaryBlockSolution> {
-    try_lightweight_affine_square_auxiliary_block_solve(problem, auxiliary_tol)
-        .or_else(|| try_lightweight_scalar_newton_auxiliary_block_solve(problem, auxiliary_tol))
+) -> LightweightAuxiliaryBlockAttempt {
+    let mut counters = LightweightAuxiliaryProbeCounters::default();
+    if let Some(solution) =
+        try_lightweight_affine_square_auxiliary_block_solve(problem, auxiliary_tol, &mut counters)
+    {
+        return LightweightAuxiliaryBlockAttempt::Solved { solution, counters };
+    }
+    if let Some(solution) =
+        try_lightweight_scalar_newton_auxiliary_block_solve(problem, auxiliary_tol, &mut counters)
+    {
+        return LightweightAuxiliaryBlockAttempt::Solved { solution, counters };
+    }
+    LightweightAuxiliaryBlockAttempt::Unsupported { counters }
 }
 
 fn try_lightweight_affine_square_auxiliary_block_solve(
     problem: &AuxiliaryBlockProblem<'_>,
     auxiliary_tol: f64,
+    counters: &mut LightweightAuxiliaryProbeCounters,
 ) -> Option<LightweightAuxiliaryBlockSolution> {
     let dim = problem.num_variables();
     if dim == 0 || dim != problem.num_constraints() || dim > LIGHTWEIGHT_AUX_DENSE_MAX_DIM {
@@ -1226,26 +1256,22 @@ fn try_lightweight_affine_square_auxiliary_block_solve(
         return None;
     }
 
-    let (zero_hessian, hess_evals) = auxiliary_block_constraint_hessian_is_zero(problem, &x)?;
+    let zero_hessian = auxiliary_block_constraint_hessian_is_zero(problem, &x, counters)?;
     if !zero_hessian {
         return None;
     }
 
-    let g = auxiliary_block_constraints(problem, &x)?;
-    let mut constr_evals = 1;
+    let g = auxiliary_block_constraints(problem, &x, counters)?;
     let initial_residual = auxiliary_target_residual(&g, &targets);
     if initial_residual <= auxiliary_tol {
         return Some(LightweightAuxiliaryBlockSolution {
             x,
             residual: initial_residual,
             iterations: 0,
-            constr_evals,
-            jac_evals: 0,
-            hess_evals,
         });
     }
 
-    let jac = auxiliary_block_dense_jacobian(problem, &x)?;
+    let jac = auxiliary_block_dense_jacobian(problem, &x, counters)?;
     let rhs: Vec<_> = targets
         .iter()
         .zip(g.iter())
@@ -1259,8 +1285,7 @@ fn try_lightweight_affine_square_auxiliary_block_solve(
         return None;
     }
 
-    let g = auxiliary_block_constraints(problem, &x)?;
-    constr_evals += 1;
+    let g = auxiliary_block_constraints(problem, &x, counters)?;
     let residual = auxiliary_target_residual(&g, &targets);
     if residual > auxiliary_tol {
         return None;
@@ -1270,15 +1295,13 @@ fn try_lightweight_affine_square_auxiliary_block_solve(
         x,
         residual,
         iterations: 0,
-        constr_evals,
-        jac_evals: 1,
-        hess_evals,
     })
 }
 
 fn try_lightweight_scalar_newton_auxiliary_block_solve(
     problem: &AuxiliaryBlockProblem<'_>,
     auxiliary_tol: f64,
+    counters: &mut LightweightAuxiliaryProbeCounters,
 ) -> Option<LightweightAuxiliaryBlockSolution> {
     if problem.num_variables() != 1 || problem.num_constraints() != 1 {
         return None;
@@ -1293,11 +1316,8 @@ fn try_lightweight_scalar_newton_auxiliary_block_solve(
         return None;
     }
 
-    let mut constr_evals = 0;
-    let mut jac_evals = 0;
     for iterations in 0..=LIGHTWEIGHT_AUX_SCALAR_NEWTON_MAX_ITERS {
-        let g = auxiliary_block_constraints(problem, &x)?;
-        constr_evals += 1;
+        let g = auxiliary_block_constraints(problem, &x, counters)?;
         let signed_residual = g[0] - target;
         let residual = signed_residual.abs();
         if residual <= auxiliary_tol {
@@ -1305,17 +1325,13 @@ fn try_lightweight_scalar_newton_auxiliary_block_solve(
                 x,
                 residual,
                 iterations,
-                constr_evals,
-                jac_evals,
-                hess_evals: 0,
             });
         }
         if iterations == LIGHTWEIGHT_AUX_SCALAR_NEWTON_MAX_ITERS {
             return None;
         }
 
-        let jac = auxiliary_block_dense_jacobian(problem, &x)?;
-        jac_evals += 1;
+        let jac = auxiliary_block_dense_jacobian(problem, &x, counters)?;
         let derivative = jac[0];
         if !derivative.is_finite()
             || derivative.abs() <= LIGHTWEIGHT_AUX_DERIVATIVE_TOL * x[0].abs().max(1.0)
@@ -1387,8 +1403,10 @@ fn auxiliary_x_respects_bounds(x: &[f64], x_l: &[f64], x_u: &[f64]) -> bool {
 fn auxiliary_block_constraints(
     problem: &AuxiliaryBlockProblem<'_>,
     x: &[f64],
+    counters: &mut LightweightAuxiliaryProbeCounters,
 ) -> Option<Vec<f64>> {
     let mut g = vec![0.0; problem.num_constraints()];
+    counters.constr_evals += 1;
     if !problem.constraints(x, true, &mut g) || g.iter().any(|value| !value.is_finite()) {
         return None;
     }
@@ -1398,10 +1416,12 @@ fn auxiliary_block_constraints(
 fn auxiliary_block_dense_jacobian(
     problem: &AuxiliaryBlockProblem<'_>,
     x: &[f64],
+    counters: &mut LightweightAuxiliaryProbeCounters,
 ) -> Option<Vec<f64>> {
     let rows = problem.num_constraints();
     let cols = problem.num_variables();
     let mut vals = vec![0.0; problem.jac_rows.len()];
+    counters.jac_evals += 1;
     if !problem.jacobian_values(x, true, &mut vals)
         || vals.iter().any(|value| !value.is_finite())
     {
@@ -1423,32 +1443,32 @@ fn auxiliary_block_dense_jacobian(
 fn auxiliary_block_constraint_hessian_is_zero(
     problem: &AuxiliaryBlockProblem<'_>,
     x: &[f64],
-) -> Option<(bool, usize)> {
+    counters: &mut LightweightAuxiliaryProbeCounters,
+) -> Option<bool> {
     let (hess_rows, _) = problem.hessian_structure();
     if hess_rows.is_empty() {
-        return Some((true, 0));
+        return Some(true);
     }
 
     let mut lambda = vec![0.0; problem.num_constraints()];
     let mut vals = vec![0.0; hess_rows.len()];
-    let mut hess_evals = 0;
     for row in 0..problem.num_constraints() {
         lambda.fill(0.0);
         lambda[row] = 1.0;
         vals.fill(0.0);
+        counters.hess_evals += 1;
         if !problem.hessian_values(x, true, 0.0, &lambda, &mut vals) {
             return None;
         }
-        hess_evals += 1;
         if vals
             .iter()
             .any(|value| !value.is_finite() || value.abs() > LIGHTWEIGHT_AUX_ZERO_HESSIAN_TOL)
         {
-            return Some((false, hess_evals));
+            return Some(false);
         }
     }
 
-    Some((true, hess_evals))
+    Some(true)
 }
 
 fn auxiliary_target_residual(values: &[f64], targets: &[f64]) -> f64 {
@@ -3199,6 +3219,74 @@ mod tests {
         }
     }
 
+    struct AffineShuffledTwoByTwoAuxProblem;
+
+    impl NlpProblem for AffineShuffledTwoByTwoAuxProblem {
+        fn num_variables(&self) -> usize {
+            3
+        }
+
+        fn num_constraints(&self) -> usize {
+            2
+        }
+
+        fn bounds(&self, x_l: &mut [f64], x_u: &mut [f64]) {
+            x_l.fill(f64::NEG_INFINITY);
+            x_u.fill(f64::INFINITY);
+        }
+
+        fn constraint_bounds(&self, g_l: &mut [f64], g_u: &mut [f64]) {
+            g_l[0] = 5.0;
+            g_u[0] = 5.0;
+            g_l[1] = 4.0;
+            g_u[1] = 4.0;
+        }
+
+        fn initial_point(&self, x0: &mut [f64]) {
+            x0.copy_from_slice(&[0.0, 7.0, 0.0]);
+        }
+
+        fn objective(&self, _x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+            *obj = 0.0;
+            true
+        }
+
+        fn gradient(&self, _x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
+            grad.fill(0.0);
+            true
+        }
+
+        fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
+            g[0] = 2.0 * x[0] + x[2];
+            g[1] = -x[0] + 3.0 * x[2];
+            true
+        }
+
+        fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            (vec![1, 0, 1, 0], vec![2, 0, 0, 2])
+        }
+
+        fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
+            vals.copy_from_slice(&[3.0, 2.0, -1.0, 1.0]);
+            true
+        }
+
+        fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            (Vec::new(), Vec::new())
+        }
+
+        fn hessian_values(
+            &self,
+            _x: &[f64],
+            _new_x: bool,
+            _obj_factor: f64,
+            _lambda: &[f64],
+            _vals: &mut [f64],
+        ) -> bool {
+            true
+        }
+    }
+
     struct TriangularAuxProblem;
 
     impl NlpProblem for TriangularAuxProblem {
@@ -4017,6 +4105,34 @@ mod tests {
     }
 
     #[test]
+    fn auxiliary_solve_uses_lightweight_affine_two_by_two_path_with_shuffled_block_order() {
+        let problem = AffineShuffledTwoByTwoAuxProblem;
+        let candidates = vec![PresolveCandidate {
+            blocks: vec![EqualityBlock {
+                rows: vec![1, 0],
+                vars: vec![2, 0],
+            }],
+        }];
+        let options = quiet_aux_options();
+
+        let outcome =
+            solve_auxiliary_blocks(&problem, &candidates, &options, std::time::Instant::now())
+                .expect("auxiliary solve");
+
+        assert_eq!(outcome.blocks_solved, 1);
+        assert!(outcome.max_residual <= options.auxiliary_tol);
+        assert!((outcome.x[0] - 11.0 / 7.0).abs() < 1e-12, "x = {:?}", outcome.x);
+        assert_eq!(outcome.x[1], 7.0);
+        assert!((outcome.x[2] - 13.0 / 7.0).abs() < 1e-12, "x = {:?}", outcome.x);
+        assert_eq!(outcome.total_iterations, 0);
+        assert_eq!(outcome.total_obj_evals, 0);
+        assert_eq!(outcome.total_grad_evals, 0);
+        assert_eq!(outcome.total_hess_evals, 0);
+        assert_eq!(outcome.total_jac_evals, 1);
+        assert_eq!(outcome.total_constr_evals, 2);
+    }
+
+    #[test]
     fn auxiliary_solve_handles_one_variable_nonlinear_equality() {
         let problem = TriangularAuxProblem;
         let candidates = vec![PresolveCandidate {
@@ -4038,7 +4154,7 @@ mod tests {
         assert!(outcome.total_iterations > 0);
         assert_eq!(outcome.total_obj_evals, 0);
         assert_eq!(outcome.total_grad_evals, 0);
-        assert_eq!(outcome.total_hess_evals, 0);
+        assert_eq!(outcome.total_hess_evals, 1);
         assert!(outcome.total_jac_evals > 0);
         assert!(outcome.total_constr_evals > 0);
     }
@@ -4046,11 +4162,38 @@ mod tests {
     #[test]
     fn auxiliary_solve_falls_back_for_unsupported_nonlinear_square_block() {
         let problem = TriangularAuxProblem;
+        let block = EqualityBlock {
+            rows: vec![0, 1],
+            vars: vec![0, 1],
+        };
+        let mut fixed_x = vec![0.0; problem.num_variables()];
+        problem.initial_point(&mut fixed_x);
+        let block_problem =
+            AuxiliaryBlockProblem::new(&problem, &block, &fixed_x).expect("auxiliary block");
+        let probe_options = quiet_aux_options();
+        let probe_counters = match try_lightweight_auxiliary_block_solve(
+            &block_problem,
+            probe_options.auxiliary_tol,
+        ) {
+            LightweightAuxiliaryBlockAttempt::Unsupported { counters } => counters,
+            LightweightAuxiliaryBlockAttempt::Solved { .. } => {
+                panic!("nonlinear 2x2 block should not use the lightweight path")
+            }
+        };
+        assert_eq!(probe_counters.hess_evals, 1);
+
+        let full_options = quiet_aux_options();
+        let full_solve_options =
+            auxiliary_solver_options(&full_options, std::time::Instant::now())
+                .expect("auxiliary options");
+        let full_result = crate::solve(&block_problem, &full_solve_options);
+        assert!(matches!(
+            full_result.status,
+            SolveStatus::Optimal | SolveStatus::Acceptable
+        ));
+
         let candidates = vec![PresolveCandidate {
-            blocks: vec![EqualityBlock {
-                rows: vec![0, 1],
-                vars: vec![0, 1],
-            }],
+            blocks: vec![block],
         }];
         let options = quiet_aux_options();
 
@@ -4065,6 +4208,11 @@ mod tests {
         assert!(
             outcome.total_obj_evals > 0,
             "unsupported nonlinear 2x2 block should fall back to the full solver"
+        );
+        assert!(
+            outcome.total_hess_evals
+                >= full_result.diagnostics.n_hess_evals + probe_counters.hess_evals,
+            "fallback diagnostics should include failed lightweight probe hessian work"
         );
     }
 
