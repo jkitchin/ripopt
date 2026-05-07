@@ -102,6 +102,7 @@ pub(crate) enum AuxiliaryRejectionReason {
     EmptyComponent,
     NonSquareComponent { rows: usize, vars: usize },
     NonClosedComponent,
+    CandidateRowsCoupledToRemainingVariables,
     RankDeficiency { rank: usize, expected: usize },
     BoundActiveAuxiliaryVariable,
     AuxiliarySolveFailure { status: SolveStatus },
@@ -121,6 +122,9 @@ impl AuxiliaryRejectionReason {
             Self::EmptyComponent => "empty component",
             Self::NonSquareComponent { .. } => "non-square component",
             Self::NonClosedComponent => "non-closed component",
+            Self::CandidateRowsCoupledToRemainingVariables => {
+                "candidate rows coupled to remaining variables"
+            }
             Self::RankDeficiency { .. } => "rank deficiency",
             Self::BoundActiveAuxiliaryVariable => "bound-active auxiliary variable",
             Self::AuxiliarySolveFailure { .. } => "auxiliary solve failure",
@@ -1240,15 +1244,37 @@ pub(crate) fn find_presolve_candidates_with_diagnostics(
     diagnostics.connected_components = components.len();
 
     let mut candidates = Vec::new();
+    let mut dm = None;
     for component in components {
+        let whole_component_square = component.rows.len() == component.vars.len();
         if let Some(candidate) = presolve_candidate_from_component(
             &incidence,
-            component,
+            component.clone(),
             &objective_independent,
             &inequality_coupled,
             &mut diagnostics,
         ) {
             candidates.push(candidate);
+            continue;
+        }
+
+        if whole_component_square {
+            continue;
+        }
+
+        let dm_partition = dm.get_or_insert_with(|| incidence.dulmage_mendelsohn_partition());
+        let dm_components =
+            dm_square_components_for_component(&incidence, dm_partition, &component);
+        for dm_component in dm_components {
+            if let Some(candidate) = presolve_candidate_from_dm_square_component(
+                &incidence,
+                dm_component,
+                &objective_independent,
+                &inequality_coupled,
+                &mut diagnostics,
+            ) {
+                candidates.push(candidate);
+            }
         }
     }
     (candidates, diagnostics)
@@ -1394,6 +1420,126 @@ fn presolve_candidate_from_component(
     }
 }
 
+fn dm_square_components_for_component(
+    incidence: &EqualityIncidence,
+    dm: &DulmageMendelsohnPartition,
+    component: &EqualityBlock,
+) -> Vec<EqualityBlock> {
+    let mut component_rows = vec![false; incidence.row_adj_vars.len()];
+    for &row in &component.rows {
+        if let Some(local_row) = incidence
+            .row_local_for_global
+            .get(row)
+            .and_then(|&local| local)
+        {
+            component_rows[local_row] = true;
+        }
+    }
+
+    let mut component_vars = vec![false; incidence.n_vars];
+    for &var in &component.vars {
+        if var < component_vars.len() {
+            component_vars[var] = true;
+        }
+    }
+
+    let square_rows: Vec<_> = dm
+        .square_rows
+        .iter()
+        .copied()
+        .filter(|&row| component_rows.get(row).copied().unwrap_or(false))
+        .collect();
+    let square_vars: Vec<_> = dm
+        .square_vars
+        .iter()
+        .copied()
+        .filter(|&var| component_vars.get(var).copied().unwrap_or(false))
+        .collect();
+
+    if square_rows.is_empty() || square_vars.is_empty() {
+        return Vec::new();
+    }
+
+    incidence.connected_components(&square_rows, &square_vars)
+}
+
+fn presolve_candidate_from_dm_square_component(
+    incidence: &EqualityIncidence,
+    component: EqualityBlock,
+    objective_independent: &[bool],
+    inequality_coupled: &[bool],
+    diagnostics: &mut AuxiliaryCandidateDiagnostics,
+) -> Option<PresolveCandidate> {
+    if component.rows.is_empty() || component.vars.is_empty() {
+        diagnostics.reject_block(component, AuxiliaryRejectionReason::EmptyComponent, None);
+        return None;
+    }
+    if component.rows.len() != component.vars.len() {
+        diagnostics.reject_block(
+            component.clone(),
+            AuxiliaryRejectionReason::NonSquareComponent {
+                rows: component.rows.len(),
+                vars: component.vars.len(),
+            },
+            Some(format!(
+                "rows={}, vars={}",
+                component.rows.len(),
+                component.vars.len()
+            )),
+        );
+        return None;
+    }
+    diagnostics.square_components += 1;
+
+    let local_rows: Vec<_> = component
+        .rows
+        .iter()
+        .map(|&row| incidence.row_local_for_global[row])
+        .collect::<Option<_>>()?;
+
+    let external_vars = noncandidate_row_variables(incidence, &local_rows, &component.vars);
+    if !external_vars.is_empty() {
+        diagnostics.reject_block(
+            component,
+            AuxiliaryRejectionReason::CandidateRowsCoupledToRemainingVariables,
+            Some(format!(
+                "candidate equality rows depend on non-candidate variables {external_vars:?}"
+            )),
+        );
+        return None;
+    }
+
+    if is_closed_equality_component(incidence, &local_rows, &component.vars) {
+        diagnostics.closed_components += 1;
+    }
+
+    let coupling =
+        classify_auxiliary_coupling(&component, objective_independent, inequality_coupled);
+    diagnostics.record_coupling_class(coupling);
+    if coupling.is_coupled() {
+        diagnostics.reject_block(
+            component,
+            AuxiliaryRejectionReason::CoupledAuxiliaryBlock { coupling },
+            Some(format!(
+                "coupling={}, default presolve policy accepts only pure equality auxiliary blocks",
+                coupling.label()
+            )),
+        );
+        return None;
+    }
+
+    match incidence.block_triangular_decomposition(&local_rows, &component.vars) {
+        Ok(blocks) => {
+            diagnostics.record_accepted_blocks(&blocks);
+            Some(PresolveCandidate { blocks })
+        }
+        Err(err) => {
+            diagnostics.record_btd_error(component, err);
+            None
+        }
+    }
+}
+
 fn classify_auxiliary_coupling(
     block: &EqualityBlock,
     objective_independent: &[bool],
@@ -1500,6 +1646,35 @@ fn is_closed_equality_component(
             .iter()
             .all(|&row| selected_rows[row])
     })
+}
+
+fn noncandidate_row_variables(
+    incidence: &EqualityIncidence,
+    local_rows: &[usize],
+    vars: &[usize],
+) -> Vec<usize> {
+    let mut selected_vars = vec![false; incidence.n_vars];
+    for &var in vars {
+        if var < selected_vars.len() {
+            selected_vars[var] = true;
+        }
+    }
+
+    let mut external_vars = Vec::new();
+    for &row in local_rows {
+        if row >= incidence.row_adj_vars.len() {
+            continue;
+        }
+        external_vars.extend(
+            incidence.row_adj_vars[row]
+                .iter()
+                .copied()
+                .filter(|&var| !selected_vars.get(var).copied().unwrap_or(false)),
+        );
+    }
+    external_vars.sort_unstable();
+    external_vars.dedup();
+    external_vars
 }
 
 fn variables_in_inequality_rows(problem: &dyn NlpProblem, tol: f64) -> Vec<bool> {
@@ -4968,13 +5143,48 @@ mod tests {
     }
 
     #[test]
-    fn find_candidates_rejects_equality_component_coupled_to_unsolved_variable() {
+    fn find_candidates_accepts_dm_square_block_embedded_in_underconstrained_component() {
         let bounds = equality_bounds(2);
         let problem = graph_problem(3, &bounds, &[(0, 0), (1, 0), (1, 1), (1, 2)]);
 
-        let candidates = find_presolve_candidates(&problem, TOL);
+        let (candidates, diagnostics) = find_presolve_candidates_with_diagnostics(&problem, TOL);
+
+        assert_eq!(
+            candidates,
+            vec![PresolveCandidate {
+                blocks: vec![EqualityBlock {
+                    rows: vec![0],
+                    vars: vec![0],
+                }],
+            }]
+        );
+        assert_eq!(diagnostics.connected_components, 1);
+        assert_eq!(diagnostics.square_components, 1);
+        assert_eq!(diagnostics.closed_components, 0);
+        assert_eq!(diagnostics.pure_equality_candidates, 1);
+        assert_eq!(diagnostics.accepted_blocks, candidates[0].blocks);
+    }
+
+    #[test]
+    fn find_candidates_rejects_dm_square_block_with_row_external_variable() {
+        let bounds = equality_bounds(3);
+        let problem = graph_problem(2, &bounds, &[(0, 0), (0, 1), (1, 1), (2, 1)]);
+
+        let (candidates, diagnostics) = find_presolve_candidates_with_diagnostics(&problem, TOL);
 
         assert!(candidates.is_empty());
+        assert!(diagnostics.rejections.iter().any(|rejection| {
+            rejection.reason == AuxiliaryRejectionReason::CandidateRowsCoupledToRemainingVariables
+                && rejection.block
+                    == Some(EqualityBlock {
+                        rows: vec![0],
+                        vars: vec![0],
+                    })
+                && rejection
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("non-candidate variables [1]"))
+        }));
     }
 
     #[test]
