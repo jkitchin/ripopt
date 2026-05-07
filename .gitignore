@@ -14,6 +14,9 @@ benchmarks/cutest/*_results.jsonl
 benchmarks/cutest/*_results.log
 benchmarks/cutest/results_*.json
 benchmarks/cutest/results_*.jsonl
+# But DO track tagged-version snapshots (results_vX.Y.Z.json — no suffix)
+!benchmarks/cutest/results_v[0-9].[0-9].[0-9].json
+!benchmarks/cutest/results_v[0-9].[0-9][0-9].[0-9].json
 benchmarks/cutest/results.jsonl
 benchmarks/cutest/full_results.jsonl
 benchmarks/cutest/cutest_phase1_run.log
