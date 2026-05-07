@@ -7,6 +7,7 @@
 use crate::logging::rip_log;
 use crate::options::SolverOptions;
 use crate::problem::NlpProblem;
+use crate::reduction_frame::{ReductionFrame, RemovedMultiplierRecovery};
 use crate::result::{SolveResult, SolveStatus};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
@@ -599,6 +600,7 @@ impl NlpProblem for AuxiliaryBlockProblem<'_> {
 #[allow(dead_code)]
 pub(crate) struct AuxiliaryReducedProblem<'a> {
     inner: &'a dyn NlpProblem,
+    frame: ReductionFrame,
     n_orig: usize,
     m_orig: usize,
     fixed_x: Vec<f64>,
@@ -712,8 +714,18 @@ impl<'a> AuxiliaryReducedProblem<'a> {
             }
         }
 
+        let frame = ReductionFrame::new(
+            n_orig,
+            m_orig,
+            var_map.clone(),
+            constr_map.clone(),
+            fixed_x.clone(),
+            RemovedMultiplierRecovery::AuxiliaryStationarity,
+        );
+
         Ok(Self {
             inner,
+            frame,
             n_orig,
             m_orig,
             fixed_x,
@@ -731,317 +743,37 @@ impl<'a> AuxiliaryReducedProblem<'a> {
     }
 
     pub(crate) fn did_reduce(&self) -> bool {
-        self.var_map.len() < self.n_orig || self.constr_map.len() < self.m_orig
+        self.frame.did_reduce()
     }
 
     pub(crate) fn num_fixed(&self) -> usize {
-        self.n_orig - self.var_map.len()
+        self.frame.num_removed_vars()
     }
 
     pub(crate) fn num_removed_constraints(&self) -> usize {
-        self.m_orig - self.constr_map.len()
+        self.frame.num_removed_rows()
     }
 
     pub(crate) fn reduced_x_scaling(&self, scaling: &[f64]) -> Option<Vec<f64>> {
-        if scaling.len() != self.n_orig {
-            return None;
-        }
-        Some(self.var_map.iter().map(|&orig| scaling[orig]).collect())
+        self.frame.reduced_x_scaling(scaling)
     }
 
     pub(crate) fn reduced_g_scaling(&self, scaling: &[f64]) -> Option<Vec<f64>> {
-        if scaling.len() != self.m_orig {
-            return None;
-        }
-        Some(self.constr_map.iter().map(|&orig| scaling[orig]).collect())
+        self.frame.reduced_g_scaling(scaling)
+    }
+
+    pub(crate) fn reduction_frame(&self) -> &ReductionFrame {
+        &self.frame
     }
 
     fn expand_x(&self, x_reduced: &[f64]) -> Vec<f64> {
-        let mut x_full = self.fixed_x.clone();
-        for (reduced, &orig) in self.var_map.iter().enumerate() {
-            x_full[orig] = x_reduced[reduced];
-        }
-        x_full
+        self.frame.expand_x(x_reduced)
     }
 
     #[cfg(test)]
     pub(crate) fn unmap_solution(&self, reduced: &SolveResult) -> SolveResult {
-        self.unmap_solution_impl(reduced, None)
+        self.frame.unmap_solution(self.inner, reduced)
     }
-
-    pub(crate) fn unmap_solution_with_options(
-        &self,
-        reduced: &SolveResult,
-        options: &SolverOptions,
-    ) -> SolveResult {
-        self.unmap_solution_impl(reduced, Some(options))
-    }
-
-    fn unmap_solution_impl(
-        &self,
-        reduced: &SolveResult,
-        options: Option<&SolverOptions>,
-    ) -> SolveResult {
-        let x_full = self.expand_x(&reduced.x);
-
-        let mut constraint_multipliers = vec![0.0; self.m_orig];
-        for (reduced_idx, &orig_idx) in self.constr_map.iter().enumerate() {
-            if reduced_idx < reduced.constraint_multipliers.len() {
-                constraint_multipliers[orig_idx] = reduced.constraint_multipliers[reduced_idx];
-            }
-        }
-
-        let mut bound_multipliers_lower = vec![0.0; self.n_orig];
-        let mut bound_multipliers_upper = vec![0.0; self.n_orig];
-        for (reduced_idx, &orig_idx) in self.var_map.iter().enumerate() {
-            if reduced_idx < reduced.bound_multipliers_lower.len() {
-                bound_multipliers_lower[orig_idx] = reduced.bound_multipliers_lower[reduced_idx];
-            }
-            if reduced_idx < reduced.bound_multipliers_upper.len() {
-                bound_multipliers_upper[orig_idx] = reduced.bound_multipliers_upper[reduced_idx];
-            }
-        }
-
-        if let Err(reason) = self.reconstruct_removed_constraint_multipliers(
-            &x_full,
-            &mut constraint_multipliers,
-            &bound_multipliers_lower,
-            &bound_multipliers_upper,
-        ) {
-            if let Some(options) = options {
-                if options.print_level >= 5 {
-                    rip_log!(
-                        "ripopt: Auxiliary multiplier reconstruction skipped: {}",
-                        reason
-                    );
-                }
-            }
-        }
-
-        let mut objective = reduced.objective;
-        let _ = self.inner.objective(&x_full, true, &mut objective);
-
-        let mut constraint_values = vec![0.0; self.m_orig];
-        if self.m_orig > 0 {
-            let _ = self
-                .inner
-                .constraints(&x_full, true, &mut constraint_values);
-        }
-
-        SolveResult {
-            x: x_full,
-            objective,
-            constraint_multipliers,
-            bound_multipliers_lower,
-            bound_multipliers_upper,
-            constraint_values,
-            status: reduced.status,
-            iterations: reduced.iterations,
-            diagnostics: reduced.diagnostics.clone(),
-        }
-    }
-
-    fn reconstruct_removed_constraint_multipliers(
-        &self,
-        x_full: &[f64],
-        constraint_multipliers: &mut [f64],
-        bound_multipliers_lower: &[f64],
-        bound_multipliers_upper: &[f64],
-    ) -> Result<(), &'static str> {
-        let removed_rows = removed_indices(self.m_orig, &self.constr_map);
-        let removed_vars = removed_indices(self.n_orig, &self.var_map);
-        if removed_rows.is_empty() && removed_vars.is_empty() {
-            return Ok(());
-        }
-        if removed_rows.len() != removed_vars.len() {
-            return Err("removed auxiliary row/variable counts are not square");
-        }
-        if removed_rows.is_empty() {
-            return Ok(());
-        }
-        if self.removed_vars_have_bound_ambiguity(&removed_vars, x_full) {
-            return Err("removed auxiliary variable is active at a finite bound");
-        }
-
-        let mut grad = vec![0.0; self.n_orig];
-        if !self.inner.gradient(x_full, true, &mut grad) {
-            return Err("full gradient evaluation failed");
-        }
-
-        let (jac_rows, jac_cols) = self.inner.jacobian_structure();
-        if jac_rows.len() != jac_cols.len() {
-            return Err("Jacobian structure has mismatched row/column lengths");
-        }
-        let mut jac_vals = vec![0.0; jac_rows.len()];
-        if !self.inner.jacobian_values(x_full, true, &mut jac_vals) {
-            return Err("full Jacobian evaluation failed");
-        }
-
-        let row_pos = index_positions(self.m_orig, &removed_rows);
-        let var_pos = index_positions(self.n_orig, &removed_vars);
-        let dim = removed_rows.len();
-        let mut system = vec![0.0; dim * dim];
-        let mut rhs: Vec<f64> = removed_vars
-            .iter()
-            .map(|&var| -(grad[var] - bound_multipliers_lower[var] + bound_multipliers_upper[var]))
-            .collect();
-
-        for (idx, (&row, &col)) in jac_rows.iter().zip(jac_cols.iter()).enumerate() {
-            if row >= self.m_orig || col >= self.n_orig {
-                continue;
-            }
-            let val = jac_vals[idx];
-            if !val.is_finite() {
-                return Err("Jacobian contains a non-finite value");
-            }
-            let Some(var_local) = var_pos[col] else {
-                continue;
-            };
-            if let Some(row_local) = row_pos[row] {
-                system[var_local * dim + row_local] += val;
-            } else {
-                rhs[var_local] -= val * constraint_multipliers[row];
-            }
-        }
-
-        let lambda = solve_dense_square_system(system, rhs, dim)?;
-        for (local, &row) in removed_rows.iter().enumerate() {
-            constraint_multipliers[row] = lambda[local];
-        }
-        Ok(())
-    }
-
-    fn removed_vars_have_bound_ambiguity(&self, removed_vars: &[usize], x_full: &[f64]) -> bool {
-        let mut x_l = vec![0.0; self.n_orig];
-        let mut x_u = vec![0.0; self.n_orig];
-        self.inner.bounds(&mut x_l, &mut x_u);
-        removed_vars.iter().any(|&var| {
-            let x = x_full[var];
-            let scale_l = x.abs().max(x_l[var].abs()).max(1.0);
-            let scale_u = x.abs().max(x_u[var].abs()).max(1.0);
-            (x_l[var].is_finite() && x <= x_l[var] + 1e-8 * scale_l)
-                || (x_u[var].is_finite() && x >= x_u[var] - 1e-8 * scale_u)
-        })
-    }
-}
-
-fn removed_indices(total: usize, kept: &[usize]) -> Vec<usize> {
-    let mut is_kept = vec![false; total];
-    for &idx in kept {
-        if idx < total {
-            is_kept[idx] = true;
-        }
-    }
-    (0..total).filter(|&idx| !is_kept[idx]).collect()
-}
-
-fn index_positions(total: usize, indices: &[usize]) -> Vec<Option<usize>> {
-    let mut positions = vec![None; total];
-    for (pos, &idx) in indices.iter().enumerate() {
-        if idx < total {
-            positions[idx] = Some(pos);
-        }
-    }
-    positions
-}
-
-fn solve_dense_square_system(
-    mut matrix: Vec<f64>,
-    mut rhs: Vec<f64>,
-    dim: usize,
-) -> Result<Vec<f64>, &'static str> {
-    if dim == 0 {
-        return Ok(Vec::new());
-    }
-    if matrix.len() != dim * dim || rhs.len() != dim {
-        return Err("dense system dimensions are inconsistent");
-    }
-    if matrix.iter().any(|value| !value.is_finite()) {
-        return Err("dense system matrix contains a non-finite value");
-    }
-    if rhs.iter().any(|value| !value.is_finite()) {
-        return Err("dense system RHS contains a non-finite value");
-    }
-
-    let matrix_norm = matrix
-        .iter()
-        .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
-    if matrix_norm == 0.0 {
-        return Err("dense system matrix is zero");
-    }
-
-    let original_matrix = matrix.clone();
-    let original_rhs = rhs.clone();
-    let pivot_tol = (dim as f64) * matrix_norm * 1e-10;
-
-    for col in 0..dim {
-        let pivot_row = (col..dim)
-            .max_by(|&a, &b| {
-                matrix[a * dim + col]
-                    .abs()
-                    .partial_cmp(&matrix[b * dim + col].abs())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .ok_or("dense system has no pivot row")?;
-        let pivot_abs = matrix[pivot_row * dim + col].abs();
-        if pivot_abs <= pivot_tol {
-            return Err("dense system is singular or ill-conditioned");
-        }
-        if pivot_row != col {
-            for j in col..dim {
-                matrix.swap(col * dim + j, pivot_row * dim + j);
-            }
-            rhs.swap(col, pivot_row);
-        }
-
-        let pivot = matrix[col * dim + col];
-        for row in (col + 1)..dim {
-            let factor = matrix[row * dim + col] / pivot;
-            matrix[row * dim + col] = 0.0;
-            for j in (col + 1)..dim {
-                matrix[row * dim + j] -= factor * matrix[col * dim + j];
-            }
-            rhs[row] -= factor * rhs[col];
-        }
-    }
-
-    let mut solution = vec![0.0; dim];
-    for i in (0..dim).rev() {
-        let mut sum = rhs[i];
-        for j in (i + 1)..dim {
-            sum -= matrix[i * dim + j] * solution[j];
-        }
-        let pivot = matrix[i * dim + i];
-        if pivot.abs() <= pivot_tol {
-            return Err("dense system is singular or ill-conditioned");
-        }
-        solution[i] = sum / pivot;
-    }
-    if solution.iter().any(|value| !value.is_finite()) {
-        return Err("dense system solution is non-finite");
-    }
-
-    let residual = dense_residual_inf(&original_matrix, &solution, &original_rhs, dim);
-    let rhs_norm = original_rhs
-        .iter()
-        .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
-    if residual > 1e-8 * rhs_norm.max(1.0) {
-        return Err("dense system residual is too large");
-    }
-
-    Ok(solution)
-}
-
-fn dense_residual_inf(matrix: &[f64], x: &[f64], rhs: &[f64], dim: usize) -> f64 {
-    let mut residual: f64 = 0.0;
-    for row in 0..dim {
-        let mut ax = 0.0;
-        for col in 0..dim {
-            ax += matrix[row * dim + col] * x[col];
-        }
-        residual = residual.max((ax - rhs[row]).abs());
-    }
-    residual
 }
 
 impl NlpProblem for AuxiliaryReducedProblem<'_> {
@@ -2617,6 +2349,8 @@ fn topologically_order_blocks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::preprocessing::PreprocessedProblem;
+    use crate::reduction_frame::{solve_dense_square_system, ReductionStack};
 
     const TOL: f64 = 1e-10;
 
@@ -3193,6 +2927,86 @@ mod tests {
         }
     }
 
+    struct ComposedReductionProblem;
+
+    impl NlpProblem for ComposedReductionProblem {
+        fn num_variables(&self) -> usize {
+            3
+        }
+
+        fn num_constraints(&self) -> usize {
+            3
+        }
+
+        fn bounds(&self, x_l: &mut [f64], x_u: &mut [f64]) {
+            x_l[0] = -10.0;
+            x_u[0] = 10.0;
+            x_l[1] = f64::NEG_INFINITY;
+            x_u[1] = f64::INFINITY;
+            x_l[2] = 5.0;
+            x_u[2] = 5.0;
+        }
+
+        fn constraint_bounds(&self, g_l: &mut [f64], g_u: &mut [f64]) {
+            g_l[0] = 0.0;
+            g_u[0] = 0.0;
+            g_l[1] = 6.0;
+            g_u[1] = 6.0;
+            g_l[2] = 6.0;
+            g_u[2] = 6.0;
+        }
+
+        fn initial_point(&self, x0: &mut [f64]) {
+            x0[0] = 0.0;
+            x0[1] = 2.0;
+            x0[2] = 5.0;
+        }
+
+        fn objective(&self, x: &[f64], _new_x: bool, obj: &mut f64) -> bool {
+            *obj = 0.5 * x[0] * x[0] + 3.0 * x[1];
+            true
+        }
+
+        fn gradient(&self, x: &[f64], _new_x: bool, grad: &mut [f64]) -> bool {
+            grad[0] = x[0];
+            grad[1] = 3.0;
+            grad[2] = 0.0;
+            true
+        }
+
+        fn constraints(&self, x: &[f64], _new_x: bool, g: &mut [f64]) -> bool {
+            g[0] = x[1] - 2.0;
+            g[1] = x[0] + x[2];
+            g[2] = x[0] + x[2];
+            true
+        }
+
+        fn jacobian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            (vec![0, 1, 1, 2, 2], vec![1, 0, 2, 0, 2])
+        }
+
+        fn jacobian_values(&self, _x: &[f64], _new_x: bool, vals: &mut [f64]) -> bool {
+            vals.fill(1.0);
+            true
+        }
+
+        fn hessian_structure(&self) -> (Vec<usize>, Vec<usize>) {
+            (vec![0], vec![0])
+        }
+
+        fn hessian_values(
+            &self,
+            _x: &[f64],
+            _new_x: bool,
+            obj_factor: f64,
+            _lambda: &[f64],
+            vals: &mut [f64],
+        ) -> bool {
+            vals[0] = obj_factor;
+            true
+        }
+    }
+
     struct RankDeficientAuxProblem;
 
     impl NlpProblem for RankDeficientAuxProblem {
@@ -3387,6 +3201,52 @@ mod tests {
         assert_eq!(full.bound_multipliers_upper, vec![0.3, 0.0, 0.4, 0.0]);
         assert_eq!(full.status, SolveStatus::Optimal);
         assert_eq!(full.iterations, 12);
+    }
+
+    #[test]
+    fn reduction_stack_composes_auxiliary_then_standard_unmapping() {
+        let problem = ComposedReductionProblem;
+        let candidates = vec![PresolveCandidate {
+            blocks: vec![EqualityBlock {
+                rows: vec![0],
+                vars: vec![1],
+            }],
+        }];
+        let auxiliary = AuxiliaryReducedProblem::new(&problem, &candidates, vec![0.0, 2.0, 5.0])
+            .expect("auxiliary reduction");
+        let standard = PreprocessedProblem::new(&auxiliary as &dyn NlpProblem, 1e-2);
+
+        assert_eq!(auxiliary.var_map, vec![0, 2]);
+        assert_eq!(auxiliary.constr_map, vec![1, 2]);
+        assert!(standard.did_reduce());
+        assert_eq!(standard.num_fixed(), 1);
+        assert_eq!(standard.num_redundant(), 1);
+
+        let nested_result = SolveResult {
+            x: vec![1.0],
+            objective: -1.0,
+            constraint_multipliers: vec![7.0],
+            bound_multipliers_lower: vec![0.1],
+            bound_multipliers_upper: vec![0.3],
+            constraint_values: vec![6.0],
+            status: SolveStatus::Optimal,
+            iterations: 4,
+            diagnostics: Default::default(),
+        };
+
+        let full = ReductionStack::new()
+            .push(standard.reduction_frame(), &auxiliary as &dyn NlpProblem)
+            .push(auxiliary.reduction_frame(), &problem as &dyn NlpProblem)
+            .unmap_solution_with_options(&nested_result, None);
+
+        assert_eq!(full.x, vec![1.0, 2.0, 5.0]);
+        assert!((full.objective - 6.5).abs() < 1e-12);
+        assert_eq!(full.constraint_values, vec![0.0, 6.0, 6.0]);
+        assert_eq!(full.constraint_multipliers, vec![-3.0, 7.0, 0.0]);
+        assert_eq!(full.bound_multipliers_lower, vec![0.1, 0.0, 0.0]);
+        assert_eq!(full.bound_multipliers_upper, vec![0.3, 0.0, 0.0]);
+        assert_eq!(full.status, SolveStatus::Optimal);
+        assert_eq!(full.iterations, 4);
     }
 
     #[test]

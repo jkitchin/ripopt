@@ -1927,8 +1927,10 @@ fn try_auxiliary_preprocessed_solve<P: NlpProblem>(
     };
 
     let nested_result = solve(&prep, &reduced_opts);
-    let auxiliary_result = prep.unmap_solution(&nested_result);
-    let mut result = reduced.unmap_solution_with_options(&auxiliary_result, options);
+    let stack = crate::reduction_frame::ReductionStack::new()
+        .push(prep.reduction_frame(), &reduced as &dyn NlpProblem)
+        .push(reduced.reduction_frame(), problem_dyn);
+    let mut result = stack.unmap_solution_with_options(&nested_result, Some(options));
     if matches!(result.status, SolveStatus::Optimal) {
         if let Some(validation) = validate_full_space_result(problem_dyn, &result, options) {
             result.objective = validation.objective;
@@ -2064,7 +2066,9 @@ fn try_auxiliary_postsolve_solve<P: NlpProblem>(
     };
 
     let nested_result = solve(&prep, &reduced_opts);
-    let auxiliary_result = prep.unmap_solution(&nested_result);
+    let standard_stack = crate::reduction_frame::ReductionStack::new()
+        .push(prep.reduction_frame(), &reduced as &dyn NlpProblem);
+    let auxiliary_result = standard_stack.unmap_solution_with_options(&nested_result, Some(options));
     if !matches!(auxiliary_result.status, SolveStatus::Optimal) {
         diagnostics.reject_global(
             crate::auxiliary_preprocessing::AuxiliaryRejectionReason::AuxiliarySolveFailure {
@@ -2082,7 +2086,10 @@ fn try_auxiliary_postsolve_solve<P: NlpProblem>(
         return AuxiliaryPreprocessAttempt::Failed;
     }
 
-    let partial = reduced.unmap_solution_with_options(&auxiliary_result, options);
+    let partial_stack = crate::reduction_frame::ReductionStack::new()
+        .push(prep.reduction_frame(), &reduced as &dyn NlpProblem)
+        .push(reduced.reduction_frame(), problem_dyn);
+    let partial = partial_stack.unmap_solution_with_options(&nested_result, Some(options));
     x_context = partial.x;
     let outcome = match crate::auxiliary_preprocessing::solve_auxiliary_blocks_from(
         problem_dyn,
@@ -2133,7 +2140,10 @@ fn try_auxiliary_postsolve_solve<P: NlpProblem>(
                 return AuxiliaryPreprocessAttempt::Failed;
             }
         };
-    let mut result = recovered_reduced.unmap_solution_with_options(&auxiliary_result, options);
+    let recovered_stack = crate::reduction_frame::ReductionStack::new()
+        .push(prep.reduction_frame(), &reduced as &dyn NlpProblem)
+        .push(recovered_reduced.reduction_frame(), problem_dyn);
+    let mut result = recovered_stack.unmap_solution_with_options(&nested_result, Some(options));
     if let Some(validation) = validate_full_space_result(problem_dyn, &result, options) {
         result.objective = validation.objective;
         result.constraint_values = validation.constraints;
