@@ -1,9 +1,9 @@
 # Changelog
 
-## [0.8.0] - unreleased
+## [0.8.0] - 2026-05-06
 
 **BREAKING:** the default sparse linear solver has changed from `rmumps` to
-[`feral`](../feral), a pure-Rust multifrontal LDLᵀ solver with Bunch-Kaufman
+[`feral`](https://crates.io/crates/feral), a pure-Rust multifrontal LDLᵀ solver with Bunch-Kaufman
 1×1/2×2 pivoting, certified inertia, MC64 scaling, and AMD/METIS ordering.
 `rmumps` remains available behind the opt-in `rmumps` feature for A/B
 comparison and regression hunting.

@@ -26,7 +26,7 @@ It implements a primal-dual interior point method with a barrier formulation, si
 
 - Primal-dual interior point method with logarithmic barrier
 - Dense LDL^T factorization via Bunch-Kaufman pivoting with inertia detection
-- Sparse multifrontal LDL^T factorization (via [`feral`](../feral) with Bunch-Kaufman 1×1/2×2 pivoting, MC64 scaling, AMD/METIS ordering, and certified inertia) for larger problems (n+m >= 110). The legacy `rmumps` backend is available behind the opt-in `rmumps` feature: `cargo build --no-default-features --features "rmumps faer"`
+- Sparse multifrontal LDL^T factorization (via [`feral`](https://crates.io/crates/feral) with Bunch-Kaufman 1×1/2×2 pivoting, MC64 scaling, AMD/METIS ordering, and certified inertia) for larger problems (n+m >= 110). The legacy `rmumps` backend is available behind the opt-in `rmumps` feature: `cargo build --no-default-features --features "rmumps faer"`
 - Banded LDL^T solver for problems with detected-banded structure (e.g., PDE discretizations)
 - Dense condensed KKT (Schur complement) for tall-narrow problems (m >> n, n <= 100)
 - Sparse condensed KKT for reducing system size when m > 0
@@ -100,13 +100,13 @@ The speed advantage comes from:
 
 Where Ipopt is faster:
 
-1. **Large sparse problems.** Ipopt's Fortran MUMPS is ~10-15x faster per factorization than rmumps on 50K-100K systems.
+1. **Large sparse problems.** Ipopt's Fortran MUMPS is ~10-15x faster per factorization than ripopt's pure-Rust feral on 50K-100K systems.
 2. **Some medium constrained problems.** A handful of problems (CORE1, HAIFAM, NET1) have high per-iteration cost in ripopt's line search or fallback cascade.
 3. **Some difficult nonlinear problems.** Ipopt's mature barrier parameter tuning gives it an edge on specific hard problems.
 
 ### Large-Scale Benchmarks
 
-Both solvers receive the exact same NlpProblem struct via the Rust trait interface, ensuring a fair comparison. ripopt uses rmumps (pure Rust multifrontal LDL^T with SuiteSparse AMD ordering); Ipopt uses MUMPS (Fortran).
+Both solvers receive the exact same NlpProblem struct via the Rust trait interface, ensuring a fair comparison. ripopt uses feral (pure-Rust multifrontal LDL^T with Bunch-Kaufman pivoting and AMD/METIS ordering); Ipopt uses MUMPS (Fortran).
 
 | Problem         | n      | m      | ripopt  | time    | Ipopt    | time    | speedup   |
 |-----------------|--------|--------|---------|---------|----------|---------|-----------|
@@ -912,7 +912,7 @@ The Jacobian is evaluated at two points to identify linear constraints (where al
 
 The solver follows the primal-dual barrier method from the Ipopt papers (Wachter & Biegler, 2006). At each iteration it:
 
-1. Assembles and factors the KKT system using dense LDL^T (Bunch-Kaufman), sparse multifrontal LDL^T (rmumps), or dense condensed Schur complement for tall-narrow problems
+1. Assembles and factors the KKT system using dense LDL^T (Bunch-Kaufman), sparse multifrontal LDL^T (feral by default; rmumps under the opt-in `rmumps` feature), or dense condensed Schur complement for tall-narrow problems
 2. Computes inertia of the factorization and applies regularization if needed
 3. Applies Mehrotra predictor-corrector with Gondzio centrality corrections (default on)
 4. Computes search directions with iterative refinement (up to 3 rounds)

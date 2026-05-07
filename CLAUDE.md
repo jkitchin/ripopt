@@ -1,7 +1,7 @@
 # ripopt Development Guide
 
 ## Linear solver backends
-- **Default (v0.8+)**: pure-Rust [`feral`](../feral) multifrontal LDLᵀ. The
+- **Default (v0.8+)**: pure-Rust [`feral`](https://crates.io/crates/feral) multifrontal LDLᵀ. The
   `default-features = ["feral", "faer"]`. Modules: `src/linear_solver/feral_direct.rs`,
   `feral_iterative.rs`, `feral_hybrid.rs`.
 - **Legacy**: `rmumps` is preserved behind the opt-in `rmumps` feature.
