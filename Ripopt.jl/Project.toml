@@ -1,6 +1,6 @@
 name = "Ripopt"
 uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
-version = "0.1.0"
+version = "0.8.0"
 
 [deps]
 MathOptInterface = "b8f27783-ece8-5eb3-8dc8-9495eed66fee"
