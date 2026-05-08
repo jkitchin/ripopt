@@ -193,7 +193,7 @@ fn set_int(p: IpoptProblem, k: &str, v: i32) {
     unsafe { AddIpoptIntOption(p, kk.as_ptr(), v); }
 }
 
-fn run_ipopt(problem: &dyn NlpProblem) -> Vec<f64> {
+fn run_ipopt_with(problem: &dyn NlpProblem, mu_strategy: &str) -> Vec<f64> {
     let n = problem.num_variables();
     let m = problem.num_constraints();
     let mut x_l = vec![0.0; n];
@@ -221,7 +221,7 @@ fn run_ipopt(problem: &dyn NlpProblem) -> Vec<f64> {
             eval_f, eval_g, eval_grad_f, eval_jac_g, eval_h,
         );
         set_str(p, "sb", "yes");
-        set_str(p, "mu_strategy", "adaptive");
+        set_str(p, "mu_strategy", mu_strategy);
         set_num(p, "tol", 1e-8);
         set_int(p, "max_iter", 3000);
         // print_level 5 prints the iteration summary; we also capture in callback.
@@ -270,17 +270,21 @@ fn main() {
 
     println!("=== {} (n={}, m={}) ===", name, problem.num_variables(), problem.num_constraints());
 
-    println!("\n--- Ipopt (adaptive, print_level=5) ---");
-    let x_ipopt = run_ipopt(&problem);
-    let trace = IPOPT_TRACE.with(|t| t.borrow().clone());
-    println!("\n[ipopt-trace] iter | obj | inf_pr | inf_du | mu | d_norm | reg | a_du | a_pr | ls");
-    for r in &trace {
-        println!(
-            "  {:>3} {:+.6e} {:.2e} {:.2e} {:.2e} {:.2e} {:.2e} {:.2e} {:.2e} {}",
-            r.iter, r.obj, r.inf_pr, r.inf_du, r.mu, r.d_norm, r.reg, r.alpha_du, r.alpha_pr, r.ls,
-        );
+    for strat in ["adaptive", "monotone"] {
+        IPOPT_TRACE.with(|t| t.borrow_mut().clear());
+        println!("\n--- Ipopt ({}, print_level=5) ---", strat);
+        let x_ipopt = run_ipopt_with(&problem, strat);
+        let trace = IPOPT_TRACE.with(|t| t.borrow().clone());
+        println!("\n[ipopt-{}-trace] iter | obj | inf_pr | inf_du | mu | d_norm | reg | a_du | a_pr | ls", strat);
+        for r in &trace {
+            println!(
+                "  {:>3} {:+.6e} {:.2e} {:.2e} {:.2e} {:.2e} {:.2e} {:.2e} {:.2e} {}",
+                r.iter, r.obj, r.inf_pr, r.inf_du, r.mu, r.d_norm, r.reg, r.alpha_du, r.alpha_pr, r.ls,
+            );
+        }
+        println!("[ipopt-{}-final-x] {:?}", strat, x_ipopt);
     }
-    println!("[ipopt-final-x] {:?}", x_ipopt);
+    let trace = IPOPT_TRACE.with(|t| t.borrow().clone());
 
     // Dump iter 0 and iter 1 x and multipliers explicitly for direct compare with ripopt.
     for k in [0usize, 1, 2, 3] {

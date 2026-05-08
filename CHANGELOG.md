@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### Changed
+- **CUTEst benchmark suite: ripopt now uses `mu_strategy=adaptive`** to mirror
+  the existing Ipopt-side `mu_strategy=adaptive` force in `run_cutest.rs`. The
+  prior asymmetric setup (Ipopt-adaptive vs ripopt-monotone, the project
+  default) was tracked as "matching project defaults" but was misleading: it
+  pitted Ipopt's QF-oracle path against ripopt's monotone path. Investigation
+  on QCNEW (issue #31) showed the failure is monotone-mu-specific and shared
+  by both Ipopt-monotone and ripopt-monotone; adaptive solves it cleanly on
+  both. Adaptive is now used uniformly across all CUTEst problems.
+  - QCNEW: `NumericalError` → `Optimal` (issue #31, partial).
+  - Net head-to-head impact (ripopt vs Ipopt, both now adaptive): +11 gained
+    (ALLINITC, BIGGS6NE, DENSCHNENE, DIAMON2DLS, DISCS, ELATTAR, GROUPING,
+    HS13, QCNEW, SIPOW2, WOMFLET); -10 lost where Ipopt-adaptive still
+    succeeds (DECONVBNE, FLETCHER, MISTAKE, OET2/4/6, PALMER2B, PENTAGON,
+    PFIT3, PT) — these are real ripopt-adaptive bugs that were hidden by
+    the asymmetric monotone setup; -5 wash where Ipopt-adaptive also fails
+    (DEVGLA2NE, HS25NE, NYSTROM5, NYSTROM5C, POLAK6).
+  - Project default (`SolverOptions::mu_strategy_adaptive = false`) is
+    unchanged; this is a benchmark-suite-only setting.
+- `examples/qcnew_probe.rs` now parameterized on `mu_strategy` so both Ipopt
+  modes can be traced side-by-side.
+
 ### Added
 - **Auxiliary equality preprocessing** (PR #32): when `enable_preprocessing` is
   enabled (default), ripopt now detects square auxiliary equality subsystems via
