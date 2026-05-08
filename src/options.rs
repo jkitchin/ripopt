@@ -351,12 +351,38 @@ pub struct SolverOptions {
     /// restoration objective is min ρ·(p+n) + (η/2)·||D_R(x − x_R)||² with
     /// η = `resto_proximity_weight` · √μ. Default: 1.0 (Ipopt 3.14).
     pub resto_proximity_weight: f64,
-    /// Enable preprocessing to internally solve and remove auxiliary equality
-    /// systems, eliminate fixed variables, and remove redundant constraints.
+    /// Enable standard preprocessing: eliminate fixed variables and remove
+    /// redundant constraints (the parts that align with Ipopt 3.14's
+    /// `TNLPAdapter` fixed-variable handling). Auxiliary equality-block
+    /// preprocessing is gated separately by `enable_auxiliary_preprocessing`.
     /// Default: true.
     pub enable_preprocessing: bool,
+    /// Enable the ripopt-only auxiliary equality-block preprocessing pass
+    /// (presolve + postsolve), which detects square equality subsystems and
+    /// solves them to reduce the main NLP. Ipopt 3.14 has no equivalent pass,
+    /// so the default is `false` to match Ipopt's behavior. Setting this to
+    /// `true` re-enables the heuristic, which has been observed to improve
+    /// some problems but regress others (notably it broke ACOPR30 by
+    /// eliminating 1×1 equality blocks that worsened the conditioning of the
+    /// reduced problem). When `false`, the auxiliary code path is skipped
+    /// even if `enable_preprocessing` is `true`.
+    /// Default: false.
+    pub enable_auxiliary_preprocessing: bool,
+    /// Enable the ripopt-only "aggressive" preprocessing passes — bound
+    /// tightening from single-variable linear constraints and redundant
+    /// constraint detection. Ipopt 3.14's `TNLPAdapter` performs neither
+    /// (`docs/IPOPT_DEVIATION_AUDIT.md` §A2), so the default is `false` to
+    /// match Ipopt's behavior. When `false` and `enable_preprocessing` is
+    /// `true`, only fixed-variable elimination runs (i.e., the wrapper is
+    /// constructed via `PreprocessedProblem::new_fixed_only`). Setting this
+    /// to `true` re-enables the heuristics, which have been observed to
+    /// regress AC-OPF problems by tightening bounds onto inactive linear
+    /// constraints in the highly-coupled equality system.
+    /// Default: false.
+    pub enable_aggressive_preprocessing: bool,
     /// Maximum accepted residual for internal auxiliary equality-system solves
-    /// during preprocessing. Default: 1e-8.
+    /// during preprocessing. Only used when
+    /// `enable_auxiliary_preprocessing = true`. Default: 1e-8.
     pub auxiliary_tol: f64,
     /// Detect linear constraints and skip their Hessian contribution.
     /// Default: true.
@@ -717,6 +743,8 @@ impl Default for SolverOptions {
             kappa_resto: 0.9,
             resto_proximity_weight: 1.0,
             enable_preprocessing: true,
+            enable_auxiliary_preprocessing: false,
+            enable_aggressive_preprocessing: false,
             auxiliary_tol: 1e-8,
             detect_linear_constraints: true,
             hessian_approximation_lbfgs: false,

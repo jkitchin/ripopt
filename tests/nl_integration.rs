@@ -415,6 +415,7 @@ fn nl_auxiliary_preprocessing_gate_fixture_matches_fallback() {
         let options = SolverOptions {
             print_level: 0,
             enable_preprocessing,
+            enable_auxiliary_preprocessing: enable_preprocessing,
             tol: 1e-8,
             ..SolverOptions::default()
         };
@@ -487,6 +488,7 @@ fn solve_issue23_fixture(
     let options = SolverOptions {
         print_level: 0,
         enable_preprocessing,
+        enable_auxiliary_preprocessing: enable_preprocessing,
         max_iter: 500,
         tol: 1e-8,
         ..SolverOptions::default()
@@ -1088,9 +1090,11 @@ fn cli_writes_validated_json_report() {
         v["diagnostics"]["preprocessing"].is_object(),
         "JSON report should include preprocessing diagnostics"
     );
+    // Auxiliary preprocessing (presolve/postsolve) is off by default to match
+    // Ipopt 3.14, so its diagnostics should record that no attempt was made.
     assert_eq!(
         v["diagnostics"]["preprocessing"]["presolve"]["attempted"],
-        true
+        false
     );
     assert_eq!(
         v["diagnostics"]["preprocessing"]["standard"]["attempted"],

@@ -562,6 +562,12 @@ pub unsafe extern "C" fn ripopt_add_str_option(
         "enable_preprocessing" => {
             p.options.enable_preprocessing = value == "yes";
         }
+        "enable_auxiliary_preprocessing" => {
+            p.options.enable_auxiliary_preprocessing = value == "yes";
+        }
+        "enable_aggressive_preprocessing" => {
+            p.options.enable_aggressive_preprocessing = value == "yes";
+        }
         "detect_linear_constraints" => {
             p.options.detect_linear_constraints = value == "yes";
         }

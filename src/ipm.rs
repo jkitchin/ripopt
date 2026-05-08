@@ -2534,6 +2534,8 @@ fn auxiliary_reduced_solve_options(
 ) -> Option<SolverOptions> {
     let mut reduced_opts = preprocess_opts.clone();
     reduced_opts.enable_preprocessing = false;
+    reduced_opts.enable_auxiliary_preprocessing = false;
+    reduced_opts.enable_aggressive_preprocessing = false;
     reduced_opts.warm_start = false;
     reduced_opts.warm_start_y = None;
     reduced_opts.warm_start_z_l = None;
@@ -3131,15 +3133,21 @@ fn try_standard_preprocessed_solve<P: NlpProblem>(
     diagnostics.original_constraints = problem.num_constraints();
     let total_start = Instant::now();
     let construction_start = Instant::now();
-    let prep = if options.enable_preprocessing {
+    let prep = if options.enable_preprocessing && options.enable_aggressive_preprocessing {
+        // Full ripopt heuristic preprocessing: fixed-var elimination,
+        // bound tightening from single-variable linear constraints, and
+        // redundant-constraint detection. Ipopt 3.14 has no equivalent;
+        // these passes are gated by `enable_aggressive_preprocessing`
+        // (default: false). See `docs/IPOPT_DEVIATION_AUDIT.md` §A2.
         crate::preprocessing::PreprocessedProblem::new(
             problem as &dyn NlpProblem,
             options.bound_push,
         )
-    } else if make_parameter {
-        // `fixed_variable_treatment = make_parameter` activates fixed-var
-        // elimination even when full preprocessing is disabled. Mirrors
-        // Ipopt 3.14's `TNLPAdapter` behavior.
+    } else if options.enable_preprocessing || make_parameter {
+        // Ipopt-aligned default: only eliminate fixed variables, matching
+        // `TNLPAdapter`'s `fixed_variable_treatment = make_parameter`. Also
+        // taken when `enable_preprocessing = false` but
+        // `fixed_variable_treatment = make_parameter`.
         crate::preprocessing::PreprocessedProblem::new_fixed_only(problem as &dyn NlpProblem)
     } else {
         unreachable!("standard preprocessing precondition checked above");
@@ -3164,6 +3172,8 @@ fn try_standard_preprocessed_solve<P: NlpProblem>(
     }
     let mut prep_opts = options.clone();
     prep_opts.enable_preprocessing = false;
+    prep_opts.enable_auxiliary_preprocessing = false;
+    prep_opts.enable_aggressive_preprocessing = false;
     let reduced_solve_start = Instant::now();
     let reduced_result = solve(&prep, &prep_opts);
     diagnostics.reduced_solve_time_secs += reduced_solve_start.elapsed().as_secs_f64();
@@ -3187,7 +3197,13 @@ fn try_preprocessed_solve<P: NlpProblem>(
     solve_start: Instant,
     diagnostics: &mut PreprocessingDiagnostics,
 ) -> Option<SolveResult> {
-    if options.enable_preprocessing {
+    // Auxiliary equality-block preprocessing is a ripopt-only heuristic with
+    // no Ipopt 3.14 equivalent. It is now gated by the dedicated
+    // `enable_auxiliary_preprocessing` flag (default: false) so the default
+    // pipeline matches Ipopt. See `docs/IPOPT_DEVIATION_AUDIT.md` §A2 and
+    // the v0.8 alignment plan; disabling this pass on cutest-large fixed
+    // ACOPR30/NET1 and improved AC-OPF timings 14–32×.
+    if options.enable_preprocessing && options.enable_auxiliary_preprocessing {
         if let AuxiliaryPreprocessAttempt::Solved(result) =
             try_auxiliary_preprocessed_solve(
                 problem,
@@ -12334,6 +12350,7 @@ mod tests {
         let options = SolverOptions {
             print_level,
             enable_preprocessing: true,
+            enable_auxiliary_preprocessing: true,
             max_iter: 100,
             ..SolverOptions::default()
         };
@@ -12550,6 +12567,7 @@ mod tests {
         let options = SolverOptions {
             print_level: 0,
             enable_preprocessing: true,
+            enable_auxiliary_preprocessing: true,
             max_iter: 100,
             ..SolverOptions::default()
         };
@@ -12594,6 +12612,7 @@ mod tests {
         let options = SolverOptions {
             print_level: 5,
             enable_preprocessing: true,
+            enable_auxiliary_preprocessing: true,
             max_iter: 100,
             ..SolverOptions::default()
         };

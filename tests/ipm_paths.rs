@@ -930,6 +930,7 @@ fn auxiliary_objective_coupled_branch_solves_full_space_objective() {
     let options = SolverOptions {
         print_level: 0,
         enable_preprocessing: true,
+        enable_auxiliary_preprocessing: true,
         max_iter: 200,
         tol: 1e-8,
         ..SolverOptions::default()
@@ -956,6 +957,7 @@ fn auxiliary_inequality_coupled_branch_solves_full_space_feasibly() {
     let options = SolverOptions {
         print_level: 0,
         enable_preprocessing: true,
+        enable_auxiliary_preprocessing: true,
         max_iter: 200,
         tol: 1e-8,
         ..SolverOptions::default()
@@ -979,6 +981,7 @@ fn auxiliary_triangular_system_solves_before_main_nlp() {
     let options = SolverOptions {
         print_level: 0,
         enable_preprocessing: true,
+        enable_auxiliary_preprocessing: true,
         max_iter: 200,
         tol: 1e-8,
         ..SolverOptions::default()
@@ -1000,6 +1003,7 @@ fn auxiliary_preprocessing_integrates_without_fallback_tag() {
     let options = SolverOptions {
         print_level: 0,
         enable_preprocessing: true,
+        enable_auxiliary_preprocessing: true,
         max_iter: 200,
         tol: 1e-8,
         ..SolverOptions::default()
@@ -1023,6 +1027,7 @@ fn auxiliary_inequality_coupled_problem_solves_on_original_path() {
     let options = SolverOptions {
         print_level: 0,
         enable_preprocessing: true,
+        enable_auxiliary_preprocessing: true,
         user_g_scaling: Some(vec![1.0, 0.5]),
         ..SolverOptions::default()
     };
@@ -1077,6 +1082,7 @@ fn auxiliary_failure_falls_back_to_original_nlp() {
     let options = SolverOptions {
         print_level: 0,
         enable_preprocessing: true,
+        enable_auxiliary_preprocessing: true,
         max_iter: 200,
         tol: 1e-8,
         ..SolverOptions::default()
@@ -1119,6 +1125,7 @@ fn auxiliary_reduced_solve_failure_falls_back_to_original_nlp() {
     let options = SolverOptions {
         print_level: 0,
         enable_preprocessing: true,
+        enable_auxiliary_preprocessing: true,
         max_iter: 200,
         tol: 1e-8,
         ..SolverOptions::default()
@@ -1252,6 +1259,7 @@ fn auxiliary_postsolve_recovers_equality_variable_after_reduced_solve() {
     let options = SolverOptions {
         print_level: 0,
         enable_preprocessing: true,
+        enable_auxiliary_preprocessing: true,
         max_iter: 200,
         tol: 1e-8,
         ..SolverOptions::default()
@@ -1284,6 +1292,7 @@ fn auxiliary_gate_options(enable_preprocessing: bool) -> SolverOptions {
     SolverOptions {
         print_level: 0,
         enable_preprocessing,
+        enable_auxiliary_preprocessing: enable_preprocessing,
         max_iter: 300,
         tol: 1e-8,
         ..SolverOptions::default()

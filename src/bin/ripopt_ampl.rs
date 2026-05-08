@@ -284,7 +284,9 @@ fn print_help() {
     println!("    gondzio_mcc_max=<int>                Max Gondzio centrality corrections [3]");
     println!();
     println!("  Preprocessing & Diagnostics");
-    println!("    enable_preprocessing=<bool>          Internal auxiliary equality solves/recovery, fixed vars, redundancies [yes]");
+    println!("    enable_preprocessing=<bool>          Master switch for preprocessing (fixed-variable elimination always runs when on) [yes]");
+    println!("    enable_auxiliary_preprocessing=<bool> Auxiliary equality-block presolve/postsolve (ripopt-only, off by default) [no]");
+    println!("    enable_aggressive_preprocessing=<bool> Bound-tightening + redundant-constraint detection (ripopt-only, off by default) [no]");
     println!("    print_level=<int>                    Verbosity: 0=silent, 5=verbose [5]");
     println!("    mu_oracle_quality_function=<bool>    Use quality function for mu selection [no]");
     println!();
@@ -469,6 +471,12 @@ fn apply_option(opts: &mut SolverOptions, key: &str, value: &str) {
         }
         "enable_preprocessing" => {
             opts.enable_preprocessing = value == "yes" || value == "true" || value == "1";
+        }
+        "enable_auxiliary_preprocessing" => {
+            opts.enable_auxiliary_preprocessing = value == "yes" || value == "true" || value == "1";
+        }
+        "enable_aggressive_preprocessing" => {
+            opts.enable_aggressive_preprocessing = value == "yes" || value == "true" || value == "1";
         }
         "detect_linear_constraints" => {
             opts.detect_linear_constraints = value == "yes" || value == "true" || value == "1";

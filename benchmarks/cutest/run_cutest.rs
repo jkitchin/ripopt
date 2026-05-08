@@ -796,11 +796,30 @@ fn main() {
                         }
                     }
 
-                    // Print the solver's stderr summary line
+                    // Re-emit subprocess stderr to parent stderr.
+                    // The single summary line (e.g. "ripopt: Optimal (obj=...)" or
+                    // "ipopt: Optimal (obj=...)") is concatenated to the current
+                    // benchmark progress line via `eprint!` for compact
+                    // `name ... ripopt: ... ipopt: ...` formatting. All other
+                    // `ripopt:`-prefixed lines (verbose IPM trace from
+                    // `RIPOPT_PRINT_LEVEL>=3`) and the iteration table rows
+                    // (no prefix, leading whitespace) are passed through with
+                    // their newlines preserved so the full trace is readable.
+                    let summary_seen_ref = std::cell::Cell::new(false);
                     for line in stderr.lines() {
                         let trimmed = line.trim();
-                        if trimmed.starts_with("ripopt:") || trimmed.starts_with("ipopt:") {
+                        let is_summary = !summary_seen_ref.get()
+                            && (trimmed.starts_with(&format!("{}: ", solver)))
+                            && trimmed.contains("(obj=");
+                        if is_summary {
                             eprint!("{} ", trimmed);
+                            summary_seen_ref.set(true);
+                        } else if trimmed.starts_with("ripopt:") || trimmed.starts_with("ipopt:") {
+                            eprintln!("{}", line);
+                        } else if !trimmed.is_empty() {
+                            // Iteration-table rows (leading whitespace + iter no.) and
+                            // any other diagnostic output: preserve verbatim.
+                            eprintln!("{}", line);
                         }
                     }
 
