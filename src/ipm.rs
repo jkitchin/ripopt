@@ -3345,6 +3345,7 @@ fn print_final_summary(result: &SolveResult) {
         SolveStatus::Infeasible => "Converged to a point of local infeasibility. Problem may be infeasible.",
         SolveStatus::LocalInfeasibility => "Converged to a point of local infeasibility.",
         SolveStatus::MaxIterations => "Maximum Number of Iterations Exceeded.",
+        SolveStatus::MaxTimeExceeded => "Maximum CPU Time Exceeded.",
         SolveStatus::NumericalError => "Numerical Difficulties Encountered.",
         SolveStatus::DivergingIterates => "Diverging Iterates -- Problem May Be Unbounded.",
         SolveStatus::RestorationFailed => "Restoration Failed.",
@@ -4760,7 +4761,7 @@ fn run_post_ls_restoration_cascade<P: NlpProblem>(
     if options.max_wall_time > 0.0 {
         let remaining = options.max_wall_time - start_time.elapsed().as_secs_f64();
         if remaining < 1.0 {
-            return RestorationCascadeDecision::Return(make_result(state, SolveStatus::MaxIterations));
+            return RestorationCascadeDecision::Return(make_result(state, SolveStatus::MaxTimeExceeded));
         }
     }
 
@@ -6245,9 +6246,10 @@ fn check_convergence_and_handle_promotions(
 
 /// Check wall-clock time limit at the top of each iteration.
 ///
-/// Returns `Some(MaxIterations)` if `max_wall_time` has been exceeded.
-/// Wall-clock is polled every iteration during the first 10, then every 10
-/// thereafter to keep overhead negligible on long runs.
+/// Returns `Some(MaxTimeExceeded)` if `max_wall_time` (also reachable via the
+/// `max_cpu_time` alias) has been exhausted. Wall-clock is polled every
+/// iteration during the first 10, then every 10 thereafter to keep overhead
+/// negligible on long runs.
 fn check_time_limits(
     state: &SolverState,
     iteration: usize,
@@ -6256,7 +6258,7 @@ fn check_time_limits(
 ) -> Option<SolveResult> {
     if (iteration < 10 || iteration % 10 == 0) && options.max_wall_time > 0.0 {
         if start_time.elapsed().as_secs_f64() >= options.max_wall_time {
-            return Some(make_result(state, SolveStatus::MaxIterations));
+            return Some(make_result(state, SolveStatus::MaxTimeExceeded));
         }
     }
     None

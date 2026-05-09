@@ -134,6 +134,7 @@ fn main() {
             ripopt::SolveStatus::Infeasible => "Infeasible",
             ripopt::SolveStatus::LocalInfeasibility => "LocalInfeasibility",
             ripopt::SolveStatus::MaxIterations => "MaxIterations",
+            ripopt::SolveStatus::MaxTimeExceeded => "MaxTimeExceeded",
             ripopt::SolveStatus::NumericalError => "NumericalError",
             ripopt::SolveStatus::DivergingIterates => "DivergingIterates",
             ripopt::SolveStatus::RestorationFailed => "RestorationFailed",

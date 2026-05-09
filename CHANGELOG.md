@@ -30,6 +30,18 @@
   AMPL CLI; setting `max_cpu_time` no longer silently does nothing on scripts
   ported from Ipopt. The limit is still enforced as wall-clock time (a one-time
   warning is printed to stderr when the alias is applied).
+- **`SolveStatus::MaxTimeExceeded`** distinguishes a wall-clock-time exit from
+  a `MaxIterations` (iteration-cap) exit (issue #36 follow-up). The previous
+  behavior reused `MaxIterations` for both, which made `max_cpu_time` look
+  ignored when used through the Pyomo `SolverFactory("ripopt")` path: the
+  solver did stop, but the `.sol` file said "Maximum Number of Iterations
+  Exceeded". The AMPL `.sol` `solve_result_num` is now 401 for time-out
+  (matching Ipopt's `Maximum_CpuTime_Exceeded` convention) and the message
+  reads "Maximum CPU Time Exceeded". The C API maps to the existing
+  `MaxWallTimeExceeded` (-5) return code. Pyomo's `.sol` parser still
+  collapses 400-499 to `TerminationCondition.maxIterations` (a Pyomo
+  limitation), but `result.solver.id` and `result.solver.message` now
+  distinguish the two cases.
 - **Unknown options now warn instead of being silently dropped on the C API**.
   `ripopt_add_num_option`, `ripopt_add_int_option`, and `ripopt_add_str_option`
   still return 0 for unknown keywords (unchanged contract for callers that

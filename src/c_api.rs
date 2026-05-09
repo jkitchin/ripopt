@@ -337,6 +337,7 @@ fn map_status(s: SolveStatus) -> RipoptReturnStatus {
             RipoptReturnStatus::InfeasibleProblem
         }
         SolveStatus::MaxIterations => RipoptReturnStatus::MaxIterExceeded,
+        SolveStatus::MaxTimeExceeded => RipoptReturnStatus::MaxWallTimeExceeded,
         SolveStatus::RestorationFailed => RipoptReturnStatus::RestorationFailed,
         SolveStatus::NumericalError => RipoptReturnStatus::ErrorInStepComputation,
         SolveStatus::EvaluationError => RipoptReturnStatus::InvalidNumberDetected,

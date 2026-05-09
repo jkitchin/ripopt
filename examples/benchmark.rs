@@ -389,6 +389,7 @@ fn status_string(s: SolveStatus) -> &'static str {
         SolveStatus::Acceptable => "Acceptable",
         SolveStatus::Infeasible => "Infeasible",
         SolveStatus::MaxIterations => "MaxIterations",
+        SolveStatus::MaxTimeExceeded => "MaxTimeExceeded",
         SolveStatus::NumericalError => "NumericalError",
         SolveStatus::EvaluationError => "EvaluationError",
         SolveStatus::UserRequestedStop => "UserRequestedStop",

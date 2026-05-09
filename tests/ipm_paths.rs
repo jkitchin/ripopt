@@ -1374,7 +1374,7 @@ fn status_rank(status: SolveStatus) -> u8 {
         SolveStatus::LocalInfeasibility
         | SolveStatus::Infeasible
         | SolveStatus::DivergingIterates => 2,
-        SolveStatus::MaxIterations => 3,
+        SolveStatus::MaxIterations | SolveStatus::MaxTimeExceeded => 3,
         SolveStatus::NumericalError
         | SolveStatus::RestorationFailed
         | SolveStatus::EvaluationError
