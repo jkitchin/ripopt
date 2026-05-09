@@ -957,6 +957,14 @@ struct MuState {
     /// switch when `adaptive_mu_restore_previous_iterate` is on. `None`
     /// until the option fires the first capture.
     accepted_iterate: Option<AcceptedIterateSnapshot>,
+    /// 2-D filter for the `obj-constr-filter` adaptive μ globalization
+    /// (`IpAdaptiveMuUpdate.cpp:80, 470-490, 519-528`). Each entry is a
+    /// `(curr_f, curr_theta)` pair from a Free-mode iterate that passed
+    /// `CheckSufficientProgress`. A trial point is acceptable iff no
+    /// entry dominates `(curr_f + margin, curr_theta + margin)` where
+    /// `margin = filter_margin_fact * min(filter_max_margin, curr_nlp_error)`.
+    /// Empty until the first remember-as-accepted call.
+    obj_constr_filter: Vec<(f64, f64)>,
 }
 
 /// T3.11: full primal-dual iterate snapshot used by the
@@ -989,6 +997,7 @@ impl MuState {
             dual_inf_window: Vec::with_capacity(4),
             initial_avg_compl: None,
             accepted_iterate: None,
+            obj_constr_filter: Vec::new(),
         }
     }
 
@@ -1006,21 +1015,76 @@ impl MuState {
         }
     }
 
-    /// Check if sufficient progress is being made (KKT error reference check).
-    fn check_sufficient_progress(&self, kkt_error: f64) -> bool {
-        if self.ref_vals.len() < self.num_refs_max {
-            return true; // Not enough history yet
+    /// Check if sufficient progress is being made under the configured
+    /// adaptive μ globalization (Ipopt `IpAdaptiveMuUpdate.cpp:446-490`).
+    ///
+    /// - `KktError`: KKT-error sliding-window reduction
+    ///   (`IpAdaptiveMuUpdate.cpp:452-468`).
+    /// - `ObjConstrFilter`: 2-D `(f, θ)` filter dominance test with margin
+    ///   `filter_margin_fact * min(filter_max_margin, curr_nlp_error)`
+    ///   (`IpAdaptiveMuUpdate.cpp:470-490`). The trial is acceptable iff
+    ///   no entry dominates `(curr_f + margin, curr_θ + margin)`.
+    /// - `NeverMonotone`: always true.
+    fn check_sufficient_progress(
+        &self,
+        options: &SolverOptions,
+        kkt_error: f64,
+        curr_f: f64,
+        curr_theta: f64,
+        curr_nlp_error: f64,
+    ) -> bool {
+        match options.adaptive_mu_globalization {
+            crate::options::AdaptiveMuGlobalization::KktError => {
+                if self.ref_vals.len() < self.num_refs_max {
+                    return true;
+                }
+                self.ref_vals.iter().any(|&r| kkt_error <= self.refs_red_fact * r)
+            }
+            crate::options::AdaptiveMuGlobalization::ObjConstrFilter => {
+                if self.obj_constr_filter.is_empty() {
+                    return true;
+                }
+                let margin = options.filter_margin_fact
+                    * options.filter_max_margin.min(curr_nlp_error.max(0.0));
+                let f_test = curr_f + margin;
+                let theta_test = curr_theta + margin;
+                // Acceptable iff no entry dominates the trial.
+                // Filter dominance: entry dominates trial when
+                // entry.f <= trial.f AND entry.theta <= trial.theta.
+                !self
+                    .obj_constr_filter
+                    .iter()
+                    .any(|&(ef, et)| ef <= f_test && et <= theta_test)
+            }
+            crate::options::AdaptiveMuGlobalization::NeverMonotone => true,
         }
-        // Sufficient if current error < refs_red_fact * any reference
-        self.ref_vals.iter().any(|&r| kkt_error <= self.refs_red_fact * r)
     }
 
-    /// Remember an accepted KKT error value.
-    fn remember_accepted(&mut self, kkt_error: f64) {
-        if self.ref_vals.len() >= self.num_refs_max {
-            self.ref_vals.remove(0);
+    /// Record the current iterate as "accepted" by the adaptive μ
+    /// globalization (Ipopt `IpAdaptiveMuUpdate.cpp:492-540`).
+    /// `KktError` pushes `kkt_error` onto the sliding window;
+    /// `ObjConstrFilter` adds `(curr_f, curr_θ)` to the 2-D filter
+    /// (Ipopt line 528 adds with no margin); `NeverMonotone` does
+    /// nothing.
+    fn remember_accepted(
+        &mut self,
+        options: &SolverOptions,
+        kkt_error: f64,
+        curr_f: f64,
+        curr_theta: f64,
+    ) {
+        match options.adaptive_mu_globalization {
+            crate::options::AdaptiveMuGlobalization::KktError => {
+                if self.ref_vals.len() >= self.num_refs_max {
+                    self.ref_vals.remove(0);
+                }
+                self.ref_vals.push(kkt_error);
+            }
+            crate::options::AdaptiveMuGlobalization::ObjConstrFilter => {
+                self.obj_constr_filter.push((curr_f, curr_theta));
+            }
+            crate::options::AdaptiveMuGlobalization::NeverMonotone => {}
         }
-        self.ref_vals.push(kkt_error);
     }
 }
 
@@ -5996,14 +6060,23 @@ fn update_barrier_parameter(
         return;
     }
 
-    let kkt_error = {
-        let pi = state.constraint_violation();
-        let di = compute_dual_inf_at_state(state);
-        let ci = compute_compl_err_at_state(state);
-        pi * pi + di * di + ci * ci
-    };
+    let pi = state.constraint_violation();
+    let di = compute_dual_inf_at_state(state);
+    let ci = compute_compl_err_at_state(state);
+    let kkt_error = pi * pi + di * di + ci * ci;
+    // Ipopt `IpCq::curr_nlp_error()` returns max of the three pieces;
+    // used to scale the obj-constr-filter acceptance margin.
+    let curr_nlp_error = pi.max(di).max(ci);
+    let curr_f = state.obj;
+    let curr_theta = pi;
 
-    let sufficient = mu_state.check_sufficient_progress(kkt_error);
+    let sufficient = mu_state.check_sufficient_progress(
+        options,
+        kkt_error,
+        curr_f,
+        curr_theta,
+        curr_nlp_error,
+    );
 
     // Track dual infeasibility for stagnation detection.
     // If du is not decreasing over 3 consecutive iterations in Free mode,
@@ -6120,7 +6193,9 @@ fn apply_free_mode_sufficient_progress_update(
     use_sparse: bool,
 ) {
     mu_state.consecutive_insufficient = 0;
-    mu_state.remember_accepted(kkt_error);
+    let curr_f = state.obj;
+    let curr_theta = state.constraint_violation();
+    mu_state.remember_accepted(options, kkt_error, curr_f, curr_theta);
     // T3.11: capture the accepted iterate so a later Free→Fixed switch
     // can roll back to it. Mirrors Ipopt
     // `RememberCurrentPointAsAccepted` (IpAdaptiveMuUpdate.cpp:541-545):
@@ -6233,7 +6308,9 @@ fn update_barrier_parameter_fixed_mode(
         // Switch back to free mode (only in adaptive strategy)
         log::debug!("Switching back to free mu mode (sufficient progress)");
         switch_mu_mode(state, mu_state, MuMode::Free);
-        mu_state.remember_accepted(kkt_error);
+        let curr_f = state.obj;
+        let curr_theta = state.constraint_violation();
+        mu_state.remember_accepted(options, kkt_error, curr_f, curr_theta);
     } else {
         mu_state.first_iter_in_mode = false;
         // Mirrors Ipopt's IpMonotoneMuUpdate.cpp:130-200: while the barrier
@@ -9625,6 +9702,7 @@ fn apply_restoration_success<P: NlpProblem>(
     }
     mu_state.first_iter_in_mode = true;
     mu_state.ref_vals.clear();
+    mu_state.obj_constr_filter.clear();
     mu_state.consecutive_restoration_failures = 0;
     // T3.25 follow-up: restoration handoff replaces x/y/z/v wholesale.
     // The atag updates above (via the writes to state.x etc.) do NOT

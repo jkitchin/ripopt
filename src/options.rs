@@ -37,6 +37,32 @@ impl Default for FixedVariableTreatment {
     }
 }
 
+/// Globalization strategy for the adaptive mu mode.
+///
+/// Mirrors Ipopt 3.14's `adaptive_mu_globalization`
+/// (`IpAdaptiveMuUpdate.cpp:77-87`). Determines how Free mode decides
+/// "insufficient progress" before switching to Fixed (monotone) mu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum AdaptiveMuGlobalization {
+    /// Sufficient KKT-error reduction across a sliding window of
+    /// recent accepted iterates. Mirrors Ipopt's `"kkt-error"` mode.
+    KktError,
+    /// 2-D filter on (objective, constraint violation). Free mode
+    /// keeps running so long as the current iterate is acceptable
+    /// (with a margin) to all entries previously deemed sufficient.
+    /// Mirrors Ipopt's `"obj-constr-filter"` (Ipopt's default).
+    ObjConstrFilter,
+    /// No globalization — Free mode never voluntarily switches to
+    /// Fixed. Mirrors Ipopt's `"never-monotone-mode"`.
+    NeverMonotone,
+}
+
+impl Default for AdaptiveMuGlobalization {
+    fn default() -> Self {
+        Self::ObjConstrFilter
+    }
+}
+
 /// Bound multiplier initialization method.
 ///
 /// Mirrors Ipopt 3.14's `bound_mult_init_method`
@@ -333,6 +359,20 @@ pub struct SolverOptions {
     /// `IpAdaptiveMuUpdate.cpp:175,308-311,362-370`). When `false` the
     /// switch keeps the current iterate; only mu/tau change.
     pub adaptive_mu_restore_previous_iterate: bool,
+    /// Globalization strategy for the adaptive mu mode. Mirrors Ipopt's
+    /// `adaptive_mu_globalization` (`IpAdaptiveMuUpdate.cpp:77-87`,
+    /// default `"obj-constr-filter"`). Decides when Free mode declares
+    /// "insufficient progress" and switches to Fixed mu.
+    pub adaptive_mu_globalization: AdaptiveMuGlobalization,
+    /// Margin factor for the obj-constr-filter adaptive mu globalization
+    /// (`filter_margin_fact`, `IpAdaptiveMuUpdate.cpp:107-118`,
+    /// default 1e-5). The acceptance test inflates the trial by
+    /// `filter_margin_fact * min(filter_max_margin, curr_nlp_error)`.
+    pub filter_margin_fact: f64,
+    /// Cap on the margin used by the obj-constr-filter adaptive mu
+    /// globalization (`filter_max_margin`, `IpAdaptiveMuUpdate.cpp:119-125`,
+    /// default 1.0).
+    pub filter_max_margin: f64,
     /// Maximum iterations for restoration NLP subproblem. Default: 200.
     pub restoration_max_iter: usize,
     /// Disable NLP restoration (prevents recursion in inner solve). Default: false.
@@ -775,6 +815,9 @@ impl Default for SolverOptions {
             mu_allow_fast_monotone_decrease: true,
             adaptive_mu_monotone_init_factor: 0.8,
             adaptive_mu_restore_previous_iterate: false,
+            adaptive_mu_globalization: AdaptiveMuGlobalization::ObjConstrFilter,
+            filter_margin_fact: 1e-5,
+            filter_max_margin: 1.0,
             restoration_max_iter: 200,
             disable_nlp_restoration: false,
             kappa_resto: 0.9,
