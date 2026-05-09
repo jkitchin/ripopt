@@ -10181,8 +10181,30 @@ fn compute_initial_ls_4block(
 
     let matrix = KktMatrix::Sparse(ssm);
     let mut solver = new_sparse_solver();
-    if solver.factor(&matrix).is_err() {
-        return None;
+    let factor_inertia = match solver.factor(&matrix) {
+        Ok(inertia) => inertia,
+        Err(_) => return None,
+    };
+    // Mirror Ipopt's `IpLeastSquareMults.cpp:80-87`: the augmented
+    // saddle-point solve is rejected when the linear solver reports
+    // wrong inertia. Without this check, MSS1's rank-deficient Jacobian
+    // at x=y=1 (where ∇f happens to lie in Range(J^T)) yields a finite
+    // y with |y|_inf ≈ 45 that drives subsequent KKT factorisations
+    // toward δ_w ≈ 1e12, exploding |dy_c| at iter 1. Ipopt rejects the
+    // solve here and falls back to y=0, which is what we now do.
+    //
+    // Target inertia for the (n+n_d+n_c+n_d) augmented LS system
+    //   diag: (+I)_n  (+I)_{n_d}  (0)_{n_c}  (0)_{n_d}
+    // is (positive=n+n_d, negative=n_c+n_d, zero=0).
+    if let Some(inertia) = factor_inertia {
+        let pos_target = n + n_d;
+        let neg_target = n_c + n_d;
+        if inertia.positive != pos_target
+            || inertia.negative != neg_target
+            || inertia.zero != 0
+        {
+            return None;
+        }
     }
     let mut sol = vec![0.0_f64; dim];
     if solver.solve(&rhs, &mut sol).is_err() {
