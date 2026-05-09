@@ -359,6 +359,11 @@ set_optimizer_attribute(model, "mu_strategy", "adaptive")
 set_time_limit_sec(model, 60.0)
 ```
 
+**Compatibility notes** for users coming from Ipopt:
+
+- ripopt accepts the same option names as Ipopt for the options it implements. Options ripopt does not implement are silently ignored by some host frontends; the C API and the AMPL CLI emit a warning to stderr listing the unknown option name.
+- Time limits: ripopt enforces a wall-clock budget via `max_wall_time`. Ipopt's default `max_cpu_time` is accepted as an alias for `max_wall_time` (with a one-time stderr warning) so existing Ipopt scripts keep working — note that the limit is enforced as wall-clock, not CPU time.
+
 Switching between ripopt and Ipopt requires only changing the optimizer constructor; the rest of the model is identical:
 
 ```julia
@@ -454,7 +459,7 @@ Key options (all have Ipopt-matching defaults):
 | `print_level`                   | 5       | Output verbosity (0=silent, 5=verbose)                     |
 | `mu_strategy_adaptive`          | true    | Adaptive vs monotone barrier update                        |
 | `max_soc`                       | 4       | Maximum second-order correction steps                      |
-| `max_wall_time`                 | 0.0     | Wall-clock time limit in seconds (0=no limit)              |
+| `max_wall_time`                 | 0.0     | Wall-clock time limit in seconds (0=no limit). Ipopt's `max_cpu_time` is accepted as an alias. |
 | `warm_start`                    | false   | Enable warm-start initialization                           |
 | `constr_viol_tol`               | 1e-4    | Constraint violation tolerance                             |
 | `dual_inf_tol`                  | 1.0     | Dual infeasibility tolerance                               |
@@ -622,7 +627,7 @@ Option-setting functions return `1` on success, `0` if the keyword is unknown. A
 | `dual_inf_tol`               | 1.0     | Dual infeasibility tolerance                    |
 | `compl_inf_tol`              | 1e-4    | Complementarity tolerance                       |
 | `auxiliary_tol`              | 1e-8    | Residual tolerance for internal auxiliary equality solves/recovery |
-| `max_wall_time`              | 0.0     | Wall-clock time limit in seconds (0 = no limit) |
+| `max_wall_time`              | 0.0     | Wall-clock time limit in seconds (0 = no limit). Ipopt's `max_cpu_time` is accepted as an alias. |
 | `warm_start_bound_push`      | 1e-3    | Warm-start bound push                           |
 | `warm_start_bound_frac`      | 1e-3    | Warm-start bound fraction                       |
 | `warm_start_mult_bound_push` | 1e-3    | Warm-start multiplier push                      |

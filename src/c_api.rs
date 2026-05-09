@@ -430,6 +430,25 @@ pub unsafe extern "C" fn ripopt_free(problem: *mut CApiProblem) {
     }
 }
 
+/// Parse a boolean string-option value. Accepts the same spellings as Ipopt
+/// (`yes`/`no`) plus `true`/`false`/`1`/`0`/`on`/`off`. Returns `None` and
+/// logs a stderr warning for anything else, so a typo like
+/// `"tru"` no longer silently flips the flag to `false`.
+fn parse_bool_str_option(key: &str, value: &str) -> Option<bool> {
+    match value {
+        "yes" | "true" | "1" | "on" => Some(true),
+        "no" | "false" | "0" | "off" => Some(false),
+        _ => {
+            eprintln!(
+                "ripopt: unrecognized value '{}' for boolean option '{}' \
+                 (use 'yes' or 'no'); leaving option unchanged",
+                value, key
+            );
+            None
+        }
+    }
+}
+
 /// Set a numeric (double) option.
 ///
 /// Returns 1 on success, 0 if the keyword is unknown.
@@ -470,6 +489,16 @@ pub unsafe extern "C" fn ripopt_add_num_option(
         "kappa" => p.options.kappa = val,
         "constr_mult_init_max" => p.options.constr_mult_init_max = val,
         "max_wall_time" => p.options.max_wall_time = val,
+        // Ipopt's default time-limit option name. ripopt does not separately
+        // track CPU time; alias it onto the wall-clock budget so existing
+        // Ipopt scripts keep working without surprises.
+        "max_cpu_time" => {
+            eprintln!(
+                "ripopt: option 'max_cpu_time' is treated as an alias for 'max_wall_time' \
+                 (ripopt enforces a wall-clock limit only)"
+            );
+            p.options.max_wall_time = val;
+        }
         "barrier_tol_factor" => p.options.barrier_tol_factor = val,
         "adaptive_mu_monotone_init_factor" => p.options.adaptive_mu_monotone_init_factor = val,
         "warm_start_target_mu" => p.options.warm_start_target_mu = Some(val),
@@ -481,7 +510,14 @@ pub unsafe extern "C" fn ripopt_add_num_option(
         "nlp_scaling_constr_target_gradient" => {
             p.options.nlp_scaling_constr_target_gradient = val
         }
-        _ => return 0,
+        _ => {
+            eprintln!(
+                "ripopt: ignoring unknown numeric option '{}' \
+                 (run 'ripopt --help' or see the README for supported options)",
+                key
+            );
+            return 0;
+        }
     }
     1
 }
@@ -514,7 +550,14 @@ pub unsafe extern "C" fn ripopt_add_int_option(
         "sparse_threshold" => p.options.sparse_threshold = val as usize,
         "restoration_max_iter" => p.options.restoration_max_iter = val as usize,
         "gondzio_mcc_max" => p.options.gondzio_mcc_max = val as usize,
-        _ => return 0,
+        _ => {
+            eprintln!(
+                "ripopt: ignoring unknown integer option '{}' \
+                 (run 'ripopt --help' or see the README for supported options)",
+                key
+            );
+            return 0;
+        }
     }
     1
 }
@@ -542,50 +585,104 @@ pub unsafe extern "C" fn ripopt_add_str_option(
     };
     match key {
         "mu_strategy" => {
-            p.options.mu_strategy_adaptive = value == "adaptive";
+            match value {
+                "adaptive" => p.options.mu_strategy_adaptive = true,
+                "monotone" => p.options.mu_strategy_adaptive = false,
+                _ => {
+                    eprintln!(
+                        "ripopt: unrecognized value '{}' for option 'mu_strategy' \
+                         (use 'adaptive' or 'monotone')",
+                        value
+                    );
+                    return 0;
+                }
+            }
         }
         "warm_start_init_point" => {
-            p.options.warm_start = value == "yes";
+            match parse_bool_str_option(key, value) {
+                Some(v) => p.options.warm_start = v,
+                None => return 0,
+            }
         }
         "mu_allow_increase" => {
-            p.options.mu_allow_increase = value == "yes";
+            match parse_bool_str_option(key, value) {
+                Some(v) => p.options.mu_allow_increase = v,
+                None => return 0,
+            }
         }
         "least_squares_mult_init" => {
-            p.options.least_squares_mult_init = value == "yes";
+            match parse_bool_str_option(key, value) {
+                Some(v) => p.options.least_squares_mult_init = v,
+                None => return 0,
+            }
         }
         "constraint_slack_barrier" => {
-            p.options.constraint_slack_barrier = value == "yes";
+            match parse_bool_str_option(key, value) {
+                Some(v) => p.options.constraint_slack_barrier = v,
+                None => return 0,
+            }
         }
         "disable_nlp_restoration" => {
-            p.options.disable_nlp_restoration = value == "yes";
+            match parse_bool_str_option(key, value) {
+                Some(v) => p.options.disable_nlp_restoration = v,
+                None => return 0,
+            }
         }
         "enable_preprocessing" => {
-            p.options.enable_preprocessing = value == "yes";
+            match parse_bool_str_option(key, value) {
+                Some(v) => p.options.enable_preprocessing = v,
+                None => return 0,
+            }
         }
         "enable_auxiliary_preprocessing" => {
-            p.options.enable_auxiliary_preprocessing = value == "yes";
+            match parse_bool_str_option(key, value) {
+                Some(v) => p.options.enable_auxiliary_preprocessing = v,
+                None => return 0,
+            }
         }
         "enable_aggressive_preprocessing" => {
-            p.options.enable_aggressive_preprocessing = value == "yes";
+            match parse_bool_str_option(key, value) {
+                Some(v) => p.options.enable_aggressive_preprocessing = v,
+                None => return 0,
+            }
         }
         "detect_linear_constraints" => {
-            p.options.detect_linear_constraints = value == "yes";
+            match parse_bool_str_option(key, value) {
+                Some(v) => p.options.detect_linear_constraints = v,
+                None => return 0,
+            }
         }
         "hessian_approximation" => {
             match value {
                 "limited-memory" => p.options.hessian_approximation_lbfgs = true,
                 "exact" => p.options.hessian_approximation_lbfgs = false,
-                _ => return 0,
+                _ => {
+                    eprintln!(
+                        "ripopt: ignoring unknown value '{}' for option 'hessian_approximation' \
+                         (use 'exact' or 'limited-memory')",
+                        value
+                    );
+                    return 0;
+                }
             }
         }
         "mehrotra_pc" => {
-            p.options.mehrotra_pc = value == "yes";
+            match parse_bool_str_option(key, value) {
+                Some(v) => p.options.mehrotra_pc = v,
+                None => return 0,
+            }
         }
         "mu_oracle_quality_function" => {
-            p.options.mu_oracle_quality_function = value == "yes";
+            match parse_bool_str_option(key, value) {
+                Some(v) => p.options.mu_oracle_quality_function = v,
+                None => return 0,
+            }
         }
         "quality_function_centrality" => {
-            p.options.quality_function_centrality = value == "yes";
+            match parse_bool_str_option(key, value) {
+                Some(v) => p.options.quality_function_centrality = v,
+                None => return 0,
+            }
         }
         "quality_function_max_section_steps" => {
             if let Ok(v) = value.parse::<usize>() {
@@ -600,10 +697,24 @@ pub unsafe extern "C" fn ripopt_add_str_option(
                 "none" => NlpScalingMethod::None,
                 "gradient-based" => NlpScalingMethod::Gradient,
                 "user-scaling" => NlpScalingMethod::User,
-                _ => return 0,
+                _ => {
+                    eprintln!(
+                        "ripopt: ignoring unknown value '{}' for option 'nlp_scaling_method' \
+                         (use 'none', 'gradient-based', or 'user-scaling')",
+                        value
+                    );
+                    return 0;
+                }
             };
         }
-        _ => return 0,
+        _ => {
+            eprintln!(
+                "ripopt: ignoring unknown string option '{}' \
+                 (run 'ripopt --help' or see the README for supported options)",
+                key
+            );
+            return 0;
+        }
     }
     1
 }

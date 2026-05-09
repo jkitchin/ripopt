@@ -425,6 +425,12 @@ fn c_api_option_known_returns_1() {
         let key = CString::new("max_wall_time").unwrap();
         assert_eq!(ripopt_add_num_option(nlp, key.as_ptr(), 30.0), 1);
 
+        // Issue #36: max_cpu_time is accepted as an alias for max_wall_time
+        // so that scripts written for Ipopt do not silently drop their time
+        // limit when switched to ripopt.
+        let key = CString::new("max_cpu_time").unwrap();
+        assert_eq!(ripopt_add_num_option(nlp, key.as_ptr(), 7.0), 1);
+
         let key = CString::new("max_iter").unwrap();
         assert_eq!(ripopt_add_int_option(nlp, key.as_ptr(), 500), 1);
 
@@ -462,6 +468,47 @@ fn c_api_option_unknown_returns_0() {
 
         let val = CString::new("whatever").unwrap();
         assert_eq!(ripopt_add_str_option(nlp, key.as_ptr(), val.as_ptr()), 0);
+
+        ripopt_free(nlp);
+    }
+}
+
+#[test]
+fn c_api_bool_option_typo_returns_0() {
+    // Issue #36 follow-up: typos in boolean string-option values used to
+    // silently flip the flag to false. They now warn on stderr and return 0.
+    let x_l = [0.0];
+    let x_u = [1.0];
+
+    unsafe {
+        let nlp = ripopt_create(
+            1, x_l.as_ptr(), x_u.as_ptr(),
+            0, ptr::null(), ptr::null(),
+            0, 1, 0,
+            rosen_eval_f, rosen_eval_grad_f, empty_eval_g, empty_eval_jac_g, rosen_eval_h,
+        );
+
+        // Typo: "tru" used to silently set warm_start = false.
+        let key = CString::new("warm_start_init_point").unwrap();
+        let val = CString::new("tru").unwrap();
+        assert_eq!(ripopt_add_str_option(nlp, key.as_ptr(), val.as_ptr()), 0);
+
+        // "no" / "false" / "off" are accepted (returns 1).
+        let val = CString::new("no").unwrap();
+        assert_eq!(ripopt_add_str_option(nlp, key.as_ptr(), val.as_ptr()), 1);
+        let val = CString::new("false").unwrap();
+        assert_eq!(ripopt_add_str_option(nlp, key.as_ptr(), val.as_ptr()), 1);
+        let val = CString::new("off").unwrap();
+        assert_eq!(ripopt_add_str_option(nlp, key.as_ptr(), val.as_ptr()), 1);
+
+        // Unknown mu_strategy value rejected; valid spellings accepted.
+        let key = CString::new("mu_strategy").unwrap();
+        let val = CString::new("garbage").unwrap();
+        assert_eq!(ripopt_add_str_option(nlp, key.as_ptr(), val.as_ptr()), 0);
+        let val = CString::new("monotone").unwrap();
+        assert_eq!(ripopt_add_str_option(nlp, key.as_ptr(), val.as_ptr()), 1);
+        let val = CString::new("adaptive").unwrap();
+        assert_eq!(ripopt_add_str_option(nlp, key.as_ptr(), val.as_ptr()), 1);
 
         ripopt_free(nlp);
     }

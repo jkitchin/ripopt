@@ -227,6 +227,7 @@ fn print_help() {
     println!("    tol=<float>                          Optimality convergence tolerance [1e-8]");
     println!("    max_iter=<int>                       Maximum iterations [3000]");
     println!("    max_wall_time=<float>                Max wall-clock time in seconds (0=no limit) [0.0]");
+    println!("    max_cpu_time=<float>                 Alias for max_wall_time (ripopt enforces wall-clock only)");
     println!();
     println!("  Constraint & Dual Tolerances");
     println!("    constr_viol_tol=<float>              Constraint violation tolerance [1e-4]");
@@ -290,7 +291,27 @@ fn print_help() {
     println!("    print_level=<int>                    Verbosity: 0=silent, 5=verbose [5]");
     println!("    mu_oracle_quality_function=<bool>    Use quality function for mu selection [no]");
     println!();
-    println!("  Boolean values accept: yes, true, 1 (anything else is false).");
+    println!("  Boolean values accept: yes/no, true/false, on/off, 1/0.");
+    println!("  Unrecognized values (typos) print a warning and leave the option unchanged.");
+}
+
+/// Parse a boolean option value. Accepts the same spellings as Ipopt (`yes`/`no`)
+/// plus the common `true`/`false`/`1`/`0`/`on`/`off`. Returns `None` and prints
+/// a warning for anything else, so typos like `enable_preprocessing=tru` no
+/// longer silently flip a flag to false.
+fn parse_bool(key: &str, value: &str) -> Option<bool> {
+    match value {
+        "yes" | "true" | "1" | "on" => Some(true),
+        "no" | "false" | "0" | "off" => Some(false),
+        _ => {
+            eprintln!(
+                "Warning: unrecognized value '{}' for boolean option '{}' \
+                 (use yes/no); leaving option unchanged",
+                value, key
+            );
+            None
+        }
+    }
 }
 
 /// Apply a key=value option to SolverOptions.
@@ -318,6 +339,18 @@ fn apply_option(opts: &mut SolverOptions, key: &str, value: &str) {
         }
         "max_wall_time" => {
             if let Ok(v) = value.parse() {
+                opts.max_wall_time = v;
+            }
+        }
+        // Ipopt's default time-limit option name. ripopt does not separately
+        // track CPU time; alias it onto the wall-clock budget so existing
+        // Ipopt scripts keep working.
+        "max_cpu_time" => {
+            if let Ok(v) = value.parse() {
+                eprintln!(
+                    "Warning: option 'max_cpu_time' is treated as an alias for \
+                     'max_wall_time' (ripopt enforces a wall-clock limit only)"
+                );
                 opts.max_wall_time = v;
             }
         }
@@ -387,7 +420,7 @@ fn apply_option(opts: &mut SolverOptions, key: &str, value: &str) {
             }
         }
         "mu_allow_increase" => {
-            opts.mu_allow_increase = value == "yes" || value == "true" || value == "1";
+            if let Some(v) = parse_bool(key, value) { opts.mu_allow_increase = v; }
         }
         "adaptive_mu_monotone_init_factor" => {
             if let Ok(v) = value.parse() {
@@ -400,10 +433,18 @@ fn apply_option(opts: &mut SolverOptions, key: &str, value: &str) {
             }
         }
         "mu_strategy" => {
-            opts.mu_strategy_adaptive = value == "adaptive";
+            match value {
+                "adaptive" => opts.mu_strategy_adaptive = true,
+                "monotone" => opts.mu_strategy_adaptive = false,
+                _ => eprintln!(
+                    "Warning: unrecognized value '{}' for option 'mu_strategy' \
+                     (use 'adaptive' or 'monotone'); leaving option unchanged",
+                    value
+                ),
+            }
         }
         "least_squares_mult_init" => {
-            opts.least_squares_mult_init = value == "yes" || value == "true" || value == "1";
+            if let Some(v) = parse_bool(key, value) { opts.least_squares_mult_init = v; }
         }
         "constr_mult_init_max" => {
             if let Ok(v) = value.parse() {
@@ -411,7 +452,7 @@ fn apply_option(opts: &mut SolverOptions, key: &str, value: &str) {
             }
         }
         "constraint_slack_barrier" => {
-            opts.constraint_slack_barrier = value == "yes" || value == "true" || value == "1";
+            if let Some(v) = parse_bool(key, value) { opts.constraint_slack_barrier = v; }
         }
         "sparse_threshold" => {
             if let Ok(v) = value.parse() {
@@ -419,7 +460,7 @@ fn apply_option(opts: &mut SolverOptions, key: &str, value: &str) {
             }
         }
         "warm_start_init_point" => {
-            opts.warm_start = value == "yes" || value == "true" || value == "1";
+            if let Some(v) = parse_bool(key, value) { opts.warm_start = v; }
         }
         "warm_start_bound_push" => {
             if let Ok(v) = value.parse() {
@@ -467,22 +508,22 @@ fn apply_option(opts: &mut SolverOptions, key: &str, value: &str) {
             }
         }
         "disable_nlp_restoration" => {
-            opts.disable_nlp_restoration = value == "yes" || value == "true" || value == "1";
+            if let Some(v) = parse_bool(key, value) { opts.disable_nlp_restoration = v; }
         }
         "enable_preprocessing" => {
-            opts.enable_preprocessing = value == "yes" || value == "true" || value == "1";
+            if let Some(v) = parse_bool(key, value) { opts.enable_preprocessing = v; }
         }
         "enable_auxiliary_preprocessing" => {
-            opts.enable_auxiliary_preprocessing = value == "yes" || value == "true" || value == "1";
+            if let Some(v) = parse_bool(key, value) { opts.enable_auxiliary_preprocessing = v; }
         }
         "enable_aggressive_preprocessing" => {
-            opts.enable_aggressive_preprocessing = value == "yes" || value == "true" || value == "1";
+            if let Some(v) = parse_bool(key, value) { opts.enable_aggressive_preprocessing = v; }
         }
         "detect_linear_constraints" => {
-            opts.detect_linear_constraints = value == "yes" || value == "true" || value == "1";
+            if let Some(v) = parse_bool(key, value) { opts.detect_linear_constraints = v; }
         }
         "mehrotra_pc" => {
-            opts.mehrotra_pc = value == "yes" || value == "true" || value == "1";
+            if let Some(v) = parse_bool(key, value) { opts.mehrotra_pc = v; }
         }
         "gondzio_mcc_max" => {
             if let Ok(v) = value.parse() {
@@ -505,10 +546,10 @@ fn apply_option(opts: &mut SolverOptions, key: &str, value: &str) {
             }
         }
         "mu_oracle_quality_function" => {
-            opts.mu_oracle_quality_function = value == "yes" || value == "true" || value == "1";
+            if let Some(v) = parse_bool(key, value) { opts.mu_oracle_quality_function = v; }
         }
         "quality_function_centrality" => {
-            opts.quality_function_centrality = value == "yes" || value == "true" || value == "1";
+            if let Some(v) = parse_bool(key, value) { opts.quality_function_centrality = v; }
         }
         "quality_function_max_section_steps" => {
             if let Ok(v) = value.parse() {
@@ -569,10 +610,10 @@ fn apply_option(opts: &mut SolverOptions, key: &str, value: &str) {
             opts.kkt_dump_name = value.to_string();
         }
         "ir_residual_full_8_block" => {
-            opts.ir_residual_full_8_block = value == "yes" || value == "true" || value == "1";
+            if let Some(v) = parse_bool(key, value) { opts.ir_residual_full_8_block = v; }
         }
         "factor_cache_enabled" => {
-            opts.factor_cache_enabled = value == "yes" || value == "true" || value == "1";
+            if let Some(v) = parse_bool(key, value) { opts.factor_cache_enabled = v; }
         }
         _ => {
             eprintln!("Warning: unknown option '{}'", key);

@@ -25,6 +25,25 @@
   modes can be traced side-by-side.
 
 ### Added
+- **`max_cpu_time` accepted as alias for `max_wall_time`** (issue #36). Ipopt's
+  default time-limit option name is now recognized by both the C API and the
+  AMPL CLI; setting `max_cpu_time` no longer silently does nothing on scripts
+  ported from Ipopt. The limit is still enforced as wall-clock time (a one-time
+  warning is printed to stderr when the alias is applied).
+- **Unknown options now warn instead of being silently dropped on the C API**.
+  `ripopt_add_num_option`, `ripopt_add_int_option`, and `ripopt_add_str_option`
+  still return 0 for unknown keywords (unchanged contract for callers that
+  check the return code), but they now also log the offending option name to
+  stderr so users of host frontends that swallow the return code (e.g. some
+  versions of `pyomo-ripopt`) get a visible signal. The AMPL CLI already
+  warned on unknown options.
+- **Boolean and `mu_strategy` values are validated**. Previously a typo such
+  as `enable_preprocessing=tru` or `mu_strategy=adptive` silently flipped the
+  flag to `false` / kept the default; both interfaces now reject the value
+  with a stderr warning and leave the option unchanged. Booleans accept
+  `yes`/`no`, `true`/`false`, `on`/`off`, `1`/`0`; `mu_strategy` accepts
+  `adaptive` or `monotone`.
+
 - **Auxiliary equality preprocessing** (PR #32): when `enable_preprocessing` is
   enabled (default), ripopt now detects square auxiliary equality subsystems via
   Dulmage-Mendelsohn partitioning and block-triangular decomposition, solves
