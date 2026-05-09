@@ -5602,93 +5602,156 @@ fn compute_quality_function_mu(
     ).ok()?;
     let (dx_aff, dy_aff) = pairs[0].clone();
     let (dx_full, dy_full) = pairs[1].clone();
-    let (dz_l_aff, dz_u_aff) = recover_dz_from_state(state, &dx_aff, 0.0);
-    let (dz_l_full, dz_u_full) = recover_dz_from_state(state, &dx_full, state.mu);
-    // B-cross6: recover slack-side primal step `ds` and slack-bound
-    // multiplier steps `dv_L, dv_U` so the QF oracle's centrality and
-    // FTB scans cover all four bound blocks (matching Ipopt's
-    // `IpQualityFunctionMuOracle::CalculateMu` which iterates over
-    // x_L, x_U, s_L, s_U). Mu oracles run before PD perturbation, so
-    // `ic_delta_c = 0` is correct for both predictor and full step
-    // (`IpPDFullSpaceSolver.cpp:229-239`, `IpProbingMuOracle.cpp:71-72`).
-    let ds_aff = recover_ds_from_state(state, &dx_aff, &dy_aff, 0.0);
-    let ds_full = recover_ds_from_state(state, &dx_full, &dy_full, 0.0);
-    let (dv_l_aff, dv_u_aff) = recover_dv_from_state(state, &ds_aff, 0.0);
-    let (dv_l_full, dv_u_full) = recover_dv_from_state(state, &ds_full, state.mu);
 
-    // 4) Pre-compute the residuals at the current iterate (needed for the
-    //    `(1−α)·residual` linearised identity).
-    let primal_inf0 = compute_primal_inf_max_at_state(state);
-    let dual_inf0 = compute_dual_inf_at_state(state);
-    let s_d = compute_residual_scaling(compute_multiplier_sum(state), compute_multiplier_count(state));
-    let s_c = compute_residual_scaling(compute_bound_multiplier_sum(state), compute_bound_multiplier_count(state));
+    // Centering step `step_cen` (mirrors Ipopt's `step_cen` from
+    // `IpQualityFunctionMuOracle.cpp:228-244`, which solves a separate
+    // KKT system whose RHS has zero (∇L, c, d-s) blocks and `avrg_compl`
+    // in the (z_L, z_U, v_L, v_U) blocks).
+    //
+    // Derivation: ripopt's `kkt.rhs` is built at `μ=state.mu` and
+    // `affine_predictor_rhs` strips exactly `μ·w_cen` from it, where
+    //   w_cen[i] = 1/s_l - 1/s_u + κ_d·sign  (n-block)
+    //   w_cen[n..] = 0                       (constraint blocks)
+    // So `rhs_full - rhs_aff = state.mu · [w_cen; 0]`. Ipopt's centered
+    // RHS is `avg_compl · [w_cen; 0]` (after PD elimination of the
+    // bound blocks). Thus:
+    //   K · (dx_full - dx_aff) = state.mu · [w_cen; 0]
+    //   K · dx_cen             = avg_compl · [w_cen; 0]
+    //   ⟹ dx_cen = (avg_compl / state.mu) · (dx_full - dx_aff)
+    // and similarly for dy_cen. This avoids a third linear-solver call.
+    let cen_scale = avg_compl / state.mu;
+    let dx_cen: Vec<f64> = dx_aff
+        .iter()
+        .zip(dx_full.iter())
+        .map(|(a, f)| cen_scale * (f - a))
+        .collect();
+    let dy_cen: Vec<f64> = dy_aff
+        .iter()
+        .zip(dy_full.iter())
+        .map(|(a, f)| cen_scale * (f - a))
+        .collect();
+
+    // 4) Pre-compute current-iterate residual 2-norms (squared) and the
+    //    counts (n_dual, n_pri, n_comp) for `NM_NORM_2_SQUARED` Q.
+    //    Mirrors Ipopt's `IpQualityFunctionMuOracle.cpp:291-296` (norm
+    //    cache) and the formulas at lines 584-595.
+    let n_d_layout = state.layout.n_d;
+    let n_dual = (state.n + n_d_layout).max(1);
+    let n_pri = (state.layout.n_c + n_d_layout).max(1);
+    let n_comp = (state.bound_layout.n_x_l
+        + state.bound_layout.n_x_u
+        + state.d_bound_layout.n_d_l
+        + state.d_bound_layout.n_d_u)
+        .max(1);
+
+    // ‖∇L_x‖² = Σ (∇f - J^T y - z_L + z_U)²
+    let z_l_full = state.z_l_combined();
+    let z_u_full = state.z_u_combined();
+    let mut grad_lag_x = state.grad_f.clone();
+    accumulate_jt_y(state, &mut grad_lag_x);
+    for k in 0..state.bound_layout.n_x_l {
+        let i = state.bound_layout.x_l_to_full[k];
+        grad_lag_x[i] -= state.z_l_compressed[k];
+    }
+    for k in 0..state.bound_layout.n_x_u {
+        let i = state.bound_layout.x_u_to_full[k];
+        grad_lag_x[i] += state.z_u_compressed[k];
+    }
+    // Drop unused full-z views now that we've folded them in.
+    let _ = (z_l_full, z_u_full);
+    let grad_lag_x_2sq: f64 = grad_lag_x.iter().map(|r| r * r).sum();
+
+    // ‖∇L_s‖² = Σ_{ineq i} (-y_d_i - v_L_i + v_U_i)²
+    let mut grad_lag_s_2sq = 0.0_f64;
+    for i in 0..state.m {
+        if constraint_is_equality(state, i) {
+            continue;
+        }
+        let r = -state.y_at(i) - state.v_l_at(i) + state.v_u_at(i);
+        grad_lag_s_2sq += r * r;
+    }
+
+    // ‖c‖² and ‖d - s‖²
+    let c_2sq: f64 = state.c_x.iter().map(|r| r * r).sum();
+    let s_combined = state.s_combined();
+    let mut d_minus_s_2sq = 0.0_f64;
+    for i in 0..state.m {
+        if state.layout.eq_pos[i].is_some() {
+            continue;
+        }
+        let r = state.d_x[state.layout.ineq_pos[i].unwrap()] - s_combined[i];
+        d_minus_s_2sq += r * r;
+    }
+
+    // FTB tau matches Ipopt's `IpData().curr_tau()`
+    // (`IpQualityFunctionMuOracle.cpp:528`): the standard
+    // `(1 - μ) ∨ τ_min` rule used by the main solve.
+    let qf_tau = (1.0 - state.mu).max(options.tau_min);
 
     // Quality-function evaluator at sigma. Captures the precomputed
-    // affine + full directions; pure scalar arithmetic from here on.
+    // affine + centering directions; pure scalar arithmetic from here on.
+    // Step blend: `step(σ) = step_aff + σ · step_cen`
+    // (Ipopt `IpQualityFunctionMuOracle.cpp:516-524`).
     let q_eval = |sigma: f64| -> f64 {
-        // Trial step d(σ) = (1−σ)·d_aff + σ·d_full
         let mut dx = vec![0.0; n];
-        let mut dz_l = vec![0.0; n];
-        let mut dz_u = vec![0.0; n];
         for i in 0..n {
-            dx[i] = (1.0 - sigma) * dx_aff[i] + sigma * dx_full[i];
-            dz_l[i] = (1.0 - sigma) * dz_l_aff[i] + sigma * dz_l_full[i];
-            dz_u[i] = (1.0 - sigma) * dz_u_aff[i] + sigma * dz_u_full[i];
+            dx[i] = dx_aff[i] + sigma * dx_cen[i];
         }
-        // B-cross6: σ-blended slack and slack-bound multiplier steps.
-        let mut ds = vec![0.0; m];
-        let mut dv_l = vec![0.0; m];
-        let mut dv_u = vec![0.0; m];
-        for i in 0..m {
-            ds[i] = (1.0 - sigma) * ds_aff[i] + sigma * ds_full[i];
-            dv_l[i] = (1.0 - sigma) * dv_l_aff[i] + sigma * dv_l_full[i];
-            dv_u[i] = (1.0 - sigma) * dv_u_aff[i] + sigma * dv_u_full[i];
+        let mut dy = vec![0.0; dy_aff.len()];
+        for i in 0..dy.len() {
+            dy[i] = dy_aff[i] + sigma * dy_cen[i];
         }
+        // Recover (dz_L, dz_U), (ds), (dv_L, dv_U) at mu_eff = σ·avg_compl.
+        // Algebraic identity: blending the standard `recover_*` outputs of
+        // `step_aff` (mu=0) and `step_cen` (mu=avg_compl with no current-
+        // compl baseline) reduces to a single `recover_*` call on the
+        // blended dx/dy with `mu_eff`.
+        let mu_eff = sigma * avg_compl;
+        let (dz_l, dz_u) = recover_dz_from_state(state, &dx, mu_eff);
+        let ds = recover_ds_from_state(state, &dx, &dy, 0.0);
+        let (dv_l, dv_u) = recover_dv_from_state(state, &ds, mu_eff);
 
-        // Fraction-to-boundary step lengths under τ=1 (Ipopt QF probe uses
-        // a full FTB scan on the candidate direction). B-cross6: include
-        // s vs [g_l, g_u] and v_L/v_U non-negativity.
+        // Fraction-to-boundary step lengths under tau = curr_tau().
         let ds_d_qf = state.layout.project_d(&ds);
         let dv_l_d_qf = state.layout.project_d(&dv_l);
         let dv_u_d_qf = state.layout.project_d(&dv_u);
-        let alpha_p = fraction_to_boundary_primal_x(state, &dx, 1.0)
-            .min(fraction_to_boundary_primal_s(state, &ds_d_qf, 1.0))
+        let alpha_p = fraction_to_boundary_primal_x(state, &dx, qf_tau)
+            .min(fraction_to_boundary_primal_s(state, &ds_d_qf, qf_tau))
             .clamp(0.0, 1.0);
-        // Phase 6d.4: project σ-blended dz_l/dz_u to compressed form
-        // for the FTB scan signature.
         let dz_l_c = state.bound_layout.project_l(&dz_l);
         let dz_u_c = state.bound_layout.project_u(&dz_u);
-        let alpha_d = fraction_to_boundary_dual_z_min(state, &dz_l_c, &dz_u_c, 1.0)
-            .min(fraction_to_boundary_dual_v_min(state, &dv_l_d_qf, &dv_u_d_qf, 1.0))
+        let alpha_d = fraction_to_boundary_dual_z_min(state, &dz_l_c, &dz_u_c, qf_tau)
+            .min(fraction_to_boundary_dual_v_min(state, &dv_l_d_qf, &dv_u_d_qf, qf_tau))
             .clamp(0.0, 1.0);
 
-        // Linearised residual reduction: ‖r(α)‖ = (1−α)·‖r(0)‖.
-        let dual_inf_trial = (1.0 - alpha_d) * dual_inf0;
-        let primal_inf_trial = (1.0 - alpha_p) * primal_inf0;
+        // NM_NORM_2_SQUARED quality function
+        // (`IpQualityFunctionMuOracle.cpp:584-595`):
+        //   dual_inf  = (1-α_d)² · (‖∇L_x‖² + ‖∇L_s‖²) / n_dual
+        //   primal_inf = (1-α_p)² · (‖c‖² + ‖d - s‖²) / n_pri
+        //   compl_inf = Σ (s'·z')² / n_comp
+        let one_minus_ad = 1.0 - alpha_d;
+        let one_minus_ap = 1.0 - alpha_p;
+        let dual_inf = one_minus_ad * one_minus_ad
+            * (grad_lag_x_2sq + grad_lag_s_2sq)
+            / (n_dual as f64);
+        let primal_inf = one_minus_ap * one_minus_ap
+            * (c_2sq + d_minus_s_2sq)
+            / (n_pri as f64);
 
-        // Complementarity at the trial point, measured against the
-        // *optimality* target μ=0 rather than the σ·μ_cur centering
-        // target. This is the discriminator that Ipopt's QF effectively
-        // uses (`IpQualityFunctionMuOracle.cpp` evaluates compl as
-        // `slack·z` directly, not `slack·z − μ`): a smaller σ that drives
-        // s·z toward zero is preferred whenever the affine step admits a
-        // long FTB stride. The σ=σ_max degeneracy (where the σ·μ_cur
-        // target is trivially met by the centered step) is broken.
-        // B-cross6: scan all four blocks (z_L, z_U, v_L, v_U).
-        let mut compl_max: f64 = 0.0;
-        // Phase 6c.2: walk compressed bound mirrors. dz_l/dz_u are
-        // full-`n` σ-blended directions, indexed via x_l_to_full[k].
+        let mut compl_inf = 0.0_f64;
         for k in 0..state.bound_layout.n_x_l {
             let i = state.bound_layout.x_l_to_full[k];
             let s_plus = (slack_xl(state, i) + alpha_p * dx[i]).max(1e-20);
             let z_plus = (state.z_l_compressed[k] + alpha_d * dz_l[i]).max(1e-20);
-            compl_max = compl_max.max(s_plus * z_plus);
+            let sz = s_plus * z_plus;
+            compl_inf += sz * sz;
         }
         for k in 0..state.bound_layout.n_x_u {
             let i = state.bound_layout.x_u_to_full[k];
             let s_plus = (slack_xu(state, i) - alpha_p * dx[i]).max(1e-20);
             let z_plus = (state.z_u_compressed[k] + alpha_d * dz_u[i]).max(1e-20);
-            compl_max = compl_max.max(s_plus * z_plus);
+            let sz = s_plus * z_plus;
+            compl_inf += sz * sz;
         }
         for i in 0..m {
             let l_fin = state.g_l_at(i).is_finite();
@@ -5699,40 +5762,27 @@ fn compute_quality_function_mu(
             if l_fin {
                 let s_plus = (slack_gl(state, i) + alpha_p * ds[i]).max(1e-20);
                 let v_plus = (state.v_l_at(i) + alpha_d * dv_l[i]).max(1e-20);
-                compl_max = compl_max.max(s_plus * v_plus);
+                let sv = s_plus * v_plus;
+                compl_inf += sv * sv;
             }
             if u_fin {
                 let s_plus = (slack_gu(state, i) - alpha_p * ds[i]).max(1e-20);
                 let v_plus = (state.v_u_at(i) + alpha_d * dv_u[i]).max(1e-20);
-                compl_max = compl_max.max(s_plus * v_plus);
+                let sv = s_plus * v_plus;
+                compl_inf += sv * sv;
             }
         }
+        compl_inf /= n_comp as f64;
 
-        let mut q = dual_inf_trial / s_d + primal_inf_trial + compl_max / s_c;
-
-        // Balancing term: penalise σ values whose linearised step admits
-        // only a tiny fraction-to-boundary step. Without this, σ=0 (full
-        // affine) and σ=1 (full centered) are both linearisation-optimal
-        // (each kills its own residual), and the search lacks a
-        // discriminator. Mirrors Ipopt's
-        // `IpQualityFunctionMuOracle.cpp:625-660` balancing term, which
-        // adds a contribution proportional to (1−min(α_p,α_d))·max_compl
-        // to penalise short steps.
-        let alpha_min = alpha_p.min(alpha_d).max(1e-12);
-        // Use the current max compl as the scale so the balancing term is
-        // commensurate with the rest of Q.
-        let scale = avg_compl.max(state.mu);
-        q += (1.0 - alpha_min) * scale / s_c;
+        let mut q = dual_inf + primal_inf + compl_inf;
 
         // Optional centrality penalty: 1/ξ where ξ = min(s·z) / avg(s·z)
         // at the trial point (Ipopt `centrality=reciprocal`,
-        // `IpQualityFunctionMuOracle.cpp:622`). B-cross6: scan all
-        // four bound blocks.
+        // `IpQualityFunctionMuOracle.cpp:638`). Default off (CEN_NONE).
         if options.quality_function_centrality {
             let mut sum_sz = 0.0_f64;
             let mut min_sz = f64::INFINITY;
             let mut nb = 0usize;
-            // Phase 6c.2: walk compressed bound mirrors.
             for k in 0..state.bound_layout.n_x_l {
                 let i = state.bound_layout.x_l_to_full[k];
                 let s_plus = (slack_xl(state, i) + alpha_p * dx[i]).max(1e-20);
@@ -5777,42 +5827,79 @@ fn compute_quality_function_mu(
             if nb > 0 && sum_sz > 0.0 {
                 let avg = sum_sz / nb as f64;
                 let xi = (min_sz / avg).clamp(1e-20, 1.0);
-                q += 1.0 / xi;
+                q += compl_inf / xi;
             }
         }
         q
     };
 
-    // 5) Golden-section minimise Q over σ ∈ [σ_min, σ_max]. Spec §3.5
-    //    quotes [1e-6, 1e2] from Ipopt's full QF with balancing terms;
-    //    ripopt's simpler linearised Q has a degeneracy near σ=1 where
-    //    both endpoints satisfy the linearised KKT, so we cap σ_max at
-    //    1.0 (Ipopt's effective range when `quality_function_balancing_term`
-    //    is `none`, which is the default). This avoids σ ≳ 1 picks that
-    //    would pin μ at avg_compl indefinitely.
+    // 5) Two-stage σ search mirroring
+    //    `IpQualityFunctionMuOracle.cpp:329-385`.
     //
-    //    Tolerance-aware σ floor (mirrors Ipopt 3.14
-    //    `IpQualityFunctionMuOracle.cpp:370`:
-    //    `sigma_lo = Max(sigma_min_, mu_min/avrg_compl)`). Without this,
-    //    when the linearised dual_inf_trial and primal_inf_trial are near
-    //    zero (current iterate already satisfies KKT in linearised sense),
-    //    Q is dominated by the monotone-decreasing complementarity term
-    //    and the minimiser slams to σ_min=1e-6, pushing μ orders of
-    //    magnitude below the user's convergence tolerance in a single
-    //    iteration. We use `0.5 * min(tol, compl_inf_tol)` as the effective
-    //    mu floor (matches Ipopt's `IpAdaptiveMuUpdate.cpp:262-264` mu_min
-    //    update rule for tol-driven safeguard).
+    //    σ range:
+    //      σ_max = min(sigma_max_, mu_max / avrg_compl)   sigma_max_=1e2
+    //      σ_min = max(sigma_min_, mu_min / avrg_compl)   sigma_min_=1e-6
+    //    where mu_min uses ripopt's tolerance-aware floor
+    //    (`IpAdaptiveMuUpdate.cpp:262-264`).
+    //
+    //    Direction decision: probe Q(1) vs Q(1-ε). If Q(1-ε) > Q(1) the
+    //    quality function is decreasing past 1, so search [1, σ_max];
+    //    otherwise search [σ_min, 1-ε]. This avoids running golden
+    //    section over a non-unimodal range that contains both regimes.
     let eff_mu_floor =
         (0.5 * options.tol.min(options.compl_inf_tol)).max(options.mu_min);
-    let sigma_min = (1e-6_f64).max(eff_mu_floor / avg_compl.max(1e-300));
-    let sigma_max = 1.0;
-    let sigma_star = golden_section_minimize(
-        &q_eval,
-        sigma_min,
-        sigma_max,
-        options.quality_function_max_section_steps,
-        0.01, // relative tolerance: |σ_hi − σ_lo| < 0.01·σ_lo
-    );
+    let mu_cap = mu_state.mu_max_cap(options, avg_compl);
+    let avg_clamp = avg_compl.max(1e-300);
+    let sigma_min = (1e-6_f64).max(eff_mu_floor / avg_clamp);
+    // sigma_max_ default in Ipopt is 1e2; expose as `quality_function_sigma_max`
+    // so we can tune it without recompiling. Cap at mu_max/avg_compl per
+    // `IpQualityFunctionMuOracle.cpp:350`.
+    let sigma_max = options
+        .quality_function_sigma_max
+        .min(mu_cap / avg_clamp)
+        .max(sigma_min * (1.0 + 1e-9));
+    let sigma_eps = 1e-4_f64;
+    let sigma_star = if sigma_max <= 1.0 + 1e-12 {
+        // Whole range is below 1 — single golden section.
+        golden_section_minimize(
+            &q_eval,
+            sigma_min,
+            (1.0_f64).min(sigma_max).max(sigma_min * (1.0 + 1e-9)),
+            options.quality_function_max_section_steps,
+            0.01,
+        )
+    } else if sigma_min >= 1.0 - sigma_eps {
+        // Whole range is above 1−ε — single golden section.
+        golden_section_minimize(
+            &q_eval,
+            sigma_min,
+            sigma_max,
+            options.quality_function_max_section_steps,
+            0.01,
+        )
+    } else {
+        let qf_1 = q_eval(1.0);
+        let qf_1minus = q_eval(1.0 - sigma_eps);
+        if qf_1minus > qf_1 {
+            // Q decreasing past 1 — search [1, σ_max].
+            golden_section_minimize(
+                &q_eval,
+                1.0,
+                sigma_max,
+                options.quality_function_max_section_steps,
+                0.01,
+            )
+        } else {
+            // Search [σ_min, 1−ε].
+            golden_section_minimize(
+                &q_eval,
+                sigma_min,
+                (1.0 - sigma_eps).max(sigma_min * (1.0 + 1e-9)),
+                options.quality_function_max_section_steps,
+                0.01,
+            )
+        }
+    };
 
     // 6) Convert σ* to μ. Apply the same monotone floor and clamp as the
     //    Loqo oracle (Ipopt's `IpQualityFunctionMuOracle::CalculateMu`
@@ -5821,7 +5908,6 @@ fn compute_quality_function_mu(
     let monotone_floor =
         (options.mu_linear_decrease_factor * state.mu)
             .min(state.mu.powf(options.mu_superlinear_decrease_power));
-    let mu_cap = mu_state.mu_max_cap(options, avg_compl);
     let new_mu = qf_mu.max(monotone_floor).clamp(options.mu_min, mu_cap);
 
     if options.print_level >= 5 {

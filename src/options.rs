@@ -468,6 +468,16 @@ pub struct SolverOptions {
     /// ~38% of the bracket width.
     /// Default: 8.
     pub quality_function_max_section_steps: usize,
+    /// Upper bound on σ explored by the QF oracle's golden-section search.
+    /// Mirrors Ipopt 3.14 `quality_function_sigma_max`
+    /// (`IpQualityFunctionMuOracle.cpp:350`, Ipopt default 1e2). The
+    /// effective upper bound is `min(quality_function_sigma_max,
+    /// mu_max/avg_compl)`. ripopt defaults to 1.0 because allowing σ>1
+    /// regressed NET1 (Q is non-unimodal on the wide bracket); the
+    /// two-stage decision (probe Q(1) vs Q(1−ε)) preserves the search
+    /// when σ_max>1 is configured.
+    /// Default: 1.0.
+    pub quality_function_sigma_max: f64,
     /// NLP scaling method. Mirrors Ipopt 3.14 `nlp_scaling_method`
     /// (`IpAlgBuilder.cpp:343-353`). Default `Gradient`.
     /// When set to `User`, the solver uses values supplied in
@@ -786,6 +796,7 @@ impl Default for SolverOptions {
             mu_oracle_quality_function: true,
             quality_function_centrality: false,
             quality_function_max_section_steps: 8,
+            quality_function_sigma_max: 1.0,
             nlp_scaling_method: NlpScalingMethod::Gradient,
             obj_scaling_factor: 1.0,
             nlp_scaling_max_gradient: 100.0,
