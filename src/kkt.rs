@@ -13,6 +13,15 @@ pub struct KktSystem {
     pub matrix: KktMatrix,
     /// Right-hand side vector.
     pub rhs: Vec<f64>,
+    /// μ-dependent centering terms baked into `rhs`. Subtracting this vector
+    /// from `rhs` yields the affine-predictor RHS used by the QF mu oracle:
+    ///   rhs_aff = rhs - mu_centering_rhs
+    /// The n-block carries `+μ/s_L − μ/s_U ± κ_d·μ` (variable bounds);
+    /// the d-block carries `Σ_s^{-1} · (μ/s_l − μ/s_u)` for inequality
+    /// constraint slacks. Mirrors the μ-centering bits stripped by Ipopt's
+    /// `IpQualityFunctionMuOracle.cpp:191-200` when it sets the affine RHS
+    /// to `compl_*` (no μ shift) instead of `compl_*_minus_mu`.
+    pub mu_centering_rhs: Vec<f64>,
     /// Per-constraint δ_c values added to the (2,2) block during assembly.
     /// Stored as positive values; the matrix gets -delta_c_diag\[i\] on diagonal (n+i, n+i).
     /// Used by iterative refinement to recover the original (unregularized) matvec.
@@ -189,6 +198,10 @@ pub fn assemble_kkt(
         KktMatrix::zeros_dense(dim)
     };
     let mut rhs = vec![0.0; dim];
+    // Track the μ-centering bits added to `rhs`. Used by
+    // `affine_predictor_rhs` to recover the affine-predictor RHS by exact
+    // subtraction (mirrors `IpQualityFunctionMuOracle.cpp:191-200`).
+    let mut mu_centering_rhs = vec![0.0; dim];
 
     // (1,1) block: H + Sigma
     for (idx, (&row, &col)) in hess_rows.iter().zip(hess_cols.iter()).enumerate() {
@@ -241,13 +254,18 @@ pub fn assemble_kkt(
     // in z_L at the active bound and prevented stationarity convergence.
     for i in 0..n {
         let mut rd = -grad_f[i];
+        let mut centering_i = 0.0;
         let l_fin = x_l[i].is_finite();
         let u_fin = x_u[i].is_finite();
         if l_fin {
-            rd += mu / (x[i] - x_l[i]);
+            let term = mu / (x[i] - x_l[i]);
+            rd += term;
+            centering_i += term;
         }
         if u_fin {
-            rd -= mu / (x_u[i] - x[i]);
+            let term = mu / (x_u[i] - x[i]);
+            rd -= term;
+            centering_i -= term;
         }
         // kappa_d damping: penalize drift toward open side of one-sided bounds.
         // Adds ±kappa_d*mu to grad_phi; r_d = -grad_lag, so subtract for lower-only,
@@ -255,11 +273,14 @@ pub fn assemble_kkt(
         if kappa_d > 0.0 && (l_fin ^ u_fin) {
             if l_fin {
                 rd -= kappa_d * mu;
+                centering_i -= kappa_d * mu;
             } else {
                 rd += kappa_d * mu;
+                centering_i += kappa_d * mu;
             }
         }
         rhs[i] = rd;
+        mu_centering_rhs[i] = centering_i;
     }
 
     // Subtract J^T * y contribution from r_d (split form — Phase 5b).
@@ -301,6 +322,10 @@ pub fn assemble_kkt(
         let i = layout.d_to_combined[k_d];
         let mut sigma_s = 0.0;
         let mut rhs_correction = y_d[k_d]; // starts with y_d
+        // The μ-centering portion of `rhs_correction` (without the y_d
+        // baseline). Used to record `Σ_s^{-1} * (μ/s_l − μ/s_u)` into
+        // `mu_centering_rhs[n+i]` for the affine-predictor RHS reconstruction.
+        let mut mu_centering_d = 0.0;
         let mut any_feasible = false;
         let mut rhs_infeasible = 0.0;
 
@@ -316,15 +341,24 @@ pub fn assemble_kkt(
         // μ/(κ_σ·s) — 1e10× smaller than μ/s — exploding the condensed
         // RHS by κ_σ on problems with strictly interior inequality
         // constraints (e.g. arki0003 had |rhs|_inf ≈ 1e13 before).
+        // Use raw slack (with a 1e-20 floor like the x-bound Σ in
+        // `compute_sigma_compressed`). Earlier versions floored at
+        // `mu.max(1e-10)`, which artificially shrinks Σ_s when slack < μ
+        // (e.g. CRESC50 iter 0: upper-slacks ≈ 1e-2 with μ=0.1 → safe_slack=μ
+        // distorts Σ_s by 10× and the corresponding centering RHS by 10×).
+        // Ipopt's `IpIpoptCalculatedQuantities::CurrSigma_s` uses raw slack;
+        // the κ_σ safeguard is enforced by an iteration-level multiplier
+        // reset (`IpoptAlgorithm::ApplyOptionalMultStep`), not at K assembly.
         if d_l[k_d].is_finite() {
             let slack = s[k_d] - d_l[k_d];
             if slack >= -1e-8 {
-                let safe_slack = slack.max(mu.max(1e-10));
+                let safe_slack = slack.max(1e-20);
                 let mu_over_s = mu / safe_slack;
                 let mut z_sl = v_l[k_d];
                 z_sl = z_sl.max(mu_over_s / kappa_sigma).min(kappa_sigma * mu_over_s);
                 sigma_s += z_sl / safe_slack;
                 rhs_correction += mu / safe_slack;
+                mu_centering_d += mu / safe_slack;
                 any_feasible = true;
             } else {
                 // Truly infeasible: drive toward feasibility
@@ -334,12 +368,13 @@ pub fn assemble_kkt(
         if d_u[k_d].is_finite() {
             let slack = d_u[k_d] - s[k_d];
             if slack >= -1e-8 {
-                let safe_slack = slack.max(mu.max(1e-10));
+                let safe_slack = slack.max(1e-20);
                 let mu_over_s = mu / safe_slack;
                 let mut z_su = v_u[k_d];
                 z_su = z_su.max(mu_over_s / kappa_sigma).min(kappa_sigma * mu_over_s);
                 sigma_s += z_su / safe_slack;
                 rhs_correction -= mu / safe_slack;
+                mu_centering_d -= mu / safe_slack;
                 any_feasible = true;
             } else {
                 // Truly infeasible: drive toward feasibility
@@ -360,6 +395,10 @@ pub fn assemble_kkt(
             // initial slacks differ from d(x_0) (e.g. arki0003 row 1097
             // had |d − s| ≈ 1.16e8, ds ≈ 1.16e8, α_pr clamped to 8.5e-11).
             rhs[n + i] = -(d_x[k_d] - s[k_d]) + sigma_s_inv * rhs_correction + rhs_infeasible;
+            // Record only the μ-centering portion (not y_d, not the
+            // primal residual `−(d−s)`, not the infeasible drive). This is
+            // the contribution stripped to form the affine-predictor RHS.
+            mu_centering_rhs[n + i] = sigma_s_inv * mu_centering_d;
             if std::env::var("RIPOPT_TRACE_RHS").is_ok() && rhs[n + i].abs() > 1e10 {
                 eprintln!(
                     "  rhs-trace: row n+{}={} sigma_s={:.3e} sigma_s_inv={:.3e} rhs_corr={:.3e} rhs_infeas={:.3e} rhs[n+i]={:.3e} y_d={:.3e} d_x={:.3e} d_l={:.3e} d_u={:.3e}",
@@ -409,6 +448,7 @@ pub fn assemble_kkt(
         m,
         matrix,
         rhs,
+        mu_centering_rhs,
         delta_c_diag,
         scale_factors: None,
         input_atags: None,
@@ -2124,38 +2164,29 @@ pub fn recover_ds(
 /// can be used to probe a better barrier parameter μ.
 ///
 /// Cost: O(n) to build — extremely cheap. The expensive part is the triangular solve.
-pub fn affine_predictor_rhs(
-    rhs: &[f64],
-    x: &[f64],
-    x_l: &[f64],
-    x_u: &[f64],
-    mu: f64,
-    kappa_d: f64,
-) -> Vec<f64> {
-    let n = x.len();
-    let mut rhs_aff = rhs.to_vec();
-    // Remove the μ/s centering terms from the primal block. Also remove the
-    // kappa_d damping term, which is proportional to μ.
-    for i in 0..n {
-        let l_fin = x_l[i].is_finite();
-        let u_fin = x_u[i].is_finite();
-        if l_fin {
-            let s_l = (x[i] - x_l[i]).max(1e-20);
-            rhs_aff[i] -= mu / s_l;
-        }
-        if u_fin {
-            let s_u = (x_u[i] - x[i]).max(1e-20);
-            rhs_aff[i] += mu / s_u;
-        }
-        if kappa_d > 0.0 && (l_fin ^ u_fin) {
-            if l_fin {
-                rhs_aff[i] += kappa_d * mu;
-            } else {
-                rhs_aff[i] -= kappa_d * mu;
-            }
-        }
-    }
-    rhs_aff
+/// Build the affine-predictor RHS by stripping the μ-centering bits that
+/// `assemble_kkt` baked into `kkt.rhs`. The strip covers BOTH the n-block
+/// (variable-bound centering `+μ/s_L − μ/s_U ± κ_d·μ`) AND the d-block
+/// (inequality-slack centering `Σ_s^{-1} · (μ/s_l − μ/s_u)`). Mirrors
+/// Ipopt's `IpQualityFunctionMuOracle.cpp:191-200`, which sets the affine
+/// RHS to the un-shifted complementarity vectors `compl_x_L = z_L·s_L`
+/// (instead of `compl_x_L − μ`) so that, after PD elimination of the
+/// bound multipliers and slack rows, the resulting augmented RHS has all
+/// μ-dependent terms removed.
+///
+/// Earlier ripopt versions stripped only the n-block (ignoring the
+/// d-block centering), which left a μ-dependent contribution in
+/// `rhs_aff[n+i]` for inequality rows. The Mehrotra blend
+/// `step(σ) = step_aff + σ·step_cen` therefore had the wrong direction
+/// signature and the QF oracle's σ-selection drifted from Ipopt on
+/// problems with dense inequality blocks (e.g. CRESC50, m=100).
+pub fn affine_predictor_rhs(kkt: &KktSystem) -> Vec<f64> {
+    debug_assert_eq!(kkt.rhs.len(), kkt.mu_centering_rhs.len());
+    kkt.rhs
+        .iter()
+        .zip(kkt.mu_centering_rhs.iter())
+        .map(|(r, c)| r - c)
+        .collect()
 }
 
 /// Batched multi-RHS variant of `solve_with_custom_rhs`. Packs `rhs_columns`
@@ -2564,6 +2595,7 @@ mod tests {
             dim: 3, n, m,
             matrix: KktMatrix::Dense(matrix),
             rhs: vec![1.0, 2.0, 3.0],
+            mu_centering_rhs: Vec::new(),
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
             input_atags: None,
@@ -2592,6 +2624,7 @@ mod tests {
             dim: 3, n, m,
             matrix: KktMatrix::Dense(matrix),
             rhs: vec![1.0, 2.0, 3.0],
+            mu_centering_rhs: Vec::new(),
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
             input_atags: None,
@@ -2632,6 +2665,7 @@ mod tests {
             dim: 3, n, m,
             matrix: KktMatrix::Dense(matrix),
             rhs: vec![1.0, 2.0, 3.0],
+            mu_centering_rhs: Vec::new(),
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
             input_atags: None,
@@ -2669,6 +2703,7 @@ mod tests {
             dim: 3, n, m,
             matrix: KktMatrix::Dense(matrix),
             rhs: vec![1.0, 0.5, -2.0],
+            mu_centering_rhs: Vec::new(),
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
             input_atags: None,
@@ -2734,6 +2769,7 @@ mod tests {
             dim: 3, n, m,
             matrix: KktMatrix::Dense(matrix),
             rhs: vec![1.0, 1.0, 0.0],
+            mu_centering_rhs: Vec::new(),
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
             input_atags: None,
@@ -2790,6 +2826,7 @@ mod tests {
             dim: 3, n, m,
             matrix: KktMatrix::Dense(matrix),
             rhs: vec![1.0, 2.0, 3.0],
+            mu_centering_rhs: Vec::new(),
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
             input_atags: None,
@@ -2823,6 +2860,7 @@ mod tests {
             dim: 3, n, m,
             matrix: KktMatrix::Dense(matrix),
             rhs: vec![1.0, 2.0, 3.0],
+            mu_centering_rhs: Vec::new(),
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
             input_atags: None,
@@ -2866,6 +2904,7 @@ mod tests {
             dim: 3, n, m,
             matrix: KktMatrix::Dense(matrix),
             rhs: vec![1.0, 2.0, 3.0],
+            mu_centering_rhs: Vec::new(),
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
             input_atags: None,
@@ -2907,6 +2946,7 @@ mod tests {
             dim: 4, n, m,
             matrix: KktMatrix::Dense(matrix),
             rhs: vec![1.0, 2.0, 3.0, 4.0],
+            mu_centering_rhs: Vec::new(),
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
             input_atags: None,
@@ -2952,6 +2992,7 @@ mod tests {
             dim: 3, n, m,
             matrix: KktMatrix::Dense(matrix),
             rhs: vec![1.0, 2.0, 3.0],
+            mu_centering_rhs: Vec::new(),
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
             input_atags: None,
@@ -2996,6 +3037,7 @@ mod tests {
             dim: 4, n, m,
             matrix: KktMatrix::Dense(matrix),
             rhs: vec![1.0, 2.0, 3.0, 4.0],
+            mu_centering_rhs: Vec::new(),
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
             input_atags: None,
@@ -3035,6 +3077,7 @@ mod tests {
             dim: 4, n, m,
             matrix: KktMatrix::Dense(matrix),
             rhs: vec![1.0, 2.0, 3.0, 4.0],
+            mu_centering_rhs: Vec::new(),
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
             input_atags: None,
@@ -3083,6 +3126,7 @@ mod tests {
                 dim: 3, n, m,
                 matrix: KktMatrix::Dense(matrix),
                 rhs: vec![1.0, 2.0, 3.0],
+                mu_centering_rhs: Vec::new(),
                 delta_c_diag: vec![0.0; m],
                 scale_factors: None,
                 input_atags: None,
@@ -3107,6 +3151,7 @@ mod tests {
             dim: 2, n, m,
             matrix: KktMatrix::Dense(matrix),
             rhs: vec![1.0, 1.0],
+            mu_centering_rhs: Vec::new(),
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
             input_atags: None,
@@ -3134,6 +3179,7 @@ mod tests {
             dim: 3, n, m,
             matrix: KktMatrix::Dense(matrix.clone()),
             rhs: rhs.clone(),
+            mu_centering_rhs: Vec::new(),
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
             input_atags: None,
@@ -3211,6 +3257,7 @@ mod tests {
             dim: 3, n, m,
             matrix: KktMatrix::Dense(matrix),
             rhs: vec![1.0, 2.0, 3.0],
+            mu_centering_rhs: Vec::new(),
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
             input_atags: Some(KktInputAtags::default()),
@@ -3389,6 +3436,7 @@ mod tests {
             dim: n + m, n, m,
             matrix: KktMatrix::Dense(matrix),
             rhs: vec![r_x_aug],
+            mu_centering_rhs: Vec::new(),
             delta_c_diag: vec![],
             scale_factors: None,
             input_atags: None,
@@ -3433,6 +3481,7 @@ mod tests {
             dim: 3, n, m,
             matrix: KktMatrix::Dense(matrix),
             rhs: vec![1.0, 0.5, -2.0],
+            mu_centering_rhs: Vec::new(),
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
             input_atags: None,
@@ -3488,6 +3537,7 @@ mod tests {
             dim: 1, n, m,
             matrix: KktMatrix::Dense(matrix),
             rhs: vec![r_x_aug],
+            mu_centering_rhs: Vec::new(),
             delta_c_diag: vec![],
             scale_factors: None,
             input_atags: None,
@@ -3537,6 +3587,7 @@ mod tests {
             dim: 3, n, m,
             matrix: KktMatrix::Dense(matrix),
             rhs: vec![0.7, -0.3, 1.2],
+            mu_centering_rhs: Vec::new(),
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
             input_atags: None,
@@ -3575,6 +3626,7 @@ mod tests {
             dim: 3, n, m,
             matrix: KktMatrix::Dense(matrix),
             rhs: vec![0.7, -0.3, 1.2],
+            mu_centering_rhs: Vec::new(),
             delta_c_diag: vec![0.0; m],
             scale_factors: None,
             input_atags: None,

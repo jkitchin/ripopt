@@ -5574,7 +5574,10 @@ fn compute_loqo_mu(
 ///    using the linear-residual identity `‖res(α)‖ = (1−α)·‖res(0)‖`.
 /// 5. Golden-section minimise over σ ∈ [1e-6, 1.0] with at most 8 steps
 ///    and relative tolerance 1e-2 on the bracket width.
-/// 6. Return clamp(σ*·avg_compl, max=1e5, min=max(monotone_floor, μ_min)).
+/// 6. Return clamp(σ*·avg_compl, [μ_min, mu_max_fact·initial_avg_compl]).
+///    No monotone floor — that floor is Fixed-mode-only in Ipopt
+///    (`IpAdaptiveMuUpdate.cpp:327`); the Free-mode `lower_mu_safeguard`
+///    is zero by default (`adaptive_mu_safeguard_factor=0.0`).
 ///
 /// Returns `None` on factorisation/solve failure so the caller can fall
 /// back to the Loqo oracle (this matches `IpQualityFunctionMuOracle`'s
@@ -5656,11 +5659,7 @@ fn compute_quality_function_mu(
     // across columns; the default trait impl loops single-RHS solves and
     // matches the prior behavior. T3.26: mu oracles use inexact backsolves
     // (allow_inexact=true, IpPDFullSpaceSolver.cpp:229-239).
-    let x_l_full = state.x_l_combined();
-    let x_u_full = state.x_u_combined();
-    let rhs_aff = kkt::affine_predictor_rhs(
-        &kkt.rhs, &state.x, &x_l_full, &x_u_full, state.mu, options.kappa_d,
-    );
+    let rhs_aff = kkt::affine_predictor_rhs(&kkt);
     let pairs = kkt::solve_with_custom_rhs_many(
         kkt.n, kkt.dim, solver.as_mut(), &[&rhs_aff, &kkt.rhs],
     ).ok()?;
@@ -5672,17 +5671,22 @@ fn compute_quality_function_mu(
     // KKT system whose RHS has zero (∇L, c, d-s) blocks and `avrg_compl`
     // in the (z_L, z_U, v_L, v_U) blocks).
     //
-    // Derivation: ripopt's `kkt.rhs` is built at `μ=state.mu` and
-    // `affine_predictor_rhs` strips exactly `μ·w_cen` from it, where
-    //   w_cen[i] = 1/s_l - 1/s_u + κ_d·sign  (n-block)
-    //   w_cen[n..] = 0                       (constraint blocks)
-    // So `rhs_full - rhs_aff = state.mu · [w_cen; 0]`. Ipopt's centered
-    // RHS is `avg_compl · [w_cen; 0]` (after PD elimination of the
-    // bound blocks). Thus:
-    //   K · (dx_full - dx_aff) = state.mu · [w_cen; 0]
-    //   K · dx_cen             = avg_compl · [w_cen; 0]
-    //   ⟹ dx_cen = (avg_compl / state.mu) · (dx_full - dx_aff)
-    // and similarly for dy_cen. This avoids a third linear-solver call.
+    // Derivation: `assemble_kkt` builds `kkt.rhs` at `μ=state.mu` and
+    // simultaneously records the μ-centering portion in
+    // `kkt.mu_centering_rhs`. `affine_predictor_rhs` subtracts that
+    // vector exactly, so:
+    //   kkt.rhs - rhs_aff = mu_centering_rhs = state.mu · w_cen
+    // where w_cen carries:
+    //   n-block  : 1/s_l − 1/s_u ± κ_d·sign     (variable bounds)
+    //   d-block  : Σ_s^{-1} · (1/s_l − 1/s_u)   (inequality slacks)
+    // Ipopt's centering RHS (`IpQualityFunctionMuOracle.cpp:228-244`)
+    // after PD elimination of the bound multiplier blocks is
+    // `avg_compl · w_cen`. Both the n- and d-block centering terms are
+    // linear in μ when the κ_σ multiplier safeguard does not bind, so:
+    //   K · (dx_full − dx_aff) = state.mu · w_cen
+    //   K · dx_cen             = avg_compl · w_cen
+    //   ⟹ dx_cen = (avg_compl / state.mu) · (dx_full − dx_aff)
+    // (and similarly for dy_cen). This avoids a third linear solve.
     let cen_scale = avg_compl / state.mu;
     let dx_cen: Vec<f64> = dx_aff
         .iter()
@@ -5922,7 +5926,12 @@ fn compute_quality_function_mu(
         .quality_function_sigma_max
         .min(mu_cap / avg_clamp)
         .max(sigma_min * (1.0 + 1e-9));
-    let sigma_eps = 1e-4_f64;
+    // `IpQualityFunctionMuOracle.cpp:339` — `sigma_eps = max(1e-4, sigma_tol_)`
+    // with `quality_function_section_sigma_tol_` default 1e-2. ripopt
+    // previously hard-coded 1e-4, which makes the Q(1) vs Q(1−ε) probe
+    // measure on a much smaller chord and miss the true σ ranking when
+    // Q has a shallow local minimum near σ=1.
+    let sigma_eps = (1e-4_f64).max(0.01);
     let sigma_star = if sigma_max <= 1.0 + 1e-12 {
         // Whole range is below 1 — single golden section.
         golden_section_minimize(
@@ -5965,31 +5974,45 @@ fn compute_quality_function_mu(
         }
     };
 
-    // 6) Convert σ* to μ. Apply the same monotone floor and clamp as the
-    //    Loqo oracle (Ipopt's `IpQualityFunctionMuOracle::CalculateMu`
-    //    re-uses the Loqo clamp).
+    // 6) Convert σ* to μ. Ipopt's `QualityFunctionMuOracle::CalculateMu`
+    //    (`IpQualityFunctionMuOracle.cpp:429`) returns `sigma * avrg_compl`
+    //    with no monotone floor — the `min(linear*mu, mu^super)` floor is
+    //    Fixed-mode-only (`IpAdaptiveMuUpdate.cpp:327`). The Free-mode
+    //    safeguards applied around the oracle return are
+    //    `Max(mu, mu_min)`, the `lower_mu_safeguard` (zero by default
+    //    since `adaptive_mu_safeguard_factor` defaults to 0.0,
+    //    `IpAdaptiveMuUpdate.cpp:751-754`), and `Min(mu, mu_max)`.
+    //    Applying the Fixed-mode floor in Free mode prevents μ from
+    //    collapsing when the affine direction is good (CRESC50 iter 3:
+    //    σ*≈0.008, avg_compl=142, qf_mu=1.15 but Fixed-mode floor=13.3
+    //    forced μ=13.3 while Ipopt's QF dropped to mu≈5e-4).
     let qf_mu = sigma_star * avg_compl;
-    let monotone_floor =
-        (options.mu_linear_decrease_factor * state.mu)
-            .min(state.mu.powf(options.mu_superlinear_decrease_power));
-    let new_mu = qf_mu.max(monotone_floor).clamp(options.mu_min, mu_cap);
+    let new_mu = qf_mu.clamp(options.mu_min, mu_cap);
 
     if options.print_level >= 5 {
-        rip_log!("ripopt: mu QF: sigma*={:.4e} avg_compl={:.3e} floor={:.3e} -> mu={:.3e}",
-            sigma_star, avg_compl, monotone_floor, new_mu);
+        rip_log!("ripopt: mu QF: sigma*={:.4e} avg_compl={:.3e} -> mu={:.3e}",
+            sigma_star, avg_compl, new_mu);
     }
     Some(new_mu)
 }
 
-/// Golden-section search for the minimum of a unimodal `f` on `[lo, hi]`
-/// (operating in log-space because the QF candidate range spans 8 orders
-/// of magnitude). Stops after at most `max_steps` shrinks or once the
-/// log-bracket width is below `rel_tol`. Returns the bracket centre.
+/// Golden-section search for the minimum of `f` on `[lo, hi]` in
+/// **linear sigma space**, matching Ipopt 3.14's `PerformGoldenSection`
+/// (`IpQualityFunctionMuOracle.cpp:668-829`).
 ///
-/// Used by [`compute_quality_function_mu`] to minimise Q(σ) per
-/// `IpQualityFunctionMuOracle.cpp:520-560` (Ipopt also operates in the
-/// log scale and bounds `quality_function_max_section_steps` at 8 by
-/// default).
+/// Ipopt's `ScaleSigma`/`UnscaleSigma` are identity (lines 836-848), and
+/// the in-source comment at lines 850-851 ("Tried search in the log
+/// space, but that was even worse than search in unscaled space")
+/// documents why linear-space is the upstream choice. ripopt previously
+/// operated in log-space; this is a structural alignment with the Ipopt
+/// reference and does not by itself change which σ* is selected when
+/// the underlying Q(σ) is non-unimodal (e.g. CRESC50, where the
+/// spurious low-σ minimum from a non-monotonic α_d persists in either
+/// search space — that case is governed by the affine/centering
+/// decomposition rather than by the line-search axis).
+///
+/// `rel_tol` is the relative sigma tolerance (Ipopt's
+/// `quality_function_section_sigma_tol`, default 1e-2).
 fn golden_section_minimize<F: Fn(f64) -> f64>(
     f: &F,
     lo: f64,
@@ -5998,35 +6021,33 @@ fn golden_section_minimize<F: Fn(f64) -> f64>(
     rel_tol: f64,
 ) -> f64 {
     debug_assert!(lo > 0.0 && hi > lo);
-    let log_lo0 = lo.ln();
-    let log_hi0 = hi.ln();
-    let mut log_lo = log_lo0;
-    let mut log_hi = log_hi0;
-    // Golden-section split factor.
-    let phi = (5.0_f64.sqrt() - 1.0) / 2.0; // ~0.618
-    let mut log_x1 = log_hi - phi * (log_hi - log_lo);
-    let mut log_x2 = log_lo + phi * (log_hi - log_lo);
-    let mut f1 = f(log_x1.exp());
-    let mut f2 = f(log_x2.exp());
-    for _ in 0..max_steps {
-        if (log_hi - log_lo).abs() < rel_tol {
-            break;
-        }
-        if f1 < f2 {
-            log_hi = log_x2;
-            log_x2 = log_x1;
-            f2 = f1;
-            log_x1 = log_hi - phi * (log_hi - log_lo);
-            f1 = f(log_x1.exp());
+    let mut sigma_lo = lo;
+    let mut sigma_up = hi;
+    // Golden-section gap factor (3 - √5)/2 ≈ 0.382, matching Ipopt
+    // (`IpQualityFunctionMuOracle.cpp:701`).
+    let gfac = (3.0 - 5.0_f64.sqrt()) / 2.0;
+    let mut sigma_mid1 = sigma_lo + gfac * (sigma_up - sigma_lo);
+    let mut sigma_mid2 = sigma_lo + (1.0 - gfac) * (sigma_up - sigma_lo);
+    let mut qmid1 = f(sigma_mid1);
+    let mut qmid2 = f(sigma_mid2);
+    let mut nsections = 0usize;
+    while (sigma_up - sigma_lo) >= rel_tol * sigma_up && nsections < max_steps {
+        nsections += 1;
+        if qmid1 > qmid2 {
+            sigma_lo = sigma_mid1;
+            sigma_mid1 = sigma_mid2;
+            qmid1 = qmid2;
+            sigma_mid2 = sigma_lo + (1.0 - gfac) * (sigma_up - sigma_lo);
+            qmid2 = f(sigma_mid2);
         } else {
-            log_lo = log_x1;
-            log_x1 = log_x2;
-            f1 = f2;
-            log_x2 = log_lo + phi * (log_hi - log_lo);
-            f2 = f(log_x2.exp());
+            sigma_up = sigma_mid2;
+            sigma_mid2 = sigma_mid1;
+            qmid2 = qmid1;
+            sigma_mid1 = sigma_lo + gfac * (sigma_up - sigma_lo);
+            qmid1 = f(sigma_mid1);
         }
     }
-    (0.5 * (log_lo + log_hi)).exp()
+    if qmid1 < qmid2 { sigma_mid1 } else { sigma_mid2 }
 }
 
 fn update_barrier_parameter(
@@ -7625,6 +7646,18 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
     // Monotone mu strategy: start in Fixed mode and never switch to Free
     if !options.mu_strategy_adaptive {
         mu_state.mode = MuMode::Fixed;
+    } else if options.warm_start_target_mu.is_none() || !options.warm_start {
+        // Adaptive mu: seed μ=1 at solver entry so the iter-0 oracle/K-assembly
+        // sees Ipopt's startup μ rather than mu_init. Mirrors
+        // `IpAdaptiveMuUpdate.cpp:246` (`Set_mu(1.)` in `InitializeImpl`,
+        // executed before the first `UpdateBarrierParameter()` call). The
+        // value is only used to seed `CalculateSafeSlack`, the κ_σ
+        // multiplier reset, and the iter-0 affine/centering KKT systems —
+        // it is overwritten by the QF oracle on the first iteration.
+        // The `warm_start_target_mu` override path keeps its user-specified
+        // μ; otherwise warm-start gets the adaptive seed too (Ipopt does
+        // the same: it always Set_mu(1.) in InitializeImpl).
+        state.mu = 1.0;
     }
 
     // Wall-clock time limit
