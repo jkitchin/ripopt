@@ -45,6 +45,23 @@ let opts = SolverOptions {
 | `sparse_threshold` | `110` | Switch to sparse multifrontal solver when `n+m ≥ threshold` |
 | `linear_solver` | `Direct` | `Direct` (MUMPS/BK), `Iterative` (MINRES), or `Hybrid` |
 
+## Inertia-free curvature test (IFRd)
+
+Opt-in alternative to inertia-based regularization (IBR). When the linear solver reports
+wrong inertia, run the curvature test of Chiang & Zavala (2016, COAP 64:327-354, eq. 28)
+on the computed direction; accept if the curvature condition holds, otherwise fall back
+to the standard δ-escalation ladder. Mirrors Ipopt 3.14's `IpPDFullSpaceSolver` dispatch.
+
+| Option | Default | Description |
+|---|---|---|
+| `neg_curv_test_tol` | `0.0` | Curvature acceptance tolerance α_d. `0.0` disables IFRd (pure IBR). Set to `1e-12` to enable. |
+| `neg_curv_test_reg` | `true` | Include δ_w·‖(dx,ds)‖² regularization in the curvature sum (matches Ipopt) |
+
+Empirically (CUTEst sweep, 727 problems): default vs. `tol=1e-12` both solve 541 to
+Optimal, but the *mix* differs — 19 problems are rescued by IFRd and 19 different
+problems regress. Default off; enable on a per-problem basis when a problem doesn't
+solve with IBR.
+
 ## Mehrotra predictor-corrector
 
 | Option | Default | Description |

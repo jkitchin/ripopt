@@ -110,6 +110,13 @@ pub enum SolveStatus {
     LocalInfeasibility,
     /// Reached maximum number of iterations.
     MaxIterations,
+    /// Wall-clock time budget (`max_wall_time`, also reachable via the
+    /// `max_cpu_time` alias) was exhausted before any termination test
+    /// fired. Distinct from `MaxIterations` so AMPL/Pyomo and C-API
+    /// callers can tell a time-out apart from an iter-cap. AMPL .sol
+    /// solve_result_num maps to 401, matching Ipopt's
+    /// `Maximum_CpuTime_Exceeded` convention.
+    MaxTimeExceeded,
     /// Numerical difficulties (e.g., singular KKT system).
     NumericalError,
     /// Iterates diverged: ‖x‖_∞ exceeded `diverging_iterates_tol`

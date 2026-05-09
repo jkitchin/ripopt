@@ -12,6 +12,11 @@ fn solve_code(status: SolveStatus) -> i32 {
         SolveStatus::LocalInfeasibility | SolveStatus::Infeasible => 200,
         SolveStatus::DivergingIterates => 300,
         SolveStatus::MaxIterations => 400,
+        // Matches Ipopt AmplTNLP.cpp's `Maximum_CpuTime_Exceeded` mapping.
+        // Pyomo's .sol parser collapses 400-499 to maxIterations, but the
+        // numeric `solver.id` and message string still distinguish a
+        // time-out from an iter-cap.
+        SolveStatus::MaxTimeExceeded => 401,
         SolveStatus::NumericalError
         | SolveStatus::EvaluationError
         | SolveStatus::RestorationFailed
@@ -29,6 +34,7 @@ fn status_message(status: SolveStatus) -> &'static str {
         SolveStatus::Infeasible => "Infeasible Problem Detected",
         SolveStatus::LocalInfeasibility => "Converged to a point of local infeasibility",
         SolveStatus::MaxIterations => "Maximum Number of Iterations Exceeded",
+        SolveStatus::MaxTimeExceeded => "Maximum CPU Time Exceeded",
         SolveStatus::NumericalError => "Numerical Difficulties",
         SolveStatus::EvaluationError => "Evaluation Error in User Callbacks",
         SolveStatus::UserRequestedStop => "Optimization Stopped by User",
@@ -87,4 +93,27 @@ pub fn write_sol<W: Write>(
     writeln!(writer, "objno 0 {}", solve_code(result.status))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn time_exceeded_distinct_from_iter_exceeded_in_sol() {
+        // Issue #36 follow-up: Pyomo collapses 400-499 to maxIterations,
+        // but `solver.id` and the message string still need to distinguish
+        // a wall-time exit from an iter-cap exit. Mirrors Ipopt's AmplTNLP
+        // mapping (Maximum_Iterations_Exceeded=400, Maximum_CpuTime_Exceeded=401).
+        assert_eq!(solve_code(SolveStatus::MaxIterations), 400);
+        assert_eq!(solve_code(SolveStatus::MaxTimeExceeded), 401);
+        assert_eq!(
+            status_message(SolveStatus::MaxIterations),
+            "Maximum Number of Iterations Exceeded"
+        );
+        assert_eq!(
+            status_message(SolveStatus::MaxTimeExceeded),
+            "Maximum CPU Time Exceeded"
+        );
+    }
 }

@@ -355,6 +355,7 @@ fn ripopt_status_to_string(status: SolveStatus) -> String {
         SolveStatus::EvaluationError => "EvaluationError".to_string(),
         SolveStatus::UserRequestedStop => "UserRequestedStop".to_string(),
         SolveStatus::StopAtTinyStep => "StopAtTinyStep".to_string(),
+        SolveStatus::MaxTimeExceeded => "MaxTimeExceeded".to_string(),
     }
 }
 
@@ -499,6 +500,14 @@ fn run_single_solver(name: &str, solver: &str) {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
             let ir_full_8_block = std::env::var("RIPOPT_IR_8BLOCK").is_ok();
+            let neg_curv_test_tol: f64 = std::env::var("RIPOPT_NEG_CURV_TEST_TOL")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0);
+            let neg_curv_test_reg: bool = std::env::var("RIPOPT_NEG_CURV_TEST_REG")
+                .ok()
+                .map(|s| s != "0" && s.to_lowercase() != "false")
+                .unwrap_or(true);
             // Mirror the Ipopt-side `mu_strategy=adaptive` force at line ~278:
             // both solvers run under the adaptive QF oracle so the comparison
             // is apples-to-apples. Without this, the suite was implicitly
@@ -514,6 +523,8 @@ fn run_single_solver(name: &str, solver: &str) {
                 max_wall_time: 30.0,
                 ir_residual_full_8_block: ir_full_8_block,
                 mu_strategy_adaptive: true,
+                neg_curv_test_tol,
+                neg_curv_test_reg,
                 ..SolverOptions::default()
             };
 

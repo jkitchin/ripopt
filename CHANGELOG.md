@@ -25,11 +25,34 @@
   modes can be traced side-by-side.
 
 ### Added
+- **Opt-in inertia-free curvature test (IFRd)** (issue #17). Implements the
+  curvature test of Chiang & Zavala (2016, COAP 64:327-354, eq. 28) inline on
+  wrong-inertia events, mirroring Ipopt 3.14's `IpPDFullSpaceSolver` dispatch
+  (lines 514-521). Two new options: `neg_curv_test_tol` (default `0.0` ⇒ pure
+  IBR, byte-equivalent to prior behavior) and `neg_curv_test_reg` (default
+  `true`). On a 727-problem CUTEst sweep, default vs. `tol=1e-12` both solve
+  541 problems to Optimal, but the mix differs — 19 problems are rescued by
+  IFRd (e.g. ACOPR30, AVION2, FBRAIN3LS, LOGHAIRY, SPIRAL) and 19 different
+  problems regress (e.g. SSINE, HELIX, HYDCAR6LS). Default off; enable
+  per-problem via `Options::neg_curv_test_tol` or env var
+  `RIPOPT_NEG_CURV_TEST_TOL` for problems that don't solve under IBR.
 - **`max_cpu_time` accepted as alias for `max_wall_time`** (issue #36). Ipopt's
   default time-limit option name is now recognized by both the C API and the
   AMPL CLI; setting `max_cpu_time` no longer silently does nothing on scripts
   ported from Ipopt. The limit is still enforced as wall-clock time (a one-time
   warning is printed to stderr when the alias is applied).
+- **`SolveStatus::MaxTimeExceeded`** distinguishes a wall-clock-time exit from
+  a `MaxIterations` (iteration-cap) exit (issue #36 follow-up). The previous
+  behavior reused `MaxIterations` for both, which made `max_cpu_time` look
+  ignored when used through the Pyomo `SolverFactory("ripopt")` path: the
+  solver did stop, but the `.sol` file said "Maximum Number of Iterations
+  Exceeded". The AMPL `.sol` `solve_result_num` is now 401 for time-out
+  (matching Ipopt's `Maximum_CpuTime_Exceeded` convention) and the message
+  reads "Maximum CPU Time Exceeded". The C API maps to the existing
+  `MaxWallTimeExceeded` (-5) return code. Pyomo's `.sol` parser still
+  collapses 400-499 to `TerminationCondition.maxIterations` (a Pyomo
+  limitation), but `result.solver.id` and `result.solver.message` now
+  distinguish the two cases.
 - **Unknown options now warn instead of being silently dropped on the C API**.
   `ripopt_add_num_option`, `ripopt_add_int_option`, and `ripopt_add_str_option`
   still return 0 for unknown keywords (unchanged contract for callers that
