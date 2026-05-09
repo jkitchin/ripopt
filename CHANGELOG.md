@@ -25,6 +25,17 @@
   modes can be traced side-by-side.
 
 ### Added
+- **Opt-in inertia-free curvature test (IFRd)** (issue #17). Implements the
+  curvature test of Chiang & Zavala (2016, COAP 64:327-354, eq. 28) inline on
+  wrong-inertia events, mirroring Ipopt 3.14's `IpPDFullSpaceSolver` dispatch
+  (lines 514-521). Two new options: `neg_curv_test_tol` (default `0.0` ⇒ pure
+  IBR, byte-equivalent to prior behavior) and `neg_curv_test_reg` (default
+  `true`). On a 727-problem CUTEst sweep, default vs. `tol=1e-12` both solve
+  541 problems to Optimal, but the mix differs — 19 problems are rescued by
+  IFRd (e.g. ACOPR30, AVION2, FBRAIN3LS, LOGHAIRY, SPIRAL) and 19 different
+  problems regress (e.g. SSINE, HELIX, HYDCAR6LS). Default off; enable
+  per-problem via `Options::neg_curv_test_tol` or env var
+  `RIPOPT_NEG_CURV_TEST_TOL` for problems that don't solve under IBR.
 - **`max_cpu_time` accepted as alias for `max_wall_time`** (issue #36). Ipopt's
   default time-limit option name is now recognized by both the C API and the
   AMPL CLI; setting `max_cpu_time` no longer silently does nothing on scripts
