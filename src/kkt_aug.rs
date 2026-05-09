@@ -772,6 +772,38 @@ pub fn factor_aug_with_inertia_correction(
     mu: f64,
     rhs: &[f64],
 ) -> Result<(f64, f64), SolverError> {
+    factor_aug_with_inertia_correction_inner(aug, solver, params, mu, rhs, None)
+}
+
+/// IFRd-aware variant of `factor_aug_with_inertia_correction`. When the
+/// inertia ladder exhausts its wrong-inertia escalation budget without
+/// satisfying `inertia == (n+n_d, n_c+n_d, 0)`, runs a primal-curvature
+/// test on the (dx, ds) blocks of the trial solution at the last attempted
+/// `(δ_w, δ_c)` and accepts that factorization if the test passes.
+///
+/// Singularity-cap-exhausted paths still return `Err` — IFRd targets
+/// false-negative inertia reads, not genuine rank deficiency.
+///
+/// Reference: Chiang & Zavala 2016 (COAP 64:327-354), eq. 28.
+pub fn factor_aug_with_inertia_correction_with_curv(
+    aug: &mut AugKktSystem,
+    solver: &mut dyn LinearSolver,
+    params: &mut crate::kkt::InertiaCorrectionParams,
+    mu: f64,
+    rhs: &[f64],
+    curv_cfg: Option<&mut AugCurvatureTestCfg>,
+) -> Result<(f64, f64), SolverError> {
+    factor_aug_with_inertia_correction_inner(aug, solver, params, mu, rhs, curv_cfg)
+}
+
+fn factor_aug_with_inertia_correction_inner(
+    aug: &mut AugKktSystem,
+    solver: &mut dyn LinearSolver,
+    params: &mut crate::kkt::InertiaCorrectionParams,
+    mu: f64,
+    rhs: &[f64],
+    mut curv_cfg: Option<&mut AugCurvatureTestCfg>,
+) -> Result<(f64, f64), SolverError> {
     use crate::kkt::DegenType;
     let n = aug.n;
     let n_c = aug.n_c;
@@ -811,12 +843,17 @@ pub fn factor_aug_with_inertia_correction(
         let (positive, negative, zero) = match inertia {
             Some(i) => (i.positive, i.negative, i.zero),
             None => {
-                // Backend can't report inertia: accept if the probe solve
-                // produces a finite vector. Mirrors kkt.rs:1006-1025.
-                let mut probe = vec![0.0; aug.dim];
-                if solver.solve(rhs, &mut probe).is_ok()
-                    && probe.iter().all(|v| v.is_finite())
-                {
+                // Backend can't report inertia. With IFRd enabled (tol > 0),
+                // gate acceptance on the primal-curvature condition; else
+                // fall back to the historical "finite probe" rule.
+                let accept = if let Some(cfg) = curv_cfg.as_deref_mut() {
+                    try_aug_curv_test(aug, solver, rhs, dx, cfg)
+                } else {
+                    let mut probe = vec![0.0; aug.dim];
+                    solver.solve(rhs, &mut probe).is_ok()
+                        && probe.iter().all(|v| v.is_finite())
+                };
+                if accept {
                     aug.matrix = perturbed;
                     aug.delta_x = dx;
                     aug.delta_s = dx;
@@ -895,6 +932,23 @@ pub fn factor_aug_with_inertia_correction(
                 ));
             }
         } else {
+            // Wrong inertia. With IFRd enabled (tol > 0), test the primal
+            // curvature condition on the actual solved direction first
+            // (Ipopt 3.14 IpPDFullSpaceSolver.cpp:600-623). Accept inline
+            // when curvature is sufficient even though inertia is wrong;
+            // only escalate δ_w when curvature itself rejects.
+            if let Some(cfg) = curv_cfg.as_deref_mut() {
+                if try_aug_curv_test(aug, solver, rhs, dx, cfg) {
+                    aug.matrix = perturbed;
+                    aug.delta_x = dx;
+                    aug.delta_s = dx;
+                    aug.delta_c = dc;
+                    aug.delta_d = dc;
+                    if dx > 0.0 { params.delta_w_last = dx; }
+                    if dc > 0.0 { params.delta_c_last = dc; }
+                    return Ok((dx, dc));
+                }
+            }
             if !perturb_for_wrong_inertia_pub(params, mu) {
                 return Err(SolverError::NumericalFailure(
                     "PDPerturbationHandler: cap exhausted in wrong-inertia ladder (aug)"
@@ -908,10 +962,92 @@ pub fn factor_aug_with_inertia_correction(
         let _ = (target_pos, target_neg, DegenType::NotYetDetermined);
     }
 
+    // Suppress unused warning when curv_cfg is None (no rescue tail anymore —
+    // the curvature test is inline on every wrong-inertia event above).
+    let _ = curv_cfg;
+
     Err(SolverError::NumericalFailure(format!(
         "PDPerturbationHandler: max_attempts={} exhausted (aug, last δ_w={:.2e}, δ_c={:.2e})",
         params.max_attempts, dx, dc
     )))
+}
+
+/// Configuration for the inertia-free curvature test (Chiang & Zavala 2016, IFRd)
+/// applied to ripopt's augmented 4-block KKT.
+///
+/// Holds borrows of the symbolic Hessian and the augmented Σ-diagonals so the
+/// quadratic form `dxᵀ(H+Σ_x)dx + dsᵀΣ_s ds` can be evaluated without
+/// re-materializing them. `eval_counter` lets the caller observe how often the
+/// test fires per IPM iteration (do-no-harm verification).
+pub struct AugCurvatureTestCfg<'a> {
+    pub tol: f64,
+    pub use_reg: bool,
+    pub hess_rows: &'a [usize],
+    pub hess_cols: &'a [usize],
+    pub hess_vals: &'a [f64],
+    pub sigma_x: &'a [f64],
+    pub sigma_s: &'a [f64],
+    pub eval_counter: Option<&'a mut usize>,
+}
+
+/// Probe the curvature test on the trial solution at the just-factored
+/// perturbed matrix. Returns `true` if the curvature condition holds —
+/// caller installs the matrix into `aug` and exits the wrong-inertia loop;
+/// `false` means the caller should escalate δ_w via `perturb_for_wrong_inertia`.
+///
+/// Mirrors Ipopt 3.14 `IpPDFullSpaceSolver.cpp:600-623`. The probe solves
+/// the perturbed system at the current RHS and tests
+/// `dxᵀ(H+Σ_x)dx + dsᵀΣ_s ds (+ δ_w·||(dx,ds)||² if use_reg) ≥ tol·||(dx,ds)||²`.
+fn try_aug_curv_test(
+    aug: &AugKktSystem,
+    solver: &mut dyn LinearSolver,
+    rhs: &[f64],
+    dx_pert: f64,
+    cfg: &mut AugCurvatureTestCfg,
+) -> bool {
+    if let Some(c) = cfg.eval_counter.as_deref_mut() {
+        *c += 1;
+    }
+    let mut sol = vec![0.0; aug.dim];
+    if solver.solve(rhs, &mut sol).is_err() {
+        return false;
+    }
+    if sol.iter().any(|v| !v.is_finite()) {
+        return false;
+    }
+    let n = aug.n;
+    let n_d = aug.n_d;
+    let dx_block = &sol[..n];
+    let ds_block = &sol[n..n + n_d];
+    let dx_norm_sq: f64 = dx_block.iter().map(|v| v * v).sum();
+    let ds_norm_sq: f64 = ds_block.iter().map(|v| v * v).sum();
+    let total_norm_sq = dx_norm_sq + ds_norm_sq;
+    if total_norm_sq < 1e-30 {
+        return true;
+    }
+
+    let mut q = 0.0_f64;
+    for i in 0..n {
+        q += cfg.sigma_x[i] * dx_block[i] * dx_block[i];
+    }
+    for k in 0..cfg.hess_rows.len() {
+        let r = cfg.hess_rows[k];
+        let c = cfg.hess_cols[k];
+        let v = cfg.hess_vals[k];
+        if r == c {
+            q += v * dx_block[r] * dx_block[r];
+        } else {
+            q += 2.0 * v * dx_block[r] * dx_block[c];
+        }
+    }
+    for k in 0..n_d {
+        q += cfg.sigma_s[k] * ds_block[k] * ds_block[k];
+    }
+    if cfg.use_reg && dx_pert > 0.0 {
+        q += dx_pert * total_norm_sq;
+    }
+
+    q >= cfg.tol * total_norm_sq
 }
 
 // ---------------------------------------------------------------------
@@ -1079,6 +1215,123 @@ pub fn aug_step_from_state(
     }
 
     // Recover the eight-block step.
+    let step = recover_step(
+        n, n_c, &result.sol,
+        x, x_l, x_u, z_l, z_u,
+        s_d, d_l, d_u, v_l_d, v_u_d, mu,
+    );
+    Ok((step, dw, dc, aug))
+}
+
+/// IFRd-aware variant of [`aug_step_from_state`] (Chiang & Zavala 2016).
+///
+/// Identical to `aug_step_from_state` when `neg_curv_test_tol <= 0`. When
+/// the tolerance is positive, the inertia-correction ladder runs as usual;
+/// only when its wrong-inertia escalation is exhausted does the curvature
+/// test fire on the most recent attempt. This preserves do-no-harm —
+/// problems that succeed under IBR see byte-identical behavior.
+#[allow(clippy::too_many_arguments)]
+pub fn aug_step_from_state_with_curv(
+    n: usize,
+    grad_f: &[f64],
+    hess_rows: &[usize],
+    hess_cols: &[usize],
+    hess_vals: &[f64],
+    jac_c_rows: &[usize],
+    jac_c_cols: &[usize],
+    jac_c_vals: &[f64],
+    jac_d_rows: &[usize],
+    jac_d_cols: &[usize],
+    jac_d_vals: &[f64],
+    x: &[f64],
+    x_l: &[f64],
+    x_u: &[f64],
+    z_l: &[f64],
+    z_u: &[f64],
+    s_d: &[f64],
+    c_x: &[f64],
+    d_x: &[f64],
+    d_l: &[f64],
+    d_u: &[f64],
+    y_c: &[f64],
+    y_d: &[f64],
+    v_l_d: &[f64],
+    v_u_d: &[f64],
+    mu: f64,
+    kappa_d: f64,
+    use_sparse: bool,
+    solver: &mut dyn LinearSolver,
+    perturbation: &mut crate::kkt::InertiaCorrectionParams,
+    neg_curv_test_tol: f64,
+    neg_curv_test_reg: bool,
+    curv_eval_counter: Option<&mut usize>,
+) -> Result<(AugStep, f64, f64, AugKktSystem), SolverError> {
+    let n_c = c_x.len();
+    let n_d = d_x.len();
+
+    let mut sigma_x = vec![0.0; n];
+    for i in 0..n {
+        if x_l[i].is_finite() {
+            let s_l = (x[i] - x_l[i]).max(1e-20);
+            sigma_x[i] += z_l[i] / s_l;
+        }
+        if x_u[i].is_finite() {
+            let s_u = (x_u[i] - x[i]).max(1e-20);
+            sigma_x[i] += z_u[i] / s_u;
+        }
+    }
+    let sigma_s = compute_sigma_s(d_l, d_u, s_d, v_l_d, v_u_d);
+
+    let mut aug = assemble_aug_kkt(
+        n, n_c, n_d,
+        hess_rows, hess_cols, hess_vals,
+        jac_c_rows, jac_c_cols, jac_c_vals,
+        jac_d_rows, jac_d_cols, jac_d_vals,
+        &sigma_x, &sigma_s,
+        0.0, 0.0, 0.0, 0.0,
+        use_sparse,
+    );
+
+    let j_t_y = compute_j_t_y_split(
+        n, y_c, y_d,
+        jac_c_rows, jac_c_cols, jac_c_vals,
+        jac_d_rows, jac_d_cols, jac_d_vals,
+    );
+
+    let outer = build_outer_rhs(
+        n, grad_f, &j_t_y,
+        x, x_l, x_u, z_l, z_u,
+        s_d, c_x, d_x, d_l, d_u, y_d, v_l_d, v_u_d,
+        mu, kappa_d,
+    );
+    let aug_rhs = fold_aug_rhs(n, &outer, x, x_l, x_u, s_d, d_l, d_u);
+
+    let (dw, dc) = if neg_curv_test_tol > 0.0 {
+        let mut cfg = AugCurvatureTestCfg {
+            tol: neg_curv_test_tol,
+            use_reg: neg_curv_test_reg,
+            hess_rows,
+            hess_cols,
+            hess_vals,
+            sigma_x: &sigma_x,
+            sigma_s: &sigma_s,
+            eval_counter: curv_eval_counter,
+        };
+        factor_aug_with_inertia_correction_with_curv(
+            &mut aug, solver, perturbation, mu, &aug_rhs, Some(&mut cfg),
+        )?
+    } else {
+        factor_aug_with_inertia_correction(&mut aug, solver, perturbation, mu, &aug_rhs)?
+    };
+
+    let result = solve_aug_with_ir(
+        solver, &aug, &aug_rhs,
+        IR_MIN_STEPS_DEFAULT,
+        IR_MAX_STEPS_DEFAULT,
+        IR_RATIO_MAX_DEFAULT,
+        IR_IMPROVEMENT_FACTOR_DEFAULT,
+    )?;
+
     let step = recover_step(
         n, n_c, &result.sol,
         x, x_l, x_u, z_l, z_u,
@@ -1349,6 +1602,148 @@ pub fn aug_step_from_state_mehrotra(
     ).unwrap_or(mu_curr);
 
     // Newton step at μ_new — same matrix, fresh RHS.
+    let outer = build_outer_rhs(
+        n, grad_f, &j_t_y,
+        x, x_l, x_u, z_l, z_u,
+        s_d, c_x, d_x, d_l, d_u, y_d, v_l_d, v_u_d,
+        mu_new, kappa_d,
+    );
+    let aug_rhs = fold_aug_rhs(n, &outer, x, x_l, x_u, s_d, d_l, d_u);
+
+    let result = solve_aug_with_ir(
+        solver, &aug, &aug_rhs,
+        IR_MIN_STEPS_DEFAULT, IR_MAX_STEPS_DEFAULT,
+        IR_RATIO_MAX_DEFAULT, IR_IMPROVEMENT_FACTOR_DEFAULT,
+    )?;
+    let step = recover_step(
+        n, n_c, &result.sol,
+        x, x_l, x_u, z_l, z_u,
+        s_d, d_l, d_u, v_l_d, v_u_d, mu_new,
+    );
+
+    Ok((step, mu_new, dw, dc, aug))
+}
+
+/// IFRd-aware variant of [`aug_step_from_state_mehrotra`] (Chiang & Zavala 2016).
+///
+/// Identical to `aug_step_from_state_mehrotra` when `neg_curv_test_tol <= 0`.
+#[allow(clippy::too_many_arguments)]
+pub fn aug_step_from_state_mehrotra_with_curv(
+    n: usize,
+    grad_f: &[f64],
+    hess_rows: &[usize],
+    hess_cols: &[usize],
+    hess_vals: &[f64],
+    jac_c_rows: &[usize],
+    jac_c_cols: &[usize],
+    jac_c_vals: &[f64],
+    jac_d_rows: &[usize],
+    jac_d_cols: &[usize],
+    jac_d_vals: &[f64],
+    x: &[f64],
+    x_l: &[f64],
+    x_u: &[f64],
+    z_l: &[f64],
+    z_u: &[f64],
+    s_d: &[f64],
+    c_x: &[f64],
+    d_x: &[f64],
+    d_l: &[f64],
+    d_u: &[f64],
+    y_c: &[f64],
+    y_d: &[f64],
+    v_l_d: &[f64],
+    v_u_d: &[f64],
+    mu_curr: f64,
+    kappa_d: f64,
+    sigma_max: f64,
+    mu_min: f64,
+    mu_max: f64,
+    use_sparse: bool,
+    solver: &mut dyn LinearSolver,
+    perturbation: &mut crate::kkt::InertiaCorrectionParams,
+    neg_curv_test_tol: f64,
+    neg_curv_test_reg: bool,
+    curv_eval_counter: Option<&mut usize>,
+) -> Result<(AugStep, f64, f64, f64, AugKktSystem), SolverError> {
+    let n_c = c_x.len();
+    let n_d = d_x.len();
+
+    let mut sigma_x = vec![0.0; n];
+    for i in 0..n {
+        if x_l[i].is_finite() {
+            let s_l = (x[i] - x_l[i]).max(1e-20);
+            sigma_x[i] += z_l[i] / s_l;
+        }
+        if x_u[i].is_finite() {
+            let s_u = (x_u[i] - x[i]).max(1e-20);
+            sigma_x[i] += z_u[i] / s_u;
+        }
+    }
+    let sigma_s = compute_sigma_s(d_l, d_u, s_d, v_l_d, v_u_d);
+
+    let mut aug = assemble_aug_kkt(
+        n, n_c, n_d,
+        hess_rows, hess_cols, hess_vals,
+        jac_c_rows, jac_c_cols, jac_c_vals,
+        jac_d_rows, jac_d_cols, jac_d_vals,
+        &sigma_x, &sigma_s,
+        0.0, 0.0, 0.0, 0.0,
+        use_sparse,
+    );
+
+    let j_t_y = compute_j_t_y_split(
+        n, y_c, y_d,
+        jac_c_rows, jac_c_cols, jac_c_vals,
+        jac_d_rows, jac_d_cols, jac_d_vals,
+    );
+
+    let outer_aff = build_outer_rhs(
+        n, grad_f, &j_t_y,
+        x, x_l, x_u, z_l, z_u,
+        s_d, c_x, d_x, d_l, d_u, y_d, v_l_d, v_u_d,
+        0.0, 0.0,
+    );
+    let aug_rhs_aff = fold_aug_rhs(n, &outer_aff, x, x_l, x_u, s_d, d_l, d_u);
+
+    let (dw, dc) = if neg_curv_test_tol > 0.0 {
+        let mut cfg = AugCurvatureTestCfg {
+            tol: neg_curv_test_tol,
+            use_reg: neg_curv_test_reg,
+            hess_rows,
+            hess_cols,
+            hess_vals,
+            sigma_x: &sigma_x,
+            sigma_s: &sigma_s,
+            eval_counter: curv_eval_counter,
+        };
+        factor_aug_with_inertia_correction_with_curv(
+            &mut aug, solver, perturbation, mu_curr, &aug_rhs_aff, Some(&mut cfg),
+        )?
+    } else {
+        factor_aug_with_inertia_correction(
+            &mut aug, solver, perturbation, mu_curr, &aug_rhs_aff,
+        )?
+    };
+
+    let aff_result = solve_aug_with_ir(
+        solver, &aug, &aug_rhs_aff,
+        IR_MIN_STEPS_DEFAULT, IR_MAX_STEPS_DEFAULT,
+        IR_RATIO_MAX_DEFAULT, IR_IMPROVEMENT_FACTOR_DEFAULT,
+    )?;
+    let step_aff = recover_step(
+        n, n_c, &aff_result.sol,
+        x, x_l, x_u, z_l, z_u,
+        s_d, d_l, d_u, v_l_d, v_u_d, 0.0,
+    );
+
+    let mu_new = aug_probing_mu_from_affine(
+        n, &step_aff,
+        x, x_l, x_u, z_l, z_u,
+        s_d, d_l, d_u, v_l_d, v_u_d,
+        mu_curr, sigma_max, mu_min, mu_max,
+    ).unwrap_or(mu_curr);
+
     let outer = build_outer_rhs(
         n, grad_f, &j_t_y,
         x, x_l, x_u, z_l, z_u,

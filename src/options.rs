@@ -679,6 +679,33 @@ pub struct SolverOptions {
     /// diverging. Default 1e20 matches Ipopt
     /// `IpOptErrorConvCheck.cpp:123`.
     pub diverging_iterates_tol: f64,
+    /// Tolerance for the inertia-free curvature test (Chiang & Zavala 2016, IFRd).
+    ///
+    /// When > 0, enables IFRd as a last-resort rescue inside the augmented
+    /// inertia-correction loop in `kkt_aug::factor_aug_with_inertia_correction`.
+    /// After the IBR ladder exhausts `max_attempts` δ_w escalations without
+    /// hitting the target inertia, the curvature test is evaluated on the
+    /// (dx, ds) blocks of the trial solution against the last attempted
+    /// perturbation:
+    ///     `dxᵀ(H+Σ_x)dx + dsᵀΣ_s ds  ≥  tol · (‖dx‖² + ‖ds‖²)`
+    /// (optionally `+ δ_w·(‖dx‖² + ‖ds‖²)` when `neg_curv_test_reg` is true).
+    /// If the test passes, the (perturbed) factorization is accepted; otherwise
+    /// the function returns the standard `NumericalFailure` and falls through
+    /// to ripopt's existing recovery paths.
+    ///
+    /// Default: 0.0 (disabled, pure IBR — matches Ipopt's default).
+    /// Typical enable value: 1e-12. Matches Ipopt's `neg_curv_test_tol` option.
+    pub neg_curv_test_tol: f64,
+    /// Whether the IFRd curvature test includes the `δ_w · ‖d‖²` regularization term.
+    ///
+    /// Only consulted when `neg_curv_test_tol > 0`. When true (default), the LHS
+    /// of the curvature test evaluates curvature of the regularized augmented
+    /// operator (more permissive at small δ_w). When false, the test evaluates
+    /// the pure unperturbed `(H+Σ_x, Σ_s)` curvature (stricter, closer to
+    /// inertia-based acceptance in spirit).
+    ///
+    /// Default: true. Matches Ipopt's `neg_curv_test_reg` option (default "yes").
+    pub neg_curv_test_reg: bool,
 }
 
 impl Default for SolverOptions {
@@ -810,6 +837,8 @@ impl Default for SolverOptions {
             acceptable_obj_change_tol: 1e20,
             acceptable_iter: 15,
             diverging_iterates_tol: 1e20,
+            neg_curv_test_tol: 0.0,
+            neg_curv_test_reg: true,
         }
     }
 }

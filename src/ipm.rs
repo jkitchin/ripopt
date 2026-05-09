@@ -7825,6 +7825,10 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         // A8.7: `aug_solver` is hoisted above the loop so its symbolic
         // cache persists across iterations.
         let probing = options.mehrotra_pc;
+        // IFRd diagnostic counter (Chiang & Zavala 2016). Only ever incremented
+        // when `options.neg_curv_test_tol > 0` and the inertia ladder exhausts
+        // its wrong-inertia escalation budget — the curvature-test rescue path.
+        let mut curv_eval_count: usize = 0;
         let (step, _dc, mu_new_opt, aug_kkt, _iter_dw, _iter_dc) = if probing {
             let avg_compl = compute_avg_complementarity(&state);
             let mu_max = mu_state.mu_max_cap(options, avg_compl);
@@ -7841,21 +7845,43 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             // with ±∞ on unbounded sides.
             let d_l_full = state.d_l();
             let d_u_full = state.d_u();
-            match crate::kkt_aug::aug_step_from_state_mehrotra(
-                n, &state.grad_f,
-                &state.hess_rows, &state.hess_cols, &state.hess_vals,
-                &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals,
-                &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals,
-                &state.x, &x_l_full, &x_u_full, &z_l_full, &z_u_full,
-                &state.s, &state.c_x, &state.d_x, &d_l_full, &d_u_full,
-                &state.y_c, &state.y_d, &v_l_full, &v_u_full,
-                state.mu, options.kappa_d,
-                crate::kkt_aug::PROBING_SIGMA_MAX_DEFAULT,
-                options.mu_min, mu_max,
-                use_sparse,
-                aug_solver.as_mut(),
-                &mut inertia_params,
-            ) {
+            let mehrotra_result = if options.neg_curv_test_tol > 0.0 {
+                crate::kkt_aug::aug_step_from_state_mehrotra_with_curv(
+                    n, &state.grad_f,
+                    &state.hess_rows, &state.hess_cols, &state.hess_vals,
+                    &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals,
+                    &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals,
+                    &state.x, &x_l_full, &x_u_full, &z_l_full, &z_u_full,
+                    &state.s, &state.c_x, &state.d_x, &d_l_full, &d_u_full,
+                    &state.y_c, &state.y_d, &v_l_full, &v_u_full,
+                    state.mu, options.kappa_d,
+                    crate::kkt_aug::PROBING_SIGMA_MAX_DEFAULT,
+                    options.mu_min, mu_max,
+                    use_sparse,
+                    aug_solver.as_mut(),
+                    &mut inertia_params,
+                    options.neg_curv_test_tol,
+                    options.neg_curv_test_reg,
+                    Some(&mut curv_eval_count),
+                )
+            } else {
+                crate::kkt_aug::aug_step_from_state_mehrotra(
+                    n, &state.grad_f,
+                    &state.hess_rows, &state.hess_cols, &state.hess_vals,
+                    &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals,
+                    &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals,
+                    &state.x, &x_l_full, &x_u_full, &z_l_full, &z_u_full,
+                    &state.s, &state.c_x, &state.d_x, &d_l_full, &d_u_full,
+                    &state.y_c, &state.y_d, &v_l_full, &v_u_full,
+                    state.mu, options.kappa_d,
+                    crate::kkt_aug::PROBING_SIGMA_MAX_DEFAULT,
+                    options.mu_min, mu_max,
+                    use_sparse,
+                    aug_solver.as_mut(),
+                    &mut inertia_params,
+                )
+            };
+            match mehrotra_result {
                 Ok((step, mu_new, dw, dc, aug)) => (step, dc, Some(mu_new), aug, dw, dc),
                 Err(_e) => {
                     timings.direction_solve += t_dir.elapsed();
@@ -7947,19 +7973,39 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
                 }
             }
 
-            match crate::kkt_aug::aug_step_from_state(
-                n, &state.grad_f,
-                &state.hess_rows, &state.hess_cols, &state.hess_vals,
-                &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals,
-                &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals,
-                &state.x, &x_l_full, &x_u_full, &z_l_full, &z_u_full,
-                &state.s, &state.c_x, &state.d_x, &d_l_full, &d_u_full,
-                &state.y_c, &state.y_d, &v_l_full, &v_u_full,
-                state.mu, options.kappa_d,
-                use_sparse,
-                aug_solver.as_mut(),
-                &mut inertia_params,
-            ) {
+            let std_result = if options.neg_curv_test_tol > 0.0 {
+                crate::kkt_aug::aug_step_from_state_with_curv(
+                    n, &state.grad_f,
+                    &state.hess_rows, &state.hess_cols, &state.hess_vals,
+                    &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals,
+                    &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals,
+                    &state.x, &x_l_full, &x_u_full, &z_l_full, &z_u_full,
+                    &state.s, &state.c_x, &state.d_x, &d_l_full, &d_u_full,
+                    &state.y_c, &state.y_d, &v_l_full, &v_u_full,
+                    state.mu, options.kappa_d,
+                    use_sparse,
+                    aug_solver.as_mut(),
+                    &mut inertia_params,
+                    options.neg_curv_test_tol,
+                    options.neg_curv_test_reg,
+                    Some(&mut curv_eval_count),
+                )
+            } else {
+                crate::kkt_aug::aug_step_from_state(
+                    n, &state.grad_f,
+                    &state.hess_rows, &state.hess_cols, &state.hess_vals,
+                    &state.jac_c_rows, &state.jac_c_cols, &state.jac_c_vals,
+                    &state.jac_d_rows, &state.jac_d_cols, &state.jac_d_vals,
+                    &state.x, &x_l_full, &x_u_full, &z_l_full, &z_u_full,
+                    &state.s, &state.c_x, &state.d_x, &d_l_full, &d_u_full,
+                    &state.y_c, &state.y_d, &v_l_full, &v_u_full,
+                    state.mu, options.kappa_d,
+                    use_sparse,
+                    aug_solver.as_mut(),
+                    &mut inertia_params,
+                )
+            };
+            match std_result {
                 Ok((step, dw, dc, aug)) => (step, dc, None, aug, dw, dc),
                 Err(_e) => {
                     timings.direction_solve += t_dir.elapsed();
@@ -7968,6 +8014,12 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             }
         };
         timings.direction_solve += t_dir.elapsed();
+        if curv_eval_count > 0 && options.print_level >= 5 {
+            rip_log!(
+                "ripopt: IFRd curvature test fired {} time(s) at iter {} mu={:.2e}",
+                curv_eval_count, iteration, state.mu
+            );
+        }
         if let Some(mu_new) = mu_new_opt {
             state.mu = mu_new;
         }
