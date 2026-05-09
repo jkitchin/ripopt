@@ -5790,7 +5790,21 @@ fn compute_quality_function_mu(
     //    1.0 (Ipopt's effective range when `quality_function_balancing_term`
     //    is `none`, which is the default). This avoids σ ≳ 1 picks that
     //    would pin μ at avg_compl indefinitely.
-    let sigma_min = 1e-6;
+    //
+    //    Tolerance-aware σ floor (mirrors Ipopt 3.14
+    //    `IpQualityFunctionMuOracle.cpp:370`:
+    //    `sigma_lo = Max(sigma_min_, mu_min/avrg_compl)`). Without this,
+    //    when the linearised dual_inf_trial and primal_inf_trial are near
+    //    zero (current iterate already satisfies KKT in linearised sense),
+    //    Q is dominated by the monotone-decreasing complementarity term
+    //    and the minimiser slams to σ_min=1e-6, pushing μ orders of
+    //    magnitude below the user's convergence tolerance in a single
+    //    iteration. We use `0.5 * min(tol, compl_inf_tol)` as the effective
+    //    mu floor (matches Ipopt's `IpAdaptiveMuUpdate.cpp:262-264` mu_min
+    //    update rule for tol-driven safeguard).
+    let eff_mu_floor =
+        (0.5 * options.tol.min(options.compl_inf_tol)).max(options.mu_min);
+    let sigma_min = (1e-6_f64).max(eff_mu_floor / avg_compl.max(1e-300));
     let sigma_max = 1.0;
     let sigma_star = golden_section_minimize(
         &q_eval,
@@ -6917,6 +6931,65 @@ fn log_iteration_row(
             bind_z, bind_dz, min_ratio,
             dw_last, dc_last,
         );
+
+        // RIPOPT_YD_PROBE: dump the y_d row whose |y_d[k]| is the inf-norm,
+        // along with the slack s, the v_L / v_U on that slack, and the
+        // step components ds[k], dy_d[k]. Used to localize whether the
+        // slow |y_d| convergence on NET1 is one specific stuck row or
+        // a global mass effect. Set RIPOPT_YD_PROBE_K=<idx> to track a
+        // specific row index instead of the inf-norm row.
+        if std::env::var("RIPOPT_YD_PROBE").is_ok() && !state.y_d.is_empty() {
+            let mut k_max = 0usize;
+            if let Ok(k_str) = std::env::var("RIPOPT_YD_PROBE_K") {
+                if let Ok(k_fixed) = k_str.parse::<usize>() {
+                    if k_fixed < state.y_d.len() { k_max = k_fixed; }
+                }
+            } else {
+                // Find argmax |y_d[k]|.
+                let mut yd_max = 0.0_f64;
+                for k in 0..state.y_d.len() {
+                    let a = state.y_d[k].abs();
+                    if a > yd_max { yd_max = a; k_max = k; }
+                }
+            }
+            let s_k = state.s[k_max];
+            // d_l, d_u for slack k_max — slack lives in n_d-space, look up
+            // via the layout. Use the same accessors as build_outer_rhs.
+            let d_l_full = state.d_l();
+            let d_u_full = state.d_u();
+            let d_l_k = d_l_full[k_max];
+            let d_u_k = d_u_full[k_max];
+            let s_l_k = if d_l_k.is_finite() { (s_k - d_l_k).max(1e-20) } else { f64::INFINITY };
+            let s_u_k = if d_u_k.is_finite() { (d_u_k - s_k).max(1e-20) } else { f64::INFINITY };
+            // v_L / v_U on this row — compressed storage means look up via layout.
+            let mut v_l_k = 0.0_f64;
+            let mut v_u_k = 0.0_f64;
+            for kc in 0..state.d_bound_layout.n_d_l {
+                if state.d_bound_layout.d_l_to_full[kc] == k_max {
+                    v_l_k = state.v_l_compressed[kc];
+                }
+            }
+            for kc in 0..state.d_bound_layout.n_d_u {
+                if state.d_bound_layout.d_u_to_full[kc] == k_max {
+                    v_u_k = state.v_u_compressed[kc];
+                }
+            }
+            let ds_k = state.ds[k_max];
+            let dy_d_k = state.dy_d[k_max];
+            // Sigma_s contribution at this row.
+            let sigma_s_k = (if d_l_k.is_finite() { v_l_k / s_l_k } else { 0.0 })
+                + (if d_u_k.is_finite() { v_u_k / s_u_k } else { 0.0 });
+            // Constraint residual d(x) - s.
+            let resid_k = state.d_x[k_max] - s_k;
+            rip_log!(
+                "ripopt: iter{}-yd-probe: k={} y_d={:+.6e} dy_d={:+.6e}  s={:+.6e} d_l={:+.3e} d_u={:+.3e}  s_L={:.3e} s_U={:.3e}  v_L={:.6e} v_U={:.6e}  ds={:+.3e} sigma_s={:.3e}  d(x)-s={:+.3e}",
+                iteration, k_max, state.y_d[k_max], dy_d_k,
+                s_k, d_l_k, d_u_k,
+                s_l_k, s_u_k,
+                v_l_k, v_u_k,
+                ds_k, sigma_s_k, resid_k,
+            );
+        }
     }
 }
 

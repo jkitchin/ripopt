@@ -280,6 +280,17 @@ fn solve_with_ipopt(problem: &dyn NlpProblem) -> IpoptResult {
         set_int_option(ipopt_problem, "max_iter", 3000);
         set_int_option(ipopt_problem, "print_level", 0);
 
+        // Probe hook: dump high-verbosity Ipopt log to disk when env var set.
+        // Format: IPOPT_FILE_OUTPUT=<path>:<level> (e.g. /tmp/net1.log:10)
+        if let Ok(spec) = std::env::var("IPOPT_FILE_OUTPUT") {
+            if let Some((path, lvl)) = spec.rsplit_once(':') {
+                if let Ok(level) = lvl.parse::<i32>() {
+                    set_str_option(ipopt_problem, "output_file", path);
+                    set_int_option(ipopt_problem, "file_print_level", level);
+                }
+            }
+        }
+
         SetIntermediateCallback(ipopt_problem, intermediate_cb);
 
         let mut x = vec![0.0; n];
