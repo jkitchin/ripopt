@@ -12,7 +12,11 @@ benchmarks/cutest/*_stderr.txt
 benchmarks/cutest/*_stdout.txt
 benchmarks/cutest/*_results.json
 benchmarks/cutest/*_results.jsonl
+benchmarks/cutest/*_results*.json
+benchmarks/cutest/*_results*.jsonl
 benchmarks/cutest/*_results.log
+benchmarks/cutest/verify_*.jsonl
+benchmarks/cutest/verify_*.json
 benchmarks/cutest/results_*.json
 benchmarks/cutest/results_*.jsonl
 # But DO track tagged-version snapshots (results_vX.Y.Z.json — no suffix)
@@ -30,6 +34,8 @@ benchmarks/cutest/fortran_open_fixed.f90
 
 # Per-suite JSONL streams from benchmarks (stream output, not artifacts)
 benchmarks/cho/cho_results.jsonl
+cho_results.json
+cho_results.jsonl
 benchmarks/electrolyte/electrolyte_results.jsonl
 benchmarks/grid/grid_results.jsonl
 benchmarks/run_stdout.txt
@@ -39,6 +45,7 @@ benchmarks/preprocessing/results/
 # arki0003 / A8 forward-walk diagnostic probes (one-off, not part of crate)
 examples/arki_*.rs
 examples/arki_*.r
+examples/rip_log_*.rs
 
 # HS suite artifacts
 benchmarks/hs/phase1_results.log
