@@ -1503,6 +1503,7 @@ impl LbfgsIpmState {
 /// `B_k = σI + V Vᵀ - U Uᵀ`. `v` and `u` are column-major n×k buffers
 /// (column j is `data[j*n .. (j+1)*n]`). Built by `LbfgsIpmState::compact`;
 /// consumed by `apply` and (in Phase 2) by the low-rank KKT wrapper.
+#[derive(Clone)]
 pub struct LbfgsCompact {
     pub n: usize,
     pub k: usize,

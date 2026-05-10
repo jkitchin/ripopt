@@ -22,7 +22,7 @@
 //! fully-assembled `KktMatrix`, not split block arguments — see the design
 //! note in issue #30.
 
-use super::{Inertia, KktMatrix, LinearSolver, SolverError};
+use super::{FactorDiagnostics, Inertia, KktMatrix, LinearSolver, SolverError};
 use crate::ipm::LbfgsCompact;
 
 /// State of a low-rank Sherman-Morrison wrapper around an inner `LinearSolver`.
@@ -48,6 +48,16 @@ pub struct LowRankKktSolver<S: LinearSolver> {
     /// `k × k` row-major lower-triangular Cholesky factor of `M2 = I − Utilde2_xᵀ U`.
     j2_chol: Vec<f64>,
     factored: bool,
+    /// Compact form + augmented dim staged by the IPM via
+    /// `set_pending_lbfgs` immediately before invoking the
+    /// `LinearSolver::factor` trait method. When `Some`, the next
+    /// `factor` call applies the Sherman-Morrison correction; when
+    /// `None`, both `factor` and `solve` pass straight through to the
+    /// inner solver. Issue #30 phase 2.5b.
+    pending: Option<(LbfgsCompact, usize)>,
+    /// True iff the most recent `factor` ran the SM correction. Drives
+    /// the `solve` dispatch.
+    sm_active: bool,
 }
 
 impl<S: LinearSolver> LowRankKktSolver<S> {
@@ -64,7 +74,35 @@ impl<S: LinearSolver> LowRankKktSolver<S> {
             j1_chol: Vec::new(),
             j2_chol: Vec::new(),
             factored: false,
+            pending: None,
+            sm_active: false,
         }
+    }
+
+    /// Stage the compact form for the next `LinearSolver::factor` call.
+    /// The IPM driver invokes this once per outer iteration when
+    /// `state.lbfgs_compact` is `Some`. The wrapper retains ownership of
+    /// the staged compact across the inertia-correction ladder so the
+    /// re-factor on perturbation retries does not need to re-stage.
+    pub fn set_pending_lbfgs(&mut self, compact: LbfgsCompact, n_aug: usize) {
+        self.pending = Some((compact, n_aug));
+    }
+
+    /// Drop any staged compact form — the next `factor` call passes
+    /// through to the inner solver. Called when the L-BFGS update is
+    /// skipped (`LbfgsIpmState::compact` returned `None`) or when
+    /// reverting to the exact-Hessian path.
+    pub fn clear_pending_lbfgs(&mut self) {
+        self.pending = None;
+    }
+
+    /// Inner accessor for tests / diagnostics.
+    pub fn inner(&self) -> &S {
+        &self.inner
+    }
+
+    pub fn inner_mut(&mut self) -> &mut S {
+        &mut self.inner
     }
 
     /// Factor `A_0 + V_aug V_augᵀ − U_aug U_augᵀ` where `A_0` is the inner
@@ -285,6 +323,83 @@ impl<S: LinearSolver> LowRankKktSolver<S> {
         }
 
         Ok(())
+    }
+}
+
+/// `LinearSolver` impl: route `factor` through the SM correction when a
+/// compact form has been staged via `set_pending_lbfgs`, otherwise pass
+/// through to the inner solver. Phase 2.5b of issue #30.
+impl<S: LinearSolver> LinearSolver for LowRankKktSolver<S> {
+    fn factor(&mut self, matrix: &KktMatrix) -> Result<Option<Inertia>, SolverError> {
+        if let Some((compact, n_aug)) = self.pending.take() {
+            // The inertia ladder may re-factor a perturbed matrix several
+            // times against the same compact, so restore `pending` before
+            // returning. We borrow the compact through a local owned copy
+            // because `self.factor` mutates other fields of `self`.
+            let result = self.factor(matrix, &compact, n_aug);
+            self.pending = Some((compact, n_aug));
+            self.sm_active = true;
+            result
+        } else {
+            self.sm_active = false;
+            self.factored = false;
+            self.inner.factor(matrix)
+        }
+    }
+
+    fn solve(&mut self, rhs: &[f64], solution: &mut [f64]) -> Result<(), SolverError> {
+        if self.sm_active {
+            self.solve(rhs, solution)
+        } else {
+            self.inner.solve(rhs, solution)
+        }
+    }
+
+    fn solve_many(
+        &mut self,
+        rhs: &[f64],
+        nrhs: usize,
+        solution: &mut [f64],
+    ) -> Result<(), SolverError> {
+        if !self.sm_active {
+            return self.inner.solve_many(rhs, nrhs, solution);
+        }
+        // No SM-corrected multi-RHS shortcut: loop single-RHS solves.
+        if nrhs == 0 {
+            return Ok(());
+        }
+        let n = rhs.len() / nrhs;
+        if rhs.len() != n * nrhs || solution.len() != n * nrhs {
+            return Err(SolverError::DimensionMismatch {
+                expected: n * nrhs,
+                got: rhs.len().min(solution.len()),
+            });
+        }
+        for c in 0..nrhs {
+            let off = c * n;
+            self.solve(&rhs[off..off + n], &mut solution[off..off + n])?;
+        }
+        Ok(())
+    }
+
+    fn provides_inertia(&self) -> bool {
+        self.inner.provides_inertia()
+    }
+
+    fn min_diagonal(&self) -> Option<f64> {
+        self.inner.min_diagonal()
+    }
+
+    fn increase_quality(&mut self) -> bool {
+        self.inner.increase_quality()
+    }
+
+    fn last_factor_diagnostics(&self) -> FactorDiagnostics {
+        self.inner.last_factor_diagnostics()
+    }
+
+    fn estimate_condition_1norm(&mut self) -> Option<f64> {
+        self.inner.estimate_condition_1norm()
     }
 }
 
@@ -657,5 +772,93 @@ mod tests {
                 ref_sol[i]
             );
         }
+    }
+
+    /// Phase 2.5b: drive the wrapper via the `LinearSolver` trait
+    /// (factor/solve with single-matrix signature) using
+    /// `set_pending_lbfgs` to stage the compact form. Must produce the
+    /// same solution as the inherent `factor(matrix, compact, n_aug)`
+    /// path — this is what the IPM relies on when it calls
+    /// `aug_solver.factor(...)` through `&mut dyn LinearSolver`.
+    #[test]
+    fn low_rank_wrapper_trait_factor_solve_matches_inherent() {
+        let n = 5;
+        let m = 2;
+        let n_aug = n + m;
+        let k = 3;
+        let sigma = 1.7;
+
+        let v_data: Vec<f64> = (0..(n * k))
+            .map(|i| ((i as f64) * 0.31 - 0.5).sin() * 0.4)
+            .collect();
+        let u_data: Vec<f64> = (0..(n * k))
+            .map(|i| ((i as f64) * 0.21 + 0.2).cos() * 0.25)
+            .collect();
+        let compact = LbfgsCompact {
+            n, k, sigma,
+            v: v_data.clone(),
+            u: u_data.clone(),
+        };
+
+        let j_mat: Vec<f64> = vec![
+            1.0, 0.5, 0.0, 0.2, -0.3,
+            -0.1, 0.4, 0.7, 0.0, 0.1,
+        ];
+        let sigma_x: Vec<f64> = vec![0.5, 0.6, 0.7, 0.4, 0.5];
+        let delta_c = 1e-8;
+
+        let mut base_kkt = KktMatrix::zeros_dense(n_aug);
+        for i in 0..n {
+            base_kkt.add(i, i, sigma + sigma_x[i]);
+        }
+        for row in 0..m {
+            for col in 0..n {
+                let v = j_mat[row * n + col];
+                if v != 0.0 { base_kkt.add(n + row, col, v); }
+            }
+            base_kkt.add(n + row, n + row, -delta_c);
+        }
+
+        let rhs: Vec<f64> = (0..n_aug)
+            .map(|i| ((i as f64) * 0.7 - 1.3).sin())
+            .collect();
+
+        // Inherent path (already covered by the small parity test).
+        let mut inh_wrapper = LowRankKktSolver::new(DenseLdl::new());
+        inh_wrapper.factor(&base_kkt, &compact, n_aug).expect("inherent factor");
+        let mut inh_sol = vec![0.0_f64; n_aug];
+        inh_wrapper.solve(&rhs, &mut inh_sol).expect("inherent solve");
+
+        // Trait path: stage via set_pending_lbfgs, then route through `&mut dyn LinearSolver`.
+        let mut trait_wrapper = LowRankKktSolver::new(DenseLdl::new());
+        trait_wrapper.set_pending_lbfgs(compact.clone(), n_aug);
+        let trait_solver: &mut dyn LinearSolver = &mut trait_wrapper;
+        trait_solver.factor(&base_kkt).expect("trait factor");
+        let mut trait_sol = vec![0.0_f64; n_aug];
+        trait_solver.solve(&rhs, &mut trait_sol).expect("trait solve");
+
+        for i in 0..n_aug {
+            assert!(
+                (inh_sol[i] - trait_sol[i]).abs() < 1e-12,
+                "row {i}: inherent={} trait={}",
+                inh_sol[i],
+                trait_sol[i]
+            );
+        }
+
+        // After clearing the pending compact, the wrapper must passthrough
+        // (factor/solve delegate to inner). Verify with a fresh small system.
+        trait_wrapper.clear_pending_lbfgs();
+        let mut passthrough_kkt = KktMatrix::zeros_dense(3);
+        passthrough_kkt.add(0, 0, 4.0);
+        passthrough_kkt.add(1, 1, 5.0);
+        passthrough_kkt.add(2, 2, 6.0);
+        let pt_solver: &mut dyn LinearSolver = &mut trait_wrapper;
+        pt_solver.factor(&passthrough_kkt).expect("passthrough factor");
+        let mut pt_sol = vec![0.0; 3];
+        pt_solver.solve(&[8.0, 10.0, 12.0], &mut pt_sol).expect("passthrough solve");
+        assert!((pt_sol[0] - 2.0).abs() < 1e-12);
+        assert!((pt_sol[1] - 2.0).abs() < 1e-12);
+        assert!((pt_sol[2] - 2.0).abs() < 1e-12);
     }
 }
