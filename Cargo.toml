@@ -73,6 +73,10 @@ name = "cat_a_probe"
 required-features = ["cutest"]
 
 [[example]]
+name = "tron_vs_ipm"
+required-features = ["cutest"]
+
+[[example]]
 name = "issue28_probe"
 required-features = ["cutest"]
 

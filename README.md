@@ -49,6 +49,7 @@ It implements a primal-dual interior point method with a barrier formulation, si
 - **Near-linear constraint detection**: Automatically identifies linear constraints and skips their Hessian contribution
 - **Limited-memory Hessian approximation**: L-BFGS-in-IPM mode (`hessian_approximation_lbfgs`) replaces exact Hessian with L-BFGS curvature pairs, eliminating the need for second-derivative callbacks
 - **Multi-solver fallback architecture**: L-BFGS, Augmented Lagrangian, SQP, and explicit slack reformulation
+- **TRON fast path for bound-constrained problems** (`solve_bc`, [Lin & Moré 1999](https://doi.org/10.1137/S1052623498345075)): trust-region projected-Newton with truncated CG. For pure bound-constrained NLPs (`m == 0`, finite bounds) it often converges in 1–3 iterations on convex/quadratic objectives where the IPM needs 5–8. Explicit entry point — not auto-dispatched. See [Bound-constrained fast path](#bound-constrained-fast-path-tron).
 - **Parametric sensitivity analysis**: sIPOPT-style post-optimal sensitivity (`ds/dp = -M⁻¹ · Nₚ`) for computing how the optimal solution changes under parameter perturbations, plus reduced Hessian extraction for covariance estimation
 - **C API** mirroring the Ipopt C interface for direct linking from C/C++/Python/Julia
 - **AMPL NL interface** with Pyomo integration via `SolverFactory('ripopt')`, with `--help` listing all options. Supports AMPL **external functions** via the `funcadd_ASL` ABI (e.g. IDAES `cbrt`, custom property-package libraries) at solve time.
@@ -446,6 +447,52 @@ println!("Objective: {:.6e}", result.objective);
 println!("Solution: {:?}", result.x);
 println!("Iterations: {}", result.iterations);
 ```
+
+### Bound-constrained fast path (TRON)
+
+For problems with **only variable bounds** (`num_constraints() == 0` and at least
+one finite bound), an alternative entry point implements Lin & Moré's TRON:
+
+```rust
+use ripopt::bc_solver::{solve_bc, BcOptions};
+
+let result = solve_bc(&problem, &BcOptions::default());
+```
+
+**When to use it**
+
+- You know up front that `m == 0`. TRON cannot handle equality or general
+  inequality constraints; it returns `InternalError` if `m != 0`.
+- The objective is well-conditioned (small to moderate `n`, smooth `f`). On
+  convex/quadratic BC problems TRON typically takes 1–3 iterations vs the
+  IPM's 5–8 (no barrier sequence to walk).
+- You want a status of `Optimal` rather than the IPM's `Acceptable` on
+  problems where the IPM stalls in the centering phase.
+
+**When to prefer the IPM (default `solve()`)**
+
+- Highly nonlinear, ill-conditioned BC problems (e.g. PALMER nonlinear
+  least-squares family). TRON converges to the same local minima but takes
+  more iterations than the IPM there because the inner CG is currently plain
+  (no incomplete-Cholesky preconditioning).
+- Multimodal landscapes — TRON and the IPM can converge to different local
+  optima from the same `x0`. There is no auto-dispatch precisely so this
+  choice stays explicit.
+- Anything with general constraints.
+
+**Algorithm summary**
+
+Per outer iteration:
+1. Cauchy step along the projected steepest-descent path `P[x − α·g]` with
+   piecewise-quadratic search and trust-region clipping.
+2. Steihaug-Toint truncated CG on the free variables after the Cauchy point;
+   terminates on residual reduction, negative curvature, trust-region
+   boundary, or a bound being hit.
+3. Trust-region acceptance via the actual/predicted-reduction ratio ρ, with
+   shrink/expand factors γ₁=0.25 / γ₂=4.0 at thresholds η₁=0.25 / η₂=0.75.
+
+See `src/bc_solver.rs` for `BcOptions` (tolerance, TR parameters, CG cap,
+print level).
 
 ### Solver Options
 
