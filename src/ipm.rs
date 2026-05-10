@@ -969,17 +969,61 @@ struct MuState {
 
 /// T3.11: full primal-dual iterate snapshot used by the
 /// `adaptive_mu_restore_previous_iterate` rollback. Mirrors Ipopt's
-/// `IteratesVector` payload (`IpAdaptiveMuUpdate.cpp:367-369`); slacks
-/// are implicit in ripopt so only x/y/z_l/z_u/v_l/v_u are stored.
+/// `IteratesVector` payload (`IpAdaptiveMuUpdate.cpp:367-369`):
+/// `(x, s, y_c, y_d, z_L, z_U, v_L, v_U)`.
 #[derive(Clone)]
 struct AcceptedIterateSnapshot {
     x: Vec<f64>,
-    y: Vec<f64>,
-    /// Phase 6d.2: native compressed bound multipliers.
+    /// Explicit slacks `s` (size n_d). Required for inequality coupling:
+    /// without restoring s alongside x, the (x, s) pair becomes
+    /// inconsistent and `d(x) − s` no longer matches the rolled-back
+    /// iterate.
+    s: Vec<f64>,
+    y_c: Vec<f64>,
+    y_d: Vec<f64>,
     z_l_compressed: Vec<f64>,
     z_u_compressed: Vec<f64>,
-    v_l: Vec<f64>,
-    v_u: Vec<f64>,
+    v_l_compressed: Vec<f64>,
+    v_u_compressed: Vec<f64>,
+}
+
+impl AcceptedIterateSnapshot {
+    /// Snapshot the live primal-dual iterate. Mirrors
+    /// `IpAdaptiveMuUpdate::RememberCurrentPointAsAccepted`
+    /// (`IpAdaptiveMuUpdate.cpp:541-545`): captures every block of
+    /// `IteratesVector`, no derived quantities (μ, τ, c_x, d_x, grad_f
+    /// are recomputed on restore from the restored iterate).
+    fn capture(state: &SolverState) -> Self {
+        Self {
+            x: state.x.clone(),
+            s: state.s.clone(),
+            y_c: state.y_c.clone(),
+            y_d: state.y_d.clone(),
+            z_l_compressed: state.z_l_compressed.clone(),
+            z_u_compressed: state.z_u_compressed.clone(),
+            v_l_compressed: state.v_l_compressed.clone(),
+            v_u_compressed: state.v_u_compressed.clone(),
+        }
+    }
+
+    /// Install the snapshot as the current iterate. Mirrors Ipopt's
+    /// `set_trial(prev_iter); AcceptTrialPoint();`
+    /// (`IpAdaptiveMuUpdate.cpp:367-369`). Bumps every KKT atag and
+    /// invalidates the factor cache so the next refactor cannot replay
+    /// stale `(δ_w, δ_c)` against a now-rolled-back matrix (matches
+    /// `WatchdogSavedState::restore`).
+    fn restore(&self, state: &mut SolverState) {
+        state.x = self.x.clone();
+        state.s = self.s.clone();
+        state.y_c = self.y_c.clone();
+        state.y_d = self.y_d.clone();
+        state.z_l_compressed = self.z_l_compressed.clone();
+        state.z_u_compressed = self.z_u_compressed.clone();
+        state.v_l_compressed = self.v_l_compressed.clone();
+        state.v_u_compressed = self.v_u_compressed.clone();
+        state.bump_all_kkt_atags();
+        state.factor_cache.invalidate();
+    }
 }
 
 impl MuState {
@@ -1888,31 +1932,6 @@ impl SolverState {
                 self.v_u_compressed[kc] = v;
             }
         }
-    }
-
-    /// Overwrite v_L from a combined m-length slice (drops eq rows).
-    /// Phase 8d: rebuild the compressed mirror directly via Pd_L^T.
-    pub fn set_v_l_combined(&mut self, v: &[f64]) {
-        debug_assert_eq!(v.len(), self.m);
-        let v_l_d: Vec<f64> = self
-            .layout
-            .d_to_combined
-            .iter()
-            .map(|&i| v[i])
-            .collect();
-        self.v_l_compressed = self.d_bound_layout.project_l(&v_l_d);
-    }
-
-    /// Overwrite v_U from a combined m-length slice (drops eq rows).
-    pub fn set_v_u_combined(&mut self, v: &[f64]) {
-        debug_assert_eq!(v.len(), self.m);
-        let v_u_d: Vec<f64> = self
-            .layout
-            .d_to_combined
-            .iter()
-            .map(|&i| v[i])
-            .collect();
-        self.v_u_compressed = self.d_bound_layout.project_u(&v_u_d);
     }
 
     /// Overwrite the search direction from a combined m-length slice.
@@ -6193,15 +6212,13 @@ fn switch_to_fixed_mode_with_adaptive_init(
     // afterwards; the snapshot is consumed on use so a subsequent
     // Fixed→Free→Fixed cycle re-captures.
     if options.adaptive_mu_restore_previous_iterate {
-        if let Some(snap) = mu_state.accepted_iterate.take() {
-            state.x = snap.x;
-            state.set_y_combined(&snap.y);
-            state.z_l_compressed = snap.z_l_compressed;
-            state.z_u_compressed = snap.z_u_compressed;
-            state.set_v_l_combined(&snap.v_l);
-            state.set_v_u_combined(&snap.v_u);
-            // T3.25: rollback touches every tracked KKT input.
-            state.bump_all_kkt_atags();
+        // Per Ipopt: snapshot persists across the switch (overwritten on
+        // the next `RememberCurrentPointAsAccepted` once we re-enter
+        // Free mode). We use `as_ref` + clone rather than `take` so a
+        // pathological Fixed→Free→Fixed cycle with no successful
+        // remember in between still rolls back to the same anchor.
+        if let Some(snap) = mu_state.accepted_iterate.as_ref().cloned() {
+            snap.restore(state);
             log::debug!("Free→Fixed rollback: restored accepted_point");
         }
     }
@@ -6247,14 +6264,7 @@ fn apply_free_mode_sufficient_progress_update(
     // `RememberCurrentPointAsAccepted` (IpAdaptiveMuUpdate.cpp:541-545):
     // only enabled under `adaptive_mu_restore_previous_iterate`.
     if options.adaptive_mu_restore_previous_iterate {
-        mu_state.accepted_iterate = Some(AcceptedIterateSnapshot {
-            x: state.x.clone(),
-            y: state.y_combined(),
-            z_l_compressed: state.z_l_compressed.clone(),
-            z_u_compressed: state.z_u_compressed.clone(),
-            v_l: state.v_l_combined(),
-            v_u: state.v_u_combined(),
-        });
+        mu_state.accepted_iterate = Some(AcceptedIterateSnapshot::capture(state));
     }
     let avg_compl = compute_avg_complementarity(state);
     if options.mu_oracle_quality_function && avg_compl > 0.0 {
@@ -13234,6 +13244,141 @@ mod tests {
         assert_eq!(filter.entries().len(), 1);
         // Stored corner per AugmentFilter: (1-γ_θ)·0.5.
         assert!((filter.entries()[0].theta - (1.0 - 1e-5) * 0.5).abs() < 1e-15);
+    }
+
+    /// T3.11: `AcceptedIterateSnapshot::capture` must clone every block of
+    /// Ipopt's `IteratesVector` (x, s, y_c, y_d, z_L, z_U, v_L, v_U).
+    /// Mutating the live state after capture must not affect the snapshot.
+    #[test]
+    fn test_t311_snapshot_captures_all_iterate_fields() {
+        let mut state = minimal_state(2, 1);
+        set_variable_bounds(&mut state, vec![-10.0, -10.0], vec![10.0, 10.0]);
+        set_constraint_bounds(&mut state, vec![-5.0], vec![5.0]);
+        state.x = vec![1.5, 2.5];
+        state.s = vec![0.7];
+        state.y_d = vec![0.3];
+        state.z_l_compressed = vec![0.11, 0.22];
+        state.z_u_compressed = vec![0.33, 0.44];
+        state.v_l_compressed = vec![0.55];
+        state.v_u_compressed = vec![0.66];
+
+        let snap = AcceptedIterateSnapshot::capture(&state);
+
+        // Mutate every captured field; snapshot must be untouched.
+        state.x = vec![9.0, 9.0];
+        state.s = vec![9.9];
+        state.y_d = vec![9.0];
+        state.z_l_compressed = vec![0.0, 0.0];
+        state.z_u_compressed = vec![0.0, 0.0];
+        state.v_l_compressed = vec![0.0];
+        state.v_u_compressed = vec![0.0];
+
+        assert_eq!(snap.x, vec![1.5, 2.5]);
+        assert_eq!(snap.s, vec![0.7]);
+        assert_eq!(snap.y_c.len(), 0);
+        assert_eq!(snap.y_d, vec![0.3]);
+        assert_eq!(snap.z_l_compressed, vec![0.11, 0.22]);
+        assert_eq!(snap.z_u_compressed, vec![0.33, 0.44]);
+        assert_eq!(snap.v_l_compressed, vec![0.55]);
+        assert_eq!(snap.v_u_compressed, vec![0.66]);
+    }
+
+    /// T3.11: `restore` must (a) write every IteratesVector block back,
+    /// (b) bump every KKT input atag, and (c) invalidate the factor cache
+    /// — otherwise the next refactor could replay stale `(δ_w, δ_c)`
+    /// against a now-rolled-back matrix (matches `WatchdogSavedState::restore`).
+    #[test]
+    fn test_t311_restore_invalidates_factor_cache_and_bumps_atags() {
+        let mut state = minimal_state(2, 1);
+        set_variable_bounds(&mut state, vec![-10.0, -10.0], vec![10.0, 10.0]);
+        set_constraint_bounds(&mut state, vec![-5.0], vec![5.0]);
+        state.x = vec![1.5, 2.5];
+        state.s = vec![0.7];
+        state.y_d = vec![0.3];
+        state.z_l_compressed = vec![0.11, 0.22];
+        state.z_u_compressed = vec![0.33, 0.44];
+        state.v_l_compressed = vec![0.55];
+        state.v_u_compressed = vec![0.66];
+
+        let snap = AcceptedIterateSnapshot::capture(&state);
+
+        // Drift the live iterate.
+        state.x = vec![9.0, 9.0];
+        state.s = vec![9.9];
+        state.y_d = vec![9.0];
+        state.z_l_compressed = vec![0.0, 0.0];
+        state.z_u_compressed = vec![0.0, 0.0];
+        state.v_l_compressed = vec![0.0];
+        state.v_u_compressed = vec![0.0];
+
+        // Prime a fingerprint so we can prove `invalidate` clears it.
+        state.factor_cache.last_fingerprint = Some(kkt::KktSystemFingerprint {
+            atags: kkt::KktInputAtags::default(),
+            delta_x: 1e-8,
+            delta_c: 1e-8,
+        });
+        let atags_before = state.kkt_atags;
+
+        snap.restore(&mut state);
+
+        // Iterate restored.
+        assert_eq!(state.x, vec![1.5, 2.5]);
+        assert_eq!(state.s, vec![0.7]);
+        assert_eq!(state.y_d, vec![0.3]);
+        assert_eq!(state.z_l_compressed, vec![0.11, 0.22]);
+        assert_eq!(state.z_u_compressed, vec![0.33, 0.44]);
+        assert_eq!(state.v_l_compressed, vec![0.55]);
+        assert_eq!(state.v_u_compressed, vec![0.66]);
+
+        // Factor cache invalidated (fingerprint cleared).
+        assert!(state.factor_cache.last_fingerprint.is_none(),
+            "restore must invalidate factor cache to prevent stale (δ_w, δ_c) replay");
+
+        // Every KKT input atag bumped.
+        let a = &state.kkt_atags;
+        assert_eq!(a.w, atags_before.w.wrapping_add(1));
+        assert_eq!(a.j_c, atags_before.j_c.wrapping_add(1));
+        assert_eq!(a.j_d, atags_before.j_d.wrapping_add(1));
+        assert_eq!(a.z_l, atags_before.z_l.wrapping_add(1));
+        assert_eq!(a.z_u, atags_before.z_u.wrapping_add(1));
+        assert_eq!(a.v_l, atags_before.v_l.wrapping_add(1));
+        assert_eq!(a.v_u, atags_before.v_u.wrapping_add(1));
+        assert_eq!(a.slacks_x, atags_before.slacks_x.wrapping_add(1));
+        assert_eq!(a.slacks_s, atags_before.slacks_s.wrapping_add(1));
+        assert_eq!(a.sigma_x, atags_before.sigma_x.wrapping_add(1));
+        assert_eq!(a.sigma_s, atags_before.sigma_s.wrapping_add(1));
+    }
+
+    /// T3.11: with `adaptive_mu_restore_previous_iterate = false` (the
+    /// Ipopt default), a sufficient-progress Free-mode iteration must
+    /// NOT capture a snapshot. The option is the on/off gate.
+    #[test]
+    fn test_t311_option_off_no_capture() {
+        let mut state = minimal_state(2, 0);
+        state.x = vec![1.0, 2.0];
+        state.mu = 0.1;
+        let mut mu_state = MuState::new();
+        let mut filter = Filter::new(1e8);
+        let mut opts = SolverOptions::default();
+        opts.adaptive_mu_restore_previous_iterate = false;
+        opts.mu_oracle_quality_function = false;
+        // No bounds and no constraints → avg_compl == 0 → linear-decrease
+        // branch; no linear-solver call so the test stays pure-arithmetic.
+        apply_free_mode_sufficient_progress_update(
+            &mut state, &mut mu_state, &mut filter, &opts, 0.5, false,
+        );
+        assert!(mu_state.accepted_iterate.is_none(),
+            "option=false must not capture snapshot");
+
+        // And with the option ON, the same call must capture.
+        opts.adaptive_mu_restore_previous_iterate = true;
+        apply_free_mode_sufficient_progress_update(
+            &mut state, &mut mu_state, &mut filter, &opts, 0.5, false,
+        );
+        assert!(mu_state.accepted_iterate.is_some(),
+            "option=true must capture snapshot on sufficient progress");
+        let snap = mu_state.accepted_iterate.as_ref().unwrap();
+        assert_eq!(snap.x, vec![1.0, 2.0]);
     }
 
     #[test]

@@ -519,6 +519,14 @@ fn run_single_solver(name: &str, solver: &str) {
                 .ok()
                 .map(|s| s != "0" && s.to_lowercase() != "false")
                 .unwrap_or(true);
+            // T3.11: A/B-test toggle for `adaptive_mu_restore_previous_iterate`.
+            // Default-OFF mirrors Ipopt 3.14. Set to "1"/"true" to enable
+            // Free→Fixed rollback to the last accepted Free-mode iterate.
+            let adaptive_mu_restore_previous_iterate: bool =
+                std::env::var("RIPOPT_ADAPTIVE_MU_RESTORE_PREV")
+                    .ok()
+                    .map(|s| s != "0" && s.to_lowercase() != "false")
+                    .unwrap_or(false);
             // Mirror the Ipopt-side `mu_strategy=adaptive` force at line ~278:
             // both solvers run under the adaptive QF oracle so the comparison
             // is apples-to-apples. Without this, the suite was implicitly
@@ -536,6 +544,7 @@ fn run_single_solver(name: &str, solver: &str) {
                 mu_strategy_adaptive: true,
                 neg_curv_test_tol,
                 neg_curv_test_reg,
+                adaptive_mu_restore_previous_iterate,
                 ..SolverOptions::default()
             };
 
