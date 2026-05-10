@@ -1157,11 +1157,13 @@ pub struct LbfgsIpmState {
 
 impl LbfgsIpmState {
     pub fn new(n: usize) -> Self {
+        // m_max = 6 mirrors Ipopt's `limited_memory_max_history` default
+        // (ref/Ipopt/src/Algorithm/IpAlgBuilder.cpp option registration).
         Self {
             n,
-            m_max: 10,
-            s_store: Vec::with_capacity(10),
-            y_store: Vec::with_capacity(10),
+            m_max: 6,
+            s_store: Vec::with_capacity(6),
+            y_store: Vec::with_capacity(6),
             prev_x: vec![0.0; n],
             prev_lag_grad: vec![0.0; n],
             has_prev: false,
@@ -1272,32 +1274,158 @@ impl LbfgsIpmState {
         self.prev_lag_grad.copy_from_slice(new_lag_grad);
     }
 
-    /// Compute B_k * v using the L-BFGS compact representation.
-    /// B_k = gamma^{-1} I - ... (inverse Hessian formulation, then invert).
-    /// Instead, we directly build B_k * v using the recursive formula.
+    /// Compute B_k * v using the Byrd-Nocedal compact form
+    /// B_k = σI + V Vᵀ - U Uᵀ. Falls back to B_0 = σI if the small
+    /// k×k Cholesky in `compact()` fails (e.g. rank-deficient S).
     pub fn multiply_bk(&self, v: &[f64]) -> Vec<f64> {
-        let n = self.n;
-        let k = self.s_store.len();
-
-        if k == 0 {
-            // B_0 = (1/gamma) * I
+        if self.s_store.is_empty() {
             let scale = 1.0 / self.gamma.max(1e-12);
             return v.iter().map(|&vi| scale * vi).collect();
         }
-
-        // Use the explicit B_k formation and multiply
-        // B_k = (1/gamma) I + sum of rank-2 updates
-        // It's easier to just form the full matrix and multiply for correctness
-        let mut result = vec![0.0; n];
-        let bk = self.form_dense_bk();
-        for i in 0..n {
-            for j in 0..n {
-                let (r, c) = if i >= j { (i, j) } else { (j, i) };
-                let idx = r * (r + 1) / 2 + c;
-                result[i] += bk[idx] * v[j];
+        match self.compact() {
+            Some(c) => c.apply(v),
+            None => {
+                let scale = 1.0 / self.gamma.max(1e-12);
+                v.iter().map(|&vi| scale * vi).collect()
             }
         }
-        result
+    }
+
+    /// Build the compact Byrd-Nocedal factors `{σ, V, U}` such that
+    /// `B_k = σI + V Vᵀ - U Uᵀ`. Mirrors Ipopt's BFGS branch in
+    /// `IpLimMemQuasiNewtonUpdater::Update_W` (ref/Ipopt/src/Algorithm/
+    /// IpLimMemQuasiNewtonUpdater.cpp:440-521).
+    ///
+    /// Returns `None` if the k×k Cholesky of `M = LtildeᵀLtilde + σSᵀS`
+    /// fails (S rank-deficient or σ ≤ 0). Caller should fall back to
+    /// `B_0 = σI`. Ipopt does the same (line 489-495: skip the update).
+    pub fn compact(&self) -> Option<LbfgsCompact> {
+        let n = self.n;
+        let k = self.s_store.len();
+        let sigma = 1.0 / self.gamma.max(1e-12);
+        if k == 0 {
+            return Some(LbfgsCompact::empty(n, sigma));
+        }
+
+        // V_j = y_j / sqrt(sⱼᵀyⱼ); D_jj = sⱼᵀyⱼ.
+        let mut v_data = vec![0.0_f64; n * k];
+        let mut d_diag = vec![0.0_f64; k];
+        for j in 0..k {
+            let s = &self.s_store[j];
+            let y = &self.y_store[j];
+            let sy: f64 = dot_product(s, y);
+            if !(sy > 0.0) {
+                return None;
+            }
+            d_diag[j] = sy;
+            let inv_sqrt = 1.0 / sy.sqrt();
+            let col = &mut v_data[j * n..(j + 1) * n];
+            for i in 0..n {
+                col[i] = y[i] * inv_sqrt;
+            }
+        }
+
+        // Ltilde[i,j] = (sᵢᵀ y_j) / sqrt(D_jj) for i > j, else 0. Row-major k×k.
+        let mut ltilde = vec![0.0_f64; k * k];
+        for i in 1..k {
+            for j in 0..i {
+                let sty: f64 = dot_product(&self.s_store[i], &self.y_store[j]);
+                ltilde[i * k + j] = sty / d_diag[j].sqrt();
+            }
+        }
+
+        // M = Ltilde · Ltildeᵀ + σ · SᵀS (k×k symmetric, row-major).
+        let mut m = vec![0.0_f64; k * k];
+        for i in 0..k {
+            for j in 0..=i {
+                let mut acc = 0.0;
+                for p in 0..k {
+                    acc += ltilde[i * k + p] * ltilde[j * k + p];
+                }
+                let sts: f64 = dot_product(&self.s_store[i], &self.s_store[j]);
+                acc += sigma * sts;
+                m[i * k + j] = acc;
+                if i != j {
+                    m[j * k + i] = acc;
+                }
+            }
+        }
+
+        // J = chol(M), in-place into m's lower triangle.
+        for j in 0..k {
+            let mut diag = m[j * k + j];
+            for p in 0..j {
+                diag -= m[j * k + p].powi(2);
+            }
+            if !(diag > 0.0) {
+                return None;
+            }
+            let ljj = diag.sqrt();
+            m[j * k + j] = ljj;
+            for i in (j + 1)..k {
+                let mut acc = m[i * k + j];
+                for p in 0..j {
+                    acc -= m[i * k + p] * m[j * k + p];
+                }
+                m[i * k + j] = acc / ljj;
+            }
+        }
+
+        // C = J^{-T}: solve Jᵀ C = I by back-substitution, column by column.
+        // c[i,j] = (δ_{ij} - Σ_{p>i} J[p,i] · c[p,j]) / J[i,i].
+        let mut c = vec![0.0_f64; k * k];
+        for jcol in 0..k {
+            for i in (0..k).rev() {
+                let mut rhs = if i == jcol { 1.0 } else { 0.0 };
+                for p in (i + 1)..k {
+                    rhs -= m[p * k + i] * c[p * k + jcol];
+                }
+                c[i * k + jcol] = rhs / m[i * k + i];
+            }
+        }
+
+        // Lbar = Ltildeᵀ · C (k×k).
+        let mut lbar = vec![0.0_f64; k * k];
+        for i in 0..k {
+            for j in 0..k {
+                let mut acc = 0.0;
+                for p in 0..k {
+                    acc += ltilde[p * k + i] * c[p * k + j];
+                }
+                lbar[i * k + j] = acc;
+            }
+        }
+
+        // U_col_j = σ · Σ_p s_p · C[p,j] + Σ_p V_col_p · Lbar[p,j].
+        let mut u_data = vec![0.0_f64; n * k];
+        for j in 0..k {
+            let ucol = &mut u_data[j * n..(j + 1) * n];
+            for p in 0..k {
+                let cpj = c[p * k + j];
+                let lpj = lbar[p * k + j];
+                if cpj != 0.0 {
+                    let sp = &self.s_store[p];
+                    let scale = sigma * cpj;
+                    for i in 0..n {
+                        ucol[i] += scale * sp[i];
+                    }
+                }
+                if lpj != 0.0 {
+                    let vcol = &v_data[p * n..(p + 1) * n];
+                    for i in 0..n {
+                        ucol[i] += vcol[i] * lpj;
+                    }
+                }
+            }
+        }
+
+        Some(LbfgsCompact {
+            n,
+            k,
+            sigma,
+            v: v_data,
+            u: u_data,
+        })
     }
 
     /// Form explicit dense B_k matrix in lower-triangle format.
@@ -1360,6 +1488,63 @@ impl LbfgsIpmState {
     fn fill_hessian(&self, hess_vals: &mut [f64]) {
         let bk = self.form_dense_bk();
         hess_vals[..bk.len()].copy_from_slice(&bk);
+    }
+}
+
+/// Compact Byrd-Nocedal factors for the L-BFGS Hessian approximation:
+/// `B_k = σI + V Vᵀ - U Uᵀ`. `v` and `u` are column-major n×k buffers
+/// (column j is `data[j*n .. (j+1)*n]`). Built by `LbfgsIpmState::compact`;
+/// consumed by `apply` and (in Phase 2) by the low-rank KKT wrapper.
+pub struct LbfgsCompact {
+    pub n: usize,
+    pub k: usize,
+    pub sigma: f64,
+    pub v: Vec<f64>,
+    pub u: Vec<f64>,
+}
+
+impl LbfgsCompact {
+    pub fn empty(n: usize, sigma: f64) -> Self {
+        Self {
+            n,
+            k: 0,
+            sigma,
+            v: Vec::new(),
+            u: Vec::new(),
+        }
+    }
+
+    /// Compute `B_k · x = σx + V (Vᵀx) - U (Uᵀx)` in O(n·k).
+    pub fn apply(&self, x: &[f64]) -> Vec<f64> {
+        let n = self.n;
+        let mut out: Vec<f64> = x.iter().map(|&xi| self.sigma * xi).collect();
+        if self.k == 0 {
+            return out;
+        }
+        let mut vtx = vec![0.0_f64; self.k];
+        let mut utx = vec![0.0_f64; self.k];
+        for j in 0..self.k {
+            let vcol = &self.v[j * n..(j + 1) * n];
+            let ucol = &self.u[j * n..(j + 1) * n];
+            let mut va = 0.0;
+            let mut ua = 0.0;
+            for i in 0..n {
+                va += vcol[i] * x[i];
+                ua += ucol[i] * x[i];
+            }
+            vtx[j] = va;
+            utx[j] = ua;
+        }
+        for j in 0..self.k {
+            let vcol = &self.v[j * n..(j + 1) * n];
+            let ucol = &self.u[j * n..(j + 1) * n];
+            let vj = vtx[j];
+            let uj = utx[j];
+            for i in 0..n {
+                out[i] += vcol[i] * vj - ucol[i] * uj;
+            }
+        }
+        out
     }
 }
 
@@ -15103,5 +15288,87 @@ mod tests {
         let (os, gs) = compute_nlp_scaling(&p, &opts, &[0.0], &p.jac_rows);
         assert_eq!(os, 0.5);
         assert_eq!(gs, vec![2.0, 3.0]);
+    }
+
+    /// Phase 1 of issue #30: the compact Byrd-Nocedal form
+    /// `B = σI + V Vᵀ - U Uᵀ` (built by `LbfgsIpmState::compact`) must
+    /// produce the same `B · v` as the existing dense `form_dense_bk` to
+    /// floating-point tolerance. This guards the rewrite of `multiply_bk`.
+    #[test]
+    fn lbfgs_compact_matches_dense_apply() {
+        let n = 8;
+        let mut state = LbfgsIpmState::new(n);
+        state.gamma = 0.7;
+
+        let pairs: [(Vec<f64>, Vec<f64>); 3] = [
+            (vec![1.0, 0.5, 0.0, 0.2, -0.3, 0.1, 0.4, -0.1],
+             vec![0.9, 0.4, 0.1, 0.3, -0.2, 0.2, 0.3, -0.05]),
+            (vec![0.2, -0.1, 0.4, 0.3, 0.0, 0.1, -0.2, 0.5],
+             vec![0.3, -0.05, 0.5, 0.4, 0.1, 0.15, -0.1, 0.6]),
+            (vec![-0.1, 0.3, 0.2, -0.4, 0.1, 0.2, 0.3, -0.2],
+             vec![-0.05, 0.4, 0.3, -0.3, 0.2, 0.25, 0.4, -0.1]),
+        ];
+        for (s, y) in pairs {
+            let sy: f64 = s.iter().zip(y.iter()).map(|(a, b)| a * b).sum();
+            assert!(sy > 0.0, "test pair must satisfy sᵀy > 0");
+            state.s_store.push(s);
+            state.y_store.push(y);
+        }
+
+        let v: Vec<f64> = (0..n).map(|i| ((i as f64) - 3.5).sin()).collect();
+
+        // Reference: apply via the dense lower-triangle B_k.
+        let bk = state.form_dense_bk();
+        let mut dense_apply = vec![0.0_f64; n];
+        for i in 0..n {
+            for j in 0..n {
+                let (r, c) = if i >= j { (i, j) } else { (j, i) };
+                let idx = r * (r + 1) / 2 + c;
+                dense_apply[i] += bk[idx] * v[j];
+            }
+        }
+
+        let compact = state.compact().expect("compact factors should exist");
+        assert_eq!(compact.k, 3);
+        assert_eq!(compact.n, n);
+        let compact_apply = compact.apply(&v);
+
+        for i in 0..n {
+            let diff = (dense_apply[i] - compact_apply[i]).abs();
+            let denom = dense_apply[i].abs().max(1e-12);
+            assert!(
+                diff / denom < 1e-10,
+                "row {i}: dense={} compact={} |Δ|={diff:e}",
+                dense_apply[i], compact_apply[i]
+            );
+        }
+
+        // Same path that production uses now (multiply_bk goes through compact()).
+        let multiply_apply = state.multiply_bk(&v);
+        for i in 0..n {
+            let diff = (dense_apply[i] - multiply_apply[i]).abs();
+            let denom = dense_apply[i].abs().max(1e-12);
+            assert!(
+                diff / denom < 1e-10,
+                "multiply_bk row {i}: dense={} got={} |Δ|={diff:e}",
+                dense_apply[i], multiply_apply[i]
+            );
+        }
+    }
+
+    /// k=0 path: B = (1/γ)I, no rank update applied.
+    #[test]
+    fn lbfgs_compact_k0_is_diagonal() {
+        let n = 5;
+        let mut state = LbfgsIpmState::new(n);
+        state.gamma = 0.4;
+        let c = state.compact().expect("k=0 always succeeds");
+        assert_eq!(c.k, 0);
+        let v = vec![1.0, -2.0, 3.0, -4.0, 5.0];
+        let got = c.apply(&v);
+        let expected: Vec<f64> = v.iter().map(|x| x / 0.4).collect();
+        for i in 0..n {
+            assert!((got[i] - expected[i]).abs() < 1e-12);
+        }
     }
 }
