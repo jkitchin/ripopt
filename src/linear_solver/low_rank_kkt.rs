@@ -81,7 +81,7 @@ impl<S: LinearSolver> LowRankKktSolver<S> {
 
     /// Stage the compact form for the next `LinearSolver::factor` call.
     /// The IPM driver invokes this once per outer iteration when
-    /// `state.lbfgs_compact` is `Some`. The wrapper retains ownership of
+    /// `state.hess_kind` is `LowRank`. The wrapper retains ownership of
     /// the staged compact across the inertia-correction ladder so the
     /// re-factor on perturbation retries does not need to re-stage.
     pub fn set_pending_lbfgs(&mut self, compact: LbfgsCompact, n_aug: usize) {
