@@ -527,6 +527,13 @@ fn run_single_solver(name: &str, solver: &str) {
                     .ok()
                     .map(|s| s != "0" && s.to_lowercase() != "false")
                     .unwrap_or(false);
+            // Issue #23 Phase 3: opt-in ℓ₁-exact penalty-barrier reformulation.
+            // Off by default to preserve byte-identical regression. Set to
+            // "1"/"true" to wrap the NLP and run the BNW outer loop.
+            let l1_exact_penalty_barrier: bool = std::env::var("RIPOPT_L1_PENALTY")
+                .ok()
+                .map(|s| s != "0" && s.to_lowercase() != "false")
+                .unwrap_or(false);
             // Mirror the Ipopt-side `mu_strategy=adaptive` force at line ~278:
             // both solvers run under the adaptive QF oracle so the comparison
             // is apples-to-apples. Without this, the suite was implicitly
@@ -545,6 +552,7 @@ fn run_single_solver(name: &str, solver: &str) {
                 neg_curv_test_tol,
                 neg_curv_test_reg,
                 adaptive_mu_restore_previous_iterate,
+                l1_exact_penalty_barrier,
                 ..SolverOptions::default()
             };
 

@@ -3333,6 +3333,188 @@ fn try_preprocessed_solve<P: NlpProblem>(
 pub fn solve<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult {
     let solve_start = Instant::now();
 
+    // Issue #23 (Thierry-Biegler 2020): when the ℓ₁-exact
+    // penalty-barrier flag is set, wrap the user NLP in
+    // `L1PenaltyBarrierNlp` (adds slack pairs `(p, n) ≥ 0` for every
+    // equality row, augments the objective with `ρ·Σ(p+n)`) and run
+    // the IPM on the reformulated NLP. The slack columns make the
+    // constraint Jacobian full row-rank by construction, sidestepping
+    // the LICQ-failure paths that drive the filter into restoration on
+    // degenerate / MPCC-like problems. On return, the augmented `x`
+    // and bound multipliers are truncated to the user's variable
+    // space, and the reported objective / constraint values are the
+    // un-augmented ones so the user sees the original NLP's solution
+    // even though the IPM solved the augmented problem.
+    if options.l1_exact_penalty_barrier {
+        let m = problem.num_constraints();
+        let n_orig = problem.num_variables();
+        let mut inner_options = options.clone();
+        inner_options.l1_exact_penalty_barrier = false;
+
+        // Phase 3: outer ρ-escalation loop with Byrd-Nocedal-Waltz
+        // steering. After each inner solve, inspect the augmented
+        // slack sum `Σ(p + n)` and the equality-row multipliers
+        // `y_eq`. The KKT conditions for the (p, n) slacks of the
+        // augmented NLP imply `|y_i| ≤ ρ` whenever the slack pair is
+        // at its bound; ρ that *dominates* the multipliers is what
+        // makes the augmented stationarity recover the original NLP's
+        // stationarity (Byrd, Nocedal & Waltz 2012, Sec. 3). The
+        // steering rule escalates ρ as
+        //   ρ_new ← max(ρ · factor, τ · ‖y_eq‖_∞ + ε)
+        // capped at `l1_penalty_max`. Total iterations across all
+        // outer attempts are summed into `result.iterations`.
+        //
+        // Termination conditions (whichever fires first):
+        //   1. slack sum ≤ l1_slack_tol   (constraints satisfied)
+        //   2. inner solve returns non-Optimal (escalation won't fix
+        //      a numerical / restoration failure at the current ρ)
+        //   3. ρ already at l1_penalty_max
+        //   4. outer iter count reaches l1_penalty_max_outer_iter
+        //
+        // After the loop, if the slack sum still exceeds `l1_slack_tol`
+        // the original NLP is locally infeasible at the returned point;
+        // the status is overridden to `LocalInfeasibility` so the user
+        // is not misled into trusting an x that violates the original
+        // constraints. The returned x is still the ℓ₁-best least-
+        // infeasible point, which is informative even though the
+        // original constraints are not satisfied.
+        let mut rho = options.l1_penalty_init;
+        let cap = options.l1_penalty_max.max(rho);
+        let factor = options.l1_penalty_increase_factor.max(1.0);
+        let max_outer = options.l1_penalty_max_outer_iter.max(1);
+        let slack_tol = options.l1_slack_tol.max(0.0);
+        let tau = options.l1_steering_factor.max(1.0);
+
+        let mut total_iters: usize = 0;
+        // Hold the latest inner result across iterations; in the
+        // worst case (every inner solve fails) we still return the
+        // last attempt. `final_*` holds the augmented-space output
+        // we'll truncate after the loop.
+        let mut final_x: Vec<f64> = Vec::new();
+        let mut final_bml: Vec<f64> = Vec::new();
+        let mut final_bmu: Vec<f64> = Vec::new();
+        let mut final_y: Vec<f64> = Vec::new();
+        let mut final_status = SolveStatus::InternalError;
+        let mut final_diagnostics = SolverDiagnostics::default();
+        let mut final_slack_sum: f64 = 0.0;
+        let mut final_m_eq_x2: usize = 0;
+
+        for outer in 0..max_outer {
+            let wrapped = crate::l1_penalty_barrier_nlp::L1PenaltyBarrierNlp::new(problem, rho);
+            let n_aug = wrapped.num_variables();
+            let m_eq_x2 = n_aug - n_orig; // 2 * m_eq
+            let eq_rows: Vec<usize> = wrapped.eq_rows().to_vec();
+
+            let inner_result = solve(&wrapped, &inner_options);
+            total_iters = total_iters.saturating_add(inner_result.iterations);
+
+            // Compute slack sum for the termination check (only when
+            // we have a usable augmented vector). A short / malformed
+            // x means the inner solve aborted before populating
+            // anything useful — treat as "not converged" and break.
+            let slack_sum: f64 = if inner_result.x.len() >= n_aug && m_eq_x2 > 0 {
+                inner_result.x[n_orig..n_aug].iter().sum()
+            } else {
+                0.0
+            };
+
+            // BNW: ‖y_eq‖_∞ extracted from the equality rows of the
+            // inner result. If the inner result has no usable y vector
+            // (failure exit), this is 0 and only the geometric
+            // escalation contributes — which is the right behavior.
+            let y_eq_inf: f64 = if inner_result.constraint_multipliers.len() >= m {
+                eq_rows
+                    .iter()
+                    .map(|&i| inner_result.constraint_multipliers[i].abs())
+                    .fold(0.0_f64, f64::max)
+            } else {
+                0.0
+            };
+
+            final_x = inner_result.x;
+            final_bml = inner_result.bound_multipliers_lower;
+            final_bmu = inner_result.bound_multipliers_upper;
+            final_y = inner_result.constraint_multipliers;
+            final_status = inner_result.status;
+            final_diagnostics = inner_result.diagnostics;
+            final_slack_sum = slack_sum;
+            final_m_eq_x2 = m_eq_x2;
+
+            let is_optimal = matches!(final_status, SolveStatus::Optimal | SolveStatus::Acceptable);
+
+            // Termination: constraints satisfied at this ρ.
+            if m_eq_x2 == 0 || (is_optimal && slack_sum <= slack_tol) {
+                break;
+            }
+            // Termination: inner solve failed — escalation won't help.
+            if !is_optimal {
+                break;
+            }
+            // Termination: ρ already at the cap, or last outer iter.
+            if rho >= cap || outer + 1 == max_outer {
+                break;
+            }
+            // BNW steering: ρ_new ≥ max(ρ · factor, τ · ‖y_eq‖_∞ + ε).
+            // The +ε buffer (1.0 here) keeps the inequality strict even
+            // when y_eq is exactly 0 (e.g. on a feasible problem where
+            // the steering branch is already moot).
+            let rho_steering = tau * y_eq_inf + 1.0;
+            rho = (rho * factor).max(rho_steering).min(cap);
+        }
+
+        // Honest infeasibility status: when the slack sum did not
+        // collapse below the tolerance, the original NLP is locally
+        // infeasible at the returned x. Override the inner-solver
+        // `Optimal` status to `LocalInfeasibility` so the user knows
+        // the original constraints are violated. The returned x is
+        // still the ℓ₁-best least-infeasible point.
+        if final_m_eq_x2 > 0
+            && final_slack_sum > slack_tol
+            && matches!(final_status, SolveStatus::Optimal | SolveStatus::Acceptable)
+        {
+            final_status = SolveStatus::LocalInfeasibility;
+        }
+
+        // Truncate to user variable space (drop slack components).
+        let x_user = if final_x.len() >= n_orig {
+            final_x[..n_orig].to_vec()
+        } else {
+            vec![0.0; n_orig]
+        };
+        let bml = if final_bml.len() >= n_orig {
+            final_bml[..n_orig].to_vec()
+        } else {
+            vec![0.0; n_orig]
+        };
+        let bmu = if final_bmu.len() >= n_orig {
+            final_bmu[..n_orig].to_vec()
+        } else {
+            vec![0.0; n_orig]
+        };
+
+        // Re-evaluate the user-facing objective and constraints at
+        // x_user so the reported values are free of the penalty term
+        // and the slack adjustments.
+        let mut f_user = f64::NAN;
+        let _ = problem.objective(&x_user, true, &mut f_user);
+        let mut g_user = vec![0.0; m];
+        if m > 0 {
+            let _ = problem.constraints(&x_user, false, &mut g_user);
+        }
+
+        return SolveResult {
+            x: x_user,
+            objective: f_user,
+            constraint_multipliers: final_y,
+            bound_multipliers_lower: bml,
+            bound_multipliers_upper: bmu,
+            constraint_values: g_user,
+            status: final_status,
+            iterations: total_iters,
+            diagnostics: final_diagnostics,
+        };
+    }
+
     // Roadmap item #6: `options.user_x_scaling`. If a non-empty,
     // strictly-positive scaling vector is provided, wrap the NLP with
     // `XScaledProblem` and run the IPM in scaled coordinates, then

@@ -746,6 +746,95 @@ pub struct SolverOptions {
     /// Default: 0.0 (disabled, pure IBR — matches Ipopt's default).
     /// Typical enable value: 1e-12. Matches Ipopt's `neg_curv_test_tol` option.
     pub neg_curv_test_tol: f64,
+    /// Wrap the user NLP in the Thierry-Biegler ℓ₁-exact penalty-barrier
+    /// reformulation before invoking the IPM. Adds slack pairs
+    /// `(p_i, n_i) ≥ 0` for every equality row (`g_l[i] == g_u[i]`),
+    /// rewrites the row as `c_i(x) − p_i + n_i = g_target`, and augments
+    /// the objective with `l1_penalty_init · Σ(p + n)`. Inequality rows
+    /// are passed through unchanged. The reformulated NLP automatically
+    /// satisfies LICQ on the augmented variables, which is the property
+    /// the method exploits to handle degenerate / MPCC-like cases the
+    /// stock filter line search thrashes on.
+    ///
+    /// **Phase 3 (current):** Byrd-Nocedal-Waltz dynamic ρ update via
+    /// an outer escalation loop. After each inner solve, ρ is escalated
+    /// to `max(ρ · l1_penalty_increase_factor, τ · ‖y_eq‖_∞ + ε)` where
+    /// τ is `l1_steering_factor`. The KKT for the (p, n) slacks gives
+    /// `|y_i| ≤ ρ` whenever the slack is at its bound, so a ρ that
+    /// dominates the equality multipliers is what makes the augmented
+    /// stationarity recover the original NLP's stationarity. After the
+    /// loop, if `Σ(p+n) > l1_slack_tol` the original constraints are
+    /// not satisfiable at the returned point and the status is honestly
+    /// reported as `LocalInfeasibility` (the returned `x` is still the
+    /// ℓ₁-best least-infeasible point).
+    ///
+    /// **Restoration handoff.** When the flag is on, the inner solve
+    /// runs with the standard restoration phase still enabled — it acts
+    /// as a defense-in-depth fallback if the augmented IPM hits an
+    /// orthogonal issue (Hessian indefiniteness, numerical breakdown).
+    /// The two mechanisms are not redundant in practice: the wrapper
+    /// targets equality-row LICQ failure, restoration targets generic
+    /// filter stalls. Set `disable_nlp_restoration = true` alongside
+    /// the flag to use ℓ₁ as a *replacement* for restoration (matches
+    /// the Thierry-Biegler 2020 architecture).
+    ///
+    /// Reference: Thierry, D. & Biegler, L.T. (2020). *"The ℓ₁ Exact
+    /// Penalty-Barrier Phase for Degenerate Nonlinear Programming
+    /// Problems in Ipopt"*, IFAC-PapersOnLine. This method is **not**
+    /// shipped in stock Ipopt 3.14.
+    ///
+    /// Default: `false` (byte-identical behavior to the unwrapped path).
+    pub l1_exact_penalty_barrier: bool,
+    /// Initial penalty weight ρ used when `l1_exact_penalty_barrier = true`.
+    /// Default: `1000.0` (matches the restoration-NLP penalty default
+    /// and the magnitude used in the Thierry-Biegler 2020 results).
+    pub l1_penalty_init: f64,
+    /// Upper bound on ρ in the dynamic-ρ outer loop. When ρ would
+    /// escalate past this cap, the current result is returned as-is.
+    /// A genuinely infeasible problem will hit this cap (its
+    /// equality multipliers diverge as ρ grows; capping ρ keeps the
+    /// numerics from blowing up). Default: `1e10`.
+    pub l1_penalty_max: f64,
+    /// Multiplicative escalation factor applied to ρ between outer
+    /// iterations of the dynamic-ρ loop when slacks remain above
+    /// `l1_slack_tol`. Default: `10.0`.
+    pub l1_penalty_increase_factor: f64,
+    /// Maximum number of outer ρ-escalation iterations performed by
+    /// the dynamic-ρ loop. Each iteration is a full inner IPM solve.
+    /// Set to `1` to recover phase-1 (static-ρ) behavior.
+    /// Default: `5`.
+    pub l1_penalty_max_outer_iter: usize,
+    /// Convergence tolerance on the slack sum `Σ(p + n)` used by the
+    /// dynamic-ρ outer loop. When the inner solve returns with a
+    /// slack sum at or below this value, the outer loop terminates —
+    /// the equality constraints are effectively satisfied and further
+    /// ρ escalation is unnecessary. Default: `1e-6`.
+    pub l1_slack_tol: f64,
+    /// Phase-3 (Byrd-Nocedal-Waltz) steering factor τ. After each
+    /// inner solve the outer loop reads the equality-row multipliers
+    /// `y_eq` and escalates ρ so that
+    /// `ρ_new ≥ max(ρ · l1_penalty_increase_factor, τ · ‖y_eq‖_∞ + ε)`.
+    /// The KKT for the (p, n) slacks of the augmented NLP gives
+    /// `|y_i| ≤ ρ` whenever the slack pair is at its bound, so a ρ that
+    /// dominates the multipliers is what makes the augmented problem's
+    /// stationarity recover the original NLP's stationarity (see Byrd,
+    /// Nocedal & Waltz 2012, Sec. 3). τ > 1 buys margin.
+    /// Default: `10.0`.
+    pub l1_steering_factor: f64,
+    /// When `true`, if a standard solve terminates with `RestorationFailed`,
+    /// `LocalInfeasibility`, or `Acceptable` (the three outcomes that BNW
+    /// ℓ₁-stationarity is most likely to either rescue to clean `Optimal`
+    /// or convert to an honest infeasibility certificate), automatically
+    /// retry with `l1_exact_penalty_barrier=true`.
+    /// The fallback runs after the first attempt returns and reuses every
+    /// other option as-is. If the retry produces `Optimal`, its result is
+    /// returned; otherwise the original (more informative or less expensive)
+    /// result is returned and the fallback iteration count is folded into
+    /// the diagnostics.
+    ///
+    /// No-op when `l1_exact_penalty_barrier` is already `true`.
+    /// Default: `false`.
+    pub l1_fallback_on_restoration_failure: bool,
     /// Whether the IFRd curvature test includes the `δ_w · ‖d‖²` regularization term.
     ///
     /// Only consulted when `neg_curv_test_tol > 0`. When true (default), the LHS
@@ -893,6 +982,14 @@ impl Default for SolverOptions {
             diverging_iterates_tol: 1e20,
             neg_curv_test_tol: 0.0,
             neg_curv_test_reg: true,
+            l1_exact_penalty_barrier: false,
+            l1_penalty_init: 1000.0,
+            l1_penalty_max: 1e10,
+            l1_penalty_increase_factor: 10.0,
+            l1_penalty_max_outer_iter: 5,
+            l1_slack_tol: 1e-6,
+            l1_steering_factor: 10.0,
+            l1_fallback_on_restoration_failure: false,
         }
     }
 }

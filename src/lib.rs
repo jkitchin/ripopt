@@ -88,6 +88,7 @@ pub mod ipm;
 pub mod iter0_dump;
 pub mod kkt;
 pub mod kkt_aug;
+pub mod l1_penalty_barrier_nlp;
 pub mod lbfgs;
 pub mod linearity;
 pub mod linear_solver;
@@ -114,8 +115,40 @@ pub use result::{SolveResult, SolverDiagnostics, SolveStatus};
 pub use sensitivity::{ParametricNlpProblem, SensitivityContext, SensitivityResult};
 
 /// Solve a nonlinear programming problem using the interior point method.
+///
+/// When `options.l1_fallback_on_restoration_failure` is `true` and the
+/// first attempt terminates with `RestorationFailed`, `LocalInfeasibility`,
+/// or `Acceptable` (and the ℓ₁ flag is not already set), the solver
+/// automatically retries with `l1_exact_penalty_barrier = true`. The retry
+/// result is returned only if it reaches `Optimal`; otherwise the original
+/// (typically more informative) result is returned and the retry's iteration
+/// count is folded into `iterations`.
 pub fn solve<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult {
-    ipm::solve(problem, options)
+    let first = ipm::solve(problem, options);
+    if !options.l1_fallback_on_restoration_failure
+        || options.l1_exact_penalty_barrier
+        || !matches!(
+            first.status,
+            SolveStatus::RestorationFailed
+                | SolveStatus::LocalInfeasibility
+                | SolveStatus::Acceptable
+        )
+    {
+        return first;
+    }
+    let mut retry_options = options.clone();
+    retry_options.l1_exact_penalty_barrier = true;
+    retry_options.l1_fallback_on_restoration_failure = false;
+    let retry = ipm::solve(problem, &retry_options);
+    if matches!(retry.status, SolveStatus::Optimal) {
+        let mut r = retry;
+        r.iterations += first.iterations;
+        r
+    } else {
+        let mut r = first;
+        r.iterations += retry.iterations;
+        r
+    }
 }
 
 /// Solve and retain factored KKT for parametric sensitivity analysis.
