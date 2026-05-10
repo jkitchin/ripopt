@@ -69,6 +69,10 @@ path = "benchmarks/cutest/collect_kkt.rs"
 required-features = ["cutest"]
 
 [[example]]
+name = "bc_audit"
+required-features = ["cutest"]
+
+[[example]]
 name = "cat_a_probe"
 required-features = ["cutest"]
 
