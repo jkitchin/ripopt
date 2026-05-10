@@ -160,6 +160,28 @@ pub enum NlpScalingMethod {
     User,
 }
 
+/// Variant of the low-rank augmented-system solver used when
+/// `use_low_rank_kkt = true`. Mirrors Ipopt 3.14's
+/// `limited_memory_aug_solver` option (`IpAlgBuilder.cpp:384-391`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub enum LimitedMemoryAugSolver {
+    /// Sherman-Morrison-Woodbury correction on top of a base factor
+    /// of the σI-substituted aug system. One inner factor + 2k inner
+    /// back-solves at setup; per RHS one inner solve plus a small
+    /// k×k Cholesky correction. Default — matches Ipopt's
+    /// `LowRankAugSystemSolver` and is preferred for direct inner
+    /// solvers (`IpLowRankAugSystemSolver.cpp:182-227,300-401`).
+    #[default]
+    ShermanMorrison,
+    /// Stretched/bordered system: V and U are appended as 2k extra
+    /// rows/cols of the aug system, lifting the dimension from
+    /// `n_aug` to `n_aug + 2k`. One factor of the bigger system, one
+    /// solve per RHS. Preferred for iterative inner solvers because
+    /// it avoids the 2k base back-solves. Matches Ipopt's
+    /// `LowRankSSAugSystemSolver` (`IpLowRankSSAugSystemSolver.cpp`).
+    Extended,
+}
+
 /// Solver options matching Ipopt defaults.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SolverOptions {
@@ -441,6 +463,12 @@ pub struct SolverOptions {
     /// solver entry.
     /// Default: false.
     pub use_low_rank_kkt: bool,
+    /// Issue #30 phase 4: variant of the low-rank augmented-system
+    /// wrapper. Mirrors Ipopt's `limited_memory_aug_solver` option
+    /// (`IpAlgBuilder.cpp:384-391`). Has no effect when
+    /// `use_low_rank_kkt = false`.
+    /// Default: `ShermanMorrison`.
+    pub limited_memory_aug_solver: LimitedMemoryAugSolver,
     /// Enable Mehrotra predictor-corrector for barrier parameter selection.
     ///
     /// After factoring the KKT system, solves an affine-scaling predictor step
@@ -927,6 +955,7 @@ impl Default for SolverOptions {
             detect_linear_constraints: true,
             hessian_approximation_lbfgs: false,
             use_low_rank_kkt: false,
+            limited_memory_aug_solver: LimitedMemoryAugSolver::ShermanMorrison,
             mehrotra_pc: false,
             gondzio_mcc_max: 3,
             linear_solver: LinearSolverChoice::default(),

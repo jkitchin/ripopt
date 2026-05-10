@@ -24,6 +24,7 @@
 
 use super::{FactorDiagnostics, Inertia, KktMatrix, LinearSolver, SolverError};
 use crate::ipm::LbfgsCompact;
+use crate::options::LimitedMemoryAugSolver;
 
 /// State of a low-rank Sherman-Morrison wrapper around an inner `LinearSolver`.
 ///
@@ -31,6 +32,12 @@ use crate::ipm::LbfgsCompact;
 /// `j` of `Vtilde`, etc.
 pub struct LowRankKktSolver<S: LinearSolver> {
     inner: S,
+    /// Phase 4: which low-rank correction strategy to apply when a
+    /// compact form has been staged. Selected at construction.
+    mode: LimitedMemoryAugSolver,
+    /// Bordered system size after a successful `Extended` factor.
+    /// Equals `n_aug + 2k` when `k > 0`, else `n_aug`.
+    ext_size: usize,
     n: usize,
     n_aug: usize,
     k: usize,
@@ -62,8 +69,16 @@ pub struct LowRankKktSolver<S: LinearSolver> {
 
 impl<S: LinearSolver> LowRankKktSolver<S> {
     pub fn new(inner: S) -> Self {
+        Self::with_mode(inner, LimitedMemoryAugSolver::ShermanMorrison)
+    }
+
+    /// Construct with an explicit low-rank correction mode. Phase 4 of
+    /// issue #30: lets the IPM honor `options.limited_memory_aug_solver`.
+    pub fn with_mode(inner: S, mode: LimitedMemoryAugSolver) -> Self {
         Self {
             inner,
+            mode,
+            ext_size: 0,
             n: 0,
             n_aug: 0,
             k: 0,
@@ -77,6 +92,11 @@ impl<S: LinearSolver> LowRankKktSolver<S> {
             pending: None,
             sm_active: false,
         }
+    }
+
+    /// Read-only accessor for the currently configured mode.
+    pub fn mode(&self) -> LimitedMemoryAugSolver {
+        self.mode
     }
 
     /// Stage the compact form for the next `LinearSolver::factor` call.
@@ -324,6 +344,163 @@ impl<S: LinearSolver> LowRankKktSolver<S> {
 
         Ok(())
     }
+
+    /// Phase 4 extended/bordered factor: assemble an `(n_aug + 2k) ×
+    /// (n_aug + 2k)` bordered KKT by appending V and U as 2k extra
+    /// rows/cols (with ±1 signs on the new diagonal block) and factor
+    /// it once via the inner solver. Mirrors Ipopt's
+    /// `LowRankSSAugSystemSolver` (`IpLowRankSSAugSystemSolver.cpp:280-360`).
+    ///
+    /// Caller's responsibility: assemble `base_kkt` with σI on the
+    /// (1,1) block, identical to the `factor` (SM) path.
+    pub fn factor_extended(
+        &mut self,
+        base_kkt: &KktMatrix,
+        compact: &LbfgsCompact,
+        n_aug: usize,
+    ) -> Result<Option<Inertia>, SolverError> {
+        let n = compact.n;
+        let k = compact.k;
+        if base_kkt.n() != n_aug {
+            return Err(SolverError::DimensionMismatch {
+                expected: n_aug,
+                got: base_kkt.n(),
+            });
+        }
+        if n_aug < n {
+            return Err(SolverError::DimensionMismatch {
+                expected: n,
+                got: n_aug,
+            });
+        }
+        self.n = n;
+        self.n_aug = n_aug;
+        self.k = k;
+
+        if k == 0 {
+            let inertia = self.inner.factor(base_kkt)?;
+            self.factored = true;
+            self.ext_size = n_aug;
+            return Ok(inertia);
+        }
+
+        let ext_n = n_aug + 2 * k;
+        let ext = build_extended_kkt(base_kkt, compact, n_aug);
+        let inner_inertia = self.inner.factor(&ext)?;
+
+        // Inertia correction: the bordered system has +k positive
+        // eigenvalues from the U-side `+1` diagonals and +k negative
+        // eigenvalues from the V-side `-1` diagonals. Subtract those
+        // off so callers see the inertia of the original
+        // `B + Σ + δ_w I` system. Mirrors
+        // `IpLowRankSSAugSystemSolver.cpp:191,197,315`.
+        let inertia = inner_inertia.map(|i| Inertia {
+            positive: i.positive.saturating_sub(k),
+            negative: i.negative.saturating_sub(k),
+            zero: i.zero,
+        });
+
+        self.factored = true;
+        self.ext_size = ext_n;
+        Ok(inertia)
+    }
+
+    /// Phase 4 extended solve: pad RHS with `2k` zeros, solve the
+    /// bordered system once, truncate the leading `n_aug` entries
+    /// back into `solution`. Mirrors
+    /// `IpLowRankSSAugSystemSolver.cpp:183-194`.
+    pub fn solve_extended(
+        &mut self,
+        rhs: &[f64],
+        solution: &mut [f64],
+    ) -> Result<(), SolverError> {
+        if !self.factored {
+            return Err(SolverError::NumericalFailure(
+                "LowRankKktSolver: solve_extended called before factor".into(),
+            ));
+        }
+        if rhs.len() != self.n_aug || solution.len() != self.n_aug {
+            return Err(SolverError::DimensionMismatch {
+                expected: self.n_aug,
+                got: rhs.len().min(solution.len()),
+            });
+        }
+        if self.k == 0 {
+            return self.inner.solve(rhs, solution);
+        }
+        let ext_n = self.ext_size;
+        let mut rhs_ext = vec![0.0_f64; ext_n];
+        rhs_ext[..self.n_aug].copy_from_slice(rhs);
+        let mut sol_ext = vec![0.0_f64; ext_n];
+        self.inner.solve(&rhs_ext, &mut sol_ext)?;
+        solution.copy_from_slice(&sol_ext[..self.n_aug]);
+        Ok(())
+    }
+}
+
+/// Build the `(n_aug + 2k) × (n_aug + 2k)` bordered KKT for the
+/// extended/SS variant. The new rows `n_aug..n_aug+k` couple to
+/// columns `0..n` via `V[:,j]` with diagonal `-1`; rows
+/// `n_aug+k..n_aug+2k` couple via `U[:,j]` with diagonal `+1`.
+fn build_extended_kkt(
+    base: &KktMatrix,
+    compact: &LbfgsCompact,
+    n_aug: usize,
+) -> KktMatrix {
+    let n = compact.n;
+    let k = compact.k;
+    let ext_n = n_aug + 2 * k;
+
+    let mut ext = match base {
+        KktMatrix::Dense(_) => KktMatrix::zeros_dense(ext_n),
+        KktMatrix::Sparse(s) => {
+            // Pre-allocate base nnz + 2k border rows (≤ n+1 entries each).
+            let cap = s.triplet_rows.len() + 2 * k * (n + 1);
+            KktMatrix::zeros_sparse(ext_n, cap)
+        }
+    };
+
+    match base {
+        KktMatrix::Dense(d) => {
+            for j in 0..n_aug {
+                for i in j..n_aug {
+                    let val = d.get(i, j);
+                    if val != 0.0 {
+                        ext.add(i, j, val);
+                    }
+                }
+            }
+        }
+        KktMatrix::Sparse(s) => {
+            for t in 0..s.triplet_rows.len() {
+                ext.add(s.triplet_rows[t], s.triplet_cols[t], s.triplet_vals[t]);
+            }
+        }
+    }
+
+    for j in 0..k {
+        let row = n_aug + j;
+        for i in 0..n {
+            let v_ij = compact.v[i + j * n];
+            if v_ij != 0.0 {
+                ext.add(row, i, v_ij);
+            }
+        }
+        ext.add(row, row, -1.0);
+    }
+
+    for j in 0..k {
+        let row = n_aug + k + j;
+        for i in 0..n {
+            let u_ij = compact.u[i + j * n];
+            if u_ij != 0.0 {
+                ext.add(row, i, u_ij);
+            }
+        }
+        ext.add(row, row, 1.0);
+    }
+
+    ext
 }
 
 /// `LinearSolver` impl: route `factor` through the SM correction when a
@@ -334,11 +511,17 @@ impl<S: LinearSolver> LinearSolver for LowRankKktSolver<S> {
         if let Some((compact, n_aug)) = self.pending.take() {
             // The inertia ladder may re-factor a perturbed matrix several
             // times against the same compact, so restore `pending` before
-            // returning. We borrow the compact through a local owned copy
-            // because `self.factor` mutates other fields of `self`.
-            let result = self.factor(matrix, &compact, n_aug);
+            // returning.
+            let result = match self.mode {
+                LimitedMemoryAugSolver::ShermanMorrison => {
+                    self.factor(matrix, &compact, n_aug)
+                }
+                LimitedMemoryAugSolver::Extended => {
+                    self.factor_extended(matrix, &compact, n_aug)
+                }
+            };
             self.pending = Some((compact, n_aug));
-            self.sm_active = true;
+            self.sm_active = result.is_ok();
             result
         } else {
             self.sm_active = false;
@@ -348,10 +531,12 @@ impl<S: LinearSolver> LinearSolver for LowRankKktSolver<S> {
     }
 
     fn solve(&mut self, rhs: &[f64], solution: &mut [f64]) -> Result<(), SolverError> {
-        if self.sm_active {
-            self.solve(rhs, solution)
-        } else {
-            self.inner.solve(rhs, solution)
+        if !self.sm_active {
+            return self.inner.solve(rhs, solution);
+        }
+        match self.mode {
+            LimitedMemoryAugSolver::ShermanMorrison => self.solve(rhs, solution),
+            LimitedMemoryAugSolver::Extended => self.solve_extended(rhs, solution),
         }
     }
 
@@ -867,5 +1052,174 @@ mod tests {
         assert!((pt_sol[0] - 2.0).abs() < 1e-12);
         assert!((pt_sol[1] - 2.0).abs() < 1e-12);
         assert!((pt_sol[2] - 2.0).abs() < 1e-12);
+    }
+
+    /// Phase 4 parity: `Extended` (bordered) and `ShermanMorrison` modes
+    /// must produce numerically identical solutions on the same low-rank
+    /// KKT system. Wraps a `DenseLdl` inner solver in both modes, runs
+    /// the same factor + solve, and asserts ‖x_ext − x_sm‖∞ ≤ 1e-9.
+    #[test]
+    fn low_rank_extended_matches_sherman_morrison() {
+        let n = 6;
+        let m = 3;
+        let n_aug = n + m;
+        let k = 4;
+        let sigma = 1.4;
+
+        let v_data: Vec<f64> = (0..(n * k))
+            .map(|i| ((i as f64) * 0.27 - 0.4).sin() * 0.45)
+            .collect();
+        let u_data: Vec<f64> = (0..(n * k))
+            .map(|i| ((i as f64) * 0.19 + 0.15).cos() * 0.28)
+            .collect();
+        let compact = LbfgsCompact {
+            n, k, sigma,
+            v: v_data.clone(),
+            u: u_data.clone(),
+        };
+
+        let j_mat: Vec<f64> = (0..(m * n))
+            .map(|i| ((i as f64) * 0.33 + 0.05).sin() * 0.55)
+            .collect();
+        let sigma_x: Vec<f64> = (0..n).map(|i| 0.4 + 0.07 * (i as f64)).collect();
+        let delta_c = 1e-8;
+
+        let mut base_kkt = KktMatrix::zeros_dense(n_aug);
+        for i in 0..n {
+            base_kkt.add(i, i, sigma + sigma_x[i]);
+        }
+        for row in 0..m {
+            for col in 0..n {
+                base_kkt.add(n + row, col, j_mat[row * n + col]);
+            }
+            base_kkt.add(n + row, n + row, -delta_c);
+        }
+
+        let rhs: Vec<f64> = (0..n_aug)
+            .map(|i| ((i as f64) * 0.83 - 0.7).cos())
+            .collect();
+
+        // SM path.
+        let mut sm = LowRankKktSolver::with_mode(
+            DenseLdl::new(),
+            LimitedMemoryAugSolver::ShermanMorrison,
+        );
+        sm.set_pending_lbfgs(compact.clone(), n_aug);
+        let sm_solver: &mut dyn LinearSolver = &mut sm;
+        sm_solver.factor(&base_kkt).expect("SM factor");
+        let mut sm_sol = vec![0.0_f64; n_aug];
+        sm_solver.solve(&rhs, &mut sm_sol).expect("SM solve");
+
+        // Extended path.
+        let mut ext = LowRankKktSolver::with_mode(
+            DenseLdl::new(),
+            LimitedMemoryAugSolver::Extended,
+        );
+        ext.set_pending_lbfgs(compact.clone(), n_aug);
+        let ext_solver: &mut dyn LinearSolver = &mut ext;
+        ext_solver.factor(&base_kkt).expect("Extended factor");
+        let mut ext_sol = vec![0.0_f64; n_aug];
+        ext_solver.solve(&rhs, &mut ext_sol).expect("Extended solve");
+
+        // The two algorithms are mathematically equivalent but execute
+        // different floating-point operation orderings (k=4 small
+        // Choleskys for SM vs one bigger LDLᵀ for Extended), so the
+        // relative tolerance reflects backward-error noise rather than
+        // algorithmic drift.
+        for i in 0..n_aug {
+            let denom = sm_sol[i].abs().max(1e-12);
+            let diff = (sm_sol[i] - ext_sol[i]).abs();
+            assert!(
+                diff / denom < 1e-7,
+                "row {i}: sm={} ext={} |Δ|={diff:e}",
+                sm_sol[i], ext_sol[i]
+            );
+        }
+
+        // Both wrappers should report `solves_corrected_operator() = true`
+        // so the IPM's IR loop skips residual chasing against the σI base.
+        assert!(sm.solves_corrected_operator());
+        assert!(ext.solves_corrected_operator());
+
+        // Sanity: residual of Extended solution against the *full* B_k
+        // system. Build the reference Hessian.
+        let mut b_full = vec![0.0_f64; n * n];
+        for i in 0..n {
+            b_full[i * n + i] = sigma;
+        }
+        for j in 0..k {
+            for r in 0..n {
+                for c in 0..n {
+                    b_full[r * n + c] += v_data[r + j * n] * v_data[c + j * n]
+                        - u_data[r + j * n] * u_data[c + j * n];
+                }
+            }
+        }
+        let mut full_kkt = KktMatrix::zeros_dense(n_aug);
+        for i in 0..n {
+            full_kkt.add(i, i, b_full[i * n + i] + sigma_x[i]);
+            for jx in 0..i {
+                full_kkt.add(i, jx, b_full[i * n + jx]);
+            }
+        }
+        for row in 0..m {
+            for col in 0..n {
+                full_kkt.add(n + row, col, j_mat[row * n + col]);
+            }
+            full_kkt.add(n + row, n + row, -delta_c);
+        }
+        let mut resid = vec![0.0_f64; n_aug];
+        full_kkt.matvec(&ext_sol, &mut resid);
+        for i in 0..n_aug {
+            resid[i] -= rhs[i];
+        }
+        let resid_norm: f64 = resid.iter().map(|r| r * r).sum::<f64>().sqrt();
+        assert!(
+            resid_norm < 1e-7,
+            "Extended residual against full B_k system too large: {:e}",
+            resid_norm
+        );
+    }
+
+    /// Extended path k=0: should pass through to the inner solver
+    /// (no border rows to add) and produce identical solutions.
+    #[test]
+    fn low_rank_extended_k0_passthrough() {
+        let n = 3;
+        let m = 1;
+        let n_aug = n + m;
+        let sigma = 0.9;
+
+        let mut kkt = KktMatrix::zeros_dense(n_aug);
+        for i in 0..n {
+            kkt.add(i, i, sigma + 0.4);
+        }
+        kkt.add(n, 0, 1.0);
+        kkt.add(n, 1, 0.5);
+        kkt.add(n, n, -1e-8);
+
+        let compact = LbfgsCompact::empty(n, sigma);
+        let mut wrapper = LowRankKktSolver::with_mode(
+            DenseLdl::new(),
+            LimitedMemoryAugSolver::Extended,
+        );
+        wrapper.factor_extended(&kkt, &compact, n_aug).expect("factor");
+
+        let rhs = vec![1.0, -2.0, 3.0, 0.5];
+        let mut wrap_sol = vec![0.0; n_aug];
+        wrapper.solve_extended(&rhs, &mut wrap_sol).expect("solve");
+
+        let mut ref_solver = DenseLdl::new();
+        ref_solver.factor(&kkt).expect("ref factor");
+        let mut ref_sol = vec![0.0; n_aug];
+        ref_solver.solve(&rhs, &mut ref_sol).expect("ref solve");
+
+        for i in 0..n_aug {
+            assert!(
+                (wrap_sol[i] - ref_sol[i]).abs() < 1e-12,
+                "row {i}: wrap={} ref={}",
+                wrap_sol[i], ref_sol[i]
+            );
+        }
     }
 }

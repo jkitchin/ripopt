@@ -1,4 +1,4 @@
-use ripopt::{NlpProblem, SolveStatus, SolverOptions};
+use ripopt::{LimitedMemoryAugSolver, NlpProblem, SolveStatus, SolverOptions};
 
 // ---------------------------------------------------------------------------
 // Rosenbrock (unconstrained) — used with L-BFGS Hessian approximation
@@ -53,6 +53,31 @@ fn lbfgs_ipm_rosenbrock() {
     assert!(
         result.status == SolveStatus::Optimal,
         "expected Optimal or Acceptable, got {:?}",
+        result.status
+    );
+    assert!((result.x[0] - 1.0).abs() < 1e-3, "x[0]={}, expected ~1.0", result.x[0]);
+    assert!((result.x[1] - 1.0).abs() < 1e-3, "x[1]={}, expected ~1.0", result.x[1]);
+    assert!(result.objective < 1e-4, "obj={}, expected ~0", result.objective);
+}
+
+#[test]
+fn lbfgs_ipm_rosenbrock_extended_aug_solver() {
+    // Drives the IPM with the bordered/extended variant of the low-rank KKT
+    // wrapper, mirroring Ipopt's `limited_memory_aug_solver = extended`. The
+    // bordered system must converge to the same optimum as the
+    // Sherman-Morrison default (covered by `lbfgs_ipm_rosenbrock`).
+    let problem = Rosenbrock;
+    let options = SolverOptions {
+        print_level: 0,
+        hessian_approximation_lbfgs: true,
+        use_low_rank_kkt: true,
+        limited_memory_aug_solver: LimitedMemoryAugSolver::Extended,
+        ..SolverOptions::default()
+    };
+    let result = ripopt::solve(&problem, &options);
+    assert!(
+        result.status == SolveStatus::Optimal,
+        "expected Optimal, got {:?}",
         result.status
     );
     assert!((result.x[0] - 1.0).abs() < 1e-3, "x[0]={}, expected ~1.0", result.x[0]);

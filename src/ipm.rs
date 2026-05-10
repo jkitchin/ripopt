@@ -8214,8 +8214,15 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
     let low_rank_kkt_active =
         options.use_low_rank_kkt || std::env::var("RIPOPT_LOW_RANK_KKT").is_ok();
     let inner_solver: Box<dyn LinearSolver> = new_fallback_solver(use_sparse);
+    // Phase 4: honor `options.limited_memory_aug_solver`. The mode is
+    // baked into the wrapper at construction; staging via
+    // `set_pending_lbfgs` then dispatches to either Sherman-Morrison
+    // or the bordered/Extended path on each `factor`.
     let mut aug_solver: Box<crate::linear_solver::low_rank_kkt::LowRankKktSolver<Box<dyn LinearSolver>>> =
-        Box::new(crate::linear_solver::low_rank_kkt::LowRankKktSolver::new(inner_solver));
+        Box::new(crate::linear_solver::low_rank_kkt::LowRankKktSolver::with_mode(
+            inner_solver,
+            options.limited_memory_aug_solver,
+        ));
 
     // Main IPM loop
     for iteration in 0..options.max_iter {
