@@ -8165,7 +8165,19 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
     // hoisting, every iter constructed a fresh `FeralLdl` and re-ran
     // METIS-style ordering — measured at ~1.5s/iter on Mittelmann
     // ex8_2_3 (90% of total wall time before this fix).
-    let mut aug_solver: Box<dyn LinearSolver> = new_fallback_solver(use_sparse);
+    //
+    // Issue #30 phase 2.5c: always wrap the inner backend in
+    // `LowRankKktSolver`. When no compact form is staged (the default,
+    // and the exact-Hessian branch), the wrapper degenerates to a
+    // pass-through (zero overhead beyond one virtual call per
+    // factor/solve). When `options.use_low_rank_kkt` is set and L-BFGS
+    // is active, we stage the compact form via `set_pending_lbfgs`
+    // each iteration so the SM correction kicks in.
+    let low_rank_kkt_active =
+        options.use_low_rank_kkt || std::env::var("RIPOPT_LOW_RANK_KKT").is_ok();
+    let inner_solver: Box<dyn LinearSolver> = new_fallback_solver(use_sparse);
+    let mut aug_solver: Box<crate::linear_solver::low_rank_kkt::LowRankKktSolver<Box<dyn LinearSolver>>> =
+        Box::new(crate::linear_solver::low_rank_kkt::LowRankKktSolver::new(inner_solver));
 
     // Main IPM loop
     for iteration in 0..options.max_iter {
@@ -8523,6 +8535,37 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         // assembled in matching layout (sparse vs dense) below.
         // A8.7: `aug_solver` is hoisted above the loop so its symbolic
         // cache persists across iterations.
+        //
+        // Issue #30 phase 2.5c: stage the L-BFGS compact form on the
+        // wrapper before each factor cycle. When `low_rank_kkt_active`
+        // is on and `state.lbfgs_compact` carries a positive-definite
+        // factorization, the wrapper assumes the (1,1) block holds σI
+        // (not the dense `B_k`); we substitute σ on the diagonal in
+        // place of the dense fill produced by `update_lbfgs_hessian`.
+        // When the staging is skipped (no compact, or option off), the
+        // wrapper degenerates to passthrough and the existing dense
+        // fill is consumed unchanged.
+        if low_rank_kkt_active {
+            if let Some(compact) = state.lbfgs_compact.clone() {
+                let sigma = compact.sigma;
+                // Overwrite the dense lower-triangle hess_vals: σ on the
+                // diagonal (row == col), 0 elsewhere. The wrapper takes
+                // care of the V/U correction analytically.
+                for k in 0..state.hess_rows.len() {
+                    if state.hess_rows[k] == state.hess_cols[k] {
+                        state.hess_vals[k] = sigma;
+                    } else {
+                        state.hess_vals[k] = 0.0;
+                    }
+                }
+                let n_aug = n + state.layout.n_d + state.layout.n_c + state.layout.n_d;
+                aug_solver.set_pending_lbfgs(compact, n_aug);
+            } else {
+                aug_solver.clear_pending_lbfgs();
+            }
+        } else {
+            aug_solver.clear_pending_lbfgs();
+        }
         let probing = options.mehrotra_pc;
         // IFRd diagnostic counter (Chiang & Zavala 2016). Only ever incremented
         // when `options.neg_curv_test_tol > 0` and the inertia ladder exhausts

@@ -401,6 +401,13 @@ impl<S: LinearSolver> LinearSolver for LowRankKktSolver<S> {
     fn estimate_condition_1norm(&mut self) -> Option<f64> {
         self.inner.estimate_condition_1norm()
     }
+
+    fn solves_corrected_operator(&self) -> bool {
+        // True only when the SM correction is currently active. When the
+        // wrapper is in passthrough (no compact staged), the solve maps
+        // to inner.solve against the assembled matrix as usual.
+        self.sm_active
+    }
 }
 
 /// Cholesky factorization of a `k × k` symmetric PD matrix into a lower

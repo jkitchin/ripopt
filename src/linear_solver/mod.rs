@@ -679,6 +679,57 @@ pub trait LinearSolver {
     fn estimate_condition_1norm(&mut self) -> Option<f64> {
         None
     }
+
+    /// Returns `true` iff this solver inverts a *different* matrix than the
+    /// caller-supplied `KktMatrix` last passed to `factor`. Default: `false`
+    /// (the solver inverts the assembled matrix). Override to `true` for
+    /// correctional wrappers like `LowRankKktSolver` whose `factor`/`solve`
+    /// pair invert `A_0 + V V^T − U U^T` while `A_0` (with σI on the (1,1)
+    /// block) is what the caller assembled. Issue #30 phase 2.5c: gates
+    /// `solve_aug_with_ir` to skip iterative refinement, since IR's
+    /// `aug_residual` would mix two different operators and diverge.
+    fn solves_corrected_operator(&self) -> bool {
+        false
+    }
+}
+
+/// Forwarder so `Box<dyn LinearSolver>` itself satisfies the
+/// `LinearSolver` trait. Used by `low_rank_kkt::LowRankKktSolver`, whose
+/// generic `S: LinearSolver` parameter is instantiated with a boxed
+/// dyn-trait object owned by the IPM (issue #30 phase 2.5c).
+impl LinearSolver for Box<dyn LinearSolver> {
+    fn factor(&mut self, matrix: &KktMatrix) -> Result<Option<Inertia>, SolverError> {
+        (**self).factor(matrix)
+    }
+    fn solve(&mut self, rhs: &[f64], solution: &mut [f64]) -> Result<(), SolverError> {
+        (**self).solve(rhs, solution)
+    }
+    fn solve_many(
+        &mut self,
+        rhs: &[f64],
+        nrhs: usize,
+        solution: &mut [f64],
+    ) -> Result<(), SolverError> {
+        (**self).solve_many(rhs, nrhs, solution)
+    }
+    fn provides_inertia(&self) -> bool {
+        (**self).provides_inertia()
+    }
+    fn min_diagonal(&self) -> Option<f64> {
+        (**self).min_diagonal()
+    }
+    fn increase_quality(&mut self) -> bool {
+        (**self).increase_quality()
+    }
+    fn last_factor_diagnostics(&self) -> FactorDiagnostics {
+        (**self).last_factor_diagnostics()
+    }
+    fn estimate_condition_1norm(&mut self) -> Option<f64> {
+        (**self).estimate_condition_1norm()
+    }
+    fn solves_corrected_operator(&self) -> bool {
+        (**self).solves_corrected_operator()
+    }
 }
 
 #[cfg(test)]

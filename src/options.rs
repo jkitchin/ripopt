@@ -432,6 +432,15 @@ pub struct SolverOptions {
     /// Equivalent to Ipopt's `hessian_approximation = "limited-memory"`.
     /// Default: false.
     pub hessian_approximation_lbfgs: bool,
+    /// Issue #30 phase 2.5c: route the augmented-system solve through
+    /// `LowRankKktSolver` when L-BFGS is active, exploiting the compact
+    /// form `B = σI + V V^T - U U^T` instead of factoring the full dense
+    /// `B_k`. Mirrors Ipopt's `IpLowRankAugSystemSolver`. Currently
+    /// opt-in (default off) while we collect parity evidence; the
+    /// `RIPOPT_LOW_RANK_KKT=1` env var overrides this option to true at
+    /// solver entry.
+    /// Default: false.
+    pub use_low_rank_kkt: bool,
     /// Enable Mehrotra predictor-corrector for barrier parameter selection.
     ///
     /// After factoring the KKT system, solves an affine-scaling predictor step
@@ -917,6 +926,7 @@ impl Default for SolverOptions {
             auxiliary_tol: 1e-8,
             detect_linear_constraints: true,
             hessian_approximation_lbfgs: false,
+            use_low_rank_kkt: false,
             mehrotra_pc: false,
             gondzio_mcc_max: 3,
             linear_solver: LinearSolverChoice::default(),

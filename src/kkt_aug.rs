@@ -678,6 +678,17 @@ pub fn solve_aug_with_ir(
         return Ok(AugSolveResult { sol, ir_iters: 1, final_ratio: None });
     }
 
+    // Issue #30 phase 2.5c: solvers that invert a *corrected* operator
+    // (e.g. `LowRankKktSolver` returning `A_0 + V V^T − U U^T` while
+    // the caller-assembled `aug.matrix` only carries `A_0`) cannot use
+    // standard IR — `aug_residual` and the inner solve disagree on the
+    // operator, so refinement diverges. Skip IR and trust the wrapper
+    // to deliver the SM-corrected solve directly (Ipopt's
+    // `IpLowRankAugSystemSolver` similarly does no IR).
+    if solver.solves_corrected_operator() {
+        return Ok(AugSolveResult { sol, ir_iters: 1, final_ratio: None });
+    }
+
     let mut ir_iters = 1usize;
     let mut last_ratio = f64::INFINITY;
     loop {
