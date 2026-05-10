@@ -10894,54 +10894,34 @@ fn compute_initial_ls_4block(
 
     let dim = n + n_d + n_c + n_d;
     let cap = n + n_d + jac_rows.len() + n_d + n_c + n_d;
-    let mut ssm = SparseSymmetricMatrix {
-        n: dim,
-        triplet_rows: Vec::with_capacity(cap),
-        triplet_cols: Vec::with_capacity(cap),
-        triplet_vals: Vec::with_capacity(cap),
-    };
+    // with_capacity pre-populates all diagonals as structural zeros, so the
+    // (3,3) and (4,4) blocks are already present; the (1,1)=+I and (2,2)=+I
+    // adds below sum with those zeros to yield 1.0 on the relevant diagonals.
+    let mut ssm = SparseSymmetricMatrix::with_capacity(dim, cap);
 
     // (1,1) = +I (delta_x = 1.0).
     for i in 0..n {
-        ssm.triplet_rows.push(i);
-        ssm.triplet_cols.push(i);
-        ssm.triplet_vals.push(1.0);
+        ssm.add(i, i, 1.0);
     }
 
     // (2,2) = +I (delta_s = 1.0).
     for k in 0..n_d {
-        ssm.triplet_rows.push(n + k);
-        ssm.triplet_cols.push(n + k);
-        ssm.triplet_vals.push(1.0);
-    }
-
-    // (3,3), (4,4) = 0 (delta_c = delta_d = 0). Explicit structural
-    // zeros so the sparse pattern is non-singular for the solver.
-    for off in 0..(n_c + n_d) {
-        ssm.triplet_rows.push(n + n_d + off);
-        ssm.triplet_cols.push(n + n_d + off);
-        ssm.triplet_vals.push(0.0);
+        ssm.add(n + k, n + k, 1.0);
     }
 
     // (1,3) J_c^T and (1,4) J_d^T off-diagonals.
     for (idx, (&row, &col)) in jac_rows.iter().zip(jac_cols.iter()).enumerate() {
         let val = jac_vals[idx];
         if let Some(rc) = c_pos[row] {
-            ssm.triplet_rows.push(col);
-            ssm.triplet_cols.push(n + n_d + rc);
-            ssm.triplet_vals.push(val);
+            ssm.add(col, n + n_d + rc, val);
         } else if let Some(rd) = d_pos[row] {
-            ssm.triplet_rows.push(col);
-            ssm.triplet_cols.push(n + n_d + n_c + rd);
-            ssm.triplet_vals.push(val);
+            ssm.add(col, n + n_d + n_c + rd, val);
         }
     }
 
     // (2,4) -I slack/y_d coupling.
     for k in 0..n_d {
-        ssm.triplet_rows.push(n + k);
-        ssm.triplet_cols.push(n + n_d + n_c + k);
-        ssm.triplet_vals.push(-1.0);
+        ssm.add(n + k, n + n_d + n_c + k, -1.0);
     }
 
     // RHS construction. Per `IpLeastSquareMults.cpp:53-66`:
@@ -11070,21 +11050,14 @@ fn build_ls_augmented_matrix(
 ) -> crate::linear_solver::SparseSymmetricMatrix {
     use crate::linear_solver::SparseSymmetricMatrix;
     let nnz_est = n + jac_rows.len() + m;
-    let mut ssm = SparseSymmetricMatrix {
-        n: n + m,
-        triplet_rows: Vec::with_capacity(nnz_est),
-        triplet_cols: Vec::with_capacity(nnz_est),
-        triplet_vals: Vec::with_capacity(nnz_est),
-    };
+    // with_capacity pre-populates diagonals with structural zeros; the
+    // top-block (+I) and bottom-block diagonal adds below sum into those.
+    let mut ssm = SparseSymmetricMatrix::with_capacity(n + m, nnz_est);
     for i in 0..n {
-        ssm.triplet_rows.push(i);
-        ssm.triplet_cols.push(i);
-        ssm.triplet_vals.push(1.0);
+        ssm.add(i, i, 1.0);
     }
     for (idx, (&row, &col)) in jac_rows.iter().zip(jac_cols.iter()).enumerate() {
-        ssm.triplet_rows.push(col);
-        ssm.triplet_cols.push(n + row);
-        ssm.triplet_vals.push(jac_vals[idx]);
+        ssm.add(col, n + row, jac_vals[idx]);
     }
     // Bottom-block diagonal:
     //   equality row  → -delta_c   (mirrors Ipopt's PDFullSpaceSolver
@@ -11096,13 +11069,11 @@ fn build_ls_augmented_matrix(
     //                                 lift to break null-space ties on
     //                                 rank-deficient `J_d`).
     for j in 0..m {
-        ssm.triplet_rows.push(n + j);
-        ssm.triplet_cols.push(n + j);
         let diag = match inequality_diag {
             Some(flags) if flags[j] => -1.0 - delta_d_extra,
             _ => -delta_c,
         };
-        ssm.triplet_vals.push(diag);
+        ssm.add(n + j, n + j, diag);
     }
     ssm
 }

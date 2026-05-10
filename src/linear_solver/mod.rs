@@ -310,18 +310,26 @@ impl SymmetricMatrix {
 
 /// Sparse symmetric matrix in COO (triplet) format.
 ///
-/// Entries are stored as (row, col, val) triplets in upper triangle (row <= col).
+/// Entries are stored as (row, col, val) triplets in **upper triangle**
+/// (row <= col). This invariant is enforced by `add` and the constructors;
+/// the triplet vectors are `pub(crate)` so external callers cannot violate it.
+///
+/// The invariant matters because consumers rely on it: `sparse.rs` hands the
+/// CSC to faer with `Side::Upper`, which silently drops any entry whose
+/// (row, col) lies in the strict lower triangle. Centralizing the
+/// normalization in `add` makes that failure mode unrepresentable.
+///
 /// Duplicate entries at the same (row, col) are summed during CSC conversion.
 #[derive(Debug, Clone)]
 pub struct SparseSymmetricMatrix {
     /// Dimension of the matrix.
     pub n: usize,
     /// Row indices (row <= col for upper triangle).
-    pub triplet_rows: Vec<usize>,
+    pub(in crate::linear_solver) triplet_rows: Vec<usize>,
     /// Column indices (col >= row for upper triangle).
-    pub triplet_cols: Vec<usize>,
+    pub(in crate::linear_solver) triplet_cols: Vec<usize>,
     /// Values.
-    pub triplet_vals: Vec<f64>,
+    pub(in crate::linear_solver) triplet_vals: Vec<f64>,
 }
 
 impl SparseSymmetricMatrix {
@@ -366,6 +374,7 @@ impl SparseSymmetricMatrix {
     /// pattern remains stable across iterations (required for cached
     /// symbolic factorization).
     pub fn add(&mut self, i: usize, j: usize, val: f64) {
+        debug_assert!(i < self.n && j < self.n, "SparseSymmetricMatrix::add: ({}, {}) out of range for n={}", i, j, self.n);
         // Store in upper triangle: row <= col
         if i <= j {
             self.triplet_rows.push(i);
