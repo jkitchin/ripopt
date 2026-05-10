@@ -1,5 +1,6 @@
 pub mod banded;
 pub mod dense;
+pub mod low_rank_kkt;
 #[cfg(feature = "rmumps")]
 pub mod multifrontal;
 #[cfg(feature = "rmumps")]
