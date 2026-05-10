@@ -76,7 +76,7 @@ command -v gfortran   &>/dev/null || MISSING_TOOLS+=("gfortran")
 
 if [[ ${#MISSING_TOOLS[@]} -gt 0 ]]; then
     echo "ERROR: Required tools not found: ${MISSING_TOOLS[*]}"
-    echo "  Install CUTEst toolchain: see install_cutest.sh"
+    echo "  Install CUTEst toolchain: https://github.com/ralna/CUTEst"
     echo "  Install gfortran: brew install gcc  (macOS) or apt install gfortran  (Linux)"
     exit 1
 fi

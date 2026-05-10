@@ -69,11 +69,6 @@ manuscript/*.blg
 # Archive of old docs
 archive/
 
-# Makefile (local build helper)
-Makefile
-
-# Install scripts
-install_cutest.sh
 
 # Python build artifacts
 *.egg-info/

@@ -32,8 +32,9 @@ mixed), with `problem_list_full.txt` covering all 1542 SIF problems.
 
 ## Prerequisites
 
-1. CUTEst toolchain installed to `~/.local/cutest/` (run
-   `bash install_cutest.sh` from the repo root, or `make cutest-install`)
+1. CUTEst toolchain installed to `~/.local/cutest/` (follow the upstream
+   instructions at <https://github.com/ralna/CUTEst>; `make cutest-install`
+   prints a summary)
 2. MASTSIF archive at `~/.local/cutest/mastsif/`
 3. gfortran (for compiling SIF problems)
 4. Source the environment before running: `source ~/.local/cutest/env.sh`
