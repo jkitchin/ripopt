@@ -1,6 +1,8 @@
 //! TRON (Trust-Region Newton method) for bound-constrained problems:
 //!
-//!     min f(x)  s.t.  l ≤ x ≤ u
+//! ```text
+//! min f(x)  s.t.  l ≤ x ≤ u
+//! ```
 //!
 //! Reference: Lin, C.-J. and Moré, J.J. "Newton's method for large
 //! bound-constrained optimization problems", SIAM J. Optim. 9(4):1100-1127, 1999.
