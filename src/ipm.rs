@@ -4406,6 +4406,11 @@ struct Watchdog {
     active: bool,
     trial_count: usize,
     saved: Option<WatchdogSavedState>,
+    /// Last observed `state.mu`; on change we reset the watchdog state
+    /// per `IpBacktrackingLineSearch.cpp:259-270`. Initialized to NaN
+    /// so the first iteration's compare-and-set is a harmless no-op
+    /// reset (active=false and counter=0 already).
+    last_mu: f64,
 }
 
 impl Watchdog {
@@ -4415,6 +4420,7 @@ impl Watchdog {
             active: false,
             trial_count: 0,
             saved: None,
+            last_mu: f64::NAN,
         }
     }
 
@@ -4435,10 +4441,17 @@ fn try_activate_watchdog(
     iteration: usize,
     filter: &Filter,
     wd: &mut Watchdog,
+    accepted_by_soft_resto: bool,
 ) {
     if wd.active
         || wd.consecutive_shortened < options.watchdog_shortened_iter_trigger
     {
+        return;
+    }
+    // Skip activation when the just-accepted step came from the soft
+    // restoration phase — Ipopt's `IpBacktrackingLineSearch.cpp:376-380`
+    // gate disables the watchdog whenever `in_soft_resto_phase_` is true.
+    if accepted_by_soft_resto {
         return;
     }
     state.diagnostics.watchdog_activations += 1;
@@ -4537,20 +4550,32 @@ fn update_watchdog<P: NlpProblem>(
     problem: &P,
     options: &SolverOptions,
     iteration: usize,
-    alpha_primal_max: f64,
+    ls_steps: usize,
+    accepted_by_soft_resto: bool,
     filter: &mut Filter,
     lbfgs_state: &mut Option<LbfgsIpmState>,
     wd: &mut Watchdog,
     linear_constraints: Option<&[bool]>,
     lbfgs_mode: bool,
 ) -> WatchdogDecision {
-    if state.alpha_primal < alpha_primal_max * 0.99 {
-        wd.consecutive_shortened += 1;
-    } else {
+    // mu-change reset (Ipopt `IpBacktrackingLineSearch.cpp:259-270`):
+    // a barrier-parameter update invalidates the watchdog state.
+    if !wd.last_mu.is_nan() && state.mu != wd.last_mu {
+        wd.deactivate();
         wd.consecutive_shortened = 0;
     }
+    wd.last_mu = state.mu;
 
-    try_activate_watchdog(state, options, iteration, filter, wd);
+    // Shortened-step counter — Ipopt's criterion is "first trial in the
+    // line search was rejected" (`n_steps != 0` at
+    // `IpBacktrackingLineSearch.cpp:644-655`), not an alpha comparison.
+    if ls_steps == 0 {
+        wd.consecutive_shortened = 0;
+    } else {
+        wd.consecutive_shortened += 1;
+    }
+
+    try_activate_watchdog(state, options, iteration, filter, wd, accepted_by_soft_resto);
 
     if let Some(decision) = process_watchdog_trial(
         state, problem, options, filter, lbfgs_state, wd,
@@ -7752,6 +7777,17 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
     for iteration in 0..options.max_iter {
         state.iter = iteration;
 
+        // Ipopt-aligned `mu_max_` capture: `IpAdaptiveMuUpdate.cpp:267-273`
+        // captures `mu_max_ = mu_max_fact * curr_avrg_compl()` exactly once,
+        // at the very first call to `UpdateBarrierParameter()`, before any
+        // oracle/path-specific decision. Anchoring it here at iter==0 guards
+        // against later paths capturing a stale (post-step) `avg_compl` and
+        // letting the QF oracle propose μ values that exceed the iter-0 cap.
+        if iteration == 0 && mu_state.initial_avg_compl.is_none() {
+            let avg_compl0 = compute_avg_complementarity(&state);
+            let _cap = mu_state.mu_max_cap(options, avg_compl0);
+        }
+
         // T0.14 (Ipopt 3.14 alignment): clear the once-per-outer-iter
         // pretend-singular flag at the top of each iteration so the
         // PD perturbation handler allows the trick exactly once per
@@ -8821,7 +8857,8 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             problem,
             options,
             iteration,
-            alpha_primal_max,
+            ls_steps,
+            accepted_by_soft_resto,
             &mut filter,
             &mut lbfgs_state,
             &mut watchdog,
