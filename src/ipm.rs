@@ -735,6 +735,14 @@ pub(crate) struct SolverState {
     pub hess_rows: Vec<usize>,
     pub hess_cols: Vec<usize>,
     pub hess_vals: Vec<f64>,
+    /// Cached L-BFGS compact form (`σI + V V^T - U U^T`) refreshed by
+    /// `update_lbfgs_hessian` whenever the L-BFGS state produces a usable
+    /// Cholesky factor (`Update_W:440-521` of Ipopt's
+    /// `IpLimMemQuasiNewtonUpdater.cpp`). `None` when the exact Hessian
+    /// path is active or when the L-BFGS update was skipped due to a
+    /// non-PD inner Cholesky. Issue #30 phase 2.5a — wired into the
+    /// `LowRankKktSolver` factor/solve path in a follow-up.
+    pub lbfgs_compact: Option<LbfgsCompact>,
     /// Consecutive acceptable iterations.
     pub consecutive_acceptable: usize,
     /// Objective scaling factor (for NLP scaling / result unscaling).
@@ -1737,6 +1745,7 @@ impl SolverState {
             hess_rows,
             hess_cols,
             hess_vals: vec![0.0; hess_nnz],
+            lbfgs_compact: None,
             consecutive_acceptable: 0,
             obj_scaling: 1.0,
             c_scaling: vec![1.0; layout.n_c],
@@ -4006,6 +4015,13 @@ fn update_lbfgs_hessian(
         );
         lbfgs.update(&state.x, &lag_grad);
         lbfgs.fill_hessian(&mut state.hess_vals);
+        // Issue #30 phase 2.5a: cache the compact form alongside the
+        // dense fill so a subsequent commit can opt into the
+        // `LowRankKktSolver` path without re-running the (S,Y) →
+        // (V,U,σ) construction. `compact()` returns `None` when Ipopt's
+        // BFGS skip-update condition fires (non-PD M = LL^T + σ S^T S),
+        // mirroring `IpLimMemQuasiNewtonUpdater.cpp:489-495`.
+        state.lbfgs_compact = lbfgs.compact();
     }
 }
 
@@ -12628,6 +12644,7 @@ mod tests {
             hess_rows: Vec::new(),
             hess_cols: Vec::new(),
             hess_vals: Vec::new(),
+            lbfgs_compact: None,
             consecutive_acceptable: 0,
             obj_scaling: 1.0,
             // Test-only constructor uses an all-inequality layout (no
@@ -15370,5 +15387,43 @@ mod tests {
         for i in 0..n {
             assert!((got[i] - expected[i]).abs() < 1e-12);
         }
+    }
+
+    /// Issue #30 phase 2.5a: `update_lbfgs_hessian` must populate
+    /// `state.lbfgs_compact` whenever a positive-definite compact form
+    /// exists, so a follow-up commit can route the augmented-system
+    /// solve through `LowRankKktSolver` without recomputing V/U.
+    #[test]
+    fn update_lbfgs_hessian_populates_compact_cache() {
+        let n = 4;
+        let mut state = minimal_state(n, 0);
+        // Hessian sparsity for L-BFGS is the dense lower triangle.
+        let (rows, cols) = dense_lower_triangle_pattern(n);
+        state.hess_rows = rows;
+        state.hess_cols = cols;
+        state.hess_vals = vec![0.0; state.hess_rows.len()];
+        state.x = vec![1.0, 2.0, 3.0, 4.0];
+        state.grad_f = vec![0.5, 1.0, 1.5, 2.0];
+
+        // Seed the L-BFGS state with a single (s, y) pair satisfying sᵀy > 0
+        // by feeding two distinct (x, grad_L) snapshots through `update`.
+        let mut lbfgs = Some(LbfgsIpmState::new(n));
+        update_lbfgs_hessian(&mut lbfgs, &mut state);
+        // Move x to generate a non-trivial s = x_new - x_old.
+        state.x = vec![1.5, 2.3, 2.7, 4.4];
+        state.grad_f = vec![0.8, 1.2, 1.4, 2.3];
+        update_lbfgs_hessian(&mut lbfgs, &mut state);
+
+        let compact = state
+            .lbfgs_compact
+            .as_ref()
+            .expect("compact cache must be populated after a successful update");
+        assert_eq!(compact.n, n);
+        assert!(
+            compact.k <= 1,
+            "with one (s,y) pair stored, compact.k should be ≤ 1, got {}",
+            compact.k
+        );
+        assert!(compact.sigma.is_finite() && compact.sigma > 0.0);
     }
 }
