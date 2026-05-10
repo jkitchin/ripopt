@@ -1492,31 +1492,25 @@ impl LbfgsIpmState {
         bk
     }
 
-    /// Fill the hess_vals buffer with the dense B_k matrix.
-    fn fill_hessian(&self, hess_vals: &mut [f64]) {
-        let bk = self.form_dense_bk();
-        hess_vals[..bk.len()].copy_from_slice(&bk);
-    }
 }
 
 /// Tagged Hessian representation carried on `SolverState`. Issue #30
 /// phase 1: the IPM no longer pretends the L-BFGS Hessian is "just a
 /// fat sparse triplet" — `LowRank` is a first-class variant that
-/// records (σ, V, U) in compact form. `Sparse` covers both the exact
-/// Hessian path and the L-BFGS path when `use_low_rank_kkt` is off
-/// (the dense lower-triangle fill stays in `hess_vals`). Mirrors
-/// Ipopt's `LowRankUpdateSymMatrix` vs ordinary `SymMatrix` dispatch
-/// in the augmented-system layer (`IpLowRankUpdateSymMatrix.hpp:20-30`).
+/// records (σ, V, U) in compact form. Mirrors Ipopt's
+/// `LowRankUpdateSymMatrix` vs ordinary `SymMatrix` dispatch in the
+/// augmented-system layer (`IpLowRankUpdateSymMatrix.hpp:20-30`).
 #[derive(Clone)]
 pub enum HessianKind {
     /// `hess_rows`/`hess_cols`/`hess_vals` carry a sparse triplet for
-    /// the full Hessian. Default for the exact-Hessian path and for
-    /// the L-BFGS path when the low-rank KKT wrapper is inactive.
+    /// the full Hessian. Used for the exact-Hessian path and as the
+    /// initial state before the first L-BFGS update primes the
+    /// compact form.
     Sparse,
     /// `hess_rows`/`hess_cols`/`hess_vals` carry σI on the (1,1)
     /// diagonal; the rank-2k correction `V Vᵀ - U Uᵀ` lives in the
     /// compact form and is consumed by `LowRankKktSolver` via
-    /// Sherman-Morrison-Woodbury.
+    /// Sherman-Morrison-Woodbury or the bordered/extended path.
     LowRank(LbfgsCompact),
 }
 
@@ -1590,20 +1584,6 @@ impl LbfgsCompact {
     }
 }
 
-/// Generate dense lower-triangle sparsity pattern for n variables.
-fn dense_lower_triangle_pattern(n: usize) -> (Vec<usize>, Vec<usize>) {
-    let nnz = n * (n + 1) / 2;
-    let mut rows = Vec::with_capacity(nnz);
-    let mut cols = Vec::with_capacity(nnz);
-    for i in 0..n {
-        for j in 0..=i {
-            rows.push(i);
-            cols.push(j);
-        }
-    }
-    (rows, cols)
-}
-
 impl SolverState {
     /// Initialize from an NLP problem.
     fn new<P: NlpProblem>(problem: &P, options: &SolverOptions) -> Self {
@@ -1661,8 +1641,16 @@ impl SolverState {
 
         let (jac_rows, jac_cols) = problem.jacobian_structure();
         let jac_nnz = jac_rows.len();
+        // Issue #30 task 4: L-BFGS Hessian sits as `σI + V Vᵀ - U Uᵀ` in
+        // the compact Byrd-Nocedal form. The σI piece lives on the
+        // diagonal of `hess_vals`; the rank-2k correction is consumed
+        // analytically by `LowRankKktSolver` via SMW or the bordered
+        // path. Allocating only n diagonal triplets (vs. n(n+1)/2 dense
+        // lower-triangle entries) matches Ipopt 3.14's
+        // `LowRankUpdateSymMatrix` representation
+        // (`IpLowRankUpdateSymMatrix.hpp:20-30`).
         let (hess_rows, hess_cols) = if options.hessian_approximation_lbfgs {
-            dense_lower_triangle_pattern(n)
+            ((0..n).collect::<Vec<_>>(), (0..n).collect::<Vec<_>>())
         } else {
             problem.hessian_structure()
         };
@@ -4048,19 +4036,22 @@ fn update_lbfgs_hessian(
             &state.y_c, &state.y_d, state.n,
         );
         lbfgs.update(&state.x, &lag_grad);
-        lbfgs.fill_hessian(&mut state.hess_vals);
-        // Issue #30 phase 1: tag the Hessian as `LowRank` when the
-        // compact form is available; otherwise leave it `Sparse` so
-        // the dense fill in `hess_vals` is consumed unchanged. The
-        // `LowRankKktSolver` wrapper later consults `state.hess_kind`
-        // to decide whether to apply the SMW correction.
-        // `compact()` returns `None` when Ipopt's BFGS skip-update
-        // condition fires (non-PD M = LL^T + σ S^T S), mirroring
-        // `IpLimMemQuasiNewtonUpdater.cpp:489-495`.
-        state.hess_kind = match lbfgs.compact() {
-            Some(c) => HessianKind::LowRank(c),
-            None => HessianKind::Sparse,
-        };
+        // Issue #30 task 4: write σ to the n diagonal entries of
+        // `hess_vals` (the L-BFGS sparsity is diagonal-only, see
+        // `SolverState::new`). The rank-2k correction lives in the
+        // compact form and is consumed by `LowRankKktSolver`. When
+        // Ipopt's BFGS skip-update condition fires (non-PD
+        // M = LL^T + σ S^T S, `IpLimMemQuasiNewtonUpdater.cpp:489-495`),
+        // `compact()` returns `None`; we then reuse the previous
+        // `hess_kind`/`hess_vals` so the augmented system sees the
+        // last accepted W, mirroring Ipopt's skip semantics.
+        if let Some(c) = lbfgs.compact() {
+            let sigma = c.sigma;
+            for v in state.hess_vals.iter_mut() {
+                *v = sigma;
+            }
+            state.hess_kind = HessianKind::LowRank(c);
+        }
     }
 }
 
@@ -6103,12 +6094,24 @@ fn compute_quality_function_mu(
     if kkt.input_atags.is_none() {
         kkt.input_atags = Some(state.kkt_atags);
     }
-    let mut solver = new_fallback_solver(use_sparse);
+    // Issue #30 task 4: when L-BFGS is on, `hess_vals` carries only
+    // σI on the diagonal — the QF oracle's local solver must apply
+    // the rank-2k V/U correction or it would solve W = σI alone and
+    // return a wrong-quality μ. Wrap the local solver in
+    // `LowRankKktSolver` and stage the current compact form.
+    let inner: Box<dyn LinearSolver> = new_fallback_solver(use_sparse);
+    let mut solver = crate::linear_solver::low_rank_kkt::LowRankKktSolver::with_mode(
+        inner, options.limited_memory_aug_solver,
+    );
+    if let Some(compact) = state.hess_kind.as_low_rank().cloned() {
+        let n_aug = n + state.layout.n_d + state.layout.n_c + state.layout.n_d;
+        solver.set_pending_lbfgs(compact, n_aug);
+    }
     let mut inertia_params = InertiaCorrectionParams::default();
     let mut local_cache = kkt::FactorCache::new();
     local_cache.enabled = factor_cache.enabled;
     let factor_result = kkt::factor_with_inertia_correction_cached(
-        &mut kkt, solver.as_mut(), &mut inertia_params, state.mu, &mut local_cache,
+        &mut kkt, &mut solver, &mut inertia_params, state.mu, &mut local_cache,
     );
     // Fold the local diagnostic counters into the shared cache so tests
     // can observe that the QF path exercised the cached entry point.
@@ -6127,7 +6130,7 @@ fn compute_quality_function_mu(
     // (allow_inexact=true, IpPDFullSpaceSolver.cpp:229-239).
     let rhs_aff = kkt::affine_predictor_rhs(&kkt);
     let pairs = kkt::solve_with_custom_rhs_many(
-        kkt.n, kkt.dim, solver.as_mut(), &[&rhs_aff, &kkt.rhs],
+        kkt.n, kkt.dim, &mut solver, &[&rhs_aff, &kkt.rhs],
     ).ok()?;
     let (dx_aff, dy_aff) = pairs[0].clone();
     let (dx_full, dy_full) = pairs[1].clone();
@@ -8211,8 +8214,15 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
     // factor/solve). When `options.use_low_rank_kkt` is set and L-BFGS
     // is active, we stage the compact form via `set_pending_lbfgs`
     // each iteration so the SM correction kicks in.
-    let low_rank_kkt_active =
-        options.use_low_rank_kkt || std::env::var("RIPOPT_LOW_RANK_KKT").is_ok();
+    // Issue #30 task 4: in L-BFGS mode `hess_vals` carries only σI on
+    // the diagonal — the rank-2k V/U correction must come from the
+    // wrapper, so the wrapper is mandatory whenever
+    // `hessian_approximation_lbfgs` is on. Mirrors Ipopt's
+    // unconditional `LowRankAugSystemSolver` wrap in
+    // `IpAlgBuilder.cpp:585-626`.
+    let low_rank_kkt_active = options.hessian_approximation_lbfgs
+        || options.use_low_rank_kkt
+        || std::env::var("RIPOPT_LOW_RANK_KKT").is_ok();
     let inner_solver: Box<dyn LinearSolver> = new_fallback_solver(use_sparse);
     // Phase 4: honor `options.limited_memory_aug_solver`. The mode is
     // baked into the wrapper at construction; staging via
@@ -8582,27 +8592,14 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
         // cache persists across iterations.
         //
         // Issue #30 phase 2.5c: stage the L-BFGS compact form on the
-        // wrapper before each factor cycle. When `low_rank_kkt_active`
-        // is on and `state.hess_kind` is `LowRank`, the wrapper
-        // assumes the (1,1) block holds σI (not the dense `B_k`); we
-        // substitute σ on the diagonal in place of the dense fill
-        // produced by `update_lbfgs_hessian`. When the staging is
-        // skipped (Sparse kind, or option off), the wrapper
-        // degenerates to passthrough and the existing dense fill is
-        // consumed unchanged.
+        // wrapper before each factor cycle. `hess_vals` already
+        // carries σI on the diagonal for the L-BFGS path (written by
+        // `update_lbfgs_hessian`); the wrapper layers the rank-2k
+        // `V Vᵀ - U Uᵀ` correction on top. When `hess_kind` is
+        // `Sparse` (exact-Hessian, or L-BFGS not yet primed), the
+        // wrapper degenerates to passthrough.
         if low_rank_kkt_active {
             if let Some(compact) = state.hess_kind.as_low_rank().cloned() {
-                let sigma = compact.sigma;
-                // Overwrite the dense lower-triangle hess_vals: σ on the
-                // diagonal (row == col), 0 elsewhere. The wrapper takes
-                // care of the V/U correction analytically.
-                for k in 0..state.hess_rows.len() {
-                    if state.hess_rows[k] == state.hess_cols[k] {
-                        state.hess_vals[k] = sigma;
-                    } else {
-                        state.hess_vals[k] = 0.0;
-                    }
-                }
                 let n_aug = n + state.layout.n_d + state.layout.n_c + state.layout.n_d;
                 aug_solver.set_pending_lbfgs(compact, n_aug);
             } else {
@@ -15486,11 +15483,10 @@ mod tests {
     fn update_lbfgs_hessian_populates_compact_cache() {
         let n = 4;
         let mut state = minimal_state(n, 0);
-        // Hessian sparsity for L-BFGS is the dense lower triangle.
-        let (rows, cols) = dense_lower_triangle_pattern(n);
-        state.hess_rows = rows;
-        state.hess_cols = cols;
-        state.hess_vals = vec![0.0; state.hess_rows.len()];
+        // Issue #30 task 4: L-BFGS sparsity is the σI diagonal only.
+        state.hess_rows = (0..n).collect();
+        state.hess_cols = (0..n).collect();
+        state.hess_vals = vec![0.0; n];
         state.x = vec![1.0, 2.0, 3.0, 4.0];
         state.grad_f = vec![0.5, 1.0, 1.5, 2.0];
 
