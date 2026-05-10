@@ -1,0 +1,8 @@
+{"problem":"ARWHEAD","n":500,"status":"Optimal","iters":12,"wall_secs":0.121273,"time_per_iter_secs":0.010106,"objective":0.000000e0}
+{"problem":"GENROSE","n":500,"status":"MaxIterations","iters":299,"wall_secs":2.726813,"time_per_iter_secs":0.009120,"objective":2.511226e2}
+{"problem":"ARWHEAD","n":1000,"status":"Optimal","iters":12,"wall_secs":0.545313,"time_per_iter_secs":0.045443,"objective":0.000000e0}
+{"problem":"GENROSE","n":1000,"status":"MaxIterations","iters":299,"wall_secs":13.976657,"time_per_iter_secs":0.046745,"objective":4.964342e2}
+{"problem":"ARWHEAD","n":2000,"status":"Acceptable","iters":20,"wall_secs":5.333606,"time_per_iter_secs":0.266680,"objective":0.000000e0}
+{"problem":"GENROSE","n":2000,"status":"MaxIterations","iters":299,"wall_secs":79.949857,"time_per_iter_secs":0.267391,"objective":9.839187e2}
+{"problem":"ARWHEAD","n":5000,"status":"Optimal","iters":13,"wall_secs":38.140290,"time_per_iter_secs":2.933868,"objective":0.000000e0}
+{"problem":"GENROSE","n":5000,"status":"MaxIterations","iters":299,"wall_secs":959.158205,"time_per_iter_secs":3.207887,"objective":2.439243e3}

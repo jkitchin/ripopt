@@ -68,6 +68,10 @@ name = "collect_kkt"
 path = "benchmarks/cutest/collect_kkt.rs"
 required-features = ["cutest"]
 
+[[bin]]
+name = "lbfgs_scaling"
+path = "benchmarks/lbfgs_scaling/run.rs"
+
 [[example]]
 name = "bc_audit"
 required-features = ["cutest"]
