@@ -9,8 +9,13 @@ fn main() {
             .output()
             .expect("pkg-config not found; install ipopt via homebrew");
         let lib_path = String::from_utf8(output.stdout).unwrap();
-        let lib_path = lib_path.trim().trim_start_matches("-L");
-        println!("cargo:rustc-link-search=native={}", lib_path);
+        let lib_path = lib_path.trim().trim_start_matches("-L").trim();
+        // pkg-config returns no -L when Ipopt lives in a system path
+        // (e.g. /usr/lib64 on Fedora). rustc 1.95+ rejects an empty -L,
+        // so only emit a link-search line when we actually have a path.
+        if !lib_path.is_empty() {
+            println!("cargo:rustc-link-search=native={}", lib_path);
+        }
         println!("cargo:rustc-link-lib=dylib=ipopt");
 
         let output = Command::new("pkg-config")
@@ -101,19 +106,30 @@ fn main() {
             );
         }
 
-        // Link gfortran runtime
+        // Link gfortran runtime. Use the platform-correct shared-library
+        // extension; gfortran's -print-file-name returns the input verbatim
+        // when the file isn't found, so a wrong extension yields a relative
+        // string whose parent is empty -- which rustc 1.95+ rejects as an
+        // empty -L. Skip emitting a link-search if we can't resolve a path.
+        let gfortran_libname = if cfg!(target_os = "macos") {
+            "libgfortran.dylib"
+        } else {
+            "libgfortran.so"
+        };
         let output = Command::new("gfortran")
-            .arg("-print-file-name=libgfortran.dylib")
+            .arg(format!("-print-file-name={}", gfortran_libname))
             .output()
             .expect("gfortran not found");
         let gfortran_path = String::from_utf8(output.stdout).unwrap();
-        let gfortran_dir = Path::new(gfortran_path.trim())
+        let gfortran_path = gfortran_path.trim();
+        let gfortran_dir = Path::new(gfortran_path)
             .parent()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-        println!("cargo:rustc-link-search=native={}", gfortran_dir);
+            .and_then(|p| p.to_str())
+            .map(str::to_string)
+            .unwrap_or_default();
+        if !gfortran_dir.is_empty() {
+            println!("cargo:rustc-link-search=native={}", gfortran_dir);
+        }
         println!("cargo:rustc-link-lib=dylib=gfortran");
 
         println!("cargo:rerun-if-changed={}", trampoline_src);
