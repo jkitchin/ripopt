@@ -1159,8 +1159,13 @@ pub struct LbfgsIpmState {
     prev_lag_grad: Vec<f64>,
     /// Whether we have a previous iterate (skip update on first call).
     has_prev: bool,
-    /// Initial Hessian scaling factor gamma (H0 = gamma * I).
+    /// Initial Hessian scaling factor gamma (H0 = gamma * I, so B0 = (1/gamma) I).
     gamma: f64,
+    /// Consecutive update skips (Ipopt `lm_skipped_iter_`,
+    /// `IpLimMemQuasiNewtonUpdater.cpp:690`). After
+    /// `limited_memory_max_skipping` (=2) consecutive skips, the entire
+    /// approximation is reset to B = I (`IpLimMemQuasiNewtonUpdater.cpp:226-270`).
+    skipped_count: usize,
 }
 
 impl LbfgsIpmState {
@@ -1176,6 +1181,7 @@ impl LbfgsIpmState {
             prev_lag_grad: vec![0.0; n],
             has_prev: false,
             gamma: 1.0,
+            skipped_count: 0,
         }
     }
 
@@ -1206,8 +1212,26 @@ impl LbfgsIpmState {
         lag_grad
     }
 
-    /// Update L-BFGS pairs after a step has been accepted.
-    /// Uses Powell damping to ensure positive curvature (s^T y > 0).
+    /// Update L-BFGS pairs after a step has been accepted, matching
+    /// Ipopt 3.14's `IpLimMemQuasiNewtonUpdater::UpdateHessian`
+    /// (`IpLimMemQuasiNewtonUpdater.cpp:344-693`).
+    ///
+    /// **Skip rule** (`CheckSkippingBFGS`, lines 985-1010): if
+    /// `s^T y <= sqrt(eps_machine) * ||s|| * ||y||`, skip the pair and
+    /// keep the prior B unchanged. After `limited_memory_max_skipping=2`
+    /// consecutive skips, reset the approximation to `B = limited_memory_init_val · I`
+    /// (default 1.0, lines 220-270).
+    ///
+    /// **σ scaling** (`limited_memory_initialization=scalar1`, default,
+    /// lines 402-431): on accepted pair, `σ = s^T y / s^T s`, clamped to
+    /// `[limited_memory_init_val_min, limited_memory_init_val_max]`
+    /// `= [1e-8, 1e8]`. ripopt stores `gamma = 1/σ`, so the diagonal
+    /// scaling `B_0 v = (1/gamma) v` follows.
+    ///
+    /// Ipopt does **not** apply Powell damping anywhere in this updater
+    /// — the prior ripopt implementation incorrectly used Powell damping,
+    /// which on negative-curvature pairs collapsed σ to ~1e7 (B ≈ 6e4 I)
+    /// and produced unusable Newton directions on GasLib-11 L-BFGS.
     pub fn update(
         &mut self,
         new_x: &[f64],
@@ -1229,48 +1253,64 @@ impl LbfgsIpmState {
         }
 
         let ss: f64 = s_k.iter().map(|v| v * v).sum();
-        if ss < 1e-30 {
-            // Step too small, skip update
-            self.prev_x.copy_from_slice(new_x);
-            self.prev_lag_grad.copy_from_slice(new_lag_grad);
-            return;
-        }
-
-        let sy: f64 = dot_product(&s_k, &y_k);
-
-        // Compute B_k * s_k for Powell damping
-        let bs = self.multiply_bk(&s_k);
-        let sbs: f64 = dot_product(&s_k, &bs);
-
-        // Powell damping: ensure s^T y >= 0.2 * s^T B s
-        if sy >= 0.2 * sbs {
-            // Use y_k as-is
-        } else {
-            let theta = if (sbs - sy).abs() < 1e-30 {
-                1.0
-            } else {
-                0.8 * sbs / (sbs - sy)
-            };
-            for i in 0..n {
-                y_k[i] = theta * y_k[i] + (1.0 - theta) * bs[i];
-            }
-        }
-
-        // Verify positive curvature after damping
-        let sy_damped: f64 = dot_product(&s_k, &y_k);
-        if sy_damped <= 1e-20 {
-            self.prev_x.copy_from_slice(new_x);
-            self.prev_lag_grad.copy_from_slice(new_lag_grad);
-            return;
-        }
-
-        // Update gamma = s^T y / y^T y
         let yy: f64 = y_k.iter().map(|v| v * v).sum();
-        if yy > 1e-30 {
-            self.gamma = sy_damped / yy;
+        let sy: f64 = dot_product(&s_k, &y_k);
+        let s_norm = ss.sqrt();
+        let y_norm = yy.sqrt();
+
+        let trace_lbfgs = std::env::var("RIPOPT_TRACE_LBFGS").is_ok();
+        let gamma_pre = self.gamma;
+
+        // Ipopt `IpLimMemQuasiNewtonUpdater.cpp:995,1005`:
+        //   tol = sqrt(eps_machine) ≈ 1.49e-8
+        //   skipping = (sTy <= tol * ||s|| * ||y||)
+        let skip_tol = f64::EPSILON.sqrt();
+        let skip = ss < 1e-30 || yy < 1e-30 || sy <= skip_tol * s_norm * y_norm;
+
+        if skip {
+            self.skipped_count += 1;
+            // After `limited_memory_max_skipping`=2 consecutive skips,
+            // reset entire approximation (`IpLimMemQuasiNewtonUpdater.cpp:220-270`).
+            let max_skipping = 2usize;
+            if self.skipped_count >= max_skipping {
+                self.s_store.clear();
+                self.y_store.clear();
+                self.gamma = 1.0;
+                if trace_lbfgs {
+                    eprintln!(
+                        "ripopt-lbfgs: skip+reset (count={}) |s|={:.3e} |y|={:.3e} sy={:.3e} tol*|s||y|={:.3e}",
+                        self.skipped_count, s_norm, y_norm, sy, skip_tol * s_norm * y_norm,
+                    );
+                }
+            } else if trace_lbfgs {
+                eprintln!(
+                    "ripopt-lbfgs: skip (count={}) |s|={:.3e} |y|={:.3e} sy={:.3e} tol*|s||y|={:.3e}",
+                    self.skipped_count, s_norm, y_norm, sy, skip_tol * s_norm * y_norm,
+                );
+            }
+            self.prev_x.copy_from_slice(new_x);
+            self.prev_lag_grad.copy_from_slice(new_lag_grad);
+            return;
         }
 
-        // Store pair
+        self.skipped_count = 0;
+
+        // Ipopt default `limited_memory_initialization=scalar1`:
+        //   σ = s^T y / s^T s, clamped to [1e-8, 1e8]
+        //   (`IpLimMemQuasiNewtonUpdater.cpp:402-431,68-76`).
+        // ripopt's `gamma` is H_0 scaling (B_0 v = (1/gamma) v), so
+        //   gamma = 1/σ = ss/sy.
+        let sigma = (sy / ss).clamp(1e-8, 1e8);
+        self.gamma = 1.0 / sigma;
+
+        if trace_lbfgs {
+            eprintln!(
+                "ripopt-lbfgs: accept |s|={:.3e} |y|={:.3e} sy={:.3e} ss={:.3e} sigma={:.3e} gamma {:.3e}->{:.3e} k={}",
+                s_norm, y_norm, sy, ss, sigma, gamma_pre, self.gamma, self.s_store.len() + 1,
+            );
+        }
+
+        // Store pair (FIFO, capped at m_max).
         if self.s_store.len() == self.m_max {
             self.s_store.remove(0);
             self.y_store.remove(0);
@@ -10838,6 +10878,16 @@ fn compute_initial_y_with_ls<P: NlpProblem>(
         &grad_f_init, jac_rows, jac_cols, &jac_vals_init,
         z_l, z_u, g_l, g_u, options.bound_mult_init_val, n, m,
     );
+    if std::env::var("RIPOPT_TRACE_LS_Y_INIT").is_ok() {
+        match &y_aug {
+            Some(y) => eprintln!(
+                "ripopt: LS-y init succeeded, |y|_inf={:.3e}, cap={:.3e}, accepted={}",
+                linf_norm(y), options.constr_mult_init_max,
+                linf_norm(y) <= options.constr_mult_init_max
+            ),
+            None => eprintln!("ripopt: LS-y init solve FAILED -> y=0"),
+        }
+    }
     match y_aug {
         Some(y) if linf_norm(&y) <= options.constr_mult_init_max => y,
         _ => vec![0.0; m],
