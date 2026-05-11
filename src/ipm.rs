@@ -6144,8 +6144,11 @@ fn compute_quality_function_mu(
         inner, options.limited_memory_aug_solver,
     );
     if let Some(compact) = state.hess_kind.as_low_rank().cloned() {
-        let n_aug = n + state.layout.n_d + state.layout.n_c + state.layout.n_d;
-        solver.set_pending_lbfgs(compact, n_aug);
+        // QF oracle uses the 2-block eliminated KKT (dim = n + m), not the
+        // 4-block augmented system the main loop uses. LowRankKktSolver is
+        // layout-agnostic — V/U are zero-padded above row n — so pass the
+        // base KKT dim regardless of which assembly produced it.
+        solver.set_pending_lbfgs(compact, kkt.dim);
     }
     let mut inertia_params = InertiaCorrectionParams::default();
     let mut local_cache = kkt::FactorCache::new();
