@@ -26,7 +26,7 @@ help:
 	@echo "  test-c           Build shared library and run C API examples"
 	@echo ""
 	@echo "CUTEst Benchmarks:"
-	@echo "  cutest-install   Print upstream CUTEst install instructions"
+	@echo "  cutest-install   Install CUTEst toolchain into \$$CUTEST_ROOT (~/.local/cutest)"
 	@echo "  cutest           Full pipeline: prepare, run, report"
 	@echo "  cutest-prepare   Compile SIF problems -> .dylib (reads problem_list.txt)"
 	@echo "  cutest-run       Run benchmark on all prepared problems (results.json)"
@@ -121,18 +121,9 @@ test-c:
 	target/release/c_example_with_options
 	@echo "=== All C API examples passed ==="
 
-# CUTEst toolchain install (manual — see benchmarks/cutest/README.md)
+# CUTEst toolchain install (SIFDecode + CUTEst + MASTSIF -> $CUTEST_ROOT)
 cutest-install:
-	@echo "ripopt does not vendor a CUTEst installer."
-	@echo ""
-	@echo "Install the upstream CUTEst toolchain into ~/.local/cutest/ following the"
-	@echo "instructions at https://github.com/ralna/CUTEst (ARCHDefs + SIFDecode +"
-	@echo "CUTEst), then clone MASTSIF:"
-	@echo "  git clone https://github.com/ralna/mastsif ~/.local/cutest/mastsif"
-	@echo ""
-	@echo "After install, source the env file and run 'make cutest-prepare':"
-	@echo "  source ~/.local/cutest/env.sh"
-	@echo "  make cutest-prepare"
+	bash benchmarks/cutest/setup_cutest.sh
 
 # Backward-compatibility shims — real targets live in benchmarks/Makefile.
 cutest-prepare cutest-run cutest-full cutest-report cutest-smoke cutest-large cutest-maxiter cutest:

@@ -46,10 +46,10 @@ help:
 
 # ---- CUTEst ----
 cutest-prepare:
-	source ~/.local/cutest/env.sh && bash $(REPO_ROOT)/benchmarks/cutest/prepare.sh
+	bash $(REPO_ROOT)/benchmarks/cutest/prepare.sh
 
 cutest-prepare-full:
-	source ~/.local/cutest/env.sh && bash $(REPO_ROOT)/benchmarks/cutest/prepare.sh \
+	bash $(REPO_ROOT)/benchmarks/cutest/prepare.sh \
 		--from-file $(REPO_ROOT)/benchmarks/cutest/problem_list_full.txt
 
 cutest-run:

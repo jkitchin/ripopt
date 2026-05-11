@@ -7,10 +7,13 @@
 #   bash prepare.sh --from-file mylist.txt   # from a custom file
 #
 # Prerequisites:
-#   1. CUTEst toolchain installed (~/.local/cutest/install/bin/sifdecoder, gfortran)
-#   2. MASTSIF: the full SIF problem library (~/.local/cutest/mastsif/)
-#      Install with: git clone https://github.com/ralna/mastsif ~/.local/cutest/mastsif
-#   3. Source the environment: source ~/.local/cutest/env.sh
+#   1. CUTEst toolchain installed at $CUTEST_ROOT/install/{bin,lib}
+#      (default $CUTEST_ROOT = ~/.local/cutest). If missing, run
+#      benchmarks/cutest/setup_cutest.sh first.
+#   2. MASTSIF: the full SIF problem library. If missing, this script
+#      will auto-clone https://bitbucket.org/optrove/sif.git into
+#      $CUTEST_ROOT/mastsif.
+#   3. gfortran on PATH (brew install gcc / apt install gfortran).
 #
 # On Linux:  produces lib<NAME>.so
 # On macOS:  produces lib<NAME>.dylib
@@ -27,20 +30,38 @@ case "$(uname -s)" in
 esac
 
 # ---------------------------------------------------------------------------
-# Source CUTEst environment
+# Set up CUTEst environment from $CUTEST_ROOT (default ~/.local/cutest).
+# No external env.sh required, but source it if present for back-compat.
 # ---------------------------------------------------------------------------
-if [[ -f ~/.local/cutest/env.sh ]]; then
-    source ~/.local/cutest/env.sh 2>/dev/null || true
+export CUTEST_ROOT="${CUTEST_ROOT:-${HOME}/.local/cutest}"
+
+if [[ -f "${CUTEST_ROOT}/env.sh" ]]; then
+    source "${CUTEST_ROOT}/env.sh" 2>/dev/null || true
 fi
+
+# Probe the standard install layout and prepend to PATH / dyld paths.
+CUTEST_INSTALL="${CUTEST_ROOT}/install"
+if [[ -d "${CUTEST_INSTALL}/bin" ]]; then
+    export PATH="${CUTEST_INSTALL}/bin:${PATH}"
+fi
+if [[ -d "${CUTEST_INSTALL}/lib" ]]; then
+    export LD_LIBRARY_PATH="${CUTEST_INSTALL}/lib:${LD_LIBRARY_PATH:-}"
+    export DYLD_LIBRARY_PATH="${CUTEST_INSTALL}/lib:${DYLD_LIBRARY_PATH:-}"
+fi
+export CUTEST="${CUTEST:-${CUTEST_INSTALL}}"
+export SIFDECODE="${SIFDECODE:-${CUTEST_INSTALL}}"
 
 # ---------------------------------------------------------------------------
 # Auto-detect MASTSIF if not set or empty
 # ---------------------------------------------------------------------------
+MASTSIF_REPO="https://bitbucket.org/optrove/sif.git"
+DEFAULT_MASTSIF="${CUTEST_ROOT}/mastsif"
+
 if [[ -z "${MASTSIF:-}" ]] || ! ls "${MASTSIF}"/*.SIF &>/dev/null 2>&1; then
     for candidate in \
-        "${HOME}/.local/cutest/mastsif" \
-        "${HOME}/.local/cutest/sifdecode/sif" \
-        "${HOME}/.local/cutest/cutest/sif" \
+        "$DEFAULT_MASTSIF" \
+        "${CUTEST_ROOT}/sifdecode/sif" \
+        "${CUTEST_ROOT}/cutest/sif" \
         "/usr/share/cutest/sif" \
         "/opt/cutest/mastsif"
     do
@@ -55,14 +76,29 @@ if [[ -z "${MASTSIF:-}" ]] || ! ls "${MASTSIF}"/*.SIF &>/dev/null 2>&1; then
     done
 fi
 
+# Auto-clone MASTSIF if still not found
+if [[ -z "${MASTSIF:-}" ]] || ! ls "${MASTSIF}"/*.SIF &>/dev/null 2>&1; then
+    if command -v git &>/dev/null; then
+        echo "MASTSIF not found — cloning ${MASTSIF_REPO} into ${DEFAULT_MASTSIF} ..."
+        mkdir -p "$(dirname "$DEFAULT_MASTSIF")"
+        if git clone --depth 1 "$MASTSIF_REPO" "$DEFAULT_MASTSIF"; then
+            export MASTSIF="$DEFAULT_MASTSIF"
+        else
+            echo "ERROR: failed to clone MASTSIF from ${MASTSIF_REPO}"
+        fi
+    else
+        echo "ERROR: git not found; cannot auto-clone MASTSIF"
+    fi
+fi
+
 # Report MASTSIF status
 if [[ -n "${MASTSIF:-}" ]] && ls "${MASTSIF}"/*.SIF &>/dev/null 2>&1; then
     SIF_COUNT=$(ls "${MASTSIF}"/*.SIF 2>/dev/null | wc -l | tr -d ' ')
     echo "MASTSIF: $MASTSIF ($SIF_COUNT SIF files)"
 else
     echo "WARNING: MASTSIF not found or empty."
-    echo "  To install the full SIF library:"
-    echo "    git clone https://github.com/ralna/mastsif ~/.local/cutest/mastsif"
+    echo "  To install the full SIF library manually:"
+    echo "    git clone ${MASTSIF_REPO} ${DEFAULT_MASTSIF}"
     echo "  Problems without a SIF file will be skipped."
     MASTSIF=""
 fi
@@ -76,8 +112,14 @@ command -v gfortran   &>/dev/null || MISSING_TOOLS+=("gfortran")
 
 if [[ ${#MISSING_TOOLS[@]} -gt 0 ]]; then
     echo "ERROR: Required tools not found: ${MISSING_TOOLS[*]}"
-    echo "  Install CUTEst toolchain: https://github.com/ralna/CUTEst"
-    echo "  Install gfortran: brew install gcc  (macOS) or apt install gfortran  (Linux)"
+    echo ""
+    echo "  To install the full CUTEst toolchain (SIFDecode + CUTEst + MASTSIF):"
+    echo "    bash ${SCRIPT_DIR}/setup_cutest.sh"
+    echo "  This installs into \$CUTEST_ROOT (default ~/.local/cutest)."
+    echo ""
+    echo "  For gfortran:"
+    echo "    macOS:  brew install gcc"
+    echo "    Linux:  apt install gfortran"
     exit 1
 fi
 
@@ -187,5 +229,5 @@ echo "Done: $SUCCESS prepared, $FAIL failed, $SKIP skipped"
 if [[ $SKIP -gt 0 && -z "${MASTSIF:-}" ]]; then
     echo ""
     echo "To prepare all problems, install MASTSIF:"
-    echo "  git clone https://github.com/ralna/mastsif ~/.local/cutest/mastsif"
+    echo "  git clone ${MASTSIF_REPO} ${DEFAULT_MASTSIF}"
 fi

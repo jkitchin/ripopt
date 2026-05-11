@@ -32,12 +32,18 @@ mixed), with `problem_list_full.txt` covering all 1542 SIF problems.
 
 ## Prerequisites
 
-1. CUTEst toolchain installed to `~/.local/cutest/` (follow the upstream
-   instructions at <https://github.com/ralna/CUTEst>; `make cutest-install`
-   prints a summary)
-2. MASTSIF archive at `~/.local/cutest/mastsif/`
-3. gfortran (for compiling SIF problems)
-4. Source the environment before running: `source ~/.local/cutest/env.sh`
+1. CUTEst toolchain installed to `$CUTEST_ROOT/install/` (default
+   `$CUTEST_ROOT = ~/.local/cutest`). Run `make cutest-install` (which
+   invokes `benchmarks/cutest/setup_cutest.sh`) to install SIFDecode +
+   CUTEst + MASTSIF via meson.
+2. gfortran (for compiling SIF problems): `brew install gcc` (macOS) or
+   `apt install gfortran` (Linux).
+3. meson + ninja (for the install step): `pip install meson ninja` or
+   `brew install meson ninja`.
+
+`prepare.sh` and `build.rs` read `$CUTEST_ROOT` directly, so no env file
+needs to be sourced. To install to a non-default location:
+`CUTEST_ROOT=/path/to/cutest make cutest-install cutest-prepare`.
 
 ## How to run
 

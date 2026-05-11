@@ -25,7 +25,9 @@ fn main() {
     // Link CUTEst when the cutest feature is enabled
     if std::env::var("CARGO_FEATURE_CUTEST").is_ok() {
         let home = std::env::var("HOME").unwrap();
-        let cutest_dir = format!("{}/.local/cutest", home);
+        let cutest_dir = std::env::var("CUTEST_ROOT")
+            .unwrap_or_else(|_| format!("{}/.local/cutest", home));
+        println!("cargo:rerun-if-env-changed=CUTEST_ROOT");
         let cutest_lib = format!("{}/install/lib", cutest_dir);
         let cutest_include = format!("{}/install/include", cutest_dir);
         let cutest_modules = format!("{}/install/modules", cutest_dir);
@@ -91,7 +93,10 @@ fn main() {
             println!("cargo:rustc-link-lib=static=cutest_trampoline");
         } else {
             panic!(
-                "CUTEst trampoline not found at {}. Install CUTEst first.",
+                "CUTEst trampoline not found at {}.\n\
+                 Install the CUTEst toolchain with:\n  \
+                 bash benchmarks/cutest/setup_cutest.sh\n\
+                 (override location with CUTEST_ROOT=/path/to/cutest).",
                 trampoline_src
             );
         }
