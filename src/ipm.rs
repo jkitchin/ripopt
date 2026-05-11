@@ -6165,51 +6165,32 @@ fn compute_quality_function_mu(
         return None;
     }
 
-    // 2+3) Affine-predictor and full-step solves submitted as one batched
+    // 2+3) Affine-predictor and centering solves submitted as one batched
     // call. Both RHSes are known up front and use the same factor, so feral's
     // `solve_sparse_many` (F1.1) shares workspace and supernode traversal
-    // across columns; the default trait impl loops single-RHS solves and
-    // matches the prior behavior. T3.26: mu oracles use inexact backsolves
+    // across columns. T3.26: mu oracles use inexact backsolves
     // (allow_inexact=true, IpPDFullSpaceSolver.cpp:229-239).
+    //
+    // Literal port of Ipopt `IpQualityFunctionMuOracle.cpp:228-244`:
+    // step_cen is the solution of a separate KKT system whose RHS, after
+    // PD elimination of the bound-multiplier blocks, is `avg_compl · w_cen`
+    // where w_cen carries:
+    //   n-block : 1/s_l − 1/s_u ± κ_d·sign       (variable bounds)
+    //   d-block : Σ_s^{-1} · (1/s_l − 1/s_u)     (inequality slacks)
+    // `assemble_kkt` records `state.mu · w_cen` in `kkt.mu_centering_rhs`,
+    // so the centering RHS is `(avg_compl / state.mu) · mu_centering_rhs`.
     let rhs_aff = kkt::affine_predictor_rhs(&kkt);
+    let cen_scale = avg_compl / state.mu;
+    let rhs_cen: Vec<f64> = kkt
+        .mu_centering_rhs
+        .iter()
+        .map(|v| cen_scale * v)
+        .collect();
     let pairs = kkt::solve_with_custom_rhs_many(
-        kkt.n, kkt.dim, &mut solver, &[&rhs_aff, &kkt.rhs],
+        kkt.n, kkt.dim, &mut solver, &[&rhs_aff, &rhs_cen],
     ).ok()?;
     let (dx_aff, dy_aff) = pairs[0].clone();
-    let (dx_full, dy_full) = pairs[1].clone();
-
-    // Centering step `step_cen` (mirrors Ipopt's `step_cen` from
-    // `IpQualityFunctionMuOracle.cpp:228-244`, which solves a separate
-    // KKT system whose RHS has zero (∇L, c, d-s) blocks and `avrg_compl`
-    // in the (z_L, z_U, v_L, v_U) blocks).
-    //
-    // Derivation: `assemble_kkt` builds `kkt.rhs` at `μ=state.mu` and
-    // simultaneously records the μ-centering portion in
-    // `kkt.mu_centering_rhs`. `affine_predictor_rhs` subtracts that
-    // vector exactly, so:
-    //   kkt.rhs - rhs_aff = mu_centering_rhs = state.mu · w_cen
-    // where w_cen carries:
-    //   n-block  : 1/s_l − 1/s_u ± κ_d·sign     (variable bounds)
-    //   d-block  : Σ_s^{-1} · (1/s_l − 1/s_u)   (inequality slacks)
-    // Ipopt's centering RHS (`IpQualityFunctionMuOracle.cpp:228-244`)
-    // after PD elimination of the bound multiplier blocks is
-    // `avg_compl · w_cen`. Both the n- and d-block centering terms are
-    // linear in μ when the κ_σ multiplier safeguard does not bind, so:
-    //   K · (dx_full − dx_aff) = state.mu · w_cen
-    //   K · dx_cen             = avg_compl · w_cen
-    //   ⟹ dx_cen = (avg_compl / state.mu) · (dx_full − dx_aff)
-    // (and similarly for dy_cen). This avoids a third linear solve.
-    let cen_scale = avg_compl / state.mu;
-    let dx_cen: Vec<f64> = dx_aff
-        .iter()
-        .zip(dx_full.iter())
-        .map(|(a, f)| cen_scale * (f - a))
-        .collect();
-    let dy_cen: Vec<f64> = dy_aff
-        .iter()
-        .zip(dy_full.iter())
-        .map(|(a, f)| cen_scale * (f - a))
-        .collect();
+    let (dx_cen, dy_cen) = pairs[1].clone();
 
     // 4) Pre-compute current-iterate residual 2-norms (squared) and the
     //    counts (n_dual, n_pri, n_comp) for `NM_NORM_2_SQUARED` Q.
