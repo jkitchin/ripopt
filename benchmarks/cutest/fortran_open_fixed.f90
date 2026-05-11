@@ -25,7 +25,7 @@ subroutine fortran_open_fixed(funit, fname, ierr) bind(c, name='fortran_open_fix
   open(unit=funit, file=trim(fpath), status='old', form='formatted', iostat=ierr)
 end subroutine fortran_open_fixed
 
-subroutine fortran_close(funit, ierr) bind(c, name='fortran_close_')
+subroutine fortran_close(funit, ierr) bind(c, name='fortran_close_fixed_')
   use iso_c_binding, only: c_int
   implicit none
   integer(c_int), intent(in)  :: funit

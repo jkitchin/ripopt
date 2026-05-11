@@ -21,7 +21,7 @@ extern "C" {
     #[link_name = "fortran_open_fixed_"]
     pub fn fortran_open(funit: *const i32, fname: *const c_char, ierr: *mut i32);
 
-    #[link_name = "fortran_close_"]
+    #[link_name = "fortran_close_fixed_"]
     pub fn fortran_close(funit: *const i32, ierr: *mut i32);
 
     // ---- Dimensions ----
