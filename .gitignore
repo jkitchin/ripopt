@@ -30,7 +30,6 @@ benchmarks/cutest/results_full.txt
 benchmarks/cutest/subset_test_results.txt
 benchmarks/cutest/test_failures.sh
 benchmarks/cutest/test_subset.txt
-benchmarks/cutest/fortran_open_fixed.f90
 
 # Per-suite JSONL streams from benchmarks (stream output, not artifacts)
 benchmarks/cho/cho_results.jsonl
