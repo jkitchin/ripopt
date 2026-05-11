@@ -11173,12 +11173,22 @@ fn compute_ls_multiplier_estimate_augmented(
             .collect()
     });
 
-    // RHS: [grad_f − z_L + z_U; (v_L − v_U) per inequality row, else 0]
+    // RHS per `IpLeastSquareMults.cpp:53-66` (Ipopt's MultVector(α,x,β,y) →
+    // y := α·M·x + β·y semantics with `rhs_x->Copy(grad_f)` then
+    // `Px_L->MultVector(1.,z_L,-1.,rhs_x)` and `Px_U->MultVector(-1.,z_U,1.,rhs_x)`):
+    //   rhs_x = -grad_f + z_L - z_U
+    //   rhs_s = +v_L - v_U  (inequality rows only)
+    // This sign convention pairs with Ipopt's stationarity
+    // `grad_f + J^T y - z_L + z_U = 0` (`L = f + y^T g`), the same convention
+    // ripopt uses for `grad_lag` (ipm.rs:11387 `accumulate_jt_y`) and for
+    // `dual_infeasibility` (convergence.rs:307-318). Earlier ripopt versions
+    // had `rhs_x = +grad_f - z_L + z_U` here, which inverts the LS y sign
+    // and inflates the post-recalc dual residual to `2·|grad_f - z_L + z_U|`.
     let mut rhs = vec![0.0_f64; n + m];
     for i in 0..n {
-        rhs[i] = grad_f[i];
-        if let Some(zl) = z_l { rhs[i] -= zl[i]; }
-        if let Some(zu) = z_u { rhs[i] += zu[i]; }
+        rhs[i] = -grad_f[i];
+        if let Some(zl) = z_l { rhs[i] += zl[i]; }
+        if let Some(zu) = z_u { rhs[i] -= zu[i]; }
     }
     if let (Some((v_l, v_u)), Some(flags)) = (slack_mults, inequality_flags.as_ref()) {
         for j in 0..m {
@@ -14553,13 +14563,14 @@ mod tests {
         assert!((x[0] - 1e-4).abs() < 1e-12, "got x = {}", x[0]);
     }
 
-    /// Set up a 1×1 LS system whose augmented solve yields y = 2.
+    /// Set up a 1×1 LS system whose augmented solve yields y = -2.
     ///
-    /// System:
-    ///   [ I  J^T ] [r]   [grad_f - z_L + z_U]
-    ///   [ J   0  ] [y] = [0                 ]
-    /// With grad_f=2, J=1, z=0 → r=0, y=2.
-    fn ls_y_equals_two_state(g: f64, g_eq: bool) -> SolverState {
+    /// System (matches Ipopt `IpLeastSquareMults.cpp:53-66`):
+    ///   [ I  J^T ] [r]   [-grad_f + z_L - z_U]
+    ///   [ J   0  ] [y] = [0                  ]
+    /// With grad_f=2, J=1, z=0 → r=0, y=-2. Sign convention paired with
+    /// stationarity `grad_f + J^T y - z_L + z_U = 0` (`L = f + y^T g`).
+    fn ls_y_state(g: f64, g_eq: bool) -> SolverState {
         let mut s = minimal_state(1, 1);
         s.grad_f = vec![2.0];
         s.jac_rows = vec![0];
@@ -14583,7 +14594,7 @@ mod tests {
 
     #[test]
     fn test_recalc_y_off_by_default_does_not_overwrite() {
-        let mut state = ls_y_equals_two_state(0.0, true);
+        let mut state = ls_y_state(0.0, true);
         let opts = SolverOptions::default();
         maybe_recalc_y_post_step(&mut state, &opts, 1, 1, false);
         assert_eq!(state.y_combined(), vec![999.0], "default off must not touch y");
@@ -14591,24 +14602,24 @@ mod tests {
 
     #[test]
     fn test_recalc_y_lbfgs_mode_recomputes_when_feasible() {
-        let mut state = ls_y_equals_two_state(0.0, true); // viol = 0 < tol
+        let mut state = ls_y_state(0.0, true); // viol = 0 < tol
         let opts = SolverOptions::default();
         maybe_recalc_y_post_step(&mut state, &opts, 1, 1, true);
-        assert!((state.y_at(0) - 2.0).abs() < 1e-10, "lbfgs gate must recompute, got {}", state.y_at(0));
+        assert!((state.y_at(0) - (-2.0)).abs() < 1e-10, "lbfgs gate must recompute, got {}", state.y_at(0));
     }
 
     #[test]
     fn test_recalc_y_explicit_on_recomputes_when_feasible() {
-        let mut state = ls_y_equals_two_state(0.0, true);
+        let mut state = ls_y_state(0.0, true);
         let opts = SolverOptions { recalc_y: true, ..SolverOptions::default() };
         maybe_recalc_y_post_step(&mut state, &opts, 1, 1, false);
-        assert!((state.y_at(0) - 2.0).abs() < 1e-10, "recalc_y=true must recompute, got {}", state.y_at(0));
+        assert!((state.y_at(0) - (-2.0)).abs() < 1e-10, "recalc_y=true must recompute, got {}", state.y_at(0));
     }
 
     #[test]
     fn test_recalc_y_skipped_when_constraint_violation_above_tol() {
         // g = 1e-3, equality constraint => constraint_violation = 1e-3 > recalc_y_feas_tol (1e-6)
-        let mut state = ls_y_equals_two_state(1e-3, true);
+        let mut state = ls_y_state(1e-3, true);
         let opts = SolverOptions { recalc_y: true, ..SolverOptions::default() };
         maybe_recalc_y_post_step(&mut state, &opts, 1, 1, false);
         assert_eq!(state.y_combined(), vec![999.0], "infeasible iterate must skip recalc_y");
@@ -14618,21 +14629,23 @@ mod tests {
     /// nonzero `(v_L − v_U)`, the post-step recalc must produce a
     /// different y than the reduced 2-block system. Setup:
     ///   n=1, m=1, lower-only inequality g_l=0 g_u=+inf, J=1, grad_f=2,
-    ///   z=0, v_L=1, v_U=0. After eliminating slack:
-    ///     y_d = J·sol_x − (v_L − v_U) = sol_x − 1
-    ///     sol_x + J·y_d = grad_f  ⇒  2·sol_x − 1 = 2  ⇒  sol_x = 1.5
-    ///     y_d = 0.5 (positive → consistent with lower-bound sign).
-    ///   The reduced 2-block system would yield y = 2 (no v coupling).
+    ///   z=0, v_L=1, v_U=0. Eliminated system (Ipopt sign convention,
+    ///   `rhs_x = -grad_f + z_L - z_U = -2`, `rhs_lower = v_L - v_U = 1`):
+    ///     sol_x + J·y_d = -2
+    ///     J·sol_x − y_d = 1
+    ///     2·sol_x = -1  ⇒  sol_x = -0.5
+    ///     y_d = -2 − sol_x = -1.5
+    ///   The reduced 2-block system would yield y = -2 (no v coupling).
     #[test]
     fn test_recalc_y_full_augmented_inequality_uses_v_l_v_u() {
-        let mut state = ls_y_equals_two_state(0.5, false);
+        let mut state = ls_y_state(0.5, false);
         set_constraint_bounds(&mut state, vec![0.0], vec![f64::INFINITY]);
         state.v_l_compressed = vec![1.0];
         let opts = SolverOptions { recalc_y: true, ..SolverOptions::default() };
         maybe_recalc_y_post_step(&mut state, &opts, 1, 1, false);
         assert!(
-            (state.y_at(0) - 0.5).abs() < 1e-10,
-            "full-augmented LS y mismatch: got {} expected 0.5", state.y_at(0)
+            (state.y_at(0) - (-1.5)).abs() < 1e-10,
+            "full-augmented LS y mismatch: got {} expected -1.5", state.y_at(0)
         );
     }
 
@@ -14640,7 +14653,7 @@ mod tests {
     /// Ipopt's slack/v_d coupling only enters for inequality rows.
     #[test]
     fn test_recalc_y_full_augmented_equality_matches_reduced() {
-        let mut state = ls_y_equals_two_state(0.0, true);
+        let mut state = ls_y_state(0.0, true);
         // Equality row: v_L/v_U values must be ignored.
         // Phase 8d: equality rows have no compressed v slot (n_d_l=n_d_u=0
         // for an all-equality layout); writes here would be no-ops.
@@ -14649,7 +14662,7 @@ mod tests {
         let opts = SolverOptions { recalc_y: true, ..SolverOptions::default() };
         maybe_recalc_y_post_step(&mut state, &opts, 1, 1, false);
         assert!(
-            (state.y_at(0) - 2.0).abs() < 1e-10,
+            (state.y_at(0) - (-2.0)).abs() < 1e-10,
             "equality row should match reduced: got {}", state.y_at(0)
         );
     }
