@@ -8667,8 +8667,14 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             };
             match mehrotra_result {
                 Ok((step, mu_new, dw, dc, aug)) => (step, dc, Some(mu_new), aug, dw, dc),
-                Err(_e) => {
+                Err(e) => {
                     timings.direction_solve += t_dir.elapsed();
+                    if options.print_level >= 3 {
+                        rip_log!(
+                            "ripopt: mehrotra direction solve failed at iter {} mu={:.2e} lbfgs={}: {} -> NumericalError",
+                            iteration, state.mu, lbfgs_mode, e
+                        );
+                    }
                     return make_result(&state, SolveStatus::NumericalError);
                 }
             }
@@ -8791,8 +8797,14 @@ fn solve_ipm<P: NlpProblem>(problem: &P, options: &SolverOptions) -> SolveResult
             };
             match std_result {
                 Ok((step, dw, dc, aug)) => (step, dc, None, aug, dw, dc),
-                Err(_e) => {
+                Err(e) => {
                     timings.direction_solve += t_dir.elapsed();
+                    if options.print_level >= 3 {
+                        rip_log!(
+                            "ripopt: std direction solve failed at iter {} mu={:.2e} lbfgs={}: {} -> NumericalError",
+                            iteration, state.mu, lbfgs_mode, e
+                        );
+                    }
                     return make_result(&state, SolveStatus::NumericalError);
                 }
             }

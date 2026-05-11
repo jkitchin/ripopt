@@ -841,7 +841,33 @@ fn factor_aug_with_inertia_correction_inner(
         let perturbed = apply_aug_perturbation(&aug.matrix, n, n_c, n_d, dx, dx, dc, dc);
         let dt_assemble = t_assemble.map(|t| t.elapsed());
         let t_factor = if trace_factor { Some(std::time::Instant::now()) } else { None };
-        let inertia = solver.factor(&perturbed)?;
+        // Ipopt 3.14 alignment (IpPDFullSpaceSolver.cpp:~480):
+        // SYMSOLVER_SINGULAR routes to `PerturbForSingularity` rather than
+        // propagating to the caller. In L-BFGS mode the W block is just σI
+        // and the base KKT can be numerically rank-deficient at early iters
+        // — the singularity ladder is the right escalation, not abort.
+        // `WrongInertia` from the LowRankKktSolver wrapper (M1/M2 Cholesky
+        // failure) is treated the same way: increasing δ_w changes A_0 and
+        // hence Vtilde/M1, so the ladder gets a chance to recover.
+        let inertia = match solver.factor(&perturbed) {
+            Ok(i) => i,
+            Err(SolverError::SingularMatrix) | Err(SolverError::WrongInertia { .. }) => {
+                if !tried_increase_quality && solver.increase_quality() {
+                    tried_increase_quality = true;
+                    continue;
+                }
+                if !perturb_for_singularity_pub(params, mu) {
+                    return Err(SolverError::NumericalFailure(
+                        "PDPerturbationHandler: cap exhausted in singularity probe (aug, factor-singular)"
+                            .to_string(),
+                    ));
+                }
+                dx = params.delta_x_curr;
+                dc = params.delta_c_curr;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         if trace_factor {
             let diag = solver.last_factor_diagnostics();
             eprintln!(
