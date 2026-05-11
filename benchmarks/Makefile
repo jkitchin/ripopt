@@ -14,8 +14,20 @@ CARGO_MANIFEST := $(REPO_ROOT)/Cargo.toml
 CARGO := cargo
 
 .PHONY: help benchmark benchmark-report \
-	cutest cutest-prepare cutest-prepare-full cutest-run cutest-full cutest-report cutest-smoke cutest-large cutest-maxiter \
+	cutest cutest-ensure-toolchain cutest-prepare cutest-prepare-full cutest-run cutest-full cutest-report cutest-smoke cutest-large cutest-maxiter \
 	electrolyte-run grid-run cho-run large-scale gas-run water-run
+
+# CUTEst toolchain auto-install guard. Used as a dependency for every
+# cutest-* target so a fresh clone "just works": missing toolchain
+# triggers setup_cutest.sh, present toolchain is a no-op.
+CUTEST_ROOT_DIR := $(if $(CUTEST_ROOT),$(CUTEST_ROOT),$(HOME)/.local/cutest)
+CUTEST_TRAMPOLINE := $(CUTEST_ROOT_DIR)/cutest/src/tools/cutest_trampoline.f90
+
+cutest-ensure-toolchain:
+	@if [ ! -f "$(CUTEST_TRAMPOLINE)" ]; then \
+		echo "CUTEst toolchain not found at $(CUTEST_ROOT_DIR); running setup_cutest.sh..."; \
+		bash $(REPO_ROOT)/benchmarks/cutest/setup_cutest.sh; \
+	fi
 
 # Show available targets
 help:
@@ -45,19 +57,19 @@ help:
 	@echo "suites are standalone (see benchmarks/{gas,water}/README.md)."
 
 # ---- CUTEst ----
-cutest-prepare:
+cutest-prepare: cutest-ensure-toolchain
 	bash $(REPO_ROOT)/benchmarks/cutest/prepare.sh
 
-cutest-prepare-full:
+cutest-prepare-full: cutest-ensure-toolchain
 	bash $(REPO_ROOT)/benchmarks/cutest/prepare.sh \
 		--from-file $(REPO_ROOT)/benchmarks/cutest/problem_list_full.txt
 
-cutest-run:
+cutest-run: cutest-ensure-toolchain cutest-prepare
 	RESULTS_FILE=$(REPO_ROOT)/benchmarks/cutest/results.json \
 	$(CARGO) run --manifest-path $(CARGO_MANIFEST) --bin cutest_suite --features cutest,ipopt-native --release \
 		2> >(tee $(REPO_ROOT)/benchmarks/cutest/benchmark_stderr.txt >&2)
 
-cutest-full:
+cutest-full: cutest-ensure-toolchain cutest-prepare-full
 	PROBLEM_LIST=$(REPO_ROOT)/benchmarks/cutest/problem_list_full.txt \
 	RESULTS_FILE=$(REPO_ROOT)/benchmarks/cutest/full_results.json \
 	$(CARGO) run --manifest-path $(CARGO_MANIFEST) --bin cutest_suite --features cutest,ipopt-native --release \
@@ -66,38 +78,52 @@ cutest-full:
 cutest-report:
 	python $(REPO_ROOT)/benchmarks/cutest/compare.py $(REPO_ROOT)/benchmarks/cutest/results.json
 
-cutest-smoke:
+# Problem lists are defined once and reused by both prepare.sh and the
+# cutest_suite binary so they cannot drift.
+SMOKE_PROBLEMS := \
+	ROSENBR BEALE CUBE DENSCHNB BROWNBS \
+	HS6 HS10 HS35 HS71 HS106 \
+	MARATOS BT1 HS13 HS57 S316-322 \
+	BEALENE BROWNBSNE ENGVAL2NE \
+	PALMER1D PALMER5D
+
+LARGE_PROBLEMS := \
+	HIMMELBI AIRPORT LAKES SWOPF QPCBLEND QPNBLEND SPANHYD LINSPANH \
+	ACOPP14 ACOPR14 ACOPP30 ACOPR30 BATCH CORE1 MSS1 HAIFAM FEEDLOC \
+	DISCS DECONVBNE DECONVNE NET1 HYDCAR20 \
+	TFI1 TFI2 TFI3 EXPFITB ELATTAR CRESC50 EXPFITC \
+	DUALC1 DUALC2 DUALC5 DUALC8 \
+	PT HET-Z OET1 OET2 OET3 OET4 KSIP \
+	SIPOW1 SIPOW1M SIPOW2 SIPOW2M SIPOW3 SIPOW4 \
+	TAXR13322 GOFFIN
+
+MAXITER_PROBLEMS := \
+	AIRCRFTB ALLINIT BENNETT5LS BIGGS3 BIGGS5 BOX2 BQPGABIM CHWIRUT2LS \
+	DJTL HAHN1LS MEYER3 MGH10LS MINSURF OSBORNEA RAT43LS SIM2BQP THURBERLS \
+	AIRCRFTA CONCON DECONVC DECONVNE DECONVU DNIEPER HS109 HS67 HS83 HS84 \
+	HS85 HS99EXP MCONCON OPTCNTRL QC QCNEW SSINE TRIGGER
+
+cutest-smoke: cutest-ensure-toolchain
+	bash $(REPO_ROOT)/benchmarks/cutest/prepare.sh $(SMOKE_PROBLEMS)
 	RESULTS_FILE=$(REPO_ROOT)/benchmarks/cutest/smoke_results.json \
 	$(CARGO) run --manifest-path $(CARGO_MANIFEST) --bin cutest_suite --features cutest,ipopt-native --release -- \
-		ROSENBR BEALE CUBE DENSCHNB BROWNBS \
-		HS6 HS10 HS35 HS71 HS106 \
-		MARATOS BT1 HS13 HS57 S316-322 \
-		BEALENE BROWNBSNE ENGVAL2NE \
-		PALMER1D PALMER5D \
+		$(SMOKE_PROBLEMS) \
 		2> >(tee $(REPO_ROOT)/benchmarks/cutest/smoke_stderr.txt >&2)
 	@echo "Smoke test complete."
 
-cutest-large:
+cutest-large: cutest-ensure-toolchain
+	bash $(REPO_ROOT)/benchmarks/cutest/prepare.sh $(LARGE_PROBLEMS)
 	RESULTS_FILE=$(REPO_ROOT)/benchmarks/cutest/large_results.json \
 	$(CARGO) run --manifest-path $(CARGO_MANIFEST) --bin cutest_suite --features cutest,ipopt-native --release -- \
-		HIMMELBI AIRPORT LAKES SWOPF QPCBLEND QPNBLEND SPANHYD LINSPANH \
-		ACOPP14 ACOPR14 ACOPP30 ACOPR30 BATCH CORE1 MSS1 HAIFAM FEEDLOC \
-		DISCS DECONVBNE DECONVNE NET1 HYDCAR20 \
-		TFI1 TFI2 TFI3 EXPFITB ELATTAR CRESC50 EXPFITC \
-		DUALC1 DUALC2 DUALC5 DUALC8 \
-		PT HET-Z OET1 OET2 OET3 OET4 KSIP \
-		SIPOW1 SIPOW1M SIPOW2 SIPOW2M SIPOW3 SIPOW4 \
-		TAXR13322 GOFFIN \
+		$(LARGE_PROBLEMS) \
 		2> >(tee $(REPO_ROOT)/benchmarks/cutest/large_stderr.txt >&2)
 	@echo "Large problem benchmark complete."
 
-cutest-maxiter:
+cutest-maxiter: cutest-ensure-toolchain
+	bash $(REPO_ROOT)/benchmarks/cutest/prepare.sh $(MAXITER_PROBLEMS)
 	RESULTS_FILE=$(REPO_ROOT)/benchmarks/cutest/maxiter_results.json \
 	$(CARGO) run --manifest-path $(CARGO_MANIFEST) --bin cutest_suite --features cutest,ipopt-native --release -- \
-		AIRCRFTB ALLINIT BENNETT5LS BIGGS3 BIGGS5 BOX2 BQPGABIM CHWIRUT2LS \
-		DJTL HAHN1LS MEYER3 MGH10LS MINSURF OSBORNEA RAT43LS SIM2BQP THURBERLS \
-		AIRCRFTA CONCON DECONVC DECONVNE DECONVU DNIEPER HS109 HS67 HS83 HS84 \
-		HS85 HS99EXP MCONCON OPTCNTRL QC QCNEW SSINE TRIGGER \
+		$(MAXITER_PROBLEMS) \
 		2> >(tee $(REPO_ROOT)/benchmarks/cutest/maxiter_stderr.txt >&2)
 
 cutest: cutest-prepare cutest-run cutest-report
