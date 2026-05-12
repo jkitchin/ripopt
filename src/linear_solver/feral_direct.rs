@@ -18,7 +18,7 @@
 
 use super::{FactorDiagnostics, Inertia, KktMatrix, LinearSolver, SolverError};
 use feral::numeric::factorize::{
-    factorize_multifrontal_with_workspace, FactorWorkspace, NumericParams, SparseFactors,
+    factorize_multifrontal_parallel_with_workspace, FactorWorkspace, NumericParams, SparseFactors,
 };
 use feral::numeric::condition::estimate_condition_1norm;
 use feral::numeric::solve::{solve_sparse, solve_sparse_many};
@@ -313,7 +313,7 @@ impl LinearSolver for FeralLdl {
             }
         };
 
-        match factorize_multifrontal_with_workspace(
+        match factorize_multifrontal_parallel_with_workspace(
             csc,
             symbolic,
             &self.numeric_params,
