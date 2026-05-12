@@ -6400,15 +6400,21 @@ fn compute_quality_function_mu(
     //    σ range:
     //      σ_max = min(sigma_max_, mu_max / avrg_compl)   sigma_max_=1e2
     //      σ_min = max(sigma_min_, mu_min / avrg_compl)   sigma_min_=1e-6
-    //    where mu_min uses ripopt's tolerance-aware floor
-    //    (`IpAdaptiveMuUpdate.cpp:262-264`).
     //
-    //    Direction decision: probe Q(1) vs Q(1-ε). If Q(1-ε) > Q(1) the
-    //    quality function is decreasing past 1, so search [1, σ_max];
-    //    otherwise search [σ_min, 1-ε]. This avoids running golden
-    //    section over a non-unimodal range that contains both regimes.
+    //    `mu_min` here is Ipopt's `mu_min_` after the tolerance cap at
+    //    `IpAdaptiveMuUpdate.cpp:262-264`:
+    //      mu_min_ = Min(mu_min_default, 0.5·min(tol, |compl_inf_tol·s_f|))
+    //    Note the **Min** — the tolerance term is an UPPER CAP that
+    //    forces a user-configured `mu_min` not to exceed half the
+    //    convergence tolerance; at defaults (mu_min=1e-11, tol=1e-8,
+    //    compl_inf_tol=1e-4) the cap is 5e-9, so `min(1e-11, 5e-9)=1e-11`
+    //    and the default `mu_min` wins. ripopt used `.max(...)` here,
+    //    which inverted the polarity and forced the QF floor to 5e-9 on
+    //    every problem, causing PALMER1/PALMER3 to stall at μ=5e-9 with
+    //    inf_du≈1e-4 while Ipopt would drop μ to 1e-11 and converge in
+    //    the same step.
     let eff_mu_floor =
-        (0.5 * options.tol.min(options.compl_inf_tol)).max(options.mu_min);
+        options.mu_min.min(0.5 * options.tol.min(options.compl_inf_tol));
     let mu_cap = mu_state.mu_max_cap(options, avg_compl);
     let avg_clamp = avg_compl.max(1e-300);
     let sigma_min = (1e-6_f64).max(eff_mu_floor / avg_clamp);
