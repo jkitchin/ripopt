@@ -6546,7 +6546,37 @@ fn golden_section_minimize<F: Fn(f64) -> f64>(
             qmid1 = f(sigma_mid1);
         }
     }
-    if qmid1 < qmid2 { sigma_mid1 } else { sigma_mid2 }
+    let (mut sigma, q) = if qmid1 < qmid2 {
+        (sigma_mid1, qmid1)
+    } else {
+        (sigma_mid2, qmid2)
+    };
+    // Endpoint re-evaluation, matching Ipopt
+    // `IpQualityFunctionMuOracle.cpp:786-825`. When an endpoint never
+    // moved during the loop (common in monotone-Q cases), the true
+    // minimum of Q on the bracket may be at the boundary itself rather
+    // than at an interior midpoint. Ipopt passes a `q_lo`/`q_up = -100`
+    // sentinel from its σ<1 / σ>1 dispatch branches and re-evaluates Q
+    // at the stuck boundary on fall-through. The `if/else if` order
+    // (sigma_up first, then sigma_lo) is preserved from upstream.
+    //
+    // Without this check, PALMER1 iter 8 hits a monotonically-increasing
+    // Q over [σ_min, 1−ε]; the loop shrinks sigma_up 8 times while
+    // sigma_lo stays put, and the unchecked midpoint return picks
+    // σ≈8.5e-3 instead of σ_min≈4.7e-4, stalling μ at ~1.8e-10 instead
+    // of dropping to 1e-11 as Ipopt does at the same iterate.
+    if sigma_up == hi {
+        let q_up = f(hi);
+        if q_up < q {
+            sigma = hi;
+        }
+    } else if sigma_lo == lo {
+        let q_lo = f(lo);
+        if q_lo < q {
+            sigma = lo;
+        }
+    }
+    sigma
 }
 
 fn update_barrier_parameter(
