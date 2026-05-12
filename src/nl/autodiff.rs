@@ -813,15 +813,83 @@ impl Tape {
     /// nonlinear op, emits the cross products of variable sets from its children.
     /// Returns the set of (row, col) pairs (lower triangle, row >= col) that have
     /// structurally nonzero second derivatives.
+    ///
+    /// **Needed-set optimization.** Naively propagating var_sets through every
+    /// tape op gives O(n²) time/memory on chained-sum objectives like
+    /// `sum_i f(x_i)`: each successive Add in the outer reduction tree clones a
+    /// linearly-growing dependency BTreeSet, even though no nonlinear ancestor
+    /// ever consumes the union. The needed mask below identifies the tape
+    /// nodes whose var_set is actually read — by some nonlinear emission point
+    /// directly, or transitively through linear ancestors — and skips var_set
+    /// materialization elsewhere. For bearing_400 (n=160k, separable
+    /// `sum_i f(x_i)`) this collapses the >180 s, OOM-killed setup down to
+    /// proportional to the union of inner cones.
     pub fn hessian_sparsity(&self) -> std::collections::BTreeSet<(usize, usize)> {
         use std::collections::BTreeSet;
 
         let n = self.ops.len();
-        // For each tape node, track which problem variables influence it
-        let mut var_sets: Vec<BTreeSet<usize>> = Vec::with_capacity(n);
         let mut hess_pairs: BTreeSet<(usize, usize)> = BTreeSet::new();
 
-        // Helper: emit all lower-triangle pairs from cross product of two sets
+        // ---- Phase 1: mark which nodes' var_sets we actually need ----
+        // A node N is `needed` iff:
+        //   (a) N is a direct input to a nonlinear emission op (Mul/Div/Pow/
+        //       Atan2/sqrt/exp/.../Funcall) — the emission reads var_set[N];
+        //   (b) some parent op P propagates var_set[N] into a needed
+        //       var_set[P] (linear ops Add/Sub/Neg/Abs/Mod/IntDiv/Less, or
+        //       nonlinear ops whose own var_set has a needed consumer).
+        // Floor/Ceil/Const have empty var_sets and read nothing.
+        //
+        // Tape is topologically sorted (children before parents); iterating
+        // in reverse visits each parent before its children, so we can
+        // propagate "needed" downward in a single pass.
+        let mut needed = vec![false; n];
+        for i in (0..n).rev() {
+            let propagate = needed[i];
+            match &self.ops[i] {
+                // Nonlinear binary: children's var_sets always needed for emission.
+                TapeOp::Mul(a, b) | TapeOp::Div(a, b)
+                | TapeOp::Pow(a, b) | TapeOp::Atan2(a, b) => {
+                    needed[*a] = true;
+                    needed[*b] = true;
+                }
+                // Nonlinear unary.
+                TapeOp::Sqrt(a) | TapeOp::Exp(a) | TapeOp::Log(a) | TapeOp::Log10(a)
+                | TapeOp::Sin(a) | TapeOp::Cos(a) | TapeOp::Tan(a)
+                | TapeOp::Asin(a) | TapeOp::Acos(a) | TapeOp::Atan(a)
+                | TapeOp::Sinh(a) | TapeOp::Cosh(a) | TapeOp::Tanh(a)
+                | TapeOp::Asinh(a) | TapeOp::Acosh(a) | TapeOp::Atanh(a) => {
+                    needed[*a] = true;
+                }
+                TapeOp::Funcall { args, .. } => {
+                    for arg in args {
+                        if let FuncallArg::Tape(t) = arg {
+                            needed[*t] = true;
+                        }
+                    }
+                }
+                // Linear ops: only propagate if this node's var_set is itself needed.
+                TapeOp::Add(a, b) | TapeOp::Sub(a, b)
+                | TapeOp::Mod(a, b) | TapeOp::IntDiv(a, b) | TapeOp::Less(a, b) => {
+                    if propagate {
+                        needed[*a] = true;
+                        needed[*b] = true;
+                    }
+                }
+                TapeOp::Neg(a) | TapeOp::Abs(a) => {
+                    if propagate {
+                        needed[*a] = true;
+                    }
+                }
+                TapeOp::Floor(_) | TapeOp::Ceil(_) | TapeOp::Const(_) | TapeOp::Var(_) => {}
+            }
+        }
+
+        // ---- Phase 2: forward pass, materializing var_sets only when needed,
+        //              emitting Hessian pairs at every nonlinear op. ----
+        let mut var_sets: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
+        // Sentinel reused for ops whose var_set is not needed.
+        let empty: BTreeSet<usize> = BTreeSet::new();
+
         let emit_cross = |s1: &BTreeSet<usize>, s2: &BTreeSet<usize>, pairs: &mut BTreeSet<(usize, usize)>| {
             for &v1 in s1 {
                 for &v2 in s2 {
@@ -830,8 +898,6 @@ impl Tape {
                 }
             }
         };
-
-        // Helper: emit all lower-triangle pairs from self-product of a set
         let emit_self = |s: &BTreeSet<usize>, pairs: &mut BTreeSet<(usize, usize)>| {
             let vars: Vec<usize> = s.iter().copied().collect();
             for (ai, &vi) in vars.iter().enumerate() {
@@ -842,58 +908,57 @@ impl Tape {
             }
         };
 
-        for op in &self.ops {
-            let vset = match op {
-                TapeOp::Const(_) => BTreeSet::new(),
+        for i in 0..n {
+            match &self.ops[i] {
+                TapeOp::Const(_) => { /* empty */ }
                 TapeOp::Var(j) => {
-                    let mut s = BTreeSet::new();
-                    s.insert(*j);
-                    s
+                    if needed[i] {
+                        var_sets[i].insert(*j);
+                    }
                 }
-                // Linear ops: union of children, no Hessian contribution
-                TapeOp::Add(a, b) | TapeOp::Sub(a, b) => {
-                    var_sets[*a].union(&var_sets[*b]).copied().collect()
+                TapeOp::Add(a, b) | TapeOp::Sub(a, b)
+                | TapeOp::Mod(a, b) | TapeOp::IntDiv(a, b) | TapeOp::Less(a, b) => {
+                    if needed[i] {
+                        var_sets[i] = var_sets[*a].union(&var_sets[*b]).copied().collect();
+                    }
                 }
-                TapeOp::Neg(a) | TapeOp::Abs(a) => var_sets[*a].clone(),
-                TapeOp::Floor(_) | TapeOp::Ceil(_) => BTreeSet::new(), // piecewise constant
-
-                // Mul(a,b): cross-product vars(a) × vars(b), plus union
+                TapeOp::Neg(a) | TapeOp::Abs(a) => {
+                    if needed[i] {
+                        var_sets[i] = var_sets[*a].clone();
+                    }
+                }
+                TapeOp::Floor(_) | TapeOp::Ceil(_) => { /* empty */ }
                 TapeOp::Mul(a, b) => {
                     emit_cross(&var_sets[*a], &var_sets[*b], &mut hess_pairs);
-                    // Also self-products since d²(a*b)/dx² has contributions
-                    // through the chain rule when a or b are nonlinear in x.
-                    // But structurally, Mul only couples vars(a) with vars(b).
-                    // The self-coupling comes from deeper ops, already handled.
-                    var_sets[*a].union(&var_sets[*b]).copied().collect()
+                    if needed[i] {
+                        var_sets[i] = var_sets[*a].union(&var_sets[*b]).copied().collect();
+                    }
                 }
-                // Div(a,b): vars(a)×vars(b) + vars(b)×vars(b)
                 TapeOp::Div(a, b) => {
                     emit_cross(&var_sets[*a], &var_sets[*b], &mut hess_pairs);
                     emit_self(&var_sets[*b], &mut hess_pairs);
-                    var_sets[*a].union(&var_sets[*b]).copied().collect()
+                    if needed[i] {
+                        var_sets[i] = var_sets[*a].union(&var_sets[*b]).copied().collect();
+                    }
                 }
-                // Pow(a,b): all three cross products
                 TapeOp::Pow(a, b) | TapeOp::Atan2(a, b) => {
-                    let combined: BTreeSet<usize> = var_sets[*a].union(&var_sets[*b]).copied().collect();
+                    let combined: BTreeSet<usize> =
+                        var_sets[*a].union(&var_sets[*b]).copied().collect();
                     emit_self(&combined, &mut hess_pairs);
-                    combined
+                    if needed[i] {
+                        var_sets[i] = combined;
+                    }
                 }
-                // Mod, IntDiv, Less: linear/discontinuous, no 2nd-order contribution
-                TapeOp::Mod(a, b) | TapeOp::IntDiv(a, b) | TapeOp::Less(a, b) => {
-                    var_sets[*a].union(&var_sets[*b]).copied().collect()
-                }
-                // Nonlinear unary ops: self-product of vars(a)
                 TapeOp::Sqrt(a) | TapeOp::Exp(a) | TapeOp::Log(a) | TapeOp::Log10(a)
                 | TapeOp::Sin(a) | TapeOp::Cos(a) | TapeOp::Tan(a)
                 | TapeOp::Asin(a) | TapeOp::Acos(a) | TapeOp::Atan(a)
                 | TapeOp::Sinh(a) | TapeOp::Cosh(a) | TapeOp::Tanh(a)
                 | TapeOp::Asinh(a) | TapeOp::Acosh(a) | TapeOp::Atanh(a) => {
                     emit_self(&var_sets[*a], &mut hess_pairs);
-                    var_sets[*a].clone()
+                    if needed[i] {
+                        var_sets[i] = var_sets[*a].clone();
+                    }
                 }
-                // External function: treat as a dense block over the union
-                // of variables influencing any real-valued argument. String
-                // args contribute nothing to sparsity.
                 TapeOp::Funcall { args, .. } => {
                     let mut combined: BTreeSet<usize> = BTreeSet::new();
                     for arg in args {
@@ -904,11 +969,15 @@ impl Tape {
                         }
                     }
                     emit_self(&combined, &mut hess_pairs);
-                    combined
+                    if needed[i] {
+                        var_sets[i] = combined;
+                    }
                 }
-            };
-            var_sets.push(vset);
+            }
         }
+        // Suppress unused warning when no branch references `empty` (kept for
+        // future passes that may want an explicit zero-set sentinel).
+        let _ = &empty;
 
         hess_pairs
     }
