@@ -12643,6 +12643,33 @@ fn compute_barrier_error_components(state: &SolverState) -> (f64, f64, f64, f64)
             compl_max = r;
         }
     }
+    // Inequality-constraint slack/multiplier pairs (s_L, s_U in Ipopt).
+    // Ipopt's `curr_barrier_error()` walks all four primal/dual sets
+    // (xL, xU, sL, sU); omitting these caused the mu-gate to under-report
+    // complementarity error on problems with no var bounds but with
+    // inequality constraints, prematurely firing the Fixed-mode μ
+    // decrease loop (henon120: mu dropped 0.1→2.83e-3 at iter 0).
+    let g_d = state.g_d();
+    let d_l = state.d_l();
+    let d_u = state.d_u();
+    let v_l_d = state.v_l_d();
+    let v_u_d = state.v_u_d();
+    for k in 0..g_d.len() {
+        if d_l[k].is_finite() {
+            let slack = (g_d[k] - d_l[k]).max(0.0);
+            let r = (slack * v_l_d[k] - state.mu).abs();
+            if r > compl_max {
+                compl_max = r;
+            }
+        }
+        if d_u[k].is_finite() {
+            let slack = (d_u[k] - g_d[k]).max(0.0);
+            let r = (slack * v_u_d[k] - state.mu).abs();
+            if r > compl_max {
+                compl_max = r;
+            }
+        }
+    }
     let compl_err = compl_max / s_c;
 
     // Primal infeasibility ‖c‖_∞ (no s-divisor in Ipopt;
