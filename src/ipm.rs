@@ -10867,10 +10867,16 @@ fn compute_initial_y_with_ls<P: NlpProblem>(
     if !(options.least_squares_mult_init && m > 0) {
         return vec![0.0; m];
     }
-    // Square-problem branch: when m == n, Ipopt's
-    // `IpDefaultIterateInitializer::least_square_mults` skips the LS solve and
-    // initializes y = 0 directly (`IpDefaultIterateInitializer.cpp:685-690`).
-    if m == n {
+    // Square-problem branch: when n_c == n (equality-constraint count
+    // equals variable count), Ipopt's
+    // `IpDefaultIterateInitializer::least_square_mults` skips the LS solve
+    // and initializes y = 0 directly
+    // (`IpDefaultIterateInitializer.cpp:685-690`). Note Ipopt's check is on
+    // `y_c->Dim() == x->Dim()` (n_c == n), NOT total constraint count
+    // m == n — for an all-inequality problem with m_d == n (e.g. svanberg)
+    // the LS estimate is informative and must not be skipped.
+    let n_c = g_l.iter().zip(g_u.iter()).filter(|(&l, &u)| l == u).count();
+    if n_c == n {
         return vec![0.0; m];
     }
     let mut grad_f_init = vec![0.0; n];
