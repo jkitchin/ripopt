@@ -11966,6 +11966,28 @@ fn compute_pderror_e_mu(state: &SolverState, mu: f64) -> f64 {
         compl_l1 += (slack * state.z_u_compressed[k] - mu).abs();
         n_compl += 1;
     }
+    // Inequality-constraint slack/multiplier pairs (s_L, s_U). Ipopt's
+    // `curr_complementarity_l1(μ)` denominator nz_v = n_xL + n_xU + n_sL + n_sU
+    // (`IpIpoptCalculatedQuantities.cpp:3198-3256`); omitting these dropped
+    // the compl term on problems with no var bounds but with inequality
+    // constraints, biasing the soft-restoration E_μ acceptance test.
+    let g_d = state.g_d();
+    let d_l = state.d_l();
+    let d_u = state.d_u();
+    let v_l_d = state.v_l_d();
+    let v_u_d = state.v_u_d();
+    for k in 0..g_d.len() {
+        if d_l[k].is_finite() {
+            let slack = (g_d[k] - d_l[k]).max(0.0);
+            compl_l1 += (slack * v_l_d[k] - mu).abs();
+            n_compl += 1;
+        }
+        if d_u[k].is_finite() {
+            let slack = (d_u[k] - g_d[k]).max(0.0);
+            compl_l1 += (slack * v_u_d[k] - mu).abs();
+            n_compl += 1;
+        }
+    }
     let compl_term = if n_compl == 0 { 0.0 } else { compl_l1 / n_compl as f64 };
 
     dual_l1 / n_dual + primal_l1 / n_pri + compl_term
