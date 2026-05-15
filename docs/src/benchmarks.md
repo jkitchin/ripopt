@@ -1,10 +1,15 @@
 # Benchmarks
 
-ripopt is benchmarked against Ipopt (native C++ with MUMPS linear solver) on three standard test suites and several domain-specific problem sets. All benchmarks run on the same hardware; both solvers receive identical problem data through the same Rust trait interface.
+ripopt is benchmarked against Ipopt (native C++ with MUMPS linear solver) on the CUTEst test set and several domain-specific problem sets. All benchmarks run on the same hardware; both solvers receive identical problem data through the same Rust trait interface.
 
-## Hock-Schittkowski Suite (120 problems)
+## Hock-Schittkowski Suite (120 problems) — retired
 
-The HS suite is the classic test set for NLP solvers, covering small problems (n ≤ 15) with mixed equality/inequality constraints.
+> The standalone HS suite has been retired from the ripopt benchmark harness;
+> the numbers below are historical (pre-v0.8) and are no longer regenerated.
+> HS-family problems are still exercised individually through CUTEst (HS6,
+> HS10, HS35, …) in the CUTEst sweeps.
+
+The HS suite was the classic test set for NLP solvers, covering small problems (n ≤ 15) with mixed equality/inequality constraints.
 
 | Metric | ripopt | Ipopt (MUMPS) |
 |---|---|---|
@@ -21,8 +26,6 @@ On 116 commonly solved problems (strict `Optimal` status required):
 | ripopt faster | 114/116 (98%) |
 | ripopt 10x+ faster | 103/116 (89%) |
 | Matching objectives (rel diff < 1e-4) | 111/116 (96%) |
-
-Run: `make hs-run`
 
 ## CUTEst Benchmark Suite (727 problems)
 

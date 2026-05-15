@@ -50,11 +50,10 @@ Replace `vX.Y.Z` with the new version number throughout (e.g. `v0.6.2`).
 
 ### Domain benchmarks to re-run individually (for debugging a single suite)
 
-`make benchmark` already runs HS, CUTEst, electrolyte, grid, CHO, and
+`make benchmark` already runs CUTEst, electrolyte, grid, CHO, and
 large-scale. Use the targets below to re-run **one** suite in isolation
 when you're debugging a regression without paying the full ~2 hours:
 
-- [ ] `make hs-run` — HS suite
 - [ ] `make electrolyte-run` — electrolyte thermodynamics
 - [ ] `make grid-run` — Grid (AC OPF)
 - [ ] `make cho-run` — CHO parameter estimation (if applicable)
@@ -83,12 +82,11 @@ and Ipopt-only counts, electrolyte/grid results.
   this release (the mdbook TOC does not auto-discover)
 - [ ] `mdbook build docs` — rebuild the book and confirm no broken links or
   missing-page warnings
-- [ ] `benchmarks/hs/PERFORMANCE_COMPARISON.md` — full HS-specific report
 - [ ] `RIPOPT_VS_IPOPT.md` — strategic comparison narrative
 - [ ] `benchmarks/electrolyte/electrolyte_benchmark_report.md` — if domain-specific numbers changed
 - [ ] `benchmarks/grid/grid_benchmark_report.md` — same
 - [ ] `MEMORY.md` (in `~/.claude/projects/...ripopt/memory/`) —
-  HS Benchmark Status section, CUTEst Benchmark Status section
+  CUTEst Benchmark Status section
 - [ ] `narrative-history.org` — append a new chapter in the same literary
   style covering the work since the last narrative update. Find the prior
   cutoff with `git log -1 --format=%H -- narrative-history.org`, then walk
@@ -378,8 +376,6 @@ After cleanup the only files in `manuscript/` should be `ripopt.org`,
 
 These let us compare per-problem timing across versions later:
 
-- [ ] `cp benchmarks/hs/hs_ripopt_results.json benchmarks/hs/hs_ripopt_results_vX.Y.Z.json`
-- [ ] `cp benchmarks/hs/hs_ipopt_native_results.json benchmarks/hs/hs_ipopt_native_results_vX.Y.Z.json`
 - [ ] `cp benchmarks/BENCHMARK_REPORT.json benchmarks/BENCHMARK_REPORT_vX.Y.Z.json`
 - [ ] (Optional) `cp benchmarks/cutest/results.json benchmarks/cutest/results_vX.Y.Z.json`
 - [ ] (Optional) `cp benchmarks/electrolyte/electrolyte_results.json benchmarks/electrolyte/electrolyte_results_vX.Y.Z.json`

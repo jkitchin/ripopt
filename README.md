@@ -58,7 +58,11 @@ It implements a primal-dual interior point method with a barrier formulation, si
 
 ## Benchmarks
 
-### Hock-Schittkowski Test Suite (120 problems)
+### Hock-Schittkowski Test Suite (120 problems) — retired
+
+> The standalone HS suite has been retired from the ripopt benchmark harness;
+> the numbers below are historical (pre-v0.8) and are no longer regenerated.
+> HS-family problems remain exercised individually through CUTEst.
 
 | Metric          | ripopt             | Ipopt (native, MUMPS) |
 |-----------------|--------------------|-----------------------|
@@ -823,7 +827,6 @@ The test suite covers:
 - **Unit tests**: Dense LDL factorization, convergence checking, filter line search, fraction-to-boundary, KKT assembly, restoration, preprocessing, linearity detection, SQP, linear solver, autodiff, L-BFGS, sensitivity analysis
 - **C API tests**: FFI integration tests
 - **Integration tests**: Rosenbrock, SimpleQP, HS071, HS035, PureBoundConstrained, MultipleEqualityConstraints, NE-to-LS reformulation, augmented Lagrangian, NL file parsing, IPM code paths, parametric sensitivity, and more
-- **HS regression tests**: Selected Hock-Schittkowski problems for regression checking
 - **Coverage tests**: Augmented Lagrangian convergence paths, NL parser/solver pipeline, autodiff tape operations, IPM preprocessing/condensed KKT/unbounded detection
 
 ## Code Coverage
@@ -920,7 +923,6 @@ tests/
   correctness.rs      Integration tests (22 NLP problems)
   ipm_paths.rs        IPM code path tests (condensed KKT, unbounded, NE-to-LS, preprocessing)
   sensitivity.rs      Parametric sensitivity integration tests
-  hs_regression.rs    HS suite regression tests (15 problems)
   c_api.rs            C API integration tests (12 tests via FFI)
   lbfgs_ipm.rs        L-BFGS Hessian approximation tests
   iterative_solvers.rs  Iterative/hybrid solver tests
