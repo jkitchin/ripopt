@@ -16,7 +16,7 @@ See [[file:supporting-information.org][supporting-information.org]] for links to
 
 * Abstract
 
-We present ripopt, a nonlinear interior point optimizer implemented in Rust. ripopt originated as a translation of the Ipopt algorithm but has diverged in several architectural and algorithmic respects. The core design decision---eliminating explicit slack variables for inequality constraints in favor of an implicit slack formulation---produces smaller Karush-Kuhn-Tucker (KKT) systems and a simplified problem interface. This formulation relies on the same Ipopt-aligned two-gate convergence test (scaled and unscaled) on the iterative bound multipliers, which v0.7.0 showed to be sufficient once the barrier subproblem has been driven to a small $\mu$. We introduce a two-phase restoration architecture that uses a fast Gauss-Newton feasibility solver before falling back to a full NLP restoration subproblem, combined with a multi-attempt recovery strategy that explores different barrier landscapes through systematic perturbation. For nonlinear equation systems posed as constrained optimization, ripopt automatically detects the problem structure and reformulates it as an unconstrained least-squares problem with a full Hessian including second-order corrections. A multi-solver fallback architecture---including L-BFGS for unconstrained problems, augmented Lagrangian for constrained problems, and explicit slack reformulation---provides additional robustness when the primary IPM fails. ripopt also provides sIPOPT-style parametric sensitivity analysis, computing how the optimal solution changes under parameter perturbations via a single KKT backsolve at near-zero cost. On the Hock-Schittkowski test suite, ripopt solves 118 of 120 problems (98.3%), two more than Ipopt's 116 (96.7%), with a 20.8$\times$ geometric mean speedup on commonly-solved problems. On the CUTEst benchmark suite of 727 problems at v0.8.0, ripopt strictly solves 564 (77.6%) versus Ipopt's 561 (77.2%), with a geometric mean wall-clock speedup of 8.9$\times$ on the 544 commonly-solved problems. ripopt solves 20 CUTEst problems that Ipopt cannot, and Ipopt solves 17 that ripopt cannot. On domain-specific benchmarks, ripopt solves all 13 electrolyte speciation problems (vs. 12/13 for Ipopt) and all 4 AC optimal power flow cases (Ipopt: 4/4). The v0.8.0 release also moves the default sparse linear solver out of the ripopt tree and into =feral= cite:feral2026, an independently developed and independently benchmarked pure-Rust multifrontal LDL$^T$ solver. The previous backend (=rmumps=, also pure Rust) was an embedded port that lived inside the ripopt repository, which made it structurally awkward to attribute failures cleanly between the IPM and the linear solver; feral resolves that entanglement by carrying its own test corpus and reference solvers. We provide a detailed analysis of where each solver excels, the failure modes that remain, and opportunities for improvement.
+We present ripopt, a nonlinear interior point optimizer implemented in Rust. ripopt originated as a translation of the Ipopt algorithm but has diverged in several architectural and algorithmic respects. The core design decision---eliminating explicit slack variables for inequality constraints in favor of an implicit slack formulation---produces smaller Karush-Kuhn-Tucker (KKT) systems and a simplified problem interface. This formulation relies on the same Ipopt-aligned two-gate convergence test (scaled and unscaled) on the iterative bound multipliers, which v0.7.0 showed to be sufficient once the barrier subproblem has been driven to a small $\mu$. We introduce a two-phase restoration architecture that uses a fast Gauss-Newton feasibility solver before falling back to a full NLP restoration subproblem, combined with a multi-attempt recovery strategy that explores different barrier landscapes through systematic perturbation. For nonlinear equation systems posed as constrained optimization, ripopt automatically detects the problem structure and reformulates it as an unconstrained least-squares problem with a full Hessian including second-order corrections. A multi-solver fallback architecture---including L-BFGS for unconstrained problems, augmented Lagrangian for constrained problems, and explicit slack reformulation---provides additional robustness when the primary IPM fails. ripopt also provides sIPOPT-style parametric sensitivity analysis, computing how the optimal solution changes under parameter perturbations via a single KKT backsolve at near-zero cost. On the Hock-Schittkowski test suite, ripopt solves 118 of 120 problems (98.3%), two more than Ipopt's 116 (96.7%), with a 20.8$\times$ geometric mean speedup on commonly-solved problems. On the CUTEst benchmark suite of 727 problems at v0.8.1, ripopt strictly solves 571 (78.5%) versus Ipopt's 561 (77.2%), with a geometric mean wall-clock speedup of 7.8$\times$ (median 10.5$\times$) on the 548 commonly-solved problems. ripopt solves 23 CUTEst problems that Ipopt cannot, and Ipopt solves 13 that ripopt cannot. On domain-specific benchmarks, ripopt solves all 13 electrolyte speciation problems (vs. 12/13 for Ipopt) and all 4 AC optimal power flow cases (Ipopt: 4/4). The v0.8 release line moves the default sparse linear solver out of the ripopt tree and into =feral= cite:feral2026, an independently developed and independently benchmarked pure-Rust multifrontal LDL$^T$ solver. The previous backend (=rmumps=, also pure Rust) was an embedded port that lived inside the ripopt repository, which made it structurally awkward to attribute failures cleanly between the IPM and the linear solver; feral resolves that entanglement by carrying its own test corpus and reference solvers. We provide a detailed analysis of where each solver excels, the failure modes that remain, and opportunities for improvement.
 
 * Introduction
 
@@ -208,7 +208,7 @@ The trial point $(x_+, y_+, z_+)$ is accepted as a soft-restoration step if $E_\
 
 ** Phase 1: Gauss-Newton Feasibility Solver
 
-Before invoking the expensive NLP restoration, we attempt a Gauss-Newton (GN) solve on the constraint violation [[cite:nocedal2006numerical]]:
+Before invoking the expensive NLP restoration, we attempt a Gauss-Newton (GN) solve on the constraint violation (see cite:nocedal2006numerical):
 
 \begin{equation}
 \min_x \; \frac{1}{2} \|h(x)\|^2, \qquad h_i(x) = \max(g_{L,i} - g_i(x), \; g_i(x) - g_{U,i}, \; 0)
@@ -228,7 +228,7 @@ The GN phase provides quadratic convergence for nonlinear equalities (vs. linear
 
 ** Phase 2: NLP Restoration
 
-If GN restoration fails on two consecutive occasions, we invoke the full NLP restoration subproblem, matching Ipopt's formulation [[cite:wachter2006implementation]]:
+If GN restoration fails on two consecutive occasions, we invoke the full NLP restoration subproblem, matching Ipopt's formulation (see cite:wachter2006implementation):
 
 \begin{equation}
 \min_{x,p,n} \; \rho \sum_i (p_i + n_i) + \frac{\eta}{2} \|D_R(x - x_R)\|^2 \quad \text{s.t.} \quad g(x) - p + n = g_{\text{target}}, \; p, n \ge 0
@@ -457,7 +457,7 @@ The primal tolerance at the max-iteration exit is relaxed to $\max(\epsilon_{\te
 
 ** Oracles
 
-ripopt provides two adaptive-$\mu$ oracles, both ported faithfully from Ipopt cite:nocedal2008adaptive,wachter2006implementation:
+ripopt provides two adaptive-$\mu$ oracles, both ported faithfully from Ipopt (see cite:nocedal2008adaptive,wachter2006implementation):
 
 *LOQO oracle (default, =mu_oracle = loqo=).* Mirrors Ipopt's =LoqoMuOracle::CalculateMu= cite:vanderbei1999loqo. The centering parameter is computed from the centrality measure $\xi = \min_i (s_i z_i) / \bar{c}$:
 \begin{equation}
@@ -888,45 +888,45 @@ The CUTEst suite cite:gould2015cutest provides 727 nonlinear programming problem
 
 | Metric        | ripopt          | Ipopt           |
 |---------------+-----------------+-----------------|
-| Total solved  | 564/727 (77.6%) | 561/727 (77.2%) |
-| Both solve    | 544             | 544             |
-| ripopt only   | 20              | ---             |
-| Ipopt only    | ---             | 17              |
+| Total solved  | 571/727 (78.5%) | 561/727 (77.2%) |
+| Both solve    | 548             | 548             |
+| ripopt only   | 23              | ---             |
+| Ipopt only    | ---             | 13              |
 
-At v0.8.0, ripopt edges out native Ipopt on CUTEst by three problems (564 vs 561 strict-Optimal). ripopt exclusively solves 20 problems that Ipopt cannot (the great majority are =IpoptStatus(-10)= NE problems handled by the NE-to-LS reformulation; a smaller tail are =MaxIterations= or =RestorationFailed= cases recovered by ripopt's restoration cascade or fallback solvers), while Ipopt exclusively solves 17. The v0.7$\to$v0.8 alignment effort traded a handful of benchmark-tuned heuristics for Ipopt-faithful kernels (filter $\le$ tolerance, =AugmentFilter= envelope, post-restoration handoff, =LoqoMuOracle::CalculateMu=); the net effect on this suite was a small gain on aggregate solves (+8 over v0.7.1's 556) but a redistribution of which problems pass.
+At v0.8.1, ripopt edges out native Ipopt on CUTEst by 10 problems (571 vs 561 strict-Optimal). ripopt exclusively solves 23 problems that Ipopt cannot (the great majority are =IpoptStatus(-10)= NE problems handled by the NE-to-LS reformulation; a smaller tail are =MaxIterations= or =RestorationFailed= cases recovered by ripopt's restoration cascade or fallback solvers), while Ipopt exclusively solves 13. The v0.7$\to$v0.8 alignment effort traded a handful of benchmark-tuned heuristics for Ipopt-faithful kernels (filter $\le$ tolerance, =AugmentFilter= envelope, post-restoration handoff, =LoqoMuOracle::CalculateMu=, soft-restoration $E_\mu$, watchdog/$\mu_{\max}$ capture); the net effect on this suite was an aggregate gain of +15 strict-Optimal over v0.7.1's 556 and a redistribution of which problems pass.
 
 *** Solution Quality
 
-On the 544 problems where both solvers converge:
-- Matching objectives (relative difference $< 10^{-4}$): 517/544 (95.0%)
-- 27 mismatches: both reach valid KKT points but at different local optima (including cases where fallback solvers find different basins)
+On the 548 problems where both solvers converge:
+- Matching objectives (relative difference $< 10^{-4}$): 527/548 (96.2%)
+- 21 mismatches: both reach valid KKT points but at different local optima (including cases where fallback solvers find different basins)
 
 *** Speed Comparison
 
-On the 544 commonly-solved problems:
+On the 548 commonly-solved problems:
 
 | Metric                                      | Value        |
 |---------------------------------------------+--------------|
-| Geometric mean speedup (ripopt faster)      | 8.9$\times$  |
-| Median speedup (ripopt faster)              | 12.8$\times$ |
-| Problems where ripopt is faster             | 91%          |
-| Problems where ripopt is 10$\times$+ faster | 58%          |
+| Geometric mean speedup (ripopt faster)      | 7.8$\times$  |
+| Median speedup (ripopt faster)              | 10.5$\times$ |
+| Problems where ripopt is faster             | 90%          |
+| Problems where ripopt is 10$\times$+ faster | 54%          |
 
 The v0.8 default linear-solver backend is the pure-Rust =feral= multifrontal LDL$^T$ (Section [[*Linear Algebra]]), developed in a separate repository with its own benchmark corpus; =rmumps= remains available behind the opt-in =rmumps= feature for A/B comparison and as a regression-hunting baseline. Both backends are pure Rust --- v0.7 also had no FFI step --- so the v0.8 change is about debuggability and component isolation rather than build simplification. The speedup gap between v0.7 and v0.8 narrowed slightly because =feral= has not yet matched Fortran MUMPS's GEMM throughput on the largest sparse problems, but the same per-iteration overhead advantage on small/medium problems persists.
 
-Mean and median iteration counts on the commonly-solved set are essentially indistinguishable between the two solvers (37.5 vs 36.6 mean, 14 vs 12 median), so the wall-clock advantage is per-iteration overhead, not algorithmic shortcut.
+Mean and median iteration counts on the commonly-solved set are within a few iterations between the two solvers (43.4 vs 35.5 mean, 13 vs 12 median), so the wall-clock advantage is per-iteration overhead, not algorithmic shortcut.
 
 *** Attribution of ripopt-only Solves
 
-The 20 CUTEst problems solved by ripopt but not Ipopt at v0.8.0 break down as:
+The 23 CUTEst problems solved by ripopt but not Ipopt at v0.8.1 break down as:
 
-- *NE-to-LS reformulation* ($\sim$13 problems): Nonlinear equation systems where Ipopt returns =IpoptStatus(-10)= (insufficient degrees of freedom) while ripopt detects the NE structure and reformulates as an unconstrained least-squares problem with Gauss-Newton Hessian plus second-order corrections (=BEALENE=, =BOX3NE=, =BROWNBSNE=, =DENSCHNBNE=, =DEVGLA1NE=, =DEVGLA2NE=, =ENGVAL2NE=, =EXP2NE=, =HS25NE=, =LANCZOS1=, =NYSTROM5=, =NYSTROM5C=, ...).
+- *NE-to-LS reformulation* ($\sim$15 problems): Nonlinear equation systems where Ipopt returns =IpoptStatus(-10)= (insufficient degrees of freedom) while ripopt detects the NE structure and reformulates as an unconstrained least-squares problem with Gauss-Newton Hessian plus second-order corrections (=BEALENE=, =BIGGS6NE=, =BOX3NE=, =DENSCHNBNE=, =DEVGLA1NE=, =DEVGLA2NE=, =ENGVAL2NE=, =EXP2NE=, =HS25NE=, =LANCZOS1=, =LEVYMONE5=, =NYSTROM5=, =NYSTROM5C=, =GROUPING=, ...).
 
-- *Two-phase restoration and fallback solvers* ($\sim$5 problems): Problems where Ipopt fails with =MaxIterations= or =RestorationFailed= but ripopt's GN phase, multi-attempt recovery, or fallback solvers (L-BFGS, AL, SQP, slack) succeed (=DECONVB=, =POLAK3=, =POLAK6=, =PFIT2=, ...).
+- *Two-phase restoration and fallback solvers* ($\sim$5 problems): Problems where Ipopt fails with =MaxIterations= or =RestorationFailed= but ripopt's GN phase, multi-attempt recovery, or fallback solvers (L-BFGS, AL, SQP, slack) succeed (=DECONVB=, =POLAK6=, =PFIT1=, =PFIT2=, ...).
 
-- *Other algorithmic differences* ($\sim$2 problems): Differences in early-termination handling, status mapping, or scaling that allow ripopt to converge where Ipopt's CUTEst interface returns a non-Optimal status (=EQC=, =ROBOT=, =TRO4X4=).
+- *Other algorithmic differences* ($\sim$3 problems): Differences in early-termination handling, status mapping, or scaling that allow ripopt to converge where Ipopt's CUTEst interface returns a non-Optimal status (=EQC=, =ROBOT=, =TRO4X4=, =WACHBIEG=).
 
-Conversely, Ipopt exclusively solves 17 problems at v0.8.0. These are primarily nonconvex problems where Ipopt's mature inertia handling and barrier-parameter strategy give it an advantage (=ACOPR30=, =CRESC50=, =DEMBO7=, =DISCS=, =DJTL=, =ELATTAR=, =FEEDLOC=, =HATFLDFLNE=, =HIMMELP4=, =LOGHAIRY=, =MSS1=, =NET1=, =PFIT4=, =QCNEW=, =SIPOW2=, =TAXR13322=, =WOMFLET=). ripopt's dominant remaining failure modes on this suite at v0.8 are =RestorationFailed= (74), =MaxIterations= (39), =LocalInfeasibility= (27), and =NumericalError= (14). The shift in profile relative to v0.7.1 (where =NumericalError= dominated at 83 cases) reflects the Ipopt-aligned post-restoration handoff and stricter convergence test now correctly classifying iterates as restoration-stalled rather than as numerical breakdown---honest signal where the solver is actually getting stuck.
+Conversely, Ipopt exclusively solves 13 problems at v0.8.1. These are primarily nonconvex problems where Ipopt's mature inertia handling and barrier-parameter strategy give it an advantage (=CRESC4=, =CRESC50=, =DECONVBNE=, =DISCS=, =DJTL=, =HATFLDFLNE=, =HIMMELP5=, =LOGHAIRY=, =MSS1=, =PFIT3=, =PFIT4=, =SSINE=, =TAXR13322=). ripopt's dominant remaining failure modes on this suite at v0.8.1 are =RestorationFailed= (70), =LocalInfeasibility= (29), =MaxTimeExceeded= (19), =MaxIterations= (18), and =NumericalError= (9). The shift in profile relative to v0.7.1 (where =NumericalError= dominated at 83 cases) reflects the Ipopt-aligned post-restoration handoff and stricter convergence test now correctly classifying iterates as restoration-stalled or time-bound rather than as numerical breakdown---honest signal where the solver is actually getting stuck.
 
 ** Domain-Specific Benchmarks
 
@@ -938,7 +938,7 @@ A set of 13 seawater electrolyte speciation problems (computing equilibrium conc
 
 *** AC Optimal Power Flow (Electrical Grid)
 
-Four AC optimal power flow problems on small IEEE/PGLib test cases (case3_lmbd, case5_pjm, case14_ieee, case30_ieee) test performance on structured engineering optimization. Both ripopt and Ipopt solve all 4 problems to strict =Optimal= at v0.8.0; case30_ieee, which had previously exhausted the iteration budget at v0.7.1 under the stricter KKT backward-error probe, now converges under the v0.8 post-restoration handoff. On the commonly-solved cases ripopt's median speedup over Ipopt is $2.1\times$ (geometric mean $1.8\times$); the gap is smaller than on the small-problem CUTEst tail because dense Bunch-Kaufman is no longer the bottleneck and feral has not yet matched MUMPS's GEMM throughput on the largest sparse fronts. The suite is named =grid= in the repository to make its purpose obvious in the directory layout.
+Four AC optimal power flow problems on small IEEE/PGLib test cases (case3_lmbd, case5_pjm, case14_ieee, case30_ieee) test performance on structured engineering optimization. Both ripopt and Ipopt solve all 4 problems to strict =Optimal= at v0.8.1; case30_ieee, which had previously exhausted the iteration budget at v0.7.1 under the stricter KKT backward-error probe, now converges under the v0.8 post-restoration handoff and lands at the same local optimum as Ipopt (\$8208.52/h, 1.57\% above the published best-known of \$8081.52/h). On the four commonly-solved cases ripopt's median speedup over Ipopt is $2.1\times$ (geometric mean $1.5\times$); the gap is smaller than on the small-problem CUTEst tail because dense Bunch-Kaufman is no longer the bottleneck and feral has not yet matched MUMPS's GEMM throughput on the largest sparse fronts. The suite is named =grid= in the repository to make its purpose obvious in the directory layout.
 
 *** Parameter Estimation
 
@@ -956,43 +956,45 @@ Six water distribution network design instances from MINLPLib cite:bussieck2003m
 
 *** Common Failure Patterns
 
-At v0.8.0, the 163 ripopt failures on CUTEst (727 problems, 564 Optimal) break down as:
-- *RestorationFailed*: 74 cases (45.4%). The dominant failure mode. Both GN and NLP restoration cycles fail to reduce constraint violation enough to escape the basin; this category subsumed many cases that v0.7 misclassified as =NumericalError= once the post-restoration handoff was aligned with Ipopt 3.14.
-- *MaxIterations*: 39 cases (23.9%). The solver makes progress but does not reach strict tolerance within the 2999-iteration budget.
-- *LocalInfeasibility*: 27 cases (16.6%). The solver reaches a stationary point of the constraint violation function and declares local infeasibility.
-- *NumericalError*: 14 cases (8.6%). Catastrophic step-computation failures (factor-cache breakdown, NaN propagation) not recoverable by inertia correction.
-- *Timeout / StopAtTinyStep / EvaluationError*: 9 cases combined (5.5%). Wall-clock exhaustion, $\alpha$-tiny stalls, or function-evaluation NaNs.
+At v0.8.1, the 156 ripopt failures on CUTEst (727 problems, 571 Optimal) break down as:
+- *RestorationFailed*: 70 cases (44.9%). The dominant failure mode. Both GN and NLP restoration cycles fail to reduce constraint violation enough to escape the basin; this category subsumed many cases that v0.7 misclassified as =NumericalError= once the post-restoration handoff was aligned with Ipopt 3.14.
+- *LocalInfeasibility*: 29 cases (18.6%). The solver reaches a stationary point of the constraint violation function and declares local infeasibility.
+- *MaxTimeExceeded*: 19 cases (12.2%). The wall-clock budget was exhausted before strict tolerance was reached. The =MaxTimeExceeded= variant was added in v0.8.1 to distinguish wall-clock cutoffs from iteration-count cutoffs.
+- *MaxIterations*: 18 cases (11.5%). The solver makes progress but does not reach strict tolerance within the 2999-iteration budget.
+- *NumericalError*: 9 cases (5.8%). Catastrophic step-computation failures (factor-cache breakdown, NaN propagation) not recoverable by inertia correction.
+- *Timeout / StopAtTinyStep / EvaluationError*: 11 cases combined (7.1%). Solver-side wall-clock timeout, $\alpha$-tiny stalls, or function-evaluation NaNs.
 
 *** Comparison of Failure Modes
 
 | Failure Mode                    | ripopt | Ipopt |
 |---------------------------------+--------+-------|
-| RestorationFailed               | *74*   | 4     |
-| MaxIterations                   | 39     | 12    |
-| LocalInfeasibility / Infeasible | 27     | 11    |
-| NumericalError                  | 14     | 0     |
-| Timeout                         | 3      | 10    |
-| StopAtTinyStep                  | 3      | 0     |
+| RestorationFailed               | *70*   | 4     |
+| LocalInfeasibility / Infeasible | 29     | 11    |
+| MaxTimeExceeded                 | 19     | 0     |
+| MaxIterations                   | 18     | 12    |
+| NumericalError                  | 9      | 0     |
+| Timeout                         | 6      | 10    |
 | EvaluationError                 | 3      | 0     |
+| StopAtTinyStep                  | 2      | 0     |
 | IpoptStatus(-10)                | ---    | *123* |
 | Other (status 3, 4, etc.)       | 0      | 6     |
-| *Total failures*                | *163*  | *166* |
+| *Total failures*                | *156*  | *166* |
 
 The failure profiles reveal fundamentally different bottlenecks. Ipopt's dominant failure mode is =IpoptStatus(-10)= (123 cases)---the CUTEst interface rejecting problems with insufficient degrees of freedom, primarily nonlinear equation systems. ripopt avoids this entirely through the NE-to-LS reformulation (Section [[*Automatic NE-to-LS Reformulation]]).
 
-ripopt's dominant failure mode is =RestorationFailed= (74 cases, 45.4%), followed by =MaxIterations= (39 cases, 23.9%). The 163 total failures compare closely to Ipopt's 166. Every ripopt-reported solve achieves full convergence to the requested tolerance.
+ripopt's dominant failure mode is =RestorationFailed= (70 cases, 44.9%), followed by =LocalInfeasibility= (29 cases, 18.6%) and =MaxTimeExceeded= (19 cases, 12.2%). The 156 total failures compare closely to Ipopt's 166. Every ripopt-reported solve achieves full convergence to the requested tolerance.
 
 ** Speed vs. Accuracy Trade-off
 
 The benchmarks reveal a clear trade-off:
 
-- *Speed*: ripopt is dramatically faster per iteration on small problems and moderately faster on medium problems, with a CUTEst geometric-mean wall-clock speedup of $8.9\times$ at v0.8.0. This advantage comes from implementation characteristics (Rust, stack allocation, no C/Fortran interop into the IPM kernel) rather than algorithmic differences; mean and median iteration counts are now within a few percent of Ipopt's (37.5 vs 36.6 mean, 14 vs 12 median on the commonly-solved CUTEst set).
+- *Speed*: ripopt is dramatically faster per iteration on small problems and moderately faster on medium problems, with a CUTEst geometric-mean wall-clock speedup of $7.8\times$ (median $10.5\times$) at v0.8.1. This advantage comes from implementation characteristics (Rust, stack allocation, no C/Fortran interop into the IPM kernel) rather than algorithmic differences; mean and median iteration counts are within a few iterations of Ipopt's (43.4 vs 35.5 mean, 13 vs 12 median on the commonly-solved CUTEst set).
 
 - *Iteration count*: With the v0.8 alignment of the Loqo and Quality-Function oracles to Ipopt's faithful implementations, the residual iteration-count gap is concentrated on a small number of problems where filter and inertia-correction interactions still differ (Section [[*Opportunities for Improvement]]).
 
-- *Robustness*: ripopt's two-phase restoration, multi-attempt recovery, and multi-solver fallback architecture provide complementary recovery mechanisms. At v0.8.0 ripopt exclusively solves 20 CUTEst problems that Ipopt cannot (primarily NE systems handled by the LS reformulation, plus a tail recovered by GN restoration and fallback solvers); Ipopt exclusively solves 17. With 163 CUTEst failures vs. Ipopt's 166, the two solvers are roughly tied on aggregate failures, though the profiles differ qualitatively: ripopt's failures are dominated by =RestorationFailed= and =MaxIterations=, while Ipopt's are dominated by =IpoptStatus(-10)= rejections on nonlinear equation systems that ripopt avoids entirely.
+- *Robustness*: ripopt's two-phase restoration, multi-attempt recovery, and multi-solver fallback architecture provide complementary recovery mechanisms. At v0.8.1 ripopt exclusively solves 23 CUTEst problems that Ipopt cannot (primarily NE systems handled by the LS reformulation, plus a tail recovered by GN restoration and fallback solvers); Ipopt exclusively solves 13. With 156 CUTEst failures vs. Ipopt's 166, the two solvers are roughly tied on aggregate failures, though the profiles differ qualitatively: ripopt's failures are dominated by =RestorationFailed= and =LocalInfeasibility=, while Ipopt's are dominated by =IpoptStatus(-10)= rejections on nonlinear equation systems that ripopt avoids entirely.
 
-- *Solution quality*: On the 544 commonly-solved CUTEst problems, the objective match rate at the $10^{-4}$ relative tolerance is $95.0\%$ (517/544). The remaining $5\%$ are different local optima from algorithmic path differences (including fallback solvers finding different basins), not accuracy deficiencies.
+- *Solution quality*: On the 548 commonly-solved CUTEst problems, the objective match rate at the $10^{-4}$ relative tolerance is $96.2\%$ (527/548). The remaining $3.8\%$ are different local optima from algorithmic path differences (including fallback solvers finding different basins), not accuracy deficiencies.
 
 * Parametric Sensitivity Analysis
   :PROPERTIES:
@@ -1037,15 +1039,15 @@ The prediction errors are $O(\Delta p^2)$ as expected from first-order Taylor ex
   :CUSTOM_ID: opportunities
   :END:
 
-The failure analysis and benchmark comparison reveal several concrete opportunities for improvement. At v0.8.0 the CUTEst failure profile is dominated by =RestorationFailed= (74 cases, 45.4%), followed by =MaxIterations= (39, 23.9%), =LocalInfeasibility= (27, 16.6%), =NumericalError= (14, 8.6%), and a long tail of =Timeout= / =StopAtTinyStep= / =EvaluationError= (3 each). The shift from v0.7.1 (where =NumericalError= dominated at 76 cases) reflects the v0.8 Ipopt-aligned post-restoration handoff and stricter convergence test correctly classifying iterates as restoration-stalled rather than as numerical breakdown. This profile suggests priorities for future work.
+The failure analysis and benchmark comparison reveal several concrete opportunities for improvement. At v0.8.1 the CUTEst failure profile is dominated by =RestorationFailed= (70 cases, 44.9%), followed by =LocalInfeasibility= (29, 18.6%), =MaxTimeExceeded= (19, 12.2%), =MaxIterations= (18, 11.5%), =NumericalError= (9, 5.8%), and a tail of =Timeout= / =EvaluationError= / =StopAtTinyStep= (11 combined). The shift from v0.7.1 (where =NumericalError= dominated at 76 cases) reflects the v0.8 Ipopt-aligned post-restoration handoff and stricter convergence test correctly classifying iterates as restoration-stalled or time-bound rather than as numerical breakdown. This profile suggests priorities for future work.
 
 ** Restoration-Phase Robustness
 
-=RestorationFailed= is the largest category at v0.8.0 (74 cases). The Ipopt-aligned handoff (Section [[*Post-Restoration State Handoff]]) eliminated the post-handoff $\mu$ blow-up that had inflated the v0.7 =NumericalError= bucket, but did not fix the underlying issue that on a sizeable subset of problems neither the GN feasibility solver nor the multi-attempt $\mu$ cycle escapes the basin. Promising directions include: (i) coupling the GN regularization $\epsilon$ to the local Jacobian conditioning so the solver does not stall in a Levenberg-Marquardt damping plateau; (ii) replacing the deterministic $x$-perturbation in the recovery cascade with a low-discrepancy or basin-hopping schedule; and (iii) using a feasibility-restoration phase that admits constraint scaling updates between attempts.
+=RestorationFailed= is the largest category at v0.8.1 (70 cases). The Ipopt-aligned handoff (Section [[*Post-Restoration State Handoff]]) eliminated the post-handoff $\mu$ blow-up that had inflated the v0.7 =NumericalError= bucket, but did not fix the underlying issue that on a sizeable subset of problems neither the GN feasibility solver nor the multi-attempt $\mu$ cycle escapes the basin. Promising directions include: (i) coupling the GN regularization $\epsilon$ to the local Jacobian conditioning so the solver does not stall in a Levenberg-Marquardt damping plateau; (ii) replacing the deterministic $x$-perturbation in the recovery cascade with a low-discrepancy or basin-hopping schedule; and (iii) using a feasibility-restoration phase that admits constraint scaling updates between attempts.
 
 ** Infeasibility Detection and Recovery
 
-The =LocalInfeasibility= failure mode (27 cases at v0.8.0) occurs when the solver reaches a stationary point of the constraint violation function $\|\nabla_x \theta(x)\| \approx 0$. While many of these are genuinely infeasible, some may represent false declarations where a feasible solution exists in a different basin. Several strategies could reduce false positives:
+The =LocalInfeasibility= failure mode (29 cases at v0.8.1) occurs when the solver reaches a stationary point of the constraint violation function $\|\nabla_x \theta(x)\| \approx 0$. While many of these are genuinely infeasible, some may represent false declarations where a feasible solution exists in a different basin. Several strategies could reduce false positives:
 
 - *Multi-start for NE problems*: When the LS reformulation converges to a nonzero local minimum, a second attempt from a perturbed starting point could escape the basin. This is particularly relevant for square NE systems ($m = n$) where the constrained IPM fallback currently uses the same starting point.
 
@@ -1063,11 +1065,11 @@ ripopt initializes constraint multipliers $y$ to zero and relies on the KKT syst
 
 ** Performance Optimization for Large Problems
 
-The 3 =Timeout= and 39 =MaxIterations= failures indicate performance and convergence-rate bottlenecks on larger problems. Two directions could help:
+The 6 =Timeout=, 19 =MaxTimeExceeded=, and 18 =MaxIterations= failures indicate performance and convergence-rate bottlenecks on larger problems. Two directions could help:
 
 - *Sparse Jacobian assembly*: For over-constrained problems (e.g., EXPFITC with $m = 502$, $n = 5$), the condensed KKT reduces the system to dimension $n$ but the dense Jacobian assembly ($O(mn)$) still dominates. Exploiting Jacobian sparsity in the condensation step could reduce per-iteration cost.
 
-- *Sparse factorization throughput on the largest fronts*: At v0.8.0 the default =feral= multifrontal backend matches Ipopt's MUMPS-backed factorization closely on small and medium problems, but trails on the largest sparse fronts where MUMPS leverages decades of GEMM-throughput tuning. Improvements in feral's BLAS-3 supernodal kernels, parallelization across independent fronts, and a true incomplete-LDL$^T$ + MINRES hybrid (deferred from v0.8 to v0.9) would close the remaining gap. The legacy =rmumps= backend remains available for benchmarks that require a direct A/B against Fortran MUMPS.
+- *Sparse factorization throughput on the largest fronts*: At v0.8.1 the default =feral= multifrontal backend matches Ipopt's MUMPS-backed factorization closely on small and medium problems, but trails on the largest sparse fronts where MUMPS leverages decades of GEMM-throughput tuning. Improvements in feral's BLAS-3 supernodal kernels, parallelization across independent fronts, and a true incomplete-LDL$^T$ + MINRES hybrid (deferred from v0.8 to v0.9) would close the remaining gap. The legacy =rmumps= backend remains available for benchmarks that require a direct A/B against Fortran MUMPS.
 
 ** Quasi-Newton as Primary Solver
 
@@ -1079,16 +1081,16 @@ ripopt implements gradient-based NLP scaling, which normalizes the objective gra
 
 ** Summary of Estimated Impact
 
-| Improvement Area             | Current Failures Addressed | Estimated Problems Recovered |
-|------------------------------+----------------------------+------------------------------|
-| Restoration-phase robustness | 74 RestorationFailed       | 15--30                       |
-| Convergence rate / max-iter  | 39 MaxIterations           | 8--15                        |
-| Infeasibility detection      | 27 LocalInfeasibility      | 3--6                         |
-| Numerical-error recovery     | 14 NumericalError          | 3--6                         |
-| Multiplier initialization    | Various                    | 2--4                         |
-| Scaling                      | Various                    | 2--5                         |
+| Improvement Area             | Current Failures Addressed       | Estimated Problems Recovered |
+|------------------------------+----------------------------------+------------------------------|
+| Restoration-phase robustness | 70 RestorationFailed             | 15--30                       |
+| Convergence rate / max-iter  | 18 MaxIterations + 19 MaxTimeExc | 8--15                        |
+| Infeasibility detection      | 29 LocalInfeasibility            | 3--6                         |
+| Numerical-error recovery     | 9 NumericalError                 | 2--4                         |
+| Multiplier initialization    | Various                          | 2--4                         |
+| Scaling                      | Various                          | 2--5                         |
 
-The largest opportunity at v0.8.0 is recovering problems that now fail as =RestorationFailed=. The Ipopt-aligned post-restoration handoff fixed the post-restoration $\mu$ blow-up that had previously masqueraded as =NumericalError=, but did not address the underlying restoration-cycling problem on a sizeable subset of inputs. Together, these improvements are largely independent and could collectively push ripopt's CUTEst solve rate toward $80$--$85\%$.
+The largest opportunity at v0.8.1 is recovering problems that now fail as =RestorationFailed=. The Ipopt-aligned post-restoration handoff fixed the post-restoration $\mu$ blow-up that had previously masqueraded as =NumericalError=, but did not address the underlying restoration-cycling problem on a sizeable subset of inputs. Together, these improvements are largely independent and could collectively push ripopt's CUTEst solve rate toward $82$--$87\%$.
 
 * Related Work
 
@@ -1106,9 +1108,9 @@ The use of iterative methods for KKT systems in interior point solvers has been 
 
 We have presented ripopt, an interior point optimizer in approximately 21,700 lines of Rust that achieves competitive performance with Ipopt through a combination of architectural simplification, algorithmic innovation, and a multi-solver fallback architecture. The implicit slack formulation produces smaller KKT systems and a cleaner interface. The Ipopt-aligned two-gate convergence test, two-phase restoration, NE-to-LS reformulation, preprocessing, near-linear constraint detection, and fallback solvers (L-BFGS, augmented Lagrangian, SQP, explicit slack) compensate for the challenges introduced by eliminating explicit slack variables and provide novel algorithmic capabilities. A configurable linear solver infrastructure---offering direct multifrontal, iterative (preconditioned MINRES), and hybrid direct-iterative modes---enables ripopt to scale to larger problems while maintaining robustness through automatic mode switching.
 
-On the Hock-Schittkowski test suite, ripopt solves 118 of 120 problems (98.3%), surpassing Ipopt's 116 (96.7%). On the CUTEst benchmark suite at v0.8.0, ripopt strictly solves 564 of 727 problems (77.6%) versus Ipopt's 561 (77.2%). The geometric mean $8.9\times$ speedup on the 544 commonly-solved CUTEst problems---rising to $20.8\times$ on the HS suite---makes ripopt particularly attractive for applications requiring rapid solves of small-to-medium NLPs, such as model predictive control, real-time optimization, and embedded systems. The v0.8.0 release also moves the default sparse linear solver from =rmumps= (an embedded pure-Rust port that lived inside the ripopt tree) to =feral= cite:feral2026, an independently developed and independently benchmarked pure-Rust multifrontal LDL$^T$ solver. The build remains entirely Rust; the gain is debuggability, since linear-solver failures can now be reproduced and isolated against feral's own test corpus rather than being entangled with ripopt's IPM-driven workload. The cost is a modest GEMM-throughput gap on the largest sparse fronts.
+On the Hock-Schittkowski test suite (historical, retired from the v0.8 harness), ripopt solved 118 of 120 problems (98.3%), surpassing Ipopt's 116 (96.7%). On the CUTEst benchmark suite at v0.8.1, ripopt strictly solves 571 of 727 problems (78.5%) versus Ipopt's 561 (77.2%). The geometric mean $7.8\times$ wall-clock speedup (median $10.5\times$) on the 548 commonly-solved CUTEst problems makes ripopt particularly attractive for applications requiring rapid solves of small-to-medium NLPs, such as model predictive control, real-time optimization, and embedded systems. The v0.8 release line moves the default sparse linear solver from =rmumps= (an embedded pure-Rust port that lived inside the ripopt tree) to =feral= cite:feral2026, an independently developed and independently benchmarked pure-Rust multifrontal LDL$^T$ solver. The build remains entirely Rust; the gain is debuggability, since linear-solver failures can now be reproduced and isolated against feral's own test corpus rather than being entangled with ripopt's IPM-driven workload. The cost is a modest GEMM-throughput gap on the largest sparse fronts.
 
-The failure analysis reveals that =RestorationFailed= is now the dominant failure mode on CUTEst (74 cases, 45.4%), followed by =MaxIterations= (39, 23.9%) and =LocalInfeasibility= (27, 16.6%). The shift from v0.7.1's =NumericalError=-dominated profile reflects the v0.8 Ipopt-aligned post-restoration handoff correctly classifying iterates as restoration-stalled rather than as numerical breakdown---an honest signal where the solver is actually getting stuck. Targeting restoration-phase robustness, multiplier initialization, and large-problem factorization throughput could push the CUTEst solve rate toward $85$--$90\%$.
+The failure analysis reveals that =RestorationFailed= is now the dominant failure mode on CUTEst (70 cases, 44.9%), followed by =LocalInfeasibility= (29, 18.6%), =MaxTimeExceeded= (19, 12.2%), and =MaxIterations= (18, 11.5%). The shift from v0.7.1's =NumericalError=-dominated profile reflects the v0.8 Ipopt-aligned post-restoration handoff correctly classifying iterates as restoration-stalled or time-bound rather than as numerical breakdown---an honest signal where the solver is actually getting stuck. Targeting restoration-phase robustness, multiplier initialization, and large-problem factorization throughput could push the CUTEst solve rate toward $85$--$90\%$.
 
 The built-in AMPL NL interface and Pyomo solver plugin enable ripopt to serve as a drop-in replacement for Ipopt in existing Pyomo workflows, requiring only a one-line change to switch solvers. The GAMS solver link extends this accessibility to the GAMS modeling ecosystem, enabling =option nlp = ripopt;= with full Hessian support and option file integration. The sIPOPT-style parametric sensitivity analysis enables post-optimal what-if analysis and uncertainty propagation at near-zero cost, extending ripopt's utility beyond single-solve optimization.
 
