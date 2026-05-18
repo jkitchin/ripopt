@@ -2,32 +2,37 @@
 
 ripopt began as a Rust translation of the Ipopt interior-point optimizer. Through
 iterative development it has diverged significantly, incorporating novel algorithmic
-strategies that allow it to solve **more problems** than the reference implementation
-on the CUTEst benchmark suite while being dramatically faster on small-to-medium
-problems. This document provides a balanced analysis of where ripopt innovates, where
-Ipopt remains stronger, and where there is room to improve.
+strategies. On the CUTEst benchmark suite at v0.8.1 it solves slightly fewer problems
+to strict `Optimal` than Ipopt (551 vs 556), but is dramatically faster on
+small-to-medium problems and solves a different set of problems --- 22 that Ipopt
+cannot, vs. 27 the other way. This document provides a balanced analysis of where
+ripopt innovates, where Ipopt remains stronger, and where there is room to improve.
+
+All counts below are strict `Optimal` (Ipopt status 0 or ripopt
+`SolveStatus::Optimal`); `Acceptable`, `MaxIterations`, `MaxTimeExceeded`, and
+`NumericalError` outcomes are not counted as solved (see `CLAUDE.md` honesty
+rule).
 
 ## Benchmark Summary
 
 |                          | ripopt                 | Ipopt                |
 |--------------------------|------------------------|----------------------|
-| CUTEst solved            | **562/727 (77.3%)**    | 561/727 (77.2%)      |
-| HS solved                | **118/120 (98.3%)**    | 116/120 (96.7%)      |
-| Both solve (CUTEst)      | 525                    | 525                  |
-| Matching objectives      | 436/525 (83.0%)        |                      |
-| ripopt-only (CUTEst)     | **37**                 | --                   |
-| Ipopt-only (CUTEst)      | --                     | **36**               |
-| Both fail (CUTEst)       | 129                    | 129                  |
+| CUTEst solved            | 551/727 (75.8%)        | **556/727 (76.5%)**  |
+| HS solved (retired)      | **118/120 (98.3%)**    | 116/120 (96.7%)      |
+| Both solve (CUTEst)      | 529                    | 529                  |
+| Matching objectives      | 514/529 (97.2%)        |                      |
+| ripopt-only (CUTEst)     | **22**                 | --                   |
+| Ipopt-only (CUTEst)      | --                     | **27**               |
 
-**Solution quality** (525 CUTEst problems where both converge):
-- Matching objectives (rel diff < 1e-4): 436/525 (83.0%)
-- 89 mismatches: both reach valid KKT points but at different local optima
+**Solution quality** (529 CUTEst problems where both converge to strict `Optimal`):
+- Matching objectives (rel diff < 1e-4): 514/529 (97.2%)
+- 15 mismatches: both reach valid KKT points but at different local optima
 
-**Speed** (525 CUTEst common successes):
-- Geometric mean speedup: **9.9x** (ripopt faster)
-- Median speedup: **18.9x**
-- 84% of problems: ripopt faster
-- 63% of problems: ripopt 10x+ faster
+**Speed** (529 CUTEst commonly-Optimal):
+- Geometric mean speedup: **7.9x** (ripopt faster)
+- Median speedup: **10.6x**
+- 90% of problems: ripopt faster
+- 54% of problems: ripopt 10x+ faster
 - Small problems (n <= 10): massive speedup (100x+ median on microsecond solves)
 - Medium problems (10 < n <= 50): typically 2-5x faster
 - Large problems (n > 50): roughly even, with Ipopt's MUMPS winning on largest systems
@@ -41,36 +46,27 @@ reverses the gap.
 
 ## Key Innovations in ripopt
 
-### 1. NE-to-LS Reformulation
+### 1. Implicit-Slack Acceptance of NE Systems
 
 **The problem.** Many CUTEst problems are "nonlinear equation" (NE) problems: find x
-such that g(x) = 0, with a trivially zero objective (f = 0). Ipopt treats these as
-constrained optimization and applies its standard IPM machinery, which struggles
-because the zero objective provides no gradient information to guide the search.
-Ipopt (via CUTEst interface) returns `IpoptStatus(-10)` on 20 such problems.
+such that g(x) = 0, with a trivially zero objective (f = 0). The CUTEst Ipopt
+wrapper rejects these up-front with `IpoptStatus(-10)` ("insufficient degrees of
+freedom") because Ipopt's interface requires a stationary objective. This locks 123
+problems out of Ipopt on CUTEst at v0.8.1.
 
-**ripopt's approach.** ripopt detects NE problems at the start of solve: if f = 0,
-grad_f = 0, all constraints are equalities, and m >= n, it reformulates the problem as
-unconstrained least-squares:
+**ripopt's approach.** ripopt's implicit-slack KKT formulation accepts these as
+ordinary equality-constrained NLPs. With f = 0 the dual-infeasibility residual
+collapses to J^T y; the convergence test reduces to feasibility plus the
+complementarity gate; and the standard barrier/restoration machinery suffices to
+drive g(x) to tolerance. No problem-specific reformulation is involved (the
+dedicated NE-to-LS reformulation that v0.7 used was removed in v0.8; the wins
+survived the removal).
 
-```
-min  (1/2) * ||g(x) - target||^2
-```
-
-with gradient J^T * r and a full Hessian that includes both the Gauss-Newton term
-(J^T * J) and the second-order correction (sum_i r_i * nabla^2 g_i). The second-order
-terms are critical for convergence when far from the solution; a GN-only Hessian fails
-on problems like PFIT4 where the initial residual is large.
-
-For square systems (m = n), if the LS reformulation reports infeasibility (stuck at a
-nonzero local minimum), ripopt falls back to the original constrained IPM. This hybrid
-strategy handles both overdetermined systems (m > n, LS natural) and square systems
-(m = n, LS first for speed, constrained as fallback).
-
-**Impact.** 10 NE problems solved by ripopt that Ipopt cannot handle (BEALENE, BOX3NE,
-BROWNBSNE, DENSCHNBNE, DENSCHNENE, DEVGLA1NE, ENGVAL2NE, EXP2NE, GULFNE, YFITNE).
-Additionally solves PFIT1, PFIT2, PFIT4, HEART6, LEWISPOL, GROUPING, MESH, NYSTROM5,
-NYSTROM5C, and others where the NE structure is exploited.
+**Impact.** Of ripopt's 22 exclusive CUTEst wins at v0.8.1, 12 are NE-style
+problems where the Ipopt wrapper returns `IpoptStatus(-10)` and ripopt's IPM
+converges (e.g. BEALENE, BIGGS6NE, BOX3NE, DENSCHNBNE, DEVGLA1NE, DEVGLA2NE,
+ENGVAL2NE, EXP2NE, HS25NE, LANCZOS1, LEVYMONE5, NYSTROM5). The remaining 10
+exclusive wins come from the restoration and fallback architecture below.
 
 ### 2. Two-Phase Restoration
 
@@ -273,23 +269,25 @@ perturbation strategy.
 
 ## Summary
 
-On the CUTEst suite, ripopt now surpasses Ipopt (562 vs 561), with ripopt
-recovering 37 problems Ipopt cannot and Ipopt recovering 36 problems ripopt cannot.
-ripopt's unique capabilities:
-- NE-to-LS reformulation (~18 NE problems Ipopt cannot handle)
+On the CUTEst suite at v0.8.1, Ipopt edges ripopt by 5 strict-Optimal problems
+(556 vs 551). ripopt recovers 22 problems Ipopt cannot, and Ipopt recovers 27
+that ripopt cannot. ripopt's unique capabilities:
+- Implicit-slack acceptance of NE systems (12 of the 22 exclusive wins; the v0.7
+  NE-to-LS reformulation was retired, the wins survived)
 - Two-phase restoration (GN fast path + NLP robust fallback)
 - Explicit slack fallback (recovers problems where implicit-slack multipliers oscillate)
 - Pragmatic inertia correction (continues past factorization failures)
-- Complementarity gate (prevents false convergence)
 - Hybrid dense/sparse linear algebra (auto-selected by problem size)
-- Raw speed advantage from Rust (median 18.9x faster on CUTEst, 14.2x on HS)
+- Raw speed advantage from Rust (median 10.6x faster on the 529 commonly-Optimal
+  CUTEst problems at v0.8.1; geomean 7.9x)
 
 Ipopt's remaining advantages are:
 - More mature mu strategy on difficult nonconvex problems
 - Decades of parameter tuning on edge cases
 - Better handling of dual oscillation at degenerate points
-- Fortran MUMPS outperforms rmumps on the very largest sparse systems
+- Fortran MUMPS outperforms `feral` on the very largest sparse systems
 
-The most impactful improvements would target the 63 CUTEst NumericalError failures
-(often on non-convex Hessians and ill-conditioned KKT systems) and the 66 LocalInfeasibility
-cases where multi-start or constraint-space search could escape false infeasibility declarations.
+The most impactful improvements would target the 70 CUTEst `RestorationFailed`
+failures (the dominant v0.8.1 bucket) and the 29 `LocalInfeasibility` cases
+where multi-start or constraint-space search could escape false infeasibility
+declarations.

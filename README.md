@@ -40,8 +40,7 @@ It implements a primal-dual interior point method with a barrier formulation, si
 - Two-phase restoration: fast Gauss-Newton + full NLP restoration subproblem
 - Multi-attempt recovery with systematic barrier landscape perturbation
 - Watchdog strategy for escaping narrow feasible corridors
-- Automatic NE-to-LS reformulation for overdetermined nonlinear equation systems
-- **Convergence polishing**: Newton polish for NE-to-LS, complementarity snap for IPM
+- **Convergence polishing**: complementarity snap for IPM
 - NLP scaling (gradient-based objective and constraint scaling)
 - Local infeasibility detection for inconsistent constraint systems
 - **Early stall detection**: bail out fast when stuck in early iterations to trigger fallbacks
@@ -75,31 +74,37 @@ On 116 commonly-solved problems: **20.8x geometric mean speedup**, median 20.9x,
 
 ### CUTEst Benchmark Suite (727 problems)
 
+All counts in this section are strict `Optimal` (Ipopt status 0 or ripopt
+`SolveStatus::Optimal`); `Acceptable`, `MaxIterations`, `MaxTimeExceeded`, and
+`NumericalError` outcomes are **not** counted as solved (see `CLAUDE.md`
+honesty rule).
+
 | Metric        | ripopt              | Ipopt (C++ with MUMPS) |
 |---------------|---------------------|------------------------|
-| Total solved  | 564/727 (77.6%)     | 561/727 (77.2%)        |
-| Both solve    | 544                 | 544                    |
-| ripopt only   | 20                  | --                     |
-| Ipopt only    | --                  | 17                     |
+| Total solved  | 551/727 (75.8%)     | 556/727 (76.5%)        |
+| Both solve    | 529                 | 529                    |
+| ripopt only   | 22                  | --                     |
+| Ipopt only    | --                  | 27                     |
 
-ripopt edges out native Ipopt on CUTEst strict-Optimal at v0.8.0 by three problems (564 vs 561). The v0.8 cycle replaced rmumps with the pure-Rust [`feral`](https://crates.io/crates/feral) LDLᵀ solver and aligned the IPM kernel with Ipopt 3.14 (post-restoration handoff, AugmentFilter, μ-update oracles); the dominant remaining failure mode is `RestorationFailed` (74 cases). See CHANGELOG and the manuscript for details.
+Ipopt edges ripopt on CUTEst strict-Optimal at v0.8.1 by 5 problems (556 vs 551). The v0.8 cycle replaced rmumps with the pure-Rust [`feral`](https://crates.io/crates/feral) LDLᵀ solver and aligned the IPM kernel with Ipopt 3.14 (post-restoration handoff, AugmentFilter, μ-update oracles, QF-oracle alignment, watchdog/μ_max capture); the dominant remaining failure mode is `RestorationFailed` (70 cases), followed by `LocalInfeasibility` (29), `Acceptable` (20, counted as a failure), and `MaxTimeExceeded` (19). Of ripopt's 22 exclusive wins, 12 are nonlinear-equation systems where the CUTEst Ipopt wrapper rejects with `IpoptStatus(-10)` (insufficient degrees of freedom) and ripopt's implicit-slack IPM accepts them as ordinary equality-constrained NLPs. See CHANGELOG and the manuscript for details.
 
-On 544 commonly-solved problems:
+On 529 commonly-Optimal problems:
 
-| Metric                          | Value            |
-|---------------------------------|------------------|
-| Geometric mean speedup          | **8.9x**         |
-| Median speedup                  | (see manuscript) |
-| Problems where ripopt is faster | majority of 544  |
+| Metric                          | Value                  |
+|---------------------------------|------------------------|
+| Geometric mean speedup          | **7.9x**               |
+| Median speedup                  | **10.6x**              |
+| Problems where ripopt is faster | 90%                    |
+| Problems where ripopt is 10x+   | 54%                    |
 
-**Interpreting the speed numbers.** Most CUTEst problems are small (n < 10) and solve in microseconds for ripopt, while Ipopt has a ~1-3ms floor from internal initialization. The per-iteration speedup on small problems comes from stack allocation, the absence of C/Fortran interop, and cache-efficient dense linear algebra. On larger problems, ripopt switches to sparse multifrontal LDL^T with SuiteSparse AMD ordering, and Ipopt's Fortran MUMPS has a per-factorization advantage. Ipopt uses fewer iterations on average on CUTEst (ripopt mean 62.3 vs Ipopt 39.5), reflecting its more mature barrier parameter tuning.
+**Interpreting the speed numbers.** Most CUTEst problems are small (n < 10) and solve in microseconds for ripopt, while Ipopt has a ~1-3ms floor from internal initialization. The per-iteration speedup on small problems comes from stack allocation, the absence of C/Fortran interop, and cache-efficient dense linear algebra. On larger problems, ripopt switches to sparse multifrontal LDLᵀ via `feral`, and Ipopt's Fortran MUMPS retains a per-factorization advantage on the largest fronts. Ipopt uses fewer iterations on average on CUTEst (ripopt mean 43.4 vs Ipopt 35.5), reflecting its more mature barrier parameter tuning.
 
 The speed advantage comes from:
 
 1. **Lower per-iteration overhead.** ripopt's dense Bunch-Kaufman factorization avoids sparse symbolic analysis and has minimal allocation. For small-to-medium problems (n < 50), this gives 2-5x per-iteration speedup.
-2. **Dense condensed KKT for tall-narrow problems.** When m >> n with n <= 100, ripopt reduces an (n+m)x(n+m) sparse factorization to an nxn dense solve, giving 100-800x speedup on problems like EXPFITC (n=5, m=502) and OET3 (n=4, m=1002).
-3. **Mehrotra predictor-corrector with Gondzio corrections.** Enabled by default, reducing iteration counts on many problems.
-4. **Fewer iterations on some problems.** NE-to-LS reformulation, two-phase restoration, and multi-solver fallback recover problems that Ipopt cannot solve.
+2. **Mehrotra predictor-corrector with Gondzio corrections.** Enabled by default, reducing iteration counts on many problems.
+3. **Implicit-slack KKT formulation.** Equality-only NE systems that the CUTEst Ipopt wrapper rejects with `IpoptStatus(-10)` are accepted by ripopt as standard equality-constrained NLPs and driven to feasibility through the usual barrier/restoration path; this accounts for most of ripopt's exclusive wins.
+4. **Two-phase restoration and multi-solver fallback** recover problems on which the primary IPM stalls.
 
 Where Ipopt is faster:
 
@@ -120,10 +125,11 @@ Both solvers receive the exact same NlpProblem struct via the Rust trait interfa
 
 Numbers above are from the v0.7 sweep. The v0.8 cycle replaced the
 sparse linear solver (rmumps → feral) and aligned the IPM kernel
-with Ipopt 3.14; aggregate CUTEst pass rate went up (564 vs 561) and
-the geomean speedup on commonly-solved problems came down to 8.9x as
-feral has not yet matched MUMPS's GEMM throughput on the largest
-sparse fronts. See the manuscript for the full v0.8 analysis.
+with Ipopt 3.14; on CUTEst strict-Optimal counts the aggregate
+shifted to 551 (ripopt) vs 556 (Ipopt) and the geomean speedup on
+529 commonly-Optimal problems is 7.9x (median 10.6x), with feral
+still trailing MUMPS on the largest sparse fronts. See the
+manuscript for the full v0.8 analysis.
 Historical numbers from v0.6.2 are preserved in
 `benchmarks/large_scale/large_scale_results.txt` snapshots. ripopt's
 advantage is strongest on unconstrained problems (L-BFGS fallback);
@@ -136,8 +142,8 @@ Run the benchmarks yourself: `make benchmark`
 
 | Suite                        | Problems | ripopt           | Ipopt         | Notes                                                              |
 |------------------------------|----------|------------------|---------------|--------------------------------------------------------------------|
-| Electrolyte thermodynamics   | 13       | **13/13 (100%)** | 12/13 (92.3%) | 17.5x geo mean speedup; ripopt uniquely solves seawater speciation |
-| Grid (AC Optimal Power Flow) | 4        | 3/4 (75%)        | **4/4 (100%)**| 2.8x geo mean on 3 commonly-solved; case30_ieee regression         |
+| Electrolyte thermodynamics   | 13       | **13/13 (100%)** | 12/13 (92.3%) | 5.7x geo mean speedup (median 8.5x); ripopt uniquely solves seawater speciation |
+| Grid (AC Optimal Power Flow) | 4        | **4/4 (100%)**   | **4/4 (100%)**| 1.5x geo mean (median 2.1x) on 4 commonly-solved                  |
 | CHO parameter estimation     | 1        | 0/1              | 0/1           | Large-scale (n=21,672, m=21,660); both hit iteration limit         |
 | Gas pipeline NLPs            | 4        | see suite README | see suite README | PDE-discretized Euler equations on pipe networks (gaslib11/40, steady/dynamic). Standalone — does not feed `BENCHMARK_REPORT.md` |
 | Water distribution NLPs      | 6        | see suite README | see suite README | MINLPLib water network design instances (Hazen-Williams head-loss). Standalone — does not feed `BENCHMARK_REPORT.md` |
@@ -557,7 +563,7 @@ Include `ripopt.h` (repo root) in your C project. It defines version macros, cal
 #include "ripopt.h"
 
 // Check version at compile time
-printf("ripopt %s\n", RIPOPT_VERSION);  // "0.8.0"
+printf("ripopt %s\n", RIPOPT_VERSION);  // "0.8.1"
 ```
 
 ### Callback signatures
@@ -826,8 +832,8 @@ cargo test
 The test suite covers:
 - **Unit tests**: Dense LDL factorization, convergence checking, filter line search, fraction-to-boundary, KKT assembly, restoration, preprocessing, linearity detection, SQP, linear solver, autodiff, L-BFGS, sensitivity analysis
 - **C API tests**: FFI integration tests
-- **Integration tests**: Rosenbrock, SimpleQP, HS071, HS035, PureBoundConstrained, MultipleEqualityConstraints, NE-to-LS reformulation, augmented Lagrangian, NL file parsing, IPM code paths, parametric sensitivity, and more
-- **Coverage tests**: Augmented Lagrangian convergence paths, NL parser/solver pipeline, autodiff tape operations, IPM preprocessing/condensed KKT/unbounded detection
+- **Integration tests**: Rosenbrock, SimpleQP, HS071, HS035, PureBoundConstrained, MultipleEqualityConstraints, augmented Lagrangian, NL file parsing, IPM code paths, parametric sensitivity, and more
+- **Coverage tests**: Augmented Lagrangian convergence paths, NL parser/solver pipeline, autodiff tape operations, IPM preprocessing/unbounded detection
 
 ## Code Coverage
 
@@ -844,45 +850,64 @@ cargo llvm-cov test --text
 cargo llvm-cov test --html && open target/llvm-cov/html/index.html
 ```
 
-Current coverage by module:
+Current coverage by module (default features = `feral + faer`):
 
-| Module                   | Line Coverage |
-|--------------------------|---------------|
-| options.rs               | 100%          |
-| slack_formulation.rs     | 97%           |
-| warmstart.rs             | 97%           |
-| filter.rs                | 95%           |
-| restoration_nlp.rs       | 93%           |
-| convergence.rs           | 92%           |
-| sensitivity.rs           | 91%           |
-| dense.rs (linear solver) | 91%           |
-| banded.rs                | 91%           |
-| nl/header.rs             | 91%           |
-| sqp.rs                   | 90%           |
-| preprocessing.rs         | 85%           |
-| linear_solver/mod.rs     | 84%           |
-| sparse.rs                | 82%           |
-| kkt.rs                   | 81%           |
-| restoration.rs           | 79%           |
-| multifrontal.rs          | 78%           |
-| nl/autodiff.rs           | 74%           |
-| lbfgs.rs                 | 70%           |
-| nl/parser.rs             | 70%           |
-| augmented_lagrangian.rs  | 66%           |
-| c_api.rs                 | 61%           |
-| nl/problem_impl.rs       | 58%           |
-| linearity.rs             | 53%           |
-| ipm.rs                   | 52%           |
-| nl/expr.rs               | 37%           |
-| hybrid.rs                | 0%            |
-| iterative.rs             | 0%            |
+| Module                          | Line Coverage |
+|---------------------------------|---------------|
+| convergence.rs                  | 100%          |
+| problem.rs                      | 100%          |
+| logging.rs                      | 100%          |
+| bound_layout.rs                 | 100%          |
+| constraint_layout.rs            | 100%          |
+| d_bound_layout.rs               | 100%          |
+| filter.rs                       | 99%           |
+| warmstart.rs                    | 97%           |
+| slack_formulation.rs            | 97%           |
+| result.rs                       | 95%           |
+| reduction_frame.rs              | 92%           |
+| restoration_nlp.rs              | 92%           |
+| nl/header.rs                    | 92%           |
+| banded.rs (linear solver)       | 91%           |
+| sensitivity.rs                  | 91%           |
+| l1_penalty_barrier_nlp.rs       | 91%           |
+| auxiliary_preprocessing.rs      | 91%           |
+| nl/problem_impl.rs              | 89%           |
+| dense.rs (linear solver)        | 88%           |
+| low_rank_kkt.rs                 | 88%           |
+| bc_solver.rs                    | 86%           |
+| nl/external.rs                  | 85%           |
+| nl/parser.rs                    | 85%           |
+| intermediate.rs                 | 85%           |
+| solution_report.rs              | 84%           |
+| preprocessing.rs                | 84%           |
+| split_nlp.rs                    | 83%           |
+| sparse.rs                       | 82%           |
+| kkt.rs                          | 82%           |
+| lib.rs                          | 81%           |
+| ipm.rs                          | 75%           |
+| options.rs                      | 74%           |
+| nl/sol.rs                       | 72%           |
+| nl/autodiff.rs                  | 72%           |
+| linear_solver/mod.rs            | 71%           |
+| lbfgs.rs                        | 70%           |
+| c_api.rs                        | 60%           |
+| kkt_aug.rs                      | 58%           |
+| linearity.rs                    | 53%           |
+| feral_direct.rs (linear solver) | 50%           |
+| nl/expr.rs                      | 43%           |
+| trace.rs                        | 24%           |
+| feral_iterative.rs              | 0%            |
+| feral_hybrid.rs                 | 0%            |
+| iter0_dump.rs                   | 0%            |
 
-**Overall: 62% line coverage** in the last recorded coverage run.
+**Overall: 78% line coverage** (31,724 lines measured; 6,833 missed) in the
+last recorded coverage run.
 
-The `hybrid.rs` and `iterative.rs` modules implement opt-in linear
-solvers (`LinearSolverChoice::Hybrid`, `::Iterative`) that no test
+The `feral_hybrid.rs` and `feral_iterative.rs` modules implement opt-in
+linear solvers (`LinearSolverChoice::Hybrid`, `::Iterative`) that no test
 currently exercises — they are never selected by the default solver
-path. Their coverage is reported as 0% until dedicated tests land.
+path. The `iter0_dump.rs` module is an opt-in debug-instrumentation
+sidecar. Their coverage is reported as 0% until dedicated tests land.
 
 ## Architecture
 
@@ -893,12 +918,11 @@ src/
   problem.rs          NlpProblem trait definition
   options.rs          SolverOptions with Ipopt-matching defaults
   result.rs           SolveResult and SolveStatus
-  ipm.rs              Main IPM loop, barrier updates, line search, NE-to-LS detection, NLP scaling
+  ipm.rs              Main IPM loop, barrier updates, line search, NLP scaling, restoration cascade
   kkt.rs              KKT system assembly, solution, and inertia correction
   convergence.rs      Convergence checking (primal/dual/complementarity)
   filter.rs           Filter line search mechanism
-  restoration.rs      Gauss-Newton restoration phase with adaptive LM regularization
-  restoration_nlp.rs  Full NLP restoration subproblem (Phase 2)
+  restoration_nlp.rs  Full NLP restoration subproblem (Phase 2). The v0.7 standalone restoration.rs module has been folded into ipm.rs.
   lbfgs.rs            L-BFGS solver for unconstrained/bound-constrained problems
   augmented_lagrangian.rs  Augmented Lagrangian fallback for constrained problems
   sqp.rs              SQP fallback for constrained problems
@@ -921,7 +945,7 @@ src/
 
 tests/
   correctness.rs      Integration tests (22 NLP problems)
-  ipm_paths.rs        IPM code path tests (condensed KKT, unbounded, NE-to-LS, preprocessing)
+  ipm_paths.rs        IPM code path tests (unbounded, preprocessing)
   sensitivity.rs      Parametric sensitivity integration tests
   c_api.rs            C API integration tests (12 tests via FFI)
   lbfgs_ipm.rs        L-BFGS Hessian approximation tests
@@ -1062,20 +1086,6 @@ Prediction errors:   8.4e-6,   8.0e-6,   1.4e-5
 ```
 
 See `examples/sensitivity.rs` for a complete working example.
-
-### Condensed KKT System
-
-For problems where the number of constraints m exceeds 2n, the solver automatically uses a condensed (Schur complement) formulation. This reduces the factorization cost from O((n+m)^3) to O(n^2 m + n^3), enabling efficient handling of problems with many constraints and few variables.
-
-### NE-to-LS Reformulation
-
-When the solver detects an overdetermined nonlinear equation system (m >= n, f(x) = 0, all equality constraints, starting point not already feasible), it automatically reformulates the problem as unconstrained least-squares minimization:
-
-```
-min  0.5 * ||g(x) - target||^2
-```
-
-using a full Hessian (J^T J + sum of r_i * nabla^2 g_i). If the residual is small at the solution, the original system is consistent and `Optimal` is reported. Otherwise, `LocalInfeasibility` is reported with the best least-squares solution.
 
 ### Two-Phase Restoration
 

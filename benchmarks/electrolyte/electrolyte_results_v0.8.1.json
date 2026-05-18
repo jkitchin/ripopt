@@ -1,0 +1,262 @@
+[
+  {
+    "solver": "ripopt",
+    "name": "Water autoionization",
+    "n": 1,
+    "m": 0,
+    "status": "Optimal",
+    "objective": 3.799326928221924e-7,
+    "iterations": 7,
+    "solve_time": 0.001026791
+  },
+  {
+    "solver": "ipopt",
+    "name": "Water autoionization",
+    "n": 1,
+    "m": 0,
+    "status": "Optimal",
+    "objective": 3.1003500361205586e-7,
+    "iterations": 7,
+    "solve_time": 0.004159875
+  },
+  {
+    "solver": "ripopt",
+    "name": "CO2-water speciation",
+    "n": 5,
+    "m": 2,
+    "status": "Optimal",
+    "objective": 0.000775592134778035,
+    "iterations": 12,
+    "solve_time": 0.000866709
+  },
+  {
+    "solver": "ipopt",
+    "name": "CO2-water speciation",
+    "n": 5,
+    "m": 2,
+    "status": "Optimal",
+    "objective": -0.006933670187752001,
+    "iterations": 28,
+    "solve_time": 0.011096083
+  },
+  {
+    "solver": "ripopt",
+    "name": "NaCl speciation",
+    "n": 4,
+    "m": 3,
+    "status": "Optimal",
+    "objective": -0.4832682274056858,
+    "iterations": 5,
+    "solve_time": 0.000306542
+  },
+  {
+    "solver": "ipopt",
+    "name": "NaCl speciation",
+    "n": 4,
+    "m": 3,
+    "status": "Optimal",
+    "objective": -0.4832680501409171,
+    "iterations": 7,
+    "solve_time": 0.001906
+  },
+  {
+    "solver": "ripopt",
+    "name": "CaCl2+NaCl mixed",
+    "n": 6,
+    "m": 4,
+    "status": "Optimal",
+    "objective": -0.7723717286693826,
+    "iterations": 2369,
+    "solve_time": 0.028235708
+  },
+  {
+    "solver": "ipopt",
+    "name": "CaCl2+NaCl mixed",
+    "n": 6,
+    "m": 4,
+    "status": "Optimal",
+    "objective": -0.7723713625975525,
+    "iterations": 9,
+    "solve_time": 0.00195725
+  },
+  {
+    "solver": "ripopt",
+    "name": "Phosphoric acid",
+    "n": 6,
+    "m": 2,
+    "status": "Optimal",
+    "objective": -0.05531209113684935,
+    "iterations": 7,
+    "solve_time": 0.000152166
+  },
+  {
+    "solver": "ipopt",
+    "name": "Phosphoric acid",
+    "n": 6,
+    "m": 2,
+    "status": "Optimal",
+    "objective": -0.05531205597235094,
+    "iterations": 6,
+    "solve_time": 0.00129625
+  },
+  {
+    "solver": "ripopt",
+    "name": "HCl mean activity",
+    "n": 1,
+    "m": 0,
+    "status": "Optimal",
+    "objective": 8.589686905781291e-16,
+    "iterations": 7,
+    "solve_time": 0.00010575
+  },
+  {
+    "solver": "ipopt",
+    "name": "HCl mean activity",
+    "n": 1,
+    "m": 0,
+    "status": "Optimal",
+    "objective": 8.892358562948893e-17,
+    "iterations": 5,
+    "solve_time": 0.000949875
+  },
+  {
+    "solver": "ripopt",
+    "name": "NaCl solubility",
+    "n": 1,
+    "m": 0,
+    "status": "Optimal",
+    "objective": 1.6006291569279337e-17,
+    "iterations": 7,
+    "solve_time": 0.000105
+  },
+  {
+    "solver": "ipopt",
+    "name": "NaCl solubility",
+    "n": 1,
+    "m": 0,
+    "status": "Optimal",
+    "objective": 7.973765395748759e-22,
+    "iterations": 5,
+    "solve_time": 0.000904333
+  },
+  {
+    "solver": "ripopt",
+    "name": "BuOH-water LLE",
+    "n": 2,
+    "m": 2,
+    "status": "Optimal",
+    "objective": 7.825840587094075e-10,
+    "iterations": 6,
+    "solve_time": 0.000143667
+  },
+  {
+    "solver": "ipopt",
+    "name": "BuOH-water LLE",
+    "n": 2,
+    "m": 2,
+    "status": "Optimal",
+    "objective": 7.825840587101624e-10,
+    "iterations": 4,
+    "solve_time": 0.00084525
+  },
+  {
+    "solver": "ripopt",
+    "name": "Saturated brine",
+    "n": 3,
+    "m": 3,
+    "status": "Optimal",
+    "objective": 0.0,
+    "iterations": 6,
+    "solve_time": 0.000129542
+  },
+  {
+    "solver": "ipopt",
+    "name": "Saturated brine",
+    "n": 3,
+    "m": 3,
+    "status": "Optimal",
+    "objective": 0.0,
+    "iterations": 4,
+    "solve_time": 0.000903375
+  },
+  {
+    "solver": "ripopt",
+    "name": "Pitzer NaCl fit",
+    "n": 3,
+    "m": 0,
+    "status": "Optimal",
+    "objective": 6.069475133172296e-15,
+    "iterations": 6,
+    "solve_time": 0.000107292
+  },
+  {
+    "solver": "ipopt",
+    "name": "Pitzer NaCl fit",
+    "n": 3,
+    "m": 0,
+    "status": "Optimal",
+    "objective": 3.6775853181046546e-16,
+    "iterations": 5,
+    "solve_time": 0.000882083
+  },
+  {
+    "solver": "ripopt",
+    "name": "Multi-salt DH fit",
+    "n": 8,
+    "m": 0,
+    "status": "Optimal",
+    "objective": 8.885297486785424e-12,
+    "iterations": 111,
+    "solve_time": 0.001079958
+  },
+  {
+    "solver": "ipopt",
+    "name": "Multi-salt DH fit",
+    "n": 8,
+    "m": 0,
+    "status": "Optimal",
+    "objective": 2.900599045629635e-10,
+    "iterations": 142,
+    "solve_time": 0.025232042
+  },
+  {
+    "solver": "ripopt",
+    "name": "eNRTL T-dep fit",
+    "n": 4,
+    "m": 0,
+    "status": "Optimal",
+    "objective": 5.285283639145215e-13,
+    "iterations": 10,
+    "solve_time": 0.000130583
+  },
+  {
+    "solver": "ipopt",
+    "name": "eNRTL T-dep fit",
+    "n": 4,
+    "m": 0,
+    "status": "Optimal",
+    "objective": 3.7390226301833385e-12,
+    "iterations": 8,
+    "solve_time": 0.001347833
+  },
+  {
+    "solver": "ripopt",
+    "name": "Seawater speciation",
+    "n": 15,
+    "m": 8,
+    "status": "Optimal",
+    "objective": -1.3482721229153687,
+    "iterations": 24,
+    "solve_time": 0.000435542
+  },
+  {
+    "solver": "ipopt",
+    "name": "Seawater speciation",
+    "n": 15,
+    "m": 8,
+    "status": "Infeasible",
+    "objective": -1.36283675686854,
+    "iterations": 23,
+    "solve_time": 0.005422875
+  }
+]

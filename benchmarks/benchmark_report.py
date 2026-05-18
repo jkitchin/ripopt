@@ -25,7 +25,15 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # ---- Helpers ----
 
 def is_solved(status):
-    return status in ('Optimal', 'Acceptable')
+    """Strict-Optimal only.
+
+    Per the project's "Honesty in Benchmarks" rule (see CLAUDE.md),
+    Acceptable is *not* counted as solved in summary metrics — it is
+    surfaced in its own "Acceptable (not Optimal)" section. A solver
+    that returns Acceptable has not converged to the requested
+    tolerance and the result should not inflate the pass rate.
+    """
+    return status == 'Optimal'
 
 
 def obj_diff(ro, co):
@@ -313,26 +321,26 @@ def generate_report(suites, output_path, baseline=None):
     lines.append("")
     lines.append(f"| Metric | ripopt | Ipopt |")
     lines.append(f"|--------|--------|-------|")
-    lines.append(f"| Optimal | **{combined['r_optimal']}/{combined['total']}** ({100*combined['r_optimal']/max(combined['total'],1):.1f}%) | **{combined['i_optimal']}/{combined['total']}** ({100*combined['i_optimal']/max(combined['total'],1):.1f}%) |")
-    lines.append(f"| Acceptable | {combined['r_acceptable']} | {combined['i_acceptable']} |")
-    lines.append(f"| Total solved (Optimal + Acceptable) | {combined['r_solved']} ({100*combined['r_solved']/max(combined['total'],1):.1f}%) | {combined['i_solved']} ({100*combined['i_solved']/max(combined['total'],1):.1f}%) |")
-    lines.append(f"| Solved exclusively | {combined['r_only']} | {combined['i_only']} |")
-    lines.append(f"| Both solved | {combined['both']} | |")
+    lines.append(f"| Optimal (strict) | **{combined['r_optimal']}/{combined['total']}** ({100*combined['r_optimal']/max(combined['total'],1):.1f}%) | **{combined['i_optimal']}/{combined['total']}** ({100*combined['i_optimal']/max(combined['total'],1):.1f}%) |")
+    lines.append(f"| Acceptable (informational, *not* counted as solved) | {combined['r_acceptable']} | {combined['i_acceptable']} |")
+    lines.append(f"| Solved exclusively (strict Optimal) | {combined['r_only']} | {combined['i_only']} |")
+    lines.append(f"| Both Optimal | {combined['both']} | |")
     lines.append(f"| Matching objectives (< 0.01%) | {combined['passed']}/{max(combined['both'],1)} | |")
     if r_acc_questionable > 0:
         lines.append(f"| Acceptable at worse local min | {r_acc_questionable} | |")
     lines.append("")
-    lines.append("> **Note:** ripopt uses fallback strategies (L-BFGS Hessian, AL, SQP, slack")
-    lines.append("> reformulation) that Ipopt does not have, which accounts for much of the")
-    lines.append("> Acceptable count difference. The \"Different Local Minima\" section below")
-    lines.append("> lists Acceptable solutions where ripopt converged to a worse local minimum.")
+    lines.append("> **Note:** All headline counts use strict Optimal status only. `Acceptable`")
+    lines.append("> means the iterate met relaxed tolerances but not the requested tolerance —")
+    lines.append("> per CLAUDE.md's \"Honesty in Benchmarks\" rule it is reported separately and")
+    lines.append("> never folded into the pass rate. See the \"Acceptable (not Optimal)\" and")
+    lines.append("> \"Different Local Minima\" sections below.")
     lines.append("")
 
     # Per-suite summary table
     lines.append("## Per-Suite Summary")
     lines.append("")
-    lines.append("| Suite | Problems | ripopt solved | Ipopt solved | ripopt only | Ipopt only | Both solved | Match |")
-    lines.append("|-------|----------|--------------|-------------|-------------|------------|------------|-------|")
+    lines.append("| Suite | Problems | ripopt Optimal | Ipopt Optimal | ripopt only | Ipopt only | Both Optimal | Match |")
+    lines.append("|-------|----------|---------------|--------------|-------------|------------|--------------|-------|")
     for name, comps in suites:
         s = suite_summary(name, comps)
         lines.append(
@@ -384,10 +392,10 @@ def generate_report(suites, output_path, baseline=None):
             lines.append(f"| {st} | {rf.get(st, 0)} | {ifail.get(st, 0)} |")
         lines.append("")
 
-    # Regressions (ripopt fails, ipopt solves)
+    # Regressions (Ipopt is Optimal, ripopt is not)
     regressions = [c for c in all_comps if c['ipopt_solved'] and not c['ripopt_solved']]
     if regressions:
-        lines.append("## Regressions (Ipopt solves, ripopt fails)")
+        lines.append("## Regressions (Ipopt Optimal, ripopt not Optimal)")
         lines.append("")
         lines.append("| Problem | Suite | n | m | ripopt status | Ipopt obj |")
         lines.append("|---------|-------|---|---|--------------|-----------|")
@@ -397,10 +405,10 @@ def generate_report(suites, output_path, baseline=None):
             lines.append(f"| {c['name']} | {c['suite']} | {c['n']} | {c['m']} | {c['ripopt_status']} | {io_str} |")
         lines.append("")
 
-    # Wins (ripopt solves, ipopt fails)
+    # Wins (ripopt is Optimal, Ipopt is not)
     wins = [c for c in all_comps if c['ripopt_solved'] and not c['ipopt_solved']]
     if wins:
-        lines.append(f"## Wins (ripopt solves, Ipopt fails) — {len(wins)} problems")
+        lines.append(f"## Wins (ripopt Optimal, Ipopt not Optimal) — {len(wins)} problems")
         lines.append("")
         lines.append("| Problem | Suite | n | m | Ipopt status | ripopt obj |")
         lines.append("|---------|-------|---|---|-------------|------------|")
