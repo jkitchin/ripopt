@@ -55,7 +55,7 @@ for nl in nl/*.nl; do
   fi
 
   # Try to extract objective and iterations from the log
-  obj=$(grep -oE 'Objective[: ]+[-+0-9.eE]+' "$log" | tail -1 | grep -oE '[-+0-9.eE]+' | head -1)
+  obj=$(grep -oE 'Objective[: ]+[-+0-9.eE]+' "$log" | tail -1 | sed -E 's/^Objective[: ]+//')
   iter=$(grep -oE 'Number of Iterations[. :]+[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$')
   obj=${obj:-null}
   iter=${iter:-null}

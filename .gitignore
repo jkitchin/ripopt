@@ -110,8 +110,10 @@ linkedin.org
 linkedin-*.md
 docs/book
 .claude/
+.scratch/
 reproducers/
 benchmarks/cho/nl_export_results/*.png
+benchmarks/mittelmann/reports/
 
 # Adversary agent (local testing, not part of crate)
 adversary/

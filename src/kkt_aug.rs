@@ -534,8 +534,8 @@ pub struct AugStep {
 /// reduce to:
 ///   Δz_L = (μ − z_L·s_L)/s_L − (z_L/s_L) · Δx_L
 ///   Δz_U = (μ − z_U·s_U)/s_U + (z_U/s_U) · Δx_U
-///   Δv_L = (μ − v_L·s_L)/s_L − (v_L/s_L) · Δs[k]
-///   Δv_U = (μ − v_U·s_U)/s_U + (v_U/s_U) · Δs[k]
+///   Δv_L = (μ − v_L·s_L)/s_L − (v_L/s_L) · Δs\[k\]
+///   Δv_U = (μ − v_U·s_U)/s_U + (v_U/s_U) · Δs\[k\]
 ///
 /// matching `kkt::recover_dz` / `kkt::recover_dv` exactly. The algebra is
 /// derived at the head of `kkt_aug.rs` near `fold_aug_rhs`.

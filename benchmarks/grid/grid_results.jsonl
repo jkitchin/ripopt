@@ -1,8 +1,8 @@
-{"solver":"ripopt","name":"case3_lmbd","n":12,"m":12,"status":"Optimal","objective":5812.643016981305,"iterations":10,"solve_time":0.000767625}
-{"solver":"ipopt","name":"case3_lmbd","n":12,"m":12,"status":"Optimal","objective":5812.642934996067,"iterations":10,"solve_time":0.002431625}
-{"solver":"ripopt","name":"case5_pjm","n":20,"m":22,"status":"Optimal","objective":17551.890927682114,"iterations":20,"solve_time":0.001424666}
-{"solver":"ipopt","name":"case5_pjm","n":20,"m":22,"status":"Optimal","objective":17551.8908990633,"iterations":15,"solve_time":0.003394417}
-{"solver":"ripopt","name":"case14_ieee","n":38,"m":68,"status":"Optimal","objective":2178.0804208038203,"iterations":14,"solve_time":0.006896542}
-{"solver":"ipopt","name":"case14_ieee","n":38,"m":68,"status":"Optimal","objective":2178.080406411837,"iterations":11,"solve_time":0.008293792}
-{"solver":"ripopt","name":"case30_ieee","n":72,"m":142,"status":"Optimal","objective":8208.5154586033,"iterations":19,"solve_time":0.032204833}
-{"solver":"ipopt","name":"case30_ieee","n":72,"m":142,"status":"Optimal","objective":8208.515425007794,"iterations":14,"solve_time":0.054517625}
+{"solver":"ripopt","name":"case3_lmbd","n":12,"m":12,"status":"Optimal","objective":5812.643016981305,"iterations":10,"solve_time":0.002147167}
+{"solver":"ipopt","name":"case3_lmbd","n":12,"m":12,"status":"Optimal","objective":5812.642934996067,"iterations":10,"solve_time":0.005331125}
+{"solver":"ripopt","name":"case5_pjm","n":20,"m":22,"status":"Optimal","objective":17551.890927682114,"iterations":20,"solve_time":0.003094041}
+{"solver":"ipopt","name":"case5_pjm","n":20,"m":22,"status":"Optimal","objective":17551.8908990633,"iterations":15,"solve_time":0.006611708}
+{"solver":"ripopt","name":"case14_ieee","n":38,"m":68,"status":"Optimal","objective":2178.0804208038116,"iterations":14,"solve_time":0.01439775}
+{"solver":"ipopt","name":"case14_ieee","n":38,"m":68,"status":"Optimal","objective":2178.080406411837,"iterations":11,"solve_time":0.011012709}
+{"solver":"ripopt","name":"case30_ieee","n":72,"m":142,"status":"Optimal","objective":8208.51545862951,"iterations":19,"solve_time":0.037773709}
+{"solver":"ipopt","name":"case30_ieee","n":72,"m":142,"status":"Optimal","objective":8208.515425007794,"iterations":14,"solve_time":0.052210291}

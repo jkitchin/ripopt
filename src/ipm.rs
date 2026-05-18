@@ -3579,7 +3579,7 @@ fn try_preprocessed_solve<P: NlpProblem>(
 /// Solve the NLP using the interior point method.
 ///
 /// When `options.user_x_scaling` is `Some(non_empty)`, the user-supplied
-/// strictly-positive `dx` vector is applied via [`XScaledProblem`]: the
+/// strictly-positive `dx` vector is applied via `XScaledProblem`: the
 /// IPM driver runs in the internal coordinate system `x' = D_x · x`, and
 /// the returned [`SolveResult`] is unscaled back to the user's
 /// coordinates (`x_user = x' / dx`, `z_L_user = dx · z_L_internal`,

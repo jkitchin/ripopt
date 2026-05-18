@@ -3,7 +3,7 @@
 //! Re-evaluates the problem at `x*` and computes constraint / bound / KKT
 //! residuals from scratch, independent of the solver's own diagnostics. The
 //! report serializes to JSON for downstream tooling. Inspired by GAMS Examiner:
-//! https://www.gams.com/latest/docs/S_EXAMINER.html
+//! <https://www.gams.com/latest/docs/S_EXAMINER.html>
 //!
 //! See issue #27.
 //!

@@ -6,7 +6,7 @@
 //!
 //! Reference: Lin, C.-J. and Moré, J.J. "Newton's method for large
 //! bound-constrained optimization problems", SIAM J. Optim. 9(4):1100-1127, 1999.
-//! https://doi.org/10.1137/S1052623498345075
+//! <https://doi.org/10.1137/S1052623498345075>
 //!
 //! # When to use this instead of `ripopt::solve`
 //!

@@ -21,10 +21,10 @@ It implements a primal-dual interior point method (IPM) with a logarithmic barri
 | Property | Value |
 |---|---|
 | Algorithm | Primal-dual IPM with Mehrotra predictor-corrector |
-| Linear solver | Dense Bunch-Kaufman LDL^T (small) / rmumps multifrontal (large) |
-| HS benchmark | **118/120** (98.3%) — surpasses Ipopt's 116/120 |
-| CUTEst benchmark | **562/727** (77.3%) — surpasses Ipopt's 561/727 |
-| Speed vs Ipopt | **15.0x** geo mean on HS suite, **9.9x** on CUTEst |
+| Linear solver | Dense Bunch-Kaufman LDLᵀ (small) / `feral` multifrontal (large) |
+| HS benchmark (retired) | **118/120** (98.3%, historical) — surpassed Ipopt's 116/120 |
+| CUTEst benchmark | **551/727** (75.8%, strict-Optimal) — Ipopt edges by 5 (556/727) |
+| Speed vs Ipopt | **7.9x** geo mean on CUTEst (median 10.6x) on 529 commonly-Optimal problems |
 | Language | Rust (no unsafe FFI) |
 | Interfaces | Rust API, C API, Pyomo/AMPL, GAMS, Julia/JuMP |
 
@@ -35,9 +35,8 @@ It implements a primal-dual interior point method (IPM) with a logarithmic barri
 - **Filter line search** with switching condition and second-order corrections
 - **Two-phase restoration**: fast Gauss-Newton + full NLP restoration subproblem
 - **Multi-solver fallback**: L-BFGS → Augmented Lagrangian → SQP → slack reformulation
-- **Dense condensed KKT** (Schur complement) for tall-narrow problems: 100-800x speedup on m >> n
 - **Adaptive and monotone barrier strategies** with automatic mode switching
-- **NE-to-LS reformulation** for overdetermined nonlinear equation systems
+- **Implicit-slack KKT formulation** that accepts NE (nonlinear-equation) systems Ipopt's CUTEst wrapper rejects (12 of 22 ripopt-only CUTEst wins)
 - **Parametric sensitivity analysis** (sIPOPT-style)
 - **Preprocessing**: fixed variable elimination, redundant constraint removal, bound tightening
 - **C API** mirroring Ipopt's interface; Pyomo, GAMS, and Julia/JuMP wrappers
