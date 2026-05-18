@@ -1,30 +1,48 @@
 # Changelog
 
-## [Unreleased]
+## [0.8.1] - 2026-05-18
 
-### Changed
-- **CUTEst benchmark suite: ripopt now uses `mu_strategy=adaptive`** to mirror
-  the existing Ipopt-side `mu_strategy=adaptive` force in `run_cutest.rs`. The
-  prior asymmetric setup (Ipopt-adaptive vs ripopt-monotone, the project
-  default) was tracked as "matching project defaults" but was misleading: it
-  pitted Ipopt's QF-oracle path against ripopt's monotone path. Investigation
-  on QCNEW (issue #31) showed the failure is monotone-mu-specific and shared
-  by both Ipopt-monotone and ripopt-monotone; adaptive solves it cleanly on
-  both. Adaptive is now used uniformly across all CUTEst problems.
-  - QCNEW: `NumericalError` → `Optimal` (issue #31, partial).
-  - Net head-to-head impact (ripopt vs Ipopt, both now adaptive): +11 gained
-    (ALLINITC, BIGGS6NE, DENSCHNENE, DIAMON2DLS, DISCS, ELATTAR, GROUPING,
-    HS13, QCNEW, SIPOW2, WOMFLET); -10 lost where Ipopt-adaptive still
-    succeeds (DECONVBNE, FLETCHER, MISTAKE, OET2/4/6, PALMER2B, PENTAGON,
-    PFIT3, PT) — these are real ripopt-adaptive bugs that were hidden by
-    the asymmetric monotone setup; -5 wash where Ipopt-adaptive also fails
-    (DEVGLA2NE, HS25NE, NYSTROM5, NYSTROM5C, POLAK6).
-  - Project default (`SolverOptions::mu_strategy_adaptive = false`) is
-    unchanged; this is a benchmark-suite-only setting.
-- `examples/qcnew_probe.rs` now parameterized on `mu_strategy` so both Ipopt
-  modes can be traced side-by-side.
+Patch release continuing the v0.8 Ipopt-3.14-alignment track. The cycle
+adds two new solver phases — a TRON trust-region method for
+bound-constrained NLPs (issue #22) and a Thierry-Biegler ℓ₁-exact
+penalty-barrier phase (issue #23) — plus a Byrd-Nocedal bordered low-rank
+KKT solver for L-BFGS (issue #30) that replaces the dense lower-triangle
+Hessian with a true compact-form representation. A large cluster of IPM
+fixes brings the QF μ-oracle, adaptive μ globalization, watchdog/μ_max
+capture, LS multiplier estimate, and L-BFGS skip-and-reset rule into
+faithful agreement with the Ipopt 3.14 reference. The auxiliary equality
+preprocessing path landed (PR #32) — Dulmage-Mendelsohn partitioning
+solves square equality subsystems outside the main IPM. Build
+ergonomics: CUTEst now bootstraps its toolchain on demand from a fresh
+clone, and several Linux/Fedora link-search and Fortran-symbol bugs are
+fixed.
+
+Workspace version bumps: `ripopt 0.8.0 → 0.8.1`, `rmumps 0.1.1 → 0.1.2`,
+`ripopt-py 0.8.0 → 0.8.1`, `pyomo-ripopt 0.8.0 → 0.8.1`. `Ripopt.jl`
+held at 0.8.0 (no Julia-affecting C-ABI changes).
 
 ### Added
+- **TRON solver for bound-constrained NLPs** (#22, dc52017). A direct
+  port of Lin & Moré's *Newton's method for large bound-constrained
+  optimization problems* (SIAM J. Optim. 9(4):1100-1127, 1999): trust
+  region around a Cauchy point, projected conjugate-gradient subproblem
+  solve, and explicit handling of finite bounds. Not auto-dispatched —
+  call `ripopt::bc_solver::solve_bc(...)` when the problem has zero
+  general constraints and at least one finite bound. See
+  `src/bc_solver.rs`.
+- **Thierry-Biegler ℓ₁-exact penalty-barrier phase** (#23, 7847bba). New
+  `L1PenaltyBarrierNlp` wrapper implements the exact-penalty barrier
+  formulation as a fallback phase when the standard IPM filter line
+  search stalls. See `src/l1_penalty_barrier_nlp.rs`.
+- **Bordered low-rank KKT solver for L-BFGS** (issue #30, phases 1-4,
+  commits b942721 → 43b2832 → 6bb4a02). Replaces the dense
+  lower-triangle L-BFGS Hessian with the Byrd-Nocedal compact form
+  `B_k = δI + UV^T`, wraps it in a `LowRankKktSolver` that implements
+  the `LinearSolver` trait via the Sherman-Morrison-Woodbury identity
+  applied to the augmented system, and wires it into the L-BFGS IPM
+  branch. `HessianKind` enum now tags Hessian representation so the
+  selector picks the bordered path automatically when `hessian_method =
+  Lbfgs`. See `src/linear_solver/low_rank_kkt.rs` and `src/lbfgs.rs`.
 - **Opt-in inertia-free curvature test (IFRd)** (issue #17). Implements the
   curvature test of Chiang & Zavala (2016, COAP 64:327-354, eq. 28) inline on
   wrong-inertia events, mirroring Ipopt 3.14's `IpPDFullSpaceSolver` dispatch
@@ -66,7 +84,6 @@
   with a stderr warning and leave the option unchanged. Booleans accept
   `yes`/`no`, `true`/`false`, `on`/`off`, `1`/`0`; `mu_strategy` accepts
   `adaptive` or `monotone`.
-
 - **Auxiliary equality preprocessing** (PR #32): when `enable_preprocessing` is
   enabled (default), ripopt now detects square auxiliary equality subsystems via
   Dulmage-Mendelsohn partitioning and block-triangular decomposition, solves
@@ -85,6 +102,102 @@
     `LocalInfeasibility` → `Optimal`), 37 problems faster (e.g. HATFLDF
     105 → 0 iters, HEART6 45 → 0), 2 problems slower (RES +16, ACOPP30 +4),
     no lost solves, no objective-match regressions.
+- **Mittelmann AMPL-NLP benchmark harness** (`benchmarks/mittelmann/`,
+  5ac9b36): build target and `run_solver.sh` wrapper that drives both
+  ripopt and Ipopt on the curated `ampl-nlp` testset.
+- **Preprocessing benchmark harness + diagnostics** (issue #35, PRs
+  2951797, ba46659, 9565136): per-pass timings, residual histograms, and
+  before/after problem-size deltas surfaced to stderr for debugging the
+  auxiliary path.
+
+### Changed
+- **IPM alignment with Ipopt 3.14** — a cluster of root-cause fixes
+  brought the adaptive μ track and the Newton step into faithful
+  agreement with the reference implementation:
+  - **QF μ-oracle**: tolerance-aware σ floor (864b418), match Ipopt
+    3.14 reference (88471f1), endpoint re-evaluation in
+    `golden_section_minimize` (dc83623), explicit centering solve
+    (625e120), `n_aug` matches the QF oracle's 2-block KKT dim for
+    L-BFGS (21025e0), `eff_mu_floor` polarity corrected `Max → Min`
+    (142030c), and Fixed-mode μ floor removed from the Free-mode oracle
+    + d-block centering (301e5ba).
+  - **Adaptive μ globalization**: switched to Ipopt's default
+    obj-constr-filter globalization (da4aade); watchdog and μ_max
+    capture aligned with Ipopt 3.14 (bc5d065).
+  - **LS multiplier estimate**: corrected `rhs_x` sign in the post-step
+    LS estimate (f789845); reject LS-y multipliers when the factor
+    inertia is wrong (bc237d0); skip-criterion fixed to `n_c == n`
+    (was `m == n`) so unconstrained problems no longer skip the LS step
+    (2fb8fd4).
+  - **Soft restoration / Fixed-mode μ-gate**: both now include the
+    inequality-slack complementarity term in `E_μ` (a00de34, f347986),
+    matching the Ipopt reference E_μ definition.
+  - **Singular factor handling**: `SYMSOLVER_SINGULAR` now routes
+    through the singularity perturbation ladder (c01910b) instead of
+    aborting the step.
+  - **Barrier parameter update** moved to the top of the loop to match
+    Ipopt's ordering (5569d1a).
+  - **L-BFGS update** aligned with Ipopt's skip-and-reset rule
+    (2b6c5f8): a curvature-pair rejection now resets the memory window
+    instead of silently skipping the update.
+  - **RememberCurrentPointAsAccepted + Free-to-Fixed rollback**
+    (abdcc6b): the adaptive→fixed transition now snapshots the
+    last-accepted point per Ipopt's `AdaptiveMuUpdate` contract.
+- **CUTEst benchmark suite: ripopt now uses `mu_strategy=adaptive`** to mirror
+  the existing Ipopt-side `mu_strategy=adaptive` force in `run_cutest.rs`. The
+  prior asymmetric setup (Ipopt-adaptive vs ripopt-monotone, the project
+  default) was tracked as "matching project defaults" but was misleading: it
+  pitted Ipopt's QF-oracle path against ripopt's monotone path. Investigation
+  on QCNEW (issue #31) showed the failure is monotone-mu-specific and shared
+  by both Ipopt-monotone and ripopt-monotone; adaptive solves it cleanly on
+  both. Adaptive is now used uniformly across all CUTEst problems.
+  - QCNEW: `NumericalError` → `Optimal` (issue #31, partial).
+  - Net head-to-head impact (ripopt vs Ipopt, both now adaptive): +11 gained
+    (ALLINITC, BIGGS6NE, DENSCHNENE, DIAMON2DLS, DISCS, ELATTAR, GROUPING,
+    HS13, QCNEW, SIPOW2, WOMFLET); -10 lost where Ipopt-adaptive still
+    succeeds (DECONVBNE, FLETCHER, MISTAKE, OET2/4/6, PALMER2B, PENTAGON,
+    PFIT3, PT) — these are real ripopt-adaptive bugs that were hidden by
+    the asymmetric monotone setup; -5 wash where Ipopt-adaptive also fails
+    (DEVGLA2NE, HS25NE, NYSTROM5, NYSTROM5C, POLAK6).
+  - Project default (`SolverOptions::mu_strategy_adaptive = false`) is
+    unchanged; this is a benchmark-suite-only setting.
+- `examples/qcnew_probe.rs` now parameterized on `mu_strategy` so both Ipopt
+  modes can be traced side-by-side.
+- **`SparseSymmetricMatrix` upper-triangle invariant is now unforgeable**
+  (932763a): the constructor enforces the convention so downstream
+  callers cannot silently pass a full-symmetric representation.
+- **L-BFGS dense lower-triangle Hessian removed** (6bb4a02): superseded
+  by the compact-form representation; cuts O(n²) storage and matvec
+  cost on the L-BFGS path.
+
+### Performance
+- **Parallel feral factorize** (bf34782): the default linear-solver
+  factorization path now dispatches through the rayon-parallel driver,
+  improving solve time on multi-core hardware without changing the
+  numerical contract.
+- **NL hessian_sparsity**: skip dead var-set propagation (1372ba4) —
+  measurable speedup on large NL problems with sparse Hessians.
+- **Lazy DM partition construction** (#34, 6720110): defer building the
+  Dulmage-Mendelsohn partition until the auxiliary preprocessing path
+  actually needs it.
+
+### Fixed
+- **L-BFGS Hessian callback contract** preserved across the bordered
+  KKT refactor (#37, 8278b30).
+- **Auxiliary preprocessing**: multiple correctness fixes across the
+  early PR train (#5-#10, #22-#28, #32) — DM partition determinism,
+  candidate extraction, postsolve recovery, reduction-frame bookkeeping,
+  lightweight solve gating, executable incidence verification.
+- **Build / CUTEst toolchain**:
+  - Self-contained toolchain bootstrap on fresh clones (a3cdfe2,
+    f207232) — CUTEst feature now installs SIF + ARCHDefs on demand
+    instead of failing at configure-time.
+  - Empty `-L` link-search paths guarded on Linux/Fedora (0a8d472).
+  - Fortran `close` wrapper renamed to avoid symbol collision (38a9aab);
+    `fortran_open_fixed.f90` now tracked by `build.rs` (c4dcb71).
+  - `benchmarks/Makefile` tracked; broken `cutest-install` target
+    dropped (eb1979e).
+  - `bc_audit` example gated on the `cutest` feature (1240641).
 
 ## [0.8.0] - 2026-05-06
 

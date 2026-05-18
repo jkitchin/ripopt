@@ -23,8 +23,8 @@
 /* Version information — keep in sync with Cargo.toml */
 #define RIPOPT_VERSION_MAJOR 0
 #define RIPOPT_VERSION_MINOR 8
-#define RIPOPT_VERSION_PATCH 0
-#define RIPOPT_VERSION "0.8.0"
+#define RIPOPT_VERSION_PATCH 1
+#define RIPOPT_VERSION "0.8.1"
 
 #ifdef __cplusplus
 extern "C" {

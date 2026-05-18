@@ -362,9 +362,9 @@ dependencies = [
 
 [[package]]
 name = "feral"
-version = "0.1.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c784e6c71221a44d6ac8bc3c6356a99ab23335fd0e3e1dcdcc81fda5c15f83b0"
+checksum = "b8db10baeb351dbf1a61175da59b49f17abfe182842038a331887c8a3b4d043c"
 dependencies = [
  "feral-amd",
  "feral-amf",
@@ -380,27 +380,27 @@ dependencies = [
 
 [[package]]
 name = "feral-amd"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c4f87b06ed526f1ba89b2a4ba7387d9fd1ca0f7e5096b1f7b5c767142c0f4c8"
+checksum = "363d1f8038ad30f115b56330770fa075444251d49259de7b9f60852f18a0a3f5"
 dependencies = [
  "feral-ordering-core",
 ]
 
 [[package]]
 name = "feral-amf"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "99dd9b2be65a040da49d58d321c157baf8ca589731102b2ab59f32ff21c4a1a3"
+checksum = "0414fac45abb5acec0d7ea9e82d125dba35ac0919491cbe5343ee6176eee8394"
 dependencies = [
  "feral-ordering-core",
 ]
 
 [[package]]
 name = "feral-kahip"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0001455ec7cce8af155f3c2cd0cc8bc21e9058aaac87971c5c3fa752bd68b36d"
+checksum = "36709fbe0273267511c0b164f3b93d16e62451ae7872bd0390cf073ced1f81d9"
 dependencies = [
  "feral-amd",
  "feral-metis",
@@ -409,9 +409,9 @@ dependencies = [
 
 [[package]]
 name = "feral-metis"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56377262eb53045b320f5b2d5ebb07a7ca56e17ff4eb7df93bab4f841eec7ab5"
+checksum = "a90e908946db5c7f03e5fd9fb51f7af18e917deb245be583157ba41635792139"
 dependencies = [
  "feral-amd",
  "feral-ordering-core",
@@ -419,15 +419,15 @@ dependencies = [
 
 [[package]]
 name = "feral-ordering-core"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cb7bfdf48a42371d6796d47da8f9f0a70153982abc68e57f2cef3fc5e6de2a5"
+checksum = "c22774549d1d1209ae367ad4ce1c094151c43c9981b2009ae4c0b55a03387dbb"
 
 [[package]]
 name = "feral-scotch"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ac69954e494b0e6850721178bc594ce7cf2042c944add0f2e051a8960d79c8e"
+checksum = "80c7b693523b6ef86bde0258983b6d3b12ef25b2979024927af5b47d2a7c7c61"
 dependencies = [
  "feral-amd",
  "feral-metis",
@@ -1345,7 +1345,7 @@ checksum = "a96887878f22d7bad8a3b6dc5b7440e0ada9a245242924394987b21cf2210a4c"
 
 [[package]]
 name = "ripopt"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "approx",
  "env_logger",
@@ -1362,7 +1362,7 @@ dependencies = [
 
 [[package]]
 name = "ripopt-py"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "numpy",
  "pyo3",
@@ -1371,7 +1371,7 @@ dependencies = [
 
 [[package]]
 name = "rmumps"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "amd",
  "faer",
