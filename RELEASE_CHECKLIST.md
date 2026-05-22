@@ -529,7 +529,7 @@ Prefer catching problems in §9 to avoid any of this.
   pip install pyomo-ripopt==X.Y.Z
   pip install ripopt==X.Y.Z
   python -c "from pyomo.environ import SolverFactory; print(SolverFactory('ripopt').available())"
-  python -c "from ripopt import minimize; import numpy as np; r = minimize(lambda x: (x[0]-1)**2, np.zeros(1)); print(r['success'], r['x'])"
+  python -c "from ripopt import minimize; import numpy as np; r = minimize(lambda x: (x[0]-1)**2, np.zeros(1)); print(r.success, r.x)"
   ```
   Both packages should resolve a wheel (not fall back to sdist on a
   supported platform). The sanity checks should return `True` and
