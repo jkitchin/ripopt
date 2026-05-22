@@ -5,7 +5,7 @@
 \tableofcontents
 * Introduction
 
-This Supporting Information provides algorithmic details and source code references for each section of the manuscript. Source code locations are given as org-mode links in the format =[[file:line]]= that point to the ripopt repository root at =src/=. All line numbers refer to ripopt v0.8.1.
+This Supporting Information provides algorithmic details and source code references for each section of the manuscript. Source code locations are given as org-mode links in the format =[[file:line]]= that point to the ripopt repository root at =src/=. All line numbers refer to ripopt v0.8.2.
 
 The ripopt source code is organized as follows:
 

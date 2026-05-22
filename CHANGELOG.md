@@ -1,5 +1,52 @@
 # Changelog
 
+## [0.8.2] - 2026-05-22
+
+Patch release: the pure-Rust `feral` sparse linear-solver backend is
+bumped from 0.4 to its published 0.5.0 crates.io release. No ripopt
+source code changed — this is a hardening-and-polishing release for the
+linear-solver layer. The full benchmark suite was re-run to confirm the
+bump is regression-free: ripopt's strict-Optimal count is unchanged at
+568/745 (CUTEst 551/727), and no problem crossed the `Optimal` boundary
+in either direction.
+
+Workspace version bumps: `ripopt 0.8.1 → 0.8.2`, `ripopt-py 0.8.1 →
+0.8.2`, `pyomo-ripopt 0.8.1 → 0.8.2`. `rmumps` held at 0.1.2 (no rmumps
+changes) and `Ripopt.jl` held at 0.8.0 (no Julia-affecting C-ABI
+changes).
+
+### Changed
+- **feral 0.4 → 0.5.0** (crates.io). The local `[patch.crates-io]`
+  override that had tracked the pre-release feral checkout is removed;
+  ripopt now builds against the published 0.5.0 crate.
+
+### Fixed
+- **MC64 scaling-cache correctness, via feral 0.5.0** (feral #47, #49).
+  feral's B2 value-bounded scaling cache no longer populates on
+  non-MC64 scalings (`InfNorm`, user-supplied `External`), and
+  `pick_scaling_strategy` is now value-aware so explicit stored-zero
+  KKT `(2,2)`-block entries no longer mis-route a constraint column to
+  MC64. The defect was latent — a stale `InfNorm` vector could be
+  replayed as an injected `External` scaling on a drifted iterate,
+  benign on every measured ripopt KKT but unsound. The fix shifts
+  ripopt's numerical path on ~12 CUTEst problems; the net effect on the
+  strict-Optimal count is zero, with `FEEDLOC` notably improving
+  (2193 → 70 iterations).
+
+### Performance
+- **feral Schur trailing-update kernel widened** (feral #44) to a quad
+  NEON-tile inner loop. The gain is concentrated on large dense Schur
+  updates; ripopt's CUTEst corpus is capped at n ≤ 100, too small for
+  the widened tile to engage, so suite-level timing is unchanged within
+  measurement noise.
+
+### Notes
+- This release closes the v0.8 linear-solver track: the `feral` backend
+  is considered solid. The remaining performance and robustness gaps
+  versus Ipopt 3.14 — concentrated at large scale and on the
+  `RestorationFailed` tail — are IPM-algorithm gaps, not linear-solver
+  gaps.
+
 ## [0.8.1] - 2026-05-18
 
 Patch release continuing the v0.8 Ipopt-3.14-alignment track. The cycle

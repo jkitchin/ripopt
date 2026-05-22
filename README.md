@@ -86,18 +86,18 @@ honesty rule).
 | ripopt only   | 22                  | --                     |
 | Ipopt only    | --                  | 27                     |
 
-Ipopt edges ripopt on CUTEst strict-Optimal at v0.8.1 by 5 problems (556 vs 551). The v0.8 cycle replaced rmumps with the pure-Rust [`feral`](https://crates.io/crates/feral) LDLᵀ solver and aligned the IPM kernel with Ipopt 3.14 (post-restoration handoff, AugmentFilter, μ-update oracles, QF-oracle alignment, watchdog/μ_max capture); the dominant remaining failure mode is `RestorationFailed` (70 cases), followed by `LocalInfeasibility` (29), `Acceptable` (20, counted as a failure), and `MaxTimeExceeded` (19). Of ripopt's 22 exclusive wins, 12 are nonlinear-equation systems where the CUTEst Ipopt wrapper rejects with `IpoptStatus(-10)` (insufficient degrees of freedom) and ripopt's implicit-slack IPM accepts them as ordinary equality-constrained NLPs. See CHANGELOG and the manuscript for details.
+Ipopt edges ripopt on CUTEst strict-Optimal at v0.8.2 by 5 problems (556 vs 551). The v0.8 cycle replaced rmumps with the pure-Rust [`feral`](https://crates.io/crates/feral) LDLᵀ solver and aligned the IPM kernel with Ipopt 3.14 (post-restoration handoff, AugmentFilter, μ-update oracles, QF-oracle alignment, watchdog/μ_max capture); the dominant remaining failure mode is `RestorationFailed` (73 cases), followed by `LocalInfeasibility` (29), `Acceptable` (20, counted as a failure), and `MaxTimeExceeded` (18). Of ripopt's 22 exclusive wins, 12 are nonlinear-equation systems where the CUTEst Ipopt wrapper rejects with `IpoptStatus(-10)` (insufficient degrees of freedom) and ripopt's implicit-slack IPM accepts them as ordinary equality-constrained NLPs. See CHANGELOG and the manuscript for details.
 
 On 529 commonly-Optimal problems:
 
 | Metric                          | Value                  |
 |---------------------------------|------------------------|
-| Geometric mean speedup          | **7.9x**               |
-| Median speedup                  | **10.6x**              |
-| Problems where ripopt is faster | 90%                    |
+| Geometric mean speedup          | **8.1x**               |
+| Median speedup                  | **10.5x**              |
+| Problems where ripopt is faster | 91%                    |
 | Problems where ripopt is 10x+   | 54%                    |
 
-**Interpreting the speed numbers.** Most CUTEst problems are small (n < 10) and solve in microseconds for ripopt, while Ipopt has a ~1-3ms floor from internal initialization. The per-iteration speedup on small problems comes from stack allocation, the absence of C/Fortran interop, and cache-efficient dense linear algebra. On larger problems, ripopt switches to sparse multifrontal LDLᵀ via `feral`, and Ipopt's Fortran MUMPS retains a per-factorization advantage on the largest fronts. Ipopt uses fewer iterations on average on CUTEst (ripopt mean 43.4 vs Ipopt 35.5), reflecting its more mature barrier parameter tuning.
+**Interpreting the speed numbers.** Most CUTEst problems are small (n < 10) and solve in microseconds for ripopt, while Ipopt has a ~1-3ms floor from internal initialization. The per-iteration speedup on small problems comes from stack allocation, the absence of C/Fortran interop, and cache-efficient dense linear algebra. On larger problems, ripopt switches to sparse multifrontal LDLᵀ via `feral`, and Ipopt's Fortran MUMPS retains a per-factorization advantage on the largest fronts. Ipopt uses fewer iterations on average on CUTEst (ripopt mean 34.7 vs Ipopt 30.7), reflecting its more mature barrier parameter tuning.
 
 The speed advantage comes from:
 
@@ -127,7 +127,7 @@ Numbers above are from the v0.7 sweep. The v0.8 cycle replaced the
 sparse linear solver (rmumps → feral) and aligned the IPM kernel
 with Ipopt 3.14; on CUTEst strict-Optimal counts the aggregate
 shifted to 551 (ripopt) vs 556 (Ipopt) and the geomean speedup on
-529 commonly-Optimal problems is 7.9x (median 10.6x), with feral
+529 commonly-Optimal problems is 8.1x (median 10.5x), with feral
 still trailing MUMPS on the largest sparse fronts. See the
 manuscript for the full v0.8 analysis.
 Historical numbers from v0.6.2 are preserved in
@@ -142,8 +142,8 @@ Run the benchmarks yourself: `make benchmark`
 
 | Suite                        | Problems | ripopt           | Ipopt         | Notes                                                              |
 |------------------------------|----------|------------------|---------------|--------------------------------------------------------------------|
-| Electrolyte thermodynamics   | 13       | **13/13 (100%)** | 12/13 (92.3%) | 5.7x geo mean speedup (median 8.5x); ripopt uniquely solves seawater speciation |
-| Grid (AC Optimal Power Flow) | 4        | **4/4 (100%)**   | **4/4 (100%)**| 1.5x geo mean (median 2.1x) on 4 commonly-solved                  |
+| Electrolyte thermodynamics   | 13       | **13/13 (100%)** | 12/13 (92.3%) | 4.6x geo mean speedup (median 6.9x); ripopt uniquely solves seawater speciation |
+| Grid (AC Optimal Power Flow) | 4        | **4/4 (100%)**   | **4/4 (100%)**| 1.7x geo mean (median 2.3x) on 4 commonly-solved                  |
 | CHO parameter estimation     | 1        | 0/1              | 0/1           | Large-scale (n=21,672, m=21,660); both hit iteration limit         |
 | Gas pipeline NLPs            | 4        | see suite README | see suite README | PDE-discretized Euler equations on pipe networks (gaslib11/40, steady/dynamic). Standalone — does not feed `BENCHMARK_REPORT.md` |
 | Water distribution NLPs      | 6        | see suite README | see suite README | MINLPLib water network design instances (Hazen-Williams head-loss). Standalone — does not feed `BENCHMARK_REPORT.md` |
@@ -563,7 +563,7 @@ Include `ripopt.h` (repo root) in your C project. It defines version macros, cal
 #include "ripopt.h"
 
 // Check version at compile time
-printf("ripopt %s\n", RIPOPT_VERSION);  // "0.8.1"
+printf("ripopt %s\n", RIPOPT_VERSION);  // "0.8.2"
 ```
 
 ### Callback signatures

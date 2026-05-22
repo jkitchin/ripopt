@@ -1,6 +1,6 @@
 # ripopt Benchmark Report
 
-Generated: 2026-05-18 17:36:48
+Generated: 2026-05-22 16:34:04
 
 ## Executive Summary
 
@@ -10,7 +10,7 @@ Generated: 2026-05-18 17:36:48
 | Acceptable (informational, *not* counted as solved) | 20 | 5 |
 | Solved exclusively (strict Optimal) | 23 | 27 |
 | Both Optimal | 545 | |
-| Matching objectives (< 0.01%) | 529/545 | |
+| Matching objectives (< 0.01%) | 530/545 | |
 
 > **Note:** All headline counts use strict Optimal status only. `Acceptable`
 > means the iterate met relaxed tolerances but not the requested tolerance —
@@ -22,7 +22,7 @@ Generated: 2026-05-18 17:36:48
 
 | Suite | Problems | ripopt Optimal | Ipopt Optimal | ripopt only | Ipopt only | Both Optimal | Match |
 |-------|----------|---------------|--------------|-------------|------------|--------------|-------|
-| CUTEst | 727 | 551 (75.8%) | 556 (76.5%) | 22 | 27 | 529 | 514/529 |
+| CUTEst | 727 | 551 (75.8%) | 556 (76.5%) | 22 | 27 | 529 | 515/529 |
 | Electrolyte | 13 | 13 (100.0%) | 12 (92.3%) | 1 | 0 | 12 | 11/12 |
 | Grid | 4 | 4 (100.0%) | 4 (100.0%) | 0 | 0 | 4 | 4/4 |
 | CHO | 1 | 0 (0.0%) | 0 (0.0%) | 0 | 0 | 0 | 0/1 |
@@ -33,16 +33,16 @@ On 529 commonly-solved problems:
 
 | Metric | ripopt | Ipopt |
 |--------|--------|-------|
-| Median time | 205us | 2.2ms |
-| Total time | 27.25s | 18.34s |
-| Mean iterations | 38.3 | 30.7 |
+| Median time | 211us | 2.3ms |
+| Total time | 20.74s | 19.26s |
+| Mean iterations | 34.7 | 30.7 |
 | Median iterations | 12 | 12 |
 
-- **Geometric mean speedup**: 7.9x
-- **Median speedup**: 10.6x
-- ripopt faster: 476/529 (90%)
-- ripopt 10x+ faster: 286/529
-- Ipopt faster: 53/529
+- **Geometric mean speedup**: 8.1x
+- **Median speedup**: 10.5x
+- ripopt faster: 480/529 (91%)
+- ripopt 10x+ faster: 287/529
+- Ipopt faster: 49/529
 
 ## Electrolyte Suite — Performance
 
@@ -50,15 +50,15 @@ On 12 commonly-solved problems:
 
 | Metric | ripopt | Ipopt |
 |--------|--------|-------|
-| Median time | 152us | 1.3ms |
-| Total time | 32.4ms | 51.5ms |
+| Median time | 162us | 1.2ms |
+| Total time | 24.2ms | 42.4ms |
 | Mean iterations | 212.8 | 19.2 |
 | Median iterations | 7 | 7 |
 
-- **Geometric mean speedup**: 5.7x
-- **Median speedup**: 8.5x
+- **Geometric mean speedup**: 4.6x
+- **Median speedup**: 6.9x
 - ripopt faster: 11/12 (92%)
-- ripopt 10x+ faster: 3/12
+- ripopt 10x+ faster: 2/12
 - Ipopt faster: 1/12
 
 ## Grid Suite — Performance
@@ -67,13 +67,13 @@ On 4 commonly-solved problems:
 
 | Metric | ripopt | Ipopt |
 |--------|--------|-------|
-| Median time | 14.4ms | 11.0ms |
-| Total time | 57.4ms | 75.2ms |
+| Median time | 9.3ms | 9.1ms |
+| Total time | 46.6ms | 75.3ms |
 | Mean iterations | 15.8 | 12.5 |
 | Median iterations | 19 | 14 |
 
-- **Geometric mean speedup**: 1.5x
-- **Median speedup**: 2.1x
+- **Geometric mean speedup**: 1.7x
+- **Median speedup**: 2.3x
 - ripopt faster: 3/4 (75%)
 - ripopt 10x+ faster: 0/4
 - Ipopt faster: 1/4
@@ -85,6 +85,7 @@ On 4 commonly-solved problems:
 | Failure Mode | ripopt | Ipopt |
 |-------------|--------|-------|
 | Acceptable | 20 | 5 |
+| DivergingIterates | 1 | 0 |
 | ErrorInStepComputation | 0 | 2 |
 | EvaluationError | 3 | 0 |
 | Infeasible | 0 | 11 |
@@ -93,12 +94,12 @@ On 4 commonly-solved problems:
 | IpoptStatus(3) | 0 | 1 |
 | IpoptStatus(4) | 0 | 2 |
 | LocalInfeasibility | 29 | 0 |
-| MaxIterations | 18 | 12 |
-| MaxTimeExceeded | 19 | 0 |
+| MaxIterations | 17 | 12 |
+| MaxTimeExceeded | 18 | 0 |
 | NumericalError | 9 | 0 |
-| RestorationFailed | 70 | 4 |
+| RestorationFailed | 73 | 4 |
 | StopAtTinyStep | 2 | 0 |
-| Timeout | 6 | 10 |
+| Timeout | 4 | 10 |
 
 ### Electrolyte Suite
 
@@ -121,10 +122,10 @@ On 4 commonly-solved problems:
 | ALLINITC | CUTEst | 4 | 1 | Acceptable | 3.049261e+01 |
 | BT8 | CUTEst | 5 | 2 | Acceptable | 1.000000e+00 |
 | CRESC4 | CUTEst | 6 | 8 | NumericalError | 8.718975e-01 |
-| CRESC50 | CUTEst | 6 | 100 | NumericalError | 7.862467e-01 |
+| CRESC50 | CUTEst | 6 | 100 | MaxIterations | 7.862467e-01 |
 | DECONVBNE | CUTEst | 63 | 40 | RestorationFailed | 0.000000e+00 |
 | DECONVU | CUTEst | 63 | 0 | Acceptable | 4.146188e-13 |
-| DISCS | CUTEst | 36 | 66 | MaxIterations | 1.200007e+01 |
+| DISCS | CUTEst | 36 | 66 | RestorationFailed | 1.200007e+01 |
 | HAIFAM | CUTEst | 99 | 150 | Acceptable | -4.500036e+01 |
 | HATFLDFLNE | CUTEst | 3 | 3 | RestorationFailed | 0.000000e+00 |
 | HIMMELP5 | CUTEst | 2 | 3 | NumericalError | -5.901318e+01 |
@@ -207,19 +208,19 @@ Both solvers receive the exact same NlpProblem struct via the Rust trait interfa
 
 | Problem | n | m | ripopt | iters | time | Ipopt | iters | time | speedup |
 |---------|---|---|--------|-------|------|-------|-------|------|---------|
-| Rosenbrock 500 | 500 | 0 | Optimal | 751 | 0.124s | Optimal | 749 | 0.179s | 1.4x |
-| SparseQP 1K | 500 | 500 | Optimal | 6 | 0.009s | Optimal | 6 | 0.004s | 0.4x |
-| Bratu 1K | 1,000 | 998 | Optimal | 2 | 0.002s | Optimal | 2 | 0.002s | 0.9x |
-| OptControl 2.5K | 2,499 | 1,250 | Optimal | 1 | 0.012s | Optimal | 1 | 0.002s | 0.2x |
-| Rosenbrock 5K | 5,000 | 0 | MaxIterations | 2999 | 3.452s | Failed | 3000 | 3.545s | 1.0x |
-| Poisson 2.5K | 5,000 | 2,500 | Optimal | 1 | 0.036s | Optimal | 1 | 0.009s | 0.3x |
-| Bratu 10K | 10,000 | 9,998 | Optimal | 1 | 0.019s | Optimal | 2 | 0.012s | 0.6x |
-| OptControl 20K | 19,999 | 10,000 | Optimal | 1 | 0.105s | Optimal | 1 | 0.017s | 0.2x |
-| Poisson 50K | 49,928 | 24,964 | Optimal | 1 | 0.463s | Optimal | 1 | 0.115s | 0.2x |
-| SparseQP 100K | 50,000 | 50,000 | Optimal | 6 | 1.032s | Optimal | 6 | 0.286s | 0.3x |
+| Rosenbrock 500 | 500 | 0 | Optimal | 751 | 0.072s | Optimal | 749 | 0.188s | 2.6x |
+| SparseQP 1K | 500 | 500 | Optimal | 6 | 0.005s | Optimal | 6 | 0.004s | 0.7x |
+| Bratu 1K | 1,000 | 998 | Optimal | 2 | 0.002s | Optimal | 2 | 0.003s | 1.2x |
+| OptControl 2.5K | 2,499 | 1,250 | Optimal | 1 | 0.010s | Optimal | 1 | 0.003s | 0.3x |
+| Rosenbrock 5K | 5,000 | 0 | MaxIterations | 2999 | 3.046s | Failed | 3000 | 3.827s | 1.3x |
+| Poisson 2.5K | 5,000 | 2,500 | Optimal | 1 | 0.036s | Optimal | 1 | 0.010s | 0.3x |
+| Bratu 10K | 10,000 | 9,998 | Optimal | 1 | 0.020s | Optimal | 2 | 0.012s | 0.6x |
+| OptControl 20K | 19,999 | 10,000 | Optimal | 1 | 0.096s | Optimal | 1 | 0.019s | 0.2x |
+| Poisson 50K | 49,928 | 24,964 | Optimal | 1 | 0.507s | Optimal | 1 | 0.166s | 0.3x |
+| SparseQP 100K | 50,000 | 50,000 | Optimal | 6 | 1.105s | Optimal | 6 | 0.326s | 0.3x |
 
-ripopt: **9/10 solved** in 5.3s total
-Ipopt: **9/10 solved** in 4.2s total
+ripopt: **9/10 solved** in 4.9s total
+Ipopt: **9/10 solved** in 4.6s total
 
 ---
 *Generated by benchmark_report.py*

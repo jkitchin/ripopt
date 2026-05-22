@@ -2,7 +2,7 @@
 
 ripopt began as a Rust translation of the Ipopt interior-point optimizer. Through
 iterative development it has diverged significantly, incorporating novel algorithmic
-strategies. On the CUTEst benchmark suite at v0.8.1 it solves slightly fewer problems
+strategies. On the CUTEst benchmark suite at v0.8.2 it solves slightly fewer problems
 to strict `Optimal` than Ipopt (551 vs 556), but is dramatically faster on
 small-to-medium problems and solves a different set of problems --- 22 that Ipopt
 cannot, vs. 27 the other way. This document provides a balanced analysis of where
@@ -20,18 +20,18 @@ rule).
 | CUTEst solved            | 551/727 (75.8%)        | **556/727 (76.5%)**  |
 | HS solved (retired)      | **118/120 (98.3%)**    | 116/120 (96.7%)      |
 | Both solve (CUTEst)      | 529                    | 529                  |
-| Matching objectives      | 514/529 (97.2%)        |                      |
+| Matching objectives      | 515/529 (97.4%)        |                      |
 | ripopt-only (CUTEst)     | **22**                 | --                   |
 | Ipopt-only (CUTEst)      | --                     | **27**               |
 
 **Solution quality** (529 CUTEst problems where both converge to strict `Optimal`):
-- Matching objectives (rel diff < 1e-4): 514/529 (97.2%)
-- 15 mismatches: both reach valid KKT points but at different local optima
+- Matching objectives (rel diff < 1e-4): 515/529 (97.4%)
+- 14 mismatches: both reach valid KKT points but at different local optima
 
 **Speed** (529 CUTEst commonly-Optimal):
-- Geometric mean speedup: **7.9x** (ripopt faster)
-- Median speedup: **10.6x**
-- 90% of problems: ripopt faster
+- Geometric mean speedup: **8.1x** (ripopt faster)
+- Median speedup: **10.5x**
+- 91% of problems: ripopt faster
 - 54% of problems: ripopt 10x+ faster
 - Small problems (n <= 10): massive speedup (100x+ median on microsecond solves)
 - Medium problems (10 < n <= 50): typically 2-5x faster
@@ -52,7 +52,7 @@ reverses the gap.
 such that g(x) = 0, with a trivially zero objective (f = 0). The CUTEst Ipopt
 wrapper rejects these up-front with `IpoptStatus(-10)` ("insufficient degrees of
 freedom") because Ipopt's interface requires a stationary objective. This locks 123
-problems out of Ipopt on CUTEst at v0.8.1.
+problems out of Ipopt on CUTEst at v0.8.2.
 
 **ripopt's approach.** ripopt's implicit-slack KKT formulation accepts these as
 ordinary equality-constrained NLPs. With f = 0 the dual-infeasibility residual
@@ -62,7 +62,7 @@ drive g(x) to tolerance. No problem-specific reformulation is involved (the
 dedicated NE-to-LS reformulation that v0.7 used was removed in v0.8; the wins
 survived the removal).
 
-**Impact.** Of ripopt's 22 exclusive CUTEst wins at v0.8.1, 12 are NE-style
+**Impact.** Of ripopt's 22 exclusive CUTEst wins at v0.8.2, 12 are NE-style
 problems where the Ipopt wrapper returns `IpoptStatus(-10)` and ripopt's IPM
 converges (e.g. BEALENE, BIGGS6NE, BOX3NE, DENSCHNBNE, DEVGLA1NE, DEVGLA2NE,
 ENGVAL2NE, EXP2NE, HS25NE, LANCZOS1, LEVYMONE5, NYSTROM5). The remaining 10
@@ -269,7 +269,7 @@ perturbation strategy.
 
 ## Summary
 
-On the CUTEst suite at v0.8.1, Ipopt edges ripopt by 5 strict-Optimal problems
+On the CUTEst suite at v0.8.2, Ipopt edges ripopt by 5 strict-Optimal problems
 (556 vs 551). ripopt recovers 22 problems Ipopt cannot, and Ipopt recovers 27
 that ripopt cannot. ripopt's unique capabilities:
 - Implicit-slack acceptance of NE systems (12 of the 22 exclusive wins; the v0.7
@@ -278,8 +278,8 @@ that ripopt cannot. ripopt's unique capabilities:
 - Explicit slack fallback (recovers problems where implicit-slack multipliers oscillate)
 - Pragmatic inertia correction (continues past factorization failures)
 - Hybrid dense/sparse linear algebra (auto-selected by problem size)
-- Raw speed advantage from Rust (median 10.6x faster on the 529 commonly-Optimal
-  CUTEst problems at v0.8.1; geomean 7.9x)
+- Raw speed advantage from Rust (median 10.5x faster on the 529 commonly-Optimal
+  CUTEst problems at v0.8.2; geomean 8.1x)
 
 Ipopt's remaining advantages are:
 - More mature mu strategy on difficult nonconvex problems
@@ -287,7 +287,7 @@ Ipopt's remaining advantages are:
 - Better handling of dual oscillation at degenerate points
 - Fortran MUMPS outperforms `feral` on the very largest sparse systems
 
-The most impactful improvements would target the 70 CUTEst `RestorationFailed`
-failures (the dominant v0.8.1 bucket) and the 29 `LocalInfeasibility` cases
+The most impactful improvements would target the 73 CUTEst `RestorationFailed`
+failures (the dominant v0.8.2 bucket) and the 29 `LocalInfeasibility` cases
 where multi-start or constraint-space search could escape false infeasibility
 declarations.

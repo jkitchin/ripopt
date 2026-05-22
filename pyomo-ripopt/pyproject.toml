@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyomo-ripopt"
-version = "0.8.1"
+version = "0.8.2"
 description = "Pyomo solver plugin for the ripopt NLP solver"
 readme = "README.md"
 requires-python = ">=3.8"

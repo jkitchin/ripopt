@@ -187,28 +187,28 @@ Standard seawater composition (mol/kg): Na = 0.4861, K = 0.01058, Mg = 0.05474, 
 All problems solved at tolerance $10^{-6}$ with a maximum of 3000 iterations.
 
 ```
-Electrolyte Thermodynamics Benchmark: ripopt vs ipopt (v0.8.1)
+Electrolyte Thermodynamics Benchmark: ripopt vs ipopt (v0.8.2)
 ==============================================================
 
 Problem                     n   m |  ripopt obj  iter  time(s) |   ipopt obj  iter  time(s)
 -------------------------------------------------------------------------------------------
 --- Speciation / Chemical Equilibrium ---
-Water autoionization        1   0 |   3.7993e-7     7   0.0010 |   3.1004e-7     7   0.0042
-CO2-water speciation        5   2 |   7.7559e-4    12   0.0009 |  -6.9337e-3    28   0.0111
-NaCl speciation             4   3 |  -4.8327e-1     5   0.0003 |  -4.8327e-1     7   0.0019
-CaCl2+NaCl mixed            6   4 |  -7.7237e-1  2369   0.0282 |  -7.7237e-1     9   0.0020
-Phosphoric acid             6   2 |  -5.5313e-2     7   0.0002 |  -5.5312e-2     6   0.0013
+Water autoionization        1   0 |   3.7993e-7     7   0.0014 |   3.1004e-7     7   0.0016
+CO2-water speciation        5   2 |   7.7559e-4    12   0.0004 |  -6.9337e-3    28   0.0052
+NaCl speciation             4   3 |  -4.8327e-1     5   0.0002 |  -4.8327e-1     7   0.0010
+CaCl2+NaCl mixed            6   4 |  -7.7237e-1  2369   0.0201 |  -7.7237e-1     9   0.0018
+Phosphoric acid             6   2 |  -5.5312e-2     7   0.0002 |  -5.5312e-2     6   0.0012
 --- Phase Equilibrium ---
-HCl mean activity           1   0 |  ~1e-17         7   0.0001 |  ~9e-17         5   0.0009
-NaCl solubility             1   0 |  ~1e-15         7   0.0001 |  ~8e-22         5   0.0009
+HCl mean activity           1   0 |  ~9e-16         7   0.0001 |  ~9e-17         5   0.0009
+NaCl solubility             1   0 |  ~2e-17         7   0.0001 |  ~8e-22         5   0.0009
 BuOH-water LLE              2   2 |  ~8e-10         6   0.0001 |  ~8e-10         4   0.0008
-Saturated brine             3   3 |    0.0000e0     6   0.0001 |    0.0000e0     4   0.0009
+Saturated brine             3   3 |    0.0000e0     6   0.0001 |    0.0000e0     4   0.0008
 --- Parameter Fitting ---
-Pitzer NaCl fit             3   0 |  ~2e-17         6   0.0001 |  ~4e-16         5   0.0009
-Multi-salt DH fit           8   0 |  ~1e-14       111   0.0011 |  ~3e-10       142   0.0252
-eNRTL T-dep fit             4   0 |  ~2e-15        10   0.0001 |  ~4e-12         8   0.0013
+Pitzer NaCl fit             3   0 |  ~6e-15         6   0.0001 |  ~4e-16         5   0.0008
+Multi-salt DH fit           8   0 |  ~9e-12       111   0.0010 |  ~3e-10       142   0.0258
+eNRTL T-dep fit             4   0 |  ~5e-13        10   0.0004 |  ~4e-12         8   0.0015
 --- Scale-Up ---
-Seawater speciation        15   8 |   -1.3407e0    24   0.0004 |   -1.3628e0    23   0.0054
+Seawater speciation        15   8 |   -1.3483e0    24   0.0005 |   -1.3628e0    23   0.0057
   status: ipopt=Infeasible
 -------------------------------------------------------------------------------------------
 ```
@@ -219,20 +219,20 @@ Seawater speciation        15   8 |   -1.3407e0    24   0.0004 |   -1.3628e0    
 |------------------|-----------|--------------------------|
 | Problems solved  | **13/13** | 12/13                    |
 | Total iterations | 2,577     | 230                      |
-| Total wall time  | ~33 ms    | ~52 ms                   |
+| Total wall time  | ~25 ms    | ~48 ms                   |
 | Failures         | 0         | 1 (seawater: Infeasible) |
 
-**Geometric mean speedup (12 commonly-solved)**: 5.7x; **median**: 8.4x.
+**Geometric mean speedup (12 commonly-solved)**: 4.6x; **median**: 6.9x.
 
 ### Robustness
 
-Both solvers handle the speciation, phase equilibrium, and parameter fitting categories well. The key differentiator is **Problem 13 (seawater speciation)**, where Ipopt declares infeasibility while ripopt converges to a physically correct solution (pH = 8.10, consistent with published seawater values). This problem combines the worst-case features of the suite: 15 tightly coupled variables, 8 constraints, divalent ions, ion pairs, and concentrations spanning 18 orders of magnitude. At v0.8.1 ripopt converges on seawater in 24 iterations (down from 1,415 at v0.7.0 and on par with v0.6.2's 22).
+Both solvers handle the speciation, phase equilibrium, and parameter fitting categories well. The key differentiator is **Problem 13 (seawater speciation)**, where Ipopt declares infeasibility while ripopt converges to a physically correct solution (pH = 8.10, consistent with published seawater values). This problem combines the worst-case features of the suite: 15 tightly coupled variables, 8 constraints, divalent ions, ion pairs, and concentrations spanning 18 orders of magnitude. At v0.8.2 ripopt converges on seawater in 24 iterations (down from 1,415 at v0.7.0 and on par with v0.6.2's 22).
 
-All 13 problems reach strict `Optimal` at v0.8.1 (in v0.6.2, CaCl2+NaCl returned `Acceptable`).
+All 13 problems reach strict `Optimal` at v0.8.2 (in v0.6.2, CaCl2+NaCl returned `Acceptable`).
 
 ### Iteration Counts
 
-On most speciation and phase-equilibrium problems the two solvers are comparable (5–12 iterations each). The notable outliers at v0.8.1:
+On most speciation and phase-equilibrium problems the two solvers are comparable (5–12 iterations each). The notable outliers at v0.8.2:
 
 - **CaCl2+NaCl mixed**: ripopt uses 2,369 iterations vs. Ipopt's 9 to reach the same objective ($-0.77237$). This is a known divergence — the v0.8 IPM alignment trades shortcut acceptance for KKT-faithful iterates on this near-degenerate Gauss-Newton landscape; both solvers land on the same minimum.
 - **Multi-salt DH fit**: ripopt converges in 111 iterations to $f \approx 10^{-14}$; Ipopt uses 142 iterations and reaches $f \approx 3 \times 10^{-10}$. ripopt finds a tighter optimum.
@@ -240,7 +240,7 @@ On most speciation and phase-equilibrium problems the two solvers are comparable
 
 ### Wall Time
 
-ripopt is 10-30x faster per problem on this benchmark. This is partly architectural (no C FFI overhead, no Ipopt initialization cost) and partly reflects that these are very small problems (n $\leq$ 15) where per-iteration overhead dominates over linear algebra. The absolute times (0.1-0.3 ms for ripopt, 1-25 ms for Ipopt) are both negligible for single solves but would matter in inner loops of process simulators where thousands of flash calculations are performed.
+ripopt is faster on 11 of the 12 commonly-solved problems (geometric mean 4.6x speedup), the exception being CaCl2+NaCl mixed where ripopt's 2,369 KKT-faithful iterations cost more wall time than Ipopt's 9. The speed advantage is partly architectural (no C FFI overhead, no Ipopt initialization cost) and partly reflects that these are very small problems (n $\leq$ 15) where per-iteration overhead dominates over linear algebra. The absolute times (around 0.1-1.4 ms for ripopt away from the CaCl2+NaCl outlier, 0.8-26 ms for Ipopt) are both negligible for single solves but would matter in inner loops of process simulators where thousands of flash calculations are performed.
 
 ### Solution Quality
 

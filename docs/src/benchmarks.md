@@ -37,17 +37,17 @@ CUTEst covers a wide range of problem types, sizes, and structures. Problems ran
 | Solved by ripopt only | 22 | — |
 | Solved by Ipopt only | — | 27 |
 
-Ipopt edges ripopt on CUTEst strict-Optimal at v0.8.1 by 5 problems (556 vs 551). All counts use strict `Optimal` status only; `Acceptable` is reported separately and never folded into the pass rate, per the project's "Honesty in Benchmarks" rule (see `CLAUDE.md`). The v0.8 cycle replaced rmumps with the pure-Rust [`feral`](https://crates.io/crates/feral) LDLᵀ solver and aligned the IPM kernel with Ipopt 3.14 (QF-oracle alignment, watchdog/μ_max capture, soft-restoration E_μ, AugmentFilter); the dominant remaining failure mode is `RestorationFailed` (70 cases).
+Ipopt edges ripopt on CUTEst strict-Optimal at v0.8.2 by 5 problems (556 vs 551). All counts use strict `Optimal` status only; `Acceptable` is reported separately and never folded into the pass rate, per the project's "Honesty in Benchmarks" rule (see `CLAUDE.md`). The v0.8 cycle replaced rmumps with the pure-Rust [`feral`](https://crates.io/crates/feral) LDLᵀ solver and aligned the IPM kernel with Ipopt 3.14 (QF-oracle alignment, watchdog/μ_max capture, soft-restoration E_μ, AugmentFilter); the dominant remaining failure mode is `RestorationFailed` (73 cases).
 
 On 529 commonly solved problems:
 
 | Metric | Value |
 |---|---|
-| Geometric mean speedup | **7.9x** |
-| Median speedup | **10.6x** |
-| ripopt faster | 476/529 (90%) |
-| ripopt 10x+ faster | 286/529 (54%) |
-| Matching objectives (rel diff < 1e-4) | 514/529 (97.2%) |
+| Geometric mean speedup | **8.1x** |
+| Median speedup | **10.5x** |
+| ripopt faster | 480/529 (91%) |
+| ripopt 10x+ faster | 287/529 (54%) |
+| Matching objectives (rel diff < 1e-4) | 515/529 (97.4%) |
 
 Run: `make benchmark` (full suite, ~2 hours) or individual problems:
 ```bash
@@ -91,8 +91,8 @@ Run: `make benchmark`
 
 | Suite | Problems | ripopt | Ipopt | Notes |
 |---|---|---|---|---|
-| Electrolyte thermodynamics | 13 | **13/13 (100%)** | 12/13 (92.3%) | 5.7x geo mean (median 8.5x); ripopt uniquely solves seawater speciation |
-| Grid (AC Optimal Power Flow) | 4 | **4/4 (100%)** | **4/4 (100%)** | 1.5x geo mean (median 2.1x) on 4 commonly-solved |
+| Electrolyte thermodynamics | 13 | **13/13 (100%)** | 12/13 (92.3%) | 4.6x geo mean (median 6.9x); ripopt uniquely solves seawater speciation |
+| Grid (AC Optimal Power Flow) | 4 | **4/4 (100%)** | **4/4 (100%)** | 1.7x geo mean (median 2.3x) on 4 commonly-solved |
 | CHO parameter estimation | 1 | 0/1 | 0/1 | n=21,672, m=21,660; both hit iteration limit |
 | Gas pipeline NLPs | 4 | see suite README | see suite README | PDE-discretized Euler equations on pipe networks (gaslib11/40). Standalone — does not feed `BENCHMARK_REPORT.md` |
 | Water distribution NLPs | 6 | see suite README | see suite README | MINLPLib water network design instances. Standalone — does not feed `BENCHMARK_REPORT.md` |

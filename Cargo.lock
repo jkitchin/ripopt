@@ -362,9 +362,9 @@ dependencies = [
 
 [[package]]
 name = "feral"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8db10baeb351dbf1a61175da59b49f17abfe182842038a331887c8a3b4d043c"
+checksum = "9e0f4a7c215acd4c2de661d9dc2fb1361b864588c83cd342a4f1a03ac09c78d4"
 dependencies = [
  "feral-amd",
  "feral-amf",
@@ -1345,7 +1345,7 @@ checksum = "a96887878f22d7bad8a3b6dc5b7440e0ada9a245242924394987b21cf2210a4c"
 
 [[package]]
 name = "ripopt"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "approx",
  "env_logger",
@@ -1362,7 +1362,7 @@ dependencies = [
 
 [[package]]
 name = "ripopt-py"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "numpy",
  "pyo3",

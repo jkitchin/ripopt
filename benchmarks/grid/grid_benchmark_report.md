@@ -115,10 +115,10 @@ AC Optimal Power Flow Benchmark: ripopt vs ipopt
 
 Problem                 n    m  nnz |   ripopt obj  iter  time(s) |    ipopt obj  iter  time(s)
 -----------------------------------------------------------------------------------------------
-case3_lmbd             12   12   66 |      5812.64    10   0.0021 |      5812.64    10   0.0053
-case5_pjm              20   22  126 |     17551.89    20   0.0031 |     17551.89    15   0.0066
-case14_ieee            38   68  386 |      2178.08    14   0.0144 |      2178.08    11   0.0110
-case30_ieee            72  142  788 |      8208.52    19   0.0378 |      8208.52    14   0.0522
+case3_lmbd             12   12   66 |      5812.64    10   0.0011 |      5812.64    10   0.0025
+case5_pjm              20   22  126 |     17551.89    20   0.0016 |     17551.89    15   0.0038
+case14_ieee            38   68  386 |      2178.08    14   0.0093 |      2178.08    11   0.0091
+case30_ieee            72  142  788 |      8208.52    19   0.0347 |      8208.52    14   0.0599
 -----------------------------------------------------------------------------------------------
 ```
 
@@ -133,7 +133,7 @@ case30_ieee            72  142  788 |      8208.52    19   0.0378 |      8208.52
 | case14_ieee | 2,178.08      | 2,178.08  | 0.000% | 2,178.08  | 0.000% |
 | case30_ieee | 8,081.52      | 8,208.52  | 1.57%  | 8,208.52  | 1.57%  |
 
-On cases 3, 5, and 14, both solvers reach the published global optimum to within solver tolerance. case30_ieee is a well-known multi-local-optimum problem in PGLib-OPF: at v0.8.1 both solvers converge to the same local optimum at 8,208.52 \$/h, 1.57% above the best-known optimum (8,081.52 \$/h obtained by PowerModels.jl with a different formulation and solver configuration). The v0.7.0 `MaxIterations` regression on case30_ieee — caused by removing the `n+m ≥ 100` shortcut in `factor_with_inertia_correction` (commit 66bce53) — has been resolved by the v0.8 IPM-alignment work.
+On cases 3, 5, and 14, both solvers reach the published global optimum to within solver tolerance. case30_ieee is a well-known multi-local-optimum problem in PGLib-OPF: at v0.8.2 both solvers converge to the same local optimum at 8,208.52 \$/h, 1.57% above the best-known optimum (8,081.52 \$/h obtained by PowerModels.jl with a different formulation and solver configuration). The v0.7.0 `MaxIterations` regression on case30_ieee — caused by removing the `n+m ≥ 100` shortcut in `factor_with_inertia_correction` (commit 66bce53) — has been resolved by the v0.8 IPM-alignment work.
 
 ### Iterations
 
@@ -150,16 +150,16 @@ ripopt converges in a comparable iteration count on all four cases (within 5 ite
 
 | Case        | ripopt  | Ipopt   | Ratio       |
 |-------------|---------|---------|-------------|
-| case3_lmbd  | 2.1 ms  | 5.3 ms  | 2.5x faster |
-| case5_pjm   | 3.1 ms  | 6.6 ms  | 2.1x faster |
-| case14_ieee | 14.4 ms | 11.0 ms | 0.8x        |
-| case30_ieee | 37.8 ms | 52.2 ms | 1.4x faster |
+| case3_lmbd  | 1.1 ms  | 2.5 ms  | 2.3x faster |
+| case5_pjm   | 1.6 ms  | 3.8 ms  | 2.4x faster |
+| case14_ieee | 9.3 ms  | 9.1 ms  | 1.0x        |
+| case30_ieee | 34.7 ms | 59.9 ms | 1.7x faster |
 
-ripopt is 1.4–2.5x faster on three of four cases; case14_ieee is the lone Ipopt win (0.8x). Geometric mean across all four is 1.5x faster (median 2.1x).
+ripopt is 1.7–2.4x faster on three of four cases; case14_ieee is a near-tie (1.0x, a hair in Ipopt's favor). Geometric mean across all four is 1.7x faster (median 2.3x).
 
 ### Convergence Status
 
-At v0.8.1, ripopt reaches strict `Optimal` on all four cases (4/4, 100%), matching Ipopt. The v0.7.0 `MaxIterations` regression on case30_ieee is resolved.
+At v0.8.2, ripopt reaches strict `Optimal` on all four cases (4/4, 100%), matching Ipopt. The v0.7.0 `MaxIterations` regression on case30_ieee is resolved.
 
 ## Implementation Notes
 
@@ -170,9 +170,9 @@ At v0.8.1, ripopt reaches strict `Optimal` on all four cases (4/4, 100%), matchi
 
 ## Conclusions
 
-1. **ripopt solves all 4 ACOPF benchmarks at v0.8.1** and matches the published global optimum on cases 3, 5, and 14. On case30_ieee both solvers converge to the same local optimum (8,208.52 \$/h, 1.57% above the best-known). The v0.7.0 `MaxIterations` regression on case30_ieee is resolved by the v0.8 IPM-alignment work.
+1. **ripopt solves all 4 ACOPF benchmarks at v0.8.2** and matches the published global optimum on cases 3, 5, and 14. On case30_ieee both solvers converge to the same local optimum (8,208.52 \$/h, 1.57% above the best-known). The v0.7.0 `MaxIterations` regression on case30_ieee is resolved by the v0.8 IPM-alignment work.
 
-2. **Nonconvexity matters**: case30_ieee is a known multi-local-optimum problem. ripopt at v0.6.2 found a different local optimum (8,609.66 \$/h, 4.6% gap); at v0.7.0 the stricter factorization acceptance exhausted the iteration budget; at v0.8.1 ripopt converges to the same local optimum as Ipopt.
+2. **Nonconvexity matters**: case30_ieee is a known multi-local-optimum problem. ripopt at v0.6.2 found a different local optimum (8,609.66 \$/h, 4.6% gap); at v0.7.0 the stricter factorization acceptance exhausted the iteration budget; at v0.8.2 ripopt converges to the same local optimum as Ipopt.
 
 3. **Per-iteration overhead favors ripopt on small problems** (cases 3, 5, 30), while Ipopt edges out ripopt on case14_ieee.
 

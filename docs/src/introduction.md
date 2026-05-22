@@ -24,7 +24,7 @@ It implements a primal-dual interior point method (IPM) with a logarithmic barri
 | Linear solver | Dense Bunch-Kaufman LDLᵀ (small) / `feral` multifrontal (large) |
 | HS benchmark (retired) | **118/120** (98.3%, historical) — surpassed Ipopt's 116/120 |
 | CUTEst benchmark | **551/727** (75.8%, strict-Optimal) — Ipopt edges by 5 (556/727) |
-| Speed vs Ipopt | **7.9x** geo mean on CUTEst (median 10.6x) on 529 commonly-Optimal problems |
+| Speed vs Ipopt | **8.1x** geo mean on CUTEst (median 10.5x) on 529 commonly-Optimal problems |
 | Language | Rust (no unsafe FFI) |
 | Interfaces | Rust API, C API, Pyomo/AMPL, GAMS, Julia/JuMP |
 
