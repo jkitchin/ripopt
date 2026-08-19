@@ -8,6 +8,8 @@
 
 ![img](./ipopt-rust.png)
 
+ripopt has been deprecated in favor of [pounce](https://github.com/jkitchin/pounce).
+
 A memory-safe interior point optimizer written in Rust, inspired by [Ipopt](https://github.com/coin-or/Ipopt).
 
 ## What is this?
