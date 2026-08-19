@@ -10367,6 +10367,29 @@ fn configure_restoration_inner_options(
     inner_opts.print_level = if options.print_level >= 5 { 3 } else { 0 };
     inner_opts.mu_init = resto_mu;
     inner_opts.tol = 1e-7;
+    // Do not pass the parent's bound multipliers to the restoration NLP.
+    //
+    // The original NLP has `n` variables, so its warm-start bound multipliers
+    // `z_l` and `z_u` are defined in an `n`-dimensional variable space.
+    //
+    // The restoration NLP, however, introduces `2m` additional slack variables
+    // and therefore has `n + 2m` variables. Its `bound_layout` may consequently
+    // reference indices in `n..n+2m` when projecting bound multipliers.
+    //
+    // Reusing the parent's length-`n` `z_l`/`z_u` vectors with the restoration
+    // layout can therefore index past the end of those vectors, causing a panic
+    // in `bound_layout::project_l/project_u` (and an abort when called through
+    // the C FFI).
+    //
+    // More importantly, the parent's bound multipliers are not a valid warm
+    // start for the restoration NLP: the two NLPs have different variable and
+    // bound spaces. Ipopt follows the same approach and does not warm-start the
+    // restoration NLP with the parent's bound multipliers.
+    //
+    // Other warm-start fields are safe to propagate because their indexing is
+    // length-tolerant or remains in the original constraint space.
+    inner_opts.warm_start_z_l = None;
+    inner_opts.warm_start_z_u = None;
 
     if options.max_wall_time > 0.0 {
         let remaining = options.max_wall_time - start_time.elapsed().as_secs_f64();
